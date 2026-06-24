@@ -1,4 +1,4 @@
-use crate::storage::{AccessControlEntry, Account, CapabilityType};
+use crate::storage::{Account, CapabilityType};
 
 // ---------------------------------------------------------------------------
 // Verification pública
@@ -49,6 +49,7 @@ fn matches_path(acl_path: &str, actual: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::AccessControlEntry;
     use std::collections::HashMap;
 
     fn test_account() -> Account {

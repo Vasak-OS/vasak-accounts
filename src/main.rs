@@ -1,4 +1,5 @@
 mod auth;
+mod protocols;
 mod storage;
 use storage::{Account, AccountDatabase, CapabilityType, SecureKeyringManager};
 
@@ -124,6 +125,56 @@ impl AccountManager {
         Ok(serde_json::to_string_pretty(&response)
             .map_err(|e| FdoError::Failed(format!("Error de serialización: {}", e)))?)
     }
+
+    /// Método `GetAccessToken` — retorna un access_token **válido** para la
+    /// cuenta y capability indicadas. El Motor de Protocolo (Stage 4) verifica
+    /// la expiración y refresca automáticamente si es necesario.
+    async fn get_access_token(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: Header<'_>,
+        account_id: String,
+        capability: String,
+    ) -> zbus::fdo::Result<String> {
+        let pid = get_caller_pid(connection, &header).await?;
+
+        // Verificar ACL (reutilizando Stage 3)
+        let mut db = AccountDatabase::new()
+            .map_err(|e| FdoError::Failed(format!("Error al abrir base de datos: {}", e)))?;
+        db.load()
+            .map_err(|e| FdoError::Failed(format!("Error al cargar cuentas: {}", e)))?;
+
+        let account = db
+            .get(&account_id)
+            .ok_or_else(|| FdoError::Failed(format!("Cuenta '{}' no encontrada", account_id)))?;
+
+        let cap: CapabilityType = serde_json::from_str(&format!("\"{}\"", capability))
+            .map_err(|e| FdoError::Failed(format!("Capability inválida '{}': {}", capability, e)))?;
+
+        let allowed = auth::verify_access(account, pid, &cap)
+            .map_err(|e| FdoError::Failed(e))?;
+
+        if !allowed {
+            tracing::warn!(
+                "ACCESS DENIED — PID {} no autorizado para '{}' en cuenta {}",
+                pid,
+                capability,
+                account_id,
+            );
+            return Err(FdoError::Failed(format!(
+                "Acceso denegado: el proceso (PID {}) no está autorizado \
+                 para '{}' en esta cuenta",
+                pid, capability,
+            )));
+        }
+
+        // Delegar al Motor de Protocolo OAuth2
+        let token = protocols::oauth2::get_valid_access_token(&account_id, &cap)
+            .await
+            .map_err(|e| FdoError::Failed(format!("Error al obtener token: {}", e)))?;
+
+        Ok(token)
+    }
 }
 
 fn init_demo_storage() -> Result<(), Box<dyn std::error::Error>> {
@@ -150,6 +201,10 @@ fn init_demo_storage() -> Result<(), Box<dyn std::error::Error>> {
             "imap_port": 993,
             "smtp_host": "smtp.gmail.com",
             "smtp_port": 587,
+            "client_id": "123456789012-xxxxx.apps.googleusercontent.com",
+            "token_url": "https://oauth2.googleapis.com/token",
+            "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
+            "expires_at": null,
         }),
     );
     caps.insert(
@@ -182,6 +237,12 @@ fn init_demo_storage() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("(busctl NO está en la ACL — las llamadas serán denegadas)");
 
     SecureKeyringManager::store_token(&account_id, "ya29.abc123-secret-demo-token")?;
+    SecureKeyringManager::store_secret(&account_id, "refresh", "1//0g-abc123-refresh-token-demo")?;
+    SecureKeyringManager::store_secret(
+        &account_id,
+        "client_secret",
+        "GOCSPX-abc123-client-secret-demo",
+    )?;
     tracing::info!("Token almacenado en el llavero del sistema (Secret Service)");
 
     let token = SecureKeyringManager::get_token(&account_id)?;
@@ -191,9 +252,24 @@ fn init_demo_storage() -> Result<(), Box<dyn std::error::Error>> {
         token.len(),
     );
 
+    let refresh = SecureKeyringManager::get_secret(&account_id, "refresh")?;
+    tracing::info!(
+        "Refresh token almacenado: {}… (longitud: {})",
+        &refresh[..12],
+        refresh.len(),
+    );
+
     let saved = db.get(&account_id).unwrap();
     let pretty = serde_json::to_string_pretty(saved)?;
     tracing::info!("Cuenta persistida:\n{}", pretty);
+
+    tracing::info!("--- Motor de Protocolo OAuth2 (Stage 4) ---");
+    tracing::info!("expires_at = null → el token se retorna sin refresco");
+    tracing::info!("Para probar refresco automático:");
+    tracing::info!("  1. Editar ~/.config/vasakos/accounts.json");
+    tracing::info!("  2. Cambiar expires_at a fecha pasada (ISO 8601)");
+    tracing::info!("  3. Llamar GetAccessToken desde busctl");
+    tracing::info!("  4. El daemon refrescará automáticamente");
 
     Ok(())
 }

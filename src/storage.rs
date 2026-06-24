@@ -175,6 +175,23 @@ impl AccountDatabase {
         self.accounts.iter().find(|a| a.id == id)
     }
 
+    pub fn update_account(&mut self, updated: Account) -> Result<(), StorageError> {
+        let id = updated.id.clone();
+        let pos = self
+            .accounts
+            .iter()
+            .position(|a| a.id == id)
+            .ok_or_else(|| {
+                StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("Account '{}' not found for update", id),
+                ))
+            })?;
+        self.accounts[pos] = updated;
+        self.save()?;
+        Ok(())
+    }
+
     pub fn remove(&mut self, id: &str) -> Result<bool, StorageError> {
         let len = self.accounts.len();
         self.accounts.retain(|a| a.id != id);
@@ -223,6 +240,20 @@ impl SecureKeyringManager {
         let entry = keyring::Entry::new(KEYRING_SERVICE, account_id)?;
         entry.delete_credential()?;
         Ok(())
+    }
+
+    /// Guarda un secreto identificado por una clave adicional
+    /// (ej. "refresh", "client_secret") en el llavero.
+    pub fn store_secret(account_id: &str, key: &str, secret: &str) -> Result<(), StorageError> {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, &format!("{}:{}", account_id, key))?;
+        entry.set_password(secret)?;
+        Ok(())
+    }
+
+    /// Lee un secreto previamente guardado con `store_secret`.
+    pub fn get_secret(account_id: &str, key: &str) -> Result<String, StorageError> {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, &format!("{}:{}", account_id, key))?;
+        Ok(entry.get_password()?)
     }
 }
 
@@ -292,6 +323,23 @@ mod tests {
         assert_eq!(deserialized.acl.len(), 2);
         assert_eq!(deserialized.acl[0].binary_path, "/usr/bin/thunderbird");
         assert_eq!(deserialized.acl[1].allowed_capabilities, vec![CapabilityType::Drive, CapabilityType::Tasks]);
+    }
+
+    #[test]
+    fn test_update_account() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let mut db = AccountDatabase::with_override(Some(dir.clone())).unwrap();
+        db.load().unwrap();
+        let id = db.add(sample_account()).unwrap();
+
+        let mut updated = db.get(&id).unwrap().clone();
+        updated.display_name = "Updated Name".into();
+        db.update_account(updated).unwrap();
+
+        let reloaded = db.get(&id).unwrap();
+        assert_eq!(reloaded.display_name, "Updated Name");
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
     }
 
     #[test]

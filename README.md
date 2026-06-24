@@ -1,9 +1,9 @@
 # VasakOS Account Manager
 
-Demonio centralizado en segundo plano para la gestión de cuentas de usuario
-en VasakOS. Proporciona un servicio D-Bus que abstrae la autenticación,
-almacenamiento de metadatos y manejo seguro de tokens para múltiples
-aplicaciones independientes (email, calendarios, contactos, chats, etc.).
+Demonio centralizado para la gestión de cuentas de usuario en VasakOS.
+Expone un servicio D-Bus (`ar.net.vasak.os.AccountManager`) que abstrae
+almacenamiento, autenticación OAuth2 y control de acceso para múltiples
+aplicaciones (email, calendarios, contactos, chats, etc.).
 
 ---
 
@@ -11,7 +11,7 @@ aplicaciones independientes (email, calendarios, contactos, chats, etc.).
 
 ```mermaid
 flowchart TB
-    subgraph Aplicaciones["Aplicaciones"]
+    subgraph Apps["Aplicaciones Cliente"]
         APP1["busctl / gdbus / zbus client"]
     end
 
@@ -20,23 +20,42 @@ flowchart TB
     end
 
     subgraph Daemon["AccountManager Daemon"]
-        direction LR
         IPC["D-Bus IPC
              ─────────
-             Ping() → PID
-             + /proc/pid/exe"]
+             Ping()          → PID + binario
+             GetAccountData  → metadatos (con ACL)
+             GetAccessToken  → token válido (con ACL)"]
+
+        ACL["Firewall de PIDs
+             ────────────────
+             /proc/{pid}/exe
+             → binary_path
+             → match ACL entry"]
+
         STORAGE["Storage Module
-                 ──────────────
+                 ─────────────
                  accounts.json
-                 (metadatos)
-                 ──────────────
+                 (metadatos + ACL + OAuth2 URLs)
+                 ─────────────
                  Secret Service
-                 (llavero)"]
+                 (llavero: access_token,
+                           refresh_token,
+                           client_secret)"]
+
+        OAUTH2["Motor de Protocolo OAuth2
+                ─────────────────────────
+                expires_at ≤ 5min
+                → refresh POST
+                → nuevo access_token
+                → actualiza expires_at"]
     end
 
-    Aplicaciones -->|método call| DBus
-    DBus -->|dispatch| Daemon
-    IPC <--> STORAGE
+    Apps -->|método call| DBus
+    DBus -->|dispatch| IPC
+    IPC --> ACL
+    ACL --> STORAGE
+    IPC --> OAUTH2
+    OAUTH2 <--> STORAGE
 ```
 
 ---
@@ -50,8 +69,11 @@ flowchart TB
 | `tracing` / `tracing-subscriber` | 0.1 / 0.3 | Logging estructurado |
 | `serde` / `serde_json` | 1 / 1 | Serialización JSON |
 | `keyring` | 4 | Llavero del sistema (Secret Service) |
-| `uuid` | 1 (v4) | Generación de UUID para cuentas |
+| `uuid` | 1 (v4) | Generación de UUID |
 | `dirs` | 5 | Resolución de directorios del usuario |
+| `oauth2` | 5 (reqwest) | Flujo de refresco OAuth2 |
+| `reqwest` | 0.12 (rustls-tls) | HTTP asíncrono |
+| `chrono` | 0.4 (serde) | Manejo de fechas/horas |
 
 ---
 
@@ -78,37 +100,35 @@ Variables de entorno disponibles:
 |----------|---------|--------|
 | `RUST_LOG` | `info`, `debug`, `trace` | Nivel de verbose |
 
-En el primer arranque el servicio crea una cuenta demo para
-verificar el funcionamiento del almacenamiento.
+En el primer arranque el servicio crea una cuenta demo con metadatos
+OAuth2, ACL y tokens de prueba en el llavero.
 
 ### Probar desde otra terminal
 
 ```bash
+# Ping — identificación del cliente
 busctl --user call                                     \
     ar.net.vasak.os.AccountManager                    \
     /ar/net/vasak/os/AccountManager                   \
     ar.net.vasak.os.AccountManager                    \
     Ping
+
+# GetAccountData — metadatos (con ACL)
+busctl --user call                                     \
+    ar.net.vasak.os.AccountManager                    \
+    /ar/net/vasak/os/AccountManager                   \
+    ar.net.vasak.os.AccountManager                    \
+    GetAccountData ss "<account_id>" "email"
+
+# GetAccessToken — token válido (con ACL + refresco automático)
+busctl --user call                                     \
+    ar.net.vasak.os.AccountManager                    \
+    /ar/net/vasak/os/AccountManager                   \
+    ar.net.vasak.os.AccountManager                    \
+    GetAccessToken ss "<account_id>" "email"
 ```
 
-Alternativa con `gdbus`:
-
-```bash
-gdbus call --session                                  \
-    --dest ar.net.vasak.os.AccountManager              \
-    --object-path /ar/net/vasak/os/AccountManager      \
-    --method ar.net.vasak.os.AccountManager.Ping
-```
-
-**Importante**: usar `--user` (busctl) o `--session` (gdbus) para
-conectarse al bus de sesión. Sin esa bandera, las herramientas
-se conectan al bus de sistema por defecto.
-
-### Script automatizado
-
-```bash
-./test_ping.sh
-```
+**Importante**: usar `--user` (busctl) para conectarse al bus de sesión.
 
 ---
 
@@ -130,62 +150,102 @@ ar.net.vasak.os.AccountManager
 
 | Método | Entrada | Salida | Descripción |
 |--------|---------|--------|-------------|
-| `Ping` | — | `String` | Identifica al cliente (PID + binario) y retorna confirmación |
+| `Ping` | — | `String` | Identifica al cliente (PID + binario) |
+| `GetAccountData` | `account_id: s, capability: s` | `String` (JSON) | Metadatos de la capability (con ACL) |
+| `GetAccessToken` | `account_id: s, capability: s` | `String` | Access_token válido (ACL + refresco automático) |
 
-**Flujo interno de `Ping`:**
-1. zbus inyecta la cabecera del mensaje D-Bus via `#[zbus(header)]`
-2. Se extrae el `sender` (nombre único, ej. `:1.42`)
-3. Se consulta al bus daemon: `GetConnectionUnixProcessID(sender)` → PID
-4. Se lee `/proc/{pid}/exe` → ruta absoluta del binario
-5. Se registra en logs: `Petición recibida del PID: X (Ruta: /path)`
-6. Se retorna el mensaje de confirmación
+### Flujo interno de `GetAccessToken`
+
+```mermaid
+sequenceDiagram
+    participant C as Cliente
+    participant D as AccountManager
+    participant K as Keyring
+    participant J as accounts.json
+    participant O as OAuth2 Provider
+
+    C->>D: GetAccessToken(account_id, capability)
+    D->>D: get_caller_pid() → PID
+    D->>D: auth::verify_access() → ACL match
+    Note over D: Si no pasa ACL → error
+
+    D->>J: load account metadata
+    D->>K: get_token(account_id) → access_token
+    D->>D: ¿expires_at > now + 5min?
+
+    alt token válido
+        D-->>C: access_token (sin refresco)
+    else expirado
+        D->>K: get_secret(id, "refresh") → refresh_token
+        D->>K: get_secret(id, "client_secret") → secret
+        D->>O: POST /token (refresh_token)
+        O-->>D: new_access_token + expires_in
+        D->>K: store_token(id, new_access_token)
+        D->>J: update expires_at
+        D-->>C: new_access_token
+    end
+```
 
 ---
 
 ## Módulo `storage`
 
-### `AccountMetadata`
+### Modelo de datos
 
 ```rust
-pub struct AccountMetadata {
-    pub id: String,       // UUID v4
-    pub provider: String, // "google", "nextcloud", etc.
-    pub username: String, // "user@gmail.com"
-    pub enabled: bool,
+pub enum CapabilityType {
+    Email, Calendar, Contacts, Chat, Drive, Tasks,
+}
+
+pub struct AccessControlEntry {
+    pub binary_path: String,
+    pub allowed_capabilities: Vec<CapabilityType>,
+}
+
+pub struct Account {
+    pub id: String,
+    pub display_name: String,
+    pub provider_type: String,
+    pub capabilities: HashMap<CapabilityType, Value>,
+    pub acl: Vec<AccessControlEntry>,
 }
 ```
 
-Persistido en `~/.config/vasakos/accounts.json` como un array JSON.
+### SecureKeyringManager
 
-### `Storage`
+| Método | Clave en llavero | Propósito |
+|--------|-------------------|-----------|
+| `store_token(id, t)` / `get_token(id)` | `{service}/{id}` | access_token |
+| `store_secret(id, "refresh", s)` / `get_secret(id, "refresh")` | `{service}/{id}:refresh` | refresh_token |
+| `store_secret(id, "client_secret", s)` / `get_secret(id, "client_secret")` | `{service}/{id}:client_secret` | client_secret |
+
+Servicio: `vasakos-account-manager`.
+
+## Módulo `auth`
 
 ```rust
-let storage = Storage::new()?;
-
-// Metadatos
-let accounts = storage.load_accounts()?;
-storage.save_accounts(&accounts)?;
-storage.add_account(&new_account)?;
-
-// Secretos (llavero del sistema)
-storage.store_secret(&account_id, "token")?;
-let token = storage.get_secret(&account_id)?;
-storage.delete_secret(&account_id)?;
+pub fn verify_access(
+    account: &Account,
+    client_pid: u32,
+    requested_capability: &CapabilityType,
+) -> Result<bool, String>
 ```
 
-Los secretos se almacenan en el **Secret Service** de Linux (GNOME
-Keyring / KDE Wallet) bajo el servicio `vasakos-account-manager`,
-indexados por `account_id`.
+Resuelve `/proc/{pid}/exe`, canonaliza, y compara contra la ACL de la
+cuenta. Si el binario del proceso llamante no está en la lista blanca,
+el acceso es denegado.
 
-### `StorageError`
+## Módulo `protocols::oauth2`
 
-Enum con tres variantes que implementa `std::error::Error`:
+```rust
+pub async fn get_valid_access_token(
+    account_id: &str,
+    capability: &CapabilityType,
+) -> Result<String, String>
+```
 
-- `StorageError::Io(std::io::Error)`
-- `StorageError::Json(serde_json::Error)`
-- `StorageError::Keyring(keyring::Error)`
-
-Cada una incluye conversión `From` automática.
+Verifica expiración, refresca automáticamente vía OAuth2 si es necesario,
+persiste el nuevo token y su fecha de expiración. Sin comentarios.
 
 ---
 
@@ -198,8 +258,12 @@ vasak-accounts/
 ├── README.md
 ├── test_ping.sh
 └── src/
-    ├── main.rs          # Servicio D-Bus + demo de storage
-    └── storage.rs       # Módulo de almacenamiento (JSON + llavero)
+    ├── main.rs              # Servicio D-Bus + demo de storage
+    ├── storage.rs           # Modelo de datos + JSON + llavero
+    ├── auth.rs              # Firewall de PIDs (ACL)
+    └── protocols/
+        ├── mod.rs
+        └── oauth2.rs        # Motor de refresco OAuth2
 ```
 
 ---
@@ -210,10 +274,19 @@ vasak-accounts/
 cargo test
 ```
 
-Actualmente hay 2 tests unitarios en `storage`:
+Actualmente 9 tests:
 
-- `test_account_metadata_roundtrip` — serialización/deserialización
-- `test_json_file_roundtrip` — escritura/lectura del archivo JSON
+| Test | Módulo | Descripción |
+|------|--------|-------------|
+| `test_account_serde_roundtrip` | storage | Serialización/deserialización |
+| `test_acl_serde_roundtrip` | storage | ACL viaja correctamente en JSON |
+| `test_add_acl_entry_helper` | storage | `add_acl_entry()` funciona |
+| `test_update_account` | storage | `update_account()` reemplaza campos |
+| `test_capability_type_snake_case` | storage | `email`, `calendar`, etc. |
+| `test_database_load_save_roundtrip` | storage | Persistencia JSON |
+| `test_resolve_own_pid` | auth | `/proc/self/exe` se resuelve |
+| `test_resolve_nonexistent_pid` | auth | PID inexistente → error |
+| `test_matches_path_false` | auth | Paths distintos no matchean |
 
 ---
 
@@ -222,7 +295,7 @@ Actualmente hay 2 tests unitarios en `storage`:
 | Etapa | Estado | Descripción |
 |-------|--------|-------------|
 | 1 | ✓ | Esqueleto D-Bus con `Ping` e identificación de cliente |
-| 2 | ✓ | Módulo `storage`: metadatos JSON + llavero Secret Service |
-| 3 | — | Métodos D-Bus para CRUD de cuentas |
-| 4 | — | Sincronización con proveedores remotos |
+| 2 | ✓ | Almacenamiento polimórfico: JSON + llavero Secret Service |
+| 3 | ✓ | Firewall de PIDs: ACL por binario en `auth.rs` |
+| 4 | ✓ | Motor de Protocolo OAuth2: refresco automático de tokens |
 | 5 | — | Notificaciones vía señales D-Bus |
