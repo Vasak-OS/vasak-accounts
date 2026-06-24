@@ -1,20 +1,52 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 // ---------------------------------------------------------------------------
-// Tipos de datos
+// CapabilityType — enum polimórfico snake_case
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AccountMetadata {
-    pub id: String,
-    pub provider: String,
-    pub username: String,
-    pub enabled: bool,
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityType {
+    Email,
+    Calendar,
+    Contacts,
+    Chat,
+    Drive,
+    Tasks,
 }
 
 // ---------------------------------------------------------------------------
-// Error propio del módulo
+// Account — struct principal de cuenta
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Account {
+    pub id: String,
+    pub display_name: String,
+    pub provider_type: String,
+    pub capabilities: HashMap<CapabilityType, Value>,
+}
+
+impl Account {
+    pub fn new(
+        display_name: &str,
+        provider_type: &str,
+        capabilities: HashMap<CapabilityType, Value>,
+    ) -> Self {
+        Account {
+            id: uuid::Uuid::new_v4().to_string(),
+            display_name: display_name.to_string(),
+            provider_type: provider_type.to_string(),
+            capabilities,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StorageError
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -45,153 +77,211 @@ impl std::error::Error for StorageError {
 }
 
 impl From<std::io::Error> for StorageError {
-    fn from(e: std::io::Error) -> Self {
-        StorageError::Io(e)
-    }
+    fn from(e: std::io::Error) -> Self { StorageError::Io(e) }
 }
 
 impl From<serde_json::Error> for StorageError {
-    fn from(e: serde_json::Error) -> Self {
-        StorageError::Json(e)
-    }
+    fn from(e: serde_json::Error) -> Self { StorageError::Json(e) }
 }
 
 impl From<keyring::Error> for StorageError {
-    fn from(e: keyring::Error) -> Self {
-        StorageError::Keyring(e)
-    }
+    fn from(e: keyring::Error) -> Self { StorageError::Keyring(e) }
 }
 
 // ---------------------------------------------------------------------------
-// Almacenamiento
+// AccountDatabase — contenedor con persistencia JSON
 // ---------------------------------------------------------------------------
 
-const SERVICE_NAME: &str = "vasakos-account-manager";
-
-pub struct Storage {
-    accounts_path: PathBuf,
+pub struct AccountDatabase {
+    path: PathBuf,
+    pub accounts: Vec<Account>,
 }
 
-impl Storage {
-    /// Crea una instancia, asegurando que el directorio de configuración
-    /// `~/.config/vasakos/` exista.
+impl AccountDatabase {
+    const DIR_NAME: &'static str = "vasakos";
+    const FILE_NAME: &'static str = "accounts.json";
+
     pub fn new() -> Result<Self, StorageError> {
-        let config_dir = dirs::config_dir().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "config directory not found")
-        })?;
-
-        let accounts_dir = config_dir.join("vasakos");
-        let accounts_path = accounts_dir.join("accounts.json");
-
-        std::fs::create_dir_all(&accounts_dir)?;
-
-        Ok(Storage { accounts_path })
+        Self::with_override(None)
     }
 
-    /// Retorna la lista completa de cuentas desde el archivo JSON.
-    /// Si el archivo no existe, retorna una lista vacía.
-    pub fn load_accounts(&self) -> Result<Vec<AccountMetadata>, StorageError> {
-        if !self.accounts_path.exists() {
-            return Ok(Vec::new());
+    fn with_override(base: Option<PathBuf>) -> Result<Self, StorageError> {
+        let path = base
+            .unwrap_or_else(|| {
+                dirs::config_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(Self::DIR_NAME)
+                    .join(Self::FILE_NAME)
+            });
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
-        let data = std::fs::read_to_string(&self.accounts_path)?;
-        let accounts: Vec<AccountMetadata> = serde_json::from_str(&data)?;
-        Ok(accounts)
+
+        Ok(AccountDatabase {
+            path,
+            accounts: Vec::new(),
+        })
     }
 
-    /// Sobrescribe el archivo JSON con la lista de cuentas provista.
-    pub fn save_accounts(&self, accounts: &[AccountMetadata]) -> Result<(), StorageError> {
-        let data = serde_json::to_string_pretty(accounts)?;
-        std::fs::write(&self.accounts_path, data)?;
+    /// Lee `accounts.json` y carga las cuentas en memoria.
+    /// Si el archivo no existe, deja la lista vacía.
+    pub fn load(&mut self) -> Result<(), StorageError> {
+        if !self.path.exists() {
+            self.accounts.clear();
+            return Ok(());
+        }
+        let data = std::fs::read_to_string(&self.path)?;
+        self.accounts = serde_json::from_str(&data)?;
         Ok(())
     }
 
-    /// Agrega una cuenta a la lista existente y persiste los cambios.
-    pub fn add_account(&self, account: &AccountMetadata) -> Result<(), StorageError> {
-        let mut accounts = self.load_accounts()?;
-        accounts.push(account.clone());
-        self.save_accounts(&accounts)
+    /// Persiste el estado actual de `accounts` a `accounts.json`.
+    pub fn save(&self) -> Result<(), StorageError> {
+        let data = serde_json::to_string_pretty(&self.accounts)?;
+        std::fs::write(&self.path, data)?;
+        Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // Llavero del sistema (Secret Service de Linux)
-    // -----------------------------------------------------------------------
+    /// Agrega una cuenta, persiste y retorna el ID asignado.
+    pub fn add(&mut self, account: Account) -> Result<String, StorageError> {
+        let id = account.id.clone();
+        self.accounts.push(account);
+        self.save()?;
+        Ok(id)
+    }
 
-    /// Guarda un token secreto en el llavero del sistema.
-    /// El secreto se asocia al servicio `vasakos-account-manager` y se
-    /// indexa con `account_id` como credencial/usuario del llavero.
-    pub fn store_secret(&self, account_id: &str, token: &str) -> Result<(), StorageError> {
-        let entry = keyring::Entry::new(SERVICE_NAME, account_id)?;
+    pub fn all(&self) -> &[Account] {
+        &self.accounts
+    }
+
+    pub fn get(&self, id: &str) -> Option<&Account> {
+        self.accounts.iter().find(|a| a.id == id)
+    }
+
+    pub fn remove(&mut self, id: &str) -> Result<bool, StorageError> {
+        let len = self.accounts.len();
+        self.accounts.retain(|a| a.id != id);
+        if self.accounts.len() != len {
+            self.save()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.accounts.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.accounts.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SecureKeyringManager — llavero del sistema (Secret Service)
+// ---------------------------------------------------------------------------
+
+const KEYRING_SERVICE: &str = "vasakos-account-manager";
+
+pub struct SecureKeyringManager;
+
+impl SecureKeyringManager {
+    /// Guarda un token OAuth2 / contraseña en el Secret Service de Linux.
+    pub fn store_token(account_id: &str, token: &str) -> Result<(), StorageError> {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, account_id)?;
         entry.set_password(token)?;
         Ok(())
     }
 
-    /// Recupera un token secreto previamente guardado.
-    pub fn get_secret(&self, account_id: &str) -> Result<String, StorageError> {
-        let entry = keyring::Entry::new(SERVICE_NAME, account_id)?;
+    /// Recupera un token previamente guardado.
+    pub fn get_token(account_id: &str) -> Result<String, StorageError> {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, account_id)?;
         let password = entry.get_password()?;
         Ok(password)
     }
 
-    /// Elimina un secreto del llavero.
-    pub fn delete_secret(&self, account_id: &str) -> Result<(), StorageError> {
-        let entry = keyring::Entry::new(SERVICE_NAME, account_id)?;
+    /// Elimina un token del llavero.
+    pub fn delete_token(account_id: &str) -> Result<(), StorageError> {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, account_id)?;
         entry.delete_credential()?;
         Ok(())
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
-    #[test]
-    fn test_account_metadata_roundtrip() {
-        let account = AccountMetadata {
-            id: uuid::Uuid::new_v4().to_string(),
-            provider: "nextcloud".into(),
-            username: "user@example.com".into(),
-            enabled: true,
-        };
-
-        let json = serde_json::to_string_pretty(&account).unwrap();
-        let deserialized: AccountMetadata = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(account.id, deserialized.id);
-        assert_eq!(account.provider, deserialized.provider);
-        assert_eq!(account.username, deserialized.username);
-        assert_eq!(account.enabled, deserialized.enabled);
+    fn sample_account() -> Account {
+        let mut caps = HashMap::new();
+        caps.insert(
+            CapabilityType::Email,
+            json!({
+                "address": "alice@gmail.com",
+                "imap_host": "imap.gmail.com",
+                "imap_port": 993,
+            }),
+        );
+        caps.insert(
+            CapabilityType::Drive,
+            json!({
+                "root_folder": "/",
+                "max_storage_gb": 15,
+            }),
+        );
+        Account::new("Alice Google", "google", caps)
     }
 
     #[test]
-    fn test_json_file_roundtrip() {
+    fn test_account_serde_roundtrip() {
+        let account = sample_account();
+
+        let json = serde_json::to_string_pretty(&account).unwrap();
+        let deserialized: Account = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(account.id, deserialized.id);
+        assert_eq!(account.display_name, deserialized.display_name);
+        assert_eq!(account.provider_type, deserialized.provider_type);
+        assert_eq!(
+            account.capabilities.get(&CapabilityType::Email),
+            deserialized.capabilities.get(&CapabilityType::Email),
+        );
+    }
+
+    #[test]
+    fn test_capability_type_snake_case() {
+        let json = serde_json::to_string(&CapabilityType::Email).unwrap();
+        assert_eq!(json, "\"email\"");
+
+        let json = serde_json::to_string(&CapabilityType::Calendar).unwrap();
+        assert_eq!(json, "\"calendar\"");
+
+        let json = serde_json::to_string(&CapabilityType::Contacts).unwrap();
+        assert_eq!(json, "\"contacts\"");
+    }
+
+    #[test]
+    fn test_database_load_save_roundtrip() {
         let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("accounts.json");
 
-        let storage = Storage { accounts_path: path.clone() };
+        let mut db = AccountDatabase::with_override(Some(dir.clone())).unwrap();
+        db.load().unwrap();
+        assert!(db.is_empty());
 
-        let accounts = vec![
-            AccountMetadata {
-                id: "a1".into(),
-                provider: "google".into(),
-                username: "alice@gmail.com".into(),
-                enabled: true,
-            },
-            AccountMetadata {
-                id: "a2".into(),
-                provider: "nextcloud".into(),
-                username: "bob@example.com".into(),
-                enabled: false,
-            },
-        ];
+        db.add(sample_account()).unwrap();
+        assert_eq!(db.len(), 1);
 
-        storage.save_accounts(&accounts).unwrap();
-        let loaded = storage.load_accounts().unwrap();
-
-        assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded[0].username, "alice@gmail.com");
-        assert_eq!(loaded[1].enabled, false);
+        let mut db2 = AccountDatabase::with_override(Some(dir.clone())).unwrap();
+        db2.load().unwrap();
+        assert_eq!(db2.len(), 1);
+        assert_eq!(db2.get(&db.accounts[0].id).unwrap().display_name, "Alice Google");
 
         std::fs::remove_dir_all(dir).unwrap_or_default();
     }

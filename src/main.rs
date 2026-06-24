@@ -1,3 +1,6 @@
+mod storage;
+use storage::{Account, AccountDatabase, CapabilityType, SecureKeyringManager};
+
 use zbus::fdo::DBusProxy;
 use zbus::fdo::Error as FdoError;
 use zbus::interface;
@@ -80,6 +83,58 @@ impl AccountManager {
     }
 }
 
+fn init_demo_storage() -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::HashMap;
+
+    let mut db = AccountDatabase::new()?;
+    db.load()?;
+
+    if !db.is_empty() {
+        return Ok(());
+    }
+
+    let mut caps = HashMap::new();
+    caps.insert(
+        CapabilityType::Email,
+        serde_json::json!({
+            "address": "demo@gmail.com",
+            "imap_host": "imap.gmail.com",
+            "imap_port": 993,
+            "smtp_host": "smtp.gmail.com",
+            "smtp_port": 587,
+        }),
+    );
+    caps.insert(
+        CapabilityType::Drive,
+        serde_json::json!({
+            "root_folder": "/",
+            "max_storage_gb": 15,
+        }),
+    );
+
+    let account = Account::new("Demo Google", "google", caps);
+    let account_id = db.add(account)?;
+
+    tracing::info!("Metadato guardado en ~/.config/vasakos/accounts.json");
+    tracing::info!("ID asignado: {}", account_id);
+
+    SecureKeyringManager::store_token(&account_id, "ya29.abc123-secret-demo-token")?;
+    tracing::info!("Token almacenado en el llavero del sistema (Secret Service)");
+
+    let token = SecureKeyringManager::get_token(&account_id)?;
+    tracing::info!(
+        "Token recuperado del llavero: {}… (longitud: {})",
+        &token[..12],
+        token.len(),
+    );
+
+    let saved = db.get(&account_id).unwrap();
+    let pretty = serde_json::to_string_pretty(saved)?;
+    tracing::info!("Cuenta persistida:\n{}", pretty);
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Inicializamos el logging con tracing.
@@ -95,6 +150,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     tracing::info!("Iniciando AccountManager…");
+
+    init_demo_storage()?;
 
     // Construimos la conexión D-Bus en el bus de sesión:
     // 1. Solicitamos el nombre well-known 'ar.net.vasak.os.AccountManager'.
