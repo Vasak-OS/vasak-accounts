@@ -1,3 +1,4 @@
+mod auth;
 mod storage;
 use storage::{Account, AccountDatabase, CapabilityType, SecureKeyringManager};
 
@@ -12,84 +13,131 @@ use zbus::names::BusName;
 /// métodos D-Bus en la interfaz `ar.net.vasak.os.AccountManager`.
 struct AccountManager;
 
+// ---------------------------------------------------------------------------
+// Helper: extrae el PID del llamante desde la cabecera D-Bus
+// ---------------------------------------------------------------------------
+
+async fn get_caller_pid(
+    connection: &zbus::Connection,
+    header: &Header<'_>,
+) -> zbus::fdo::Result<u32> {
+    let sender = header
+        .sender()
+        .ok_or_else(|| FdoError::Failed("Sender no presente en la cabecera".into()))?;
+
+    tracing::debug!("Nombre único del emisor: {}", sender);
+
+    let dbus_proxy = DBusProxy::new(connection)
+        .await
+        .map_err(|e| FdoError::Failed(format!("Error al crear proxy D-Bus: {}", e)))?;
+
+    let pid = dbus_proxy
+        .get_connection_unix_process_id(BusName::from(sender.clone()))
+        .await
+        .map_err(|e| {
+            FdoError::Failed(format!("Error al obtener PID para '{}': {}", sender, e))
+        })?;
+
+    Ok(pid)
+}
+
 #[interface(name = "ar.net.vasak.os.AccountManager")]
 impl AccountManager {
-    /// Método `Ping` que identifica al cliente llamante mediante su PID
-    /// (consultando las credenciales del bus D-Bus), lee `/proc/{pid}/exe`
-    /// para obtener la ruta del binario y retorna un mensaje de confirmación.
-    ///
-    /// Parámetros inyectados por zbus via `#[zbus(connection)]` y
-    /// `#[zbus(header)]`:
-    /// - `connection`: referencia a la conexión D-Bus activa del servicio.
-    /// - `header`: cabecera del mensaje D-Bus entrante (contiene `sender`).
+    /// Método `Ping` — identifica al cliente llamante (PID + binario).
     async fn ping(
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
     ) -> zbus::fdo::Result<String> {
-        // Extraemos el nombre único del emisor (p.ej. ":1.42") desde la
-        // cabecera del mensaje D-Bus. El sender siempre está presente en
-        // las llamadas a método.
-        let sender: &zbus::names::UniqueName<'_> = header
-            .sender()
-            .ok_or_else(|| {
-                FdoError::Failed("Sender no presente en la cabecera".into())
-            })?;
+        let pid = get_caller_pid(connection, &header).await?;
 
-        tracing::debug!("Nombre único del emisor: {}", sender);
-
-        // Creamos un proxy hacia el bus D-Bus (session bus) para consultar
-        // las credenciales del proceso que realizó la llamada.
-        let dbus_proxy = DBusProxy::new(connection)
-            .await
-            .map_err(|e| FdoError::Failed(format!("Error al crear proxy D-Bus: {}", e)))?;
-
-        // Solicitamos el PID del proceso asociado al nombre único del
-        // emisor usando el método estándar `GetConnectionUnixProcessID`
-        // (org.freedesktop.DBus.GetConnectionUnixProcessID).
-        let pid: u32 = dbus_proxy
-            .get_connection_unix_process_id(BusName::from(sender.clone()))
-            .await
-            .map_err(|e| {
-                FdoError::Failed(format!(
-                    "Error al obtener PID para '{}': {}",
-                    sender, e,
-                ))
-            })?;
-
-        // Leemos el enlace simbólico /proc/{pid}/exe para determinar la
-        // ruta absoluta del binario del proceso cliente.
         let exe_path = std::fs::read_link(format!("/proc/{}/exe", pid))
             .map_err(|e| {
-                FdoError::Failed(format!(
-                    "No se pudo leer /proc/{}/exe: {}",
-                    pid, e,
-                ))
+                FdoError::Failed(format!("No se pudo leer /proc/{}/exe: {}", pid, e))
             })?;
 
-        // Registramos la información en los logs del demonio.
         tracing::info!(
-            "Petición recibida del PID: {} (Ruta: {})",
+            "Ping recibido del PID: {} (Ruta: {})",
             pid,
             exe_path.display(),
         );
 
-        // Retornamos confirmación al cliente.
         Ok(format!(
             "OK: PID {} identificado correctamente (Ruta: {})",
             pid,
             exe_path.display(),
         ))
     }
+
+    /// Método `GetAccountData` — retorna datos de una cuenta solo si el
+    /// proceso llamante tiene permiso en la ACL para la capability solicitada.
+    async fn get_account_data(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: Header<'_>,
+        account_id: String,
+        capability: String,
+    ) -> zbus::fdo::Result<String> {
+        let pid = get_caller_pid(connection, &header).await?;
+
+        let mut db = AccountDatabase::new()
+            .map_err(|e| FdoError::Failed(format!("Error al abrir base de datos: {}", e)))?;
+        db.load()
+            .map_err(|e| FdoError::Failed(format!("Error al cargar cuentas: {}", e)))?;
+
+        let account = db
+            .get(&account_id)
+            .ok_or_else(|| FdoError::Failed(format!("Cuenta '{}' no encontrada", account_id)))?;
+
+        let cap: CapabilityType = serde_json::from_str(&format!("\"{}\"", capability))
+            .map_err(|e| FdoError::Failed(format!("Capability inválida '{}': {}", capability, e)))?;
+
+        let allowed = auth::verify_access(account, pid, &cap)
+            .map_err(|e| FdoError::Failed(e))?;
+
+        if !allowed {
+            tracing::warn!(
+                "ACCESS DENIED — PID {} no autorizado para '{}' en cuenta {}",
+                pid,
+                capability,
+                account_id,
+            );
+            return Err(FdoError::Failed(format!(
+                "Acceso denegado: el proceso (PID {}) no está autorizado \
+                 para '{}' en esta cuenta",
+                pid, capability,
+            )));
+        }
+
+        let data = account.capabilities.get(&cap).ok_or_else(|| {
+            FdoError::Failed(format!("Capability '{}' no configurada en la cuenta", capability))
+        })?;
+
+        let response = serde_json::json!({
+            "account_id": account_id,
+            "display_name": account.display_name,
+            "provider_type": account.provider_type,
+            "capability": capability,
+            "config": data,
+        });
+
+        Ok(serde_json::to_string_pretty(&response)
+            .map_err(|e| FdoError::Failed(format!("Error de serialización: {}", e)))?)
+    }
 }
 
 fn init_demo_storage() -> Result<(), Box<dyn std::error::Error>> {
     use std::collections::HashMap;
+    use storage::AccessControlEntry;
 
     let mut db = AccountDatabase::new()?;
     db.load()?;
 
     if !db.is_empty() {
+        // Mostramos el ID de la primera cuenta para facilitar pruebas con busctl
+        if let Some(acct) = db.accounts.first() {
+            tracing::info!("Cuenta existente: id={}", acct.id);
+        }
         return Ok(());
     }
 
@@ -112,11 +160,26 @@ fn init_demo_storage() -> Result<(), Box<dyn std::error::Error>> {
         }),
     );
 
-    let account = Account::new("Demo Google", "google", caps);
+    let mut account = Account::new("Demo Google", "google", caps);
+    account.acl = vec![
+        AccessControlEntry {
+            binary_path: "/usr/bin/vasak-client".into(),
+            allowed_capabilities: vec![CapabilityType::Email, CapabilityType::Drive],
+        },
+        AccessControlEntry {
+            binary_path: "/usr/bin/authorized-bridge".into(),
+            allowed_capabilities: vec![CapabilityType::Email],
+        },
+    ];
     let account_id = db.add(account)?;
 
     tracing::info!("Metadato guardado en ~/.config/vasakos/accounts.json");
-    tracing::info!("ID asignado: {}", account_id);
+    tracing::info!("=== ID DE CUENTA (usar en busctl) ===");
+    tracing::info!("{}", account_id);
+    tracing::info!("=====================================");
+    tracing::info!("ACL configurada: /usr/bin/vasak-client → email, drive");
+    tracing::info!("ACL configurada: /usr/bin/authorized-bridge → email");
+    tracing::info!("(busctl NO está en la ACL — las llamadas serán denegadas)");
 
     SecureKeyringManager::store_token(&account_id, "ya29.abc123-secret-demo-token")?;
     tracing::info!("Token almacenado en el llavero del sistema (Secret Service)");

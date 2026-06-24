@@ -19,6 +19,16 @@ pub enum CapabilityType {
 }
 
 // ---------------------------------------------------------------------------
+// AccessControlEntry — entrada de lista blanca (ACL)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccessControlEntry {
+    pub binary_path: String,
+    pub allowed_capabilities: Vec<CapabilityType>,
+}
+
+// ---------------------------------------------------------------------------
 // Account — struct principal de cuenta
 // ---------------------------------------------------------------------------
 
@@ -28,6 +38,7 @@ pub struct Account {
     pub display_name: String,
     pub provider_type: String,
     pub capabilities: HashMap<CapabilityType, Value>,
+    pub acl: Vec<AccessControlEntry>,
 }
 
 impl Account {
@@ -41,7 +52,12 @@ impl Account {
             display_name: display_name.to_string(),
             provider_type: provider_type.to_string(),
             capabilities,
+            acl: Vec::new(),
         }
+    }
+
+    pub fn add_acl_entry(&mut self, entry: AccessControlEntry) {
+        self.acl.push(entry);
     }
 }
 
@@ -236,7 +252,18 @@ mod tests {
                 "max_storage_gb": 15,
             }),
         );
-        Account::new("Alice Google", "google", caps)
+        let mut account = Account::new("Alice Google", "google", caps);
+        account.acl = vec![
+            AccessControlEntry {
+                binary_path: "/usr/bin/thunderbird".into(),
+                allowed_capabilities: vec![CapabilityType::Email],
+            },
+            AccessControlEntry {
+                binary_path: "/usr/bin/rclone".into(),
+                allowed_capabilities: vec![CapabilityType::Drive, CapabilityType::Tasks],
+            },
+        ];
+        account
     }
 
     #[test]
@@ -253,6 +280,29 @@ mod tests {
             account.capabilities.get(&CapabilityType::Email),
             deserialized.capabilities.get(&CapabilityType::Email),
         );
+    }
+
+    #[test]
+    fn test_acl_serde_roundtrip() {
+        let account = sample_account();
+        assert_eq!(account.acl.len(), 2);
+
+        let json = serde_json::to_string_pretty(&account).unwrap();
+        let deserialized: Account = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.acl.len(), 2);
+        assert_eq!(deserialized.acl[0].binary_path, "/usr/bin/thunderbird");
+        assert_eq!(deserialized.acl[1].allowed_capabilities, vec![CapabilityType::Drive, CapabilityType::Tasks]);
+    }
+
+    #[test]
+    fn test_add_acl_entry_helper() {
+        let mut account = Account::new("Test", "local", HashMap::new());
+        assert!(account.acl.is_empty());
+        account.add_acl_entry(AccessControlEntry {
+            binary_path: "/usr/bin/foo".into(),
+            allowed_capabilities: vec![CapabilityType::Email],
+        });
+        assert_eq!(account.acl.len(), 1);
     }
 
     #[test]
