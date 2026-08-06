@@ -1,0 +1,14 @@
+[Unit]
+Description=VasakOS Account Manager (online accounts / OAuth token broker)
+Documentation=https://github.com/Vasak-OS/vasak-accounts
+# Headless, on-demand: started by D-Bus activation on first token request (see
+# ar.net.vasak.os.AccountManager.service). Bound to the graphical session only
+# for teardown — it is not started by the target, but stops with it at logout.
+PartOf=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=ar.net.vasak.os.AccountManager
+ExecStart=/usr/bin/vasak-accounts
+Restart=on-failure
+RestartSec=3

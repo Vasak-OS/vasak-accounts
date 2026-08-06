@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=ar.net.vasak.os.AccountManager
+Exec=/usr/bin/vasak-accounts
+SystemdService=vasak-accounts.service
