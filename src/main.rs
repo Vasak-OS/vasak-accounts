@@ -1,7 +1,7 @@
 mod auth;
 mod protocols;
 mod storage;
-use storage::{Account, AccountDatabase, CapabilityType, SecureKeyringManager};
+use storage::{AccountDatabase, CapabilityType};
 
 use zbus::fdo::DBusProxy;
 use zbus::fdo::Error as FdoError;
@@ -42,6 +42,17 @@ async fn get_caller_pid(
     Ok(pid)
 }
 
+/// Obtiene el PID del llamante y lo **fija con un pidfd** de inmediato, para que
+/// el binario resuelto no pueda ser suplantado por reciclado de PID mientras se
+/// realiza la verificación (cierra la ventana TOCTOU).
+async fn caller_identity(
+    connection: &zbus::Connection,
+    header: &Header<'_>,
+) -> zbus::fdo::Result<auth::PinnedCaller> {
+    let pid = get_caller_pid(connection, header).await?;
+    auth::PinnedCaller::capture(pid).map_err(FdoError::Failed)
+}
+
 #[interface(name = "ar.net.vasak.os.AccountManager")]
 impl AccountManager {
     /// Método `Ping` — identifica al cliente llamante (PID + binario).
@@ -50,23 +61,18 @@ impl AccountManager {
         #[zbus(connection)] connection: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
     ) -> zbus::fdo::Result<String> {
-        let pid = get_caller_pid(connection, &header).await?;
-
-        let exe_path = std::fs::read_link(format!("/proc/{}/exe", pid))
-            .map_err(|e| {
-                FdoError::Failed(format!("No se pudo leer /proc/{}/exe: {}", pid, e))
-            })?;
+        let caller = caller_identity(connection, &header).await?;
 
         tracing::info!(
             "Ping recibido del PID: {} (Ruta: {})",
-            pid,
-            exe_path.display(),
+            caller.pid,
+            caller.exe.display(),
         );
 
         Ok(format!(
             "OK: PID {} identificado correctamente (Ruta: {})",
-            pid,
-            exe_path.display(),
+            caller.pid,
+            caller.exe.display(),
         ))
     }
 
@@ -79,7 +85,7 @@ impl AccountManager {
         account_id: String,
         capability: String,
     ) -> zbus::fdo::Result<String> {
-        let pid = get_caller_pid(connection, &header).await?;
+        let caller = caller_identity(connection, &header).await?;
 
         let mut db = AccountDatabase::new()
             .map_err(|e| FdoError::Failed(format!("Error al abrir base de datos: {}", e)))?;
@@ -93,20 +99,20 @@ impl AccountManager {
         let cap: CapabilityType = serde_json::from_str(&format!("\"{}\"", capability))
             .map_err(|e| FdoError::Failed(format!("Capability inválida '{}': {}", capability, e)))?;
 
-        let allowed = auth::verify_access(account, pid, &cap)
-            .map_err(|e| FdoError::Failed(e))?;
+        let allowed = auth::verify_access(account, &caller, &cap)
+            .map_err(FdoError::Failed)?;
 
         if !allowed {
             tracing::warn!(
                 "ACCESS DENIED — PID {} no autorizado para '{}' en cuenta {}",
-                pid,
+                caller.pid,
                 capability,
                 account_id,
             );
             return Err(FdoError::Failed(format!(
                 "Acceso denegado: el proceso (PID {}) no está autorizado \
                  para '{}' en esta cuenta",
-                pid, capability,
+                caller.pid, capability,
             )));
         }
 
@@ -136,7 +142,7 @@ impl AccountManager {
         account_id: String,
         capability: String,
     ) -> zbus::fdo::Result<String> {
-        let pid = get_caller_pid(connection, &header).await?;
+        let caller = caller_identity(connection, &header).await?;
 
         // Verificar ACL (reutilizando Stage 3)
         let mut db = AccountDatabase::new()
@@ -151,20 +157,20 @@ impl AccountManager {
         let cap: CapabilityType = serde_json::from_str(&format!("\"{}\"", capability))
             .map_err(|e| FdoError::Failed(format!("Capability inválida '{}': {}", capability, e)))?;
 
-        let allowed = auth::verify_access(account, pid, &cap)
-            .map_err(|e| FdoError::Failed(e))?;
+        let allowed = auth::verify_access(account, &caller, &cap)
+            .map_err(FdoError::Failed)?;
 
         if !allowed {
             tracing::warn!(
                 "ACCESS DENIED — PID {} no autorizado para '{}' en cuenta {}",
-                pid,
+                caller.pid,
                 capability,
                 account_id,
             );
             return Err(FdoError::Failed(format!(
                 "Acceso denegado: el proceso (PID {}) no está autorizado \
                  para '{}' en esta cuenta",
-                pid, capability,
+                caller.pid, capability,
             )));
         }
 
@@ -177,9 +183,14 @@ impl AccountManager {
     }
 }
 
+/// Siembra una cuenta y tokens de demostración. **Solo en builds de debug**:
+/// nunca se compila ni se ejecuta en release, para no dejar credenciales de
+/// prueba en el binario ni escribirlas en el llavero/`accounts.json` de un
+/// sistema real.
+#[cfg(debug_assertions)]
 fn init_demo_storage() -> Result<(), Box<dyn std::error::Error>> {
     use std::collections::HashMap;
-    use storage::AccessControlEntry;
+    use storage::{AccessControlEntry, Account, SecureKeyringManager};
 
     let mut db = AccountDatabase::new()?;
     db.load()?;
@@ -290,6 +301,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Iniciando AccountManager…");
 
+    // Demo storage solo en debug (ver init_demo_storage).
+    #[cfg(debug_assertions)]
     init_demo_storage()?;
 
     // Construimos la conexión D-Bus en el bus de sesión:

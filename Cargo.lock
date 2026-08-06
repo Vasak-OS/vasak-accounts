@@ -2150,6 +2150,7 @@ dependencies = [
  "chrono",
  "dirs",
  "keyring",
+ "libc",
  "oauth2",
  "reqwest",
  "serde",

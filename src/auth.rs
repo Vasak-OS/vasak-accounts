@@ -1,3 +1,5 @@
+use std::os::fd::{FromRawFd, OwnedFd};
+
 use crate::storage::{Account, CapabilityType};
 
 // ---------------------------------------------------------------------------
@@ -5,23 +7,60 @@ use crate::storage::{Account, CapabilityType};
 // ---------------------------------------------------------------------------
 
 /// Resuelve la ruta del binario correspondiente a un PID vía `/proc/{pid}/exe`.
+///
+/// Usado solo por los tests; el camino de producción usa [`PinnedCaller`], que
+/// fija el PID antes de leer el ejecutable.
+#[cfg(test)]
 pub fn resolve_binary_path(pid: u32) -> Result<String, std::io::Error> {
     let link = std::fs::read_link(format!("/proc/{}/exe", pid))?;
     Ok(link.to_string_lossy().into_owned())
 }
 
-/// Verifica si el proceso identificado por `client_pid` tiene permiso para
+/// Identidad de un proceso llamante fijada por un `pidfd`.
+///
+/// Mientras se mantenga abierto el `pidfd`, el kernel **no puede reciclar** ese
+/// PID sobre otro proceso, por lo que leer `/proc/{pid}/exe` deja de ser una
+/// condición de carrera (TOCTOU): el binario resuelto corresponde con certeza
+/// al proceso que originó la llamada D-Bus.
+pub struct PinnedCaller {
+    pub pid: u32,
+    // Se conserva abierto durante toda la verificación; su `Drop` libera el pin.
+    _pidfd: OwnedFd,
+    pub exe: std::path::PathBuf,
+}
+
+impl PinnedCaller {
+    /// Fija `pid` con `pidfd_open` (bloqueando el reciclado del PID) y resuelve
+    /// su ejecutable. Debe llamarse lo antes posible tras obtener el PID del bus,
+    /// para minimizar la ventana previa al pin.
+    pub fn capture(pid: u32) -> Result<Self, String> {
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+        if raw < 0 {
+            return Err(format!(
+                "pidfd_open({pid}) failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: `raw` es un descriptor válido recién devuelto por pidfd_open.
+        let pidfd = unsafe { OwnedFd::from_raw_fd(raw as std::os::fd::RawFd) };
+
+        // El PID ya está fijado: resolver el ejecutable es libre de carreras.
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .map_err(|e| format!("Failed to resolve /proc/{pid}/exe: {e}"))?;
+
+        Ok(Self { pid, _pidfd: pidfd, exe })
+    }
+}
+
+/// Verifica si el proceso `caller` (ya fijado por pidfd) tiene permiso para
 /// acceder a `requested_capability` en la cuenta `account` según la ACL.
 pub fn verify_access(
     account: &Account,
-    client_pid: u32,
+    caller: &PinnedCaller,
     requested_capability: &CapabilityType,
 ) -> Result<bool, String> {
-    let binary_path = resolve_binary_path(client_pid)
-        .map_err(|e| format!("Failed to resolve PID {}: {}", client_pid, e))?;
-
-    let resolved = std::fs::canonicalize(&binary_path)
-        .unwrap_or_else(|_| std::path::PathBuf::from(&binary_path));
+    let resolved = std::fs::canonicalize(&caller.exe)
+        .unwrap_or_else(|_| caller.exe.clone());
 
     match account
         .acl
