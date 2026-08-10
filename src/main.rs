@@ -1,13 +1,79 @@
 mod auth;
+mod prompt;
 mod protocols;
 mod storage;
-use storage::{AccountDatabase, CapabilityType};
+use storage::{AccessDecision, AccountDatabase, CapabilityType};
 
 use zbus::fdo::DBusProxy;
 use zbus::fdo::Error as FdoError;
 use zbus::interface;
 use zbus::message::Header;
 use zbus::names::BusName;
+
+/// Decides whether `caller` may use `capability` on `account_id`, asking the
+/// user the first time and remembering the answer.
+///
+/// Every account created from the settings interface starts with an empty
+/// access list, and an empty list denies everything — so before this existed,
+/// no application could use any account the user had added. The list is the
+/// right mechanism; what was missing was any way to add to it.
+async fn authorize(
+    connection: &zbus::Connection,
+    caller: &auth::PinnedCaller,
+    db: &mut AccountDatabase,
+    account_id: &str,
+    capability: &str,
+) -> zbus::fdo::Result<CapabilityType> {
+    let cap: CapabilityType = serde_json::from_str(&format!("\"{capability}\""))
+        .map_err(|e| FdoError::Failed(format!("Capability inválida '{capability}': {e}")))?;
+
+    let account = db
+        .get(account_id)
+        .ok_or_else(|| FdoError::Failed(format!("Cuenta '{account_id}' no encontrada")))?;
+
+    let decision = auth::verify_access(account, caller, &cap).map_err(FdoError::Failed)?;
+
+    let granted = match decision {
+        AccessDecision::Allowed => true,
+        AccessDecision::Denied => false,
+        AccessDecision::Unknown => {
+            let program = auth::caller_binary_path(caller);
+            let account_name = account.display_name.clone();
+
+            let answer =
+                prompt::request_access(connection, account_id, &account_name, &program, &cap).await;
+
+            // Record it either way: a refusal that is not stored means the same
+            // dialog reappears on the program's next attempt, which is a loop
+            // the user cannot get out of.
+            if let Some(account) = db.get_mut(account_id) {
+                account.record_decision(&program, cap.clone(), answer);
+            }
+            db.save().map_err(|e| {
+                FdoError::Failed(format!("No se pudo guardar la decisión de acceso: {e}"))
+            })?;
+
+            answer
+        }
+    };
+
+    if !granted {
+        tracing::warn!(
+            "ACCESS DENIED — PID {} no autorizado para '{}' en cuenta {}",
+            caller.pid,
+            capability,
+            account_id,
+        );
+        return Err(FdoError::AccessDenied(format!(
+            "El programa {} no tiene permiso para '{}' en esta cuenta. \
+             Podés cambiarlo en Configuración → Cuentas en línea.",
+            auth::caller_binary_path(caller),
+            capability,
+        )));
+    }
+
+    Ok(cap)
+}
 
 /// Estructura principal del servicio AccountManager.
 /// Los métodos definidos en el bloque `#[interface]` se exponen como
@@ -92,29 +158,11 @@ impl AccountManager {
         db.load()
             .map_err(|e| FdoError::Failed(format!("Error al cargar cuentas: {}", e)))?;
 
+        let cap = authorize(connection, &caller, &mut db, &account_id, &capability).await?;
+
         let account = db
             .get(&account_id)
             .ok_or_else(|| FdoError::Failed(format!("Cuenta '{}' no encontrada", account_id)))?;
-
-        let cap: CapabilityType = serde_json::from_str(&format!("\"{}\"", capability))
-            .map_err(|e| FdoError::Failed(format!("Capability inválida '{}': {}", capability, e)))?;
-
-        let allowed = auth::verify_access(account, &caller, &cap)
-            .map_err(FdoError::Failed)?;
-
-        if !allowed {
-            tracing::warn!(
-                "ACCESS DENIED — PID {} no autorizado para '{}' en cuenta {}",
-                caller.pid,
-                capability,
-                account_id,
-            );
-            return Err(FdoError::Failed(format!(
-                "Acceso denegado: el proceso (PID {}) no está autorizado \
-                 para '{}' en esta cuenta",
-                caller.pid, capability,
-            )));
-        }
 
         let data = account.capabilities.get(&cap).ok_or_else(|| {
             FdoError::Failed(format!("Capability '{}' no configurada en la cuenta", capability))
@@ -130,6 +178,72 @@ impl AccountManager {
 
         Ok(serde_json::to_string_pretty(&response)
             .map_err(|e| FdoError::Failed(format!("Error de serialización: {}", e)))?)
+    }
+
+    /// Método `ListAccess` — qué programas tienen decidido algo sobre una
+    /// cuenta, para mostrarlo y poder cambiarlo en Configuración.
+    async fn list_access(&self, account_id: String) -> zbus::fdo::Result<String> {
+        let mut db = AccountDatabase::new()
+            .map_err(|e| FdoError::Failed(format!("Error al abrir base de datos: {}", e)))?;
+        db.load()
+            .map_err(|e| FdoError::Failed(format!("Error al cargar cuentas: {}", e)))?;
+
+        let account = db
+            .get(&account_id)
+            .ok_or_else(|| FdoError::Failed(format!("Cuenta '{account_id}' no encontrada")))?;
+
+        serde_json::to_string(&account.acl)
+            .map_err(|e| FdoError::Failed(format!("Error de serialización: {e}")))
+    }
+
+    /// Método `SetAccess` — otorga o revoca una capability para un programa.
+    ///
+    /// Es lo que usan las casillas de Configuración. Revocar deja constancia
+    /// del "no": si solo se borrara el permiso, el próximo acceso volvería a
+    /// preguntar y el usuario no podría decir que no de forma definitiva.
+    async fn set_access(
+        &self,
+        account_id: String,
+        binary_path: String,
+        capability: String,
+        allowed: bool,
+    ) -> zbus::fdo::Result<()> {
+        let cap: CapabilityType = serde_json::from_str(&format!("\"{capability}\""))
+            .map_err(|e| FdoError::Failed(format!("Capability inválida '{capability}': {e}")))?;
+
+        let mut db = AccountDatabase::new()
+            .map_err(|e| FdoError::Failed(format!("Error al abrir base de datos: {}", e)))?;
+        db.load()
+            .map_err(|e| FdoError::Failed(format!("Error al cargar cuentas: {}", e)))?;
+
+        let account = db
+            .get_mut(&account_id)
+            .ok_or_else(|| FdoError::Failed(format!("Cuenta '{account_id}' no encontrada")))?;
+        account.record_decision(&binary_path, cap, allowed);
+
+        db.save()
+            .map_err(|e| FdoError::Failed(format!("No se pudo guardar el permiso: {e}")))
+    }
+
+    /// Método `ForgetAccess` — olvida todo lo decidido sobre un programa, de
+    /// modo que el próximo acceso vuelva a preguntar.
+    async fn forget_access(
+        &self,
+        account_id: String,
+        binary_path: String,
+    ) -> zbus::fdo::Result<()> {
+        let mut db = AccountDatabase::new()
+            .map_err(|e| FdoError::Failed(format!("Error al abrir base de datos: {}", e)))?;
+        db.load()
+            .map_err(|e| FdoError::Failed(format!("Error al cargar cuentas: {}", e)))?;
+
+        let account = db
+            .get_mut(&account_id)
+            .ok_or_else(|| FdoError::Failed(format!("Cuenta '{account_id}' no encontrada")))?;
+        account.forget(&binary_path);
+
+        db.save()
+            .map_err(|e| FdoError::Failed(format!("No se pudo guardar el cambio: {e}")))
     }
 
     /// Método `GetAccessToken` — retorna un access_token **válido** para la
@@ -150,29 +264,7 @@ impl AccountManager {
         db.load()
             .map_err(|e| FdoError::Failed(format!("Error al cargar cuentas: {}", e)))?;
 
-        let account = db
-            .get(&account_id)
-            .ok_or_else(|| FdoError::Failed(format!("Cuenta '{}' no encontrada", account_id)))?;
-
-        let cap: CapabilityType = serde_json::from_str(&format!("\"{}\"", capability))
-            .map_err(|e| FdoError::Failed(format!("Capability inválida '{}': {}", capability, e)))?;
-
-        let allowed = auth::verify_access(account, &caller, &cap)
-            .map_err(FdoError::Failed)?;
-
-        if !allowed {
-            tracing::warn!(
-                "ACCESS DENIED — PID {} no autorizado para '{}' en cuenta {}",
-                caller.pid,
-                capability,
-                account_id,
-            );
-            return Err(FdoError::Failed(format!(
-                "Acceso denegado: el proceso (PID {}) no está autorizado \
-                 para '{}' en esta cuenta",
-                caller.pid, capability,
-            )));
-        }
+        let cap = authorize(connection, &caller, &mut db, &account_id, &capability).await?;
 
         // Delegar al Motor de Protocolo OAuth2
         let token = protocols::oauth2::get_valid_access_token(&account_id, &cap)
@@ -231,10 +323,12 @@ fn init_demo_storage() -> Result<(), Box<dyn std::error::Error>> {
         AccessControlEntry {
             binary_path: "/usr/bin/vasak-client".into(),
             allowed_capabilities: vec![CapabilityType::Email, CapabilityType::Drive],
+            denied_capabilities: Vec::new(),
         },
         AccessControlEntry {
             binary_path: "/usr/bin/authorized-bridge".into(),
             allowed_capabilities: vec![CapabilityType::Email],
+            denied_capabilities: Vec::new(),
         },
     ];
     let account_id = db.add(account)?;
