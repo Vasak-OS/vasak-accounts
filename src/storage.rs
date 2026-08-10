@@ -19,54 +19,6 @@ pub enum CapabilityType {
 }
 
 // ---------------------------------------------------------------------------
-// AccessControlEntry — entrada de lista blanca (ACL)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AccessControlEntry {
-    pub binary_path: String,
-    pub allowed_capabilities: Vec<CapabilityType>,
-    /// What the user explicitly refused.
-    ///
-    /// Kept separately from "never asked": without it, a refusal is
-    /// indistinguishable from a first request and the user is asked again on
-    /// every single access.
-    #[serde(default)]
-    pub denied_capabilities: Vec<CapabilityType>,
-}
-
-impl AccessControlEntry {
-    pub fn new(binary_path: &str) -> Self {
-        Self {
-            binary_path: binary_path.to_string(),
-            allowed_capabilities: Vec::new(),
-            denied_capabilities: Vec::new(),
-        }
-    }
-
-    /// Records a decision, replacing any previous one for the same capability.
-    pub fn record(&mut self, capability: CapabilityType, allowed: bool) {
-        self.allowed_capabilities.retain(|c| *c != capability);
-        self.denied_capabilities.retain(|c| *c != capability);
-
-        if allowed {
-            self.allowed_capabilities.push(capability);
-        } else {
-            self.denied_capabilities.push(capability);
-        }
-    }
-}
-
-/// What the stored access rules say about one request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AccessDecision {
-    Allowed,
-    Denied,
-    /// Never decided, so the user has to be asked.
-    Unknown,
-}
-
-// ---------------------------------------------------------------------------
 // Account — struct principal de cuenta
 // ---------------------------------------------------------------------------
 
@@ -76,7 +28,6 @@ pub struct Account {
     pub display_name: String,
     pub provider_type: String,
     pub capabilities: HashMap<CapabilityType, Value>,
-    pub acl: Vec<AccessControlEntry>,
 }
 
 impl Account {
@@ -90,40 +41,9 @@ impl Account {
             display_name: display_name.to_string(),
             provider_type: provider_type.to_string(),
             capabilities,
-            acl: Vec::new(),
         }
     }
 
-    pub fn add_acl_entry(&mut self, entry: AccessControlEntry) {
-        self.acl.push(entry);
-    }
-
-    /// Stores the user's answer for one program and capability.
-    pub fn record_decision(
-        &mut self,
-        binary_path: &str,
-        capability: CapabilityType,
-        allowed: bool,
-    ) {
-        match self
-            .acl
-            .iter_mut()
-            .find(|entry| entry.binary_path == binary_path)
-        {
-            Some(entry) => entry.record(capability, allowed),
-            None => {
-                let mut entry = AccessControlEntry::new(binary_path);
-                entry.record(capability, allowed);
-                self.acl.push(entry);
-            }
-        }
-    }
-
-    /// Forgets everything decided about a program, so the next access asks
-    /// again. This is what "remove" in the settings list does.
-    pub fn forget(&mut self, binary_path: &str) {
-        self.acl.retain(|entry| entry.binary_path != binary_path);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -352,20 +272,7 @@ mod tests {
                 "max_storage_gb": 15,
             }),
         );
-        let mut account = Account::new("Alice Google", "google", caps);
-        account.acl = vec![
-            AccessControlEntry {
-                binary_path: "/usr/bin/thunderbird".into(),
-                allowed_capabilities: vec![CapabilityType::Email],
-                denied_capabilities: Vec::new(),
-            },
-            AccessControlEntry {
-                binary_path: "/usr/bin/rclone".into(),
-                allowed_capabilities: vec![CapabilityType::Drive, CapabilityType::Tasks],
-                denied_capabilities: Vec::new(),
-            },
-        ];
-        account
+        Account::new("Alice Google", "google", caps)
     }
 
     #[test]
@@ -384,17 +291,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_acl_serde_roundtrip() {
-        let account = sample_account();
-        assert_eq!(account.acl.len(), 2);
-
-        let json = serde_json::to_string_pretty(&account).unwrap();
-        let deserialized: Account = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.acl.len(), 2);
-        assert_eq!(deserialized.acl[0].binary_path, "/usr/bin/thunderbird");
-        assert_eq!(deserialized.acl[1].allowed_capabilities, vec![CapabilityType::Drive, CapabilityType::Tasks]);
-    }
 
     #[test]
     fn test_update_account() {
@@ -413,80 +309,10 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap_or_default();
     }
 
-    #[test]
-    fn test_add_acl_entry_helper() {
-        let mut account = Account::new("Test", "local", HashMap::new());
-        assert!(account.acl.is_empty());
-        account.add_acl_entry(AccessControlEntry {
-            binary_path: "/usr/bin/foo".into(),
-            allowed_capabilities: vec![CapabilityType::Email],
-            denied_capabilities: Vec::new(),
-        });
-        assert_eq!(account.acl.len(), 1);
-    }
 
-    /// Granting, then refusing, then granting again must leave one answer —
-    /// not a program listed as both allowed and denied for the same thing.
-    #[test]
-    fn a_decision_replaces_the_previous_one() {
-        let mut account = Account::new("Test", "local", HashMap::new());
 
-        account.record_decision("/usr/bin/mail", CapabilityType::Email, true);
-        assert_eq!(account.acl.len(), 1);
-        assert_eq!(account.acl[0].allowed_capabilities, vec![CapabilityType::Email]);
-        assert!(account.acl[0].denied_capabilities.is_empty());
 
-        account.record_decision("/usr/bin/mail", CapabilityType::Email, false);
-        assert_eq!(account.acl.len(), 1, "still one entry for the program");
-        assert!(account.acl[0].allowed_capabilities.is_empty());
-        assert_eq!(account.acl[0].denied_capabilities, vec![CapabilityType::Email]);
 
-        account.record_decision("/usr/bin/mail", CapabilityType::Email, true);
-        assert_eq!(account.acl[0].allowed_capabilities, vec![CapabilityType::Email]);
-        assert!(account.acl[0].denied_capabilities.is_empty());
-    }
-
-    /// Answers about different capabilities are independent: allowing mail
-    /// must not silently allow the calendar too.
-    #[test]
-    fn capabilities_are_decided_separately() {
-        let mut account = Account::new("Test", "local", HashMap::new());
-
-        account.record_decision("/usr/bin/mail", CapabilityType::Email, true);
-        account.record_decision("/usr/bin/mail", CapabilityType::Calendar, false);
-
-        assert_eq!(account.acl.len(), 1);
-        assert_eq!(account.acl[0].allowed_capabilities, vec![CapabilityType::Email]);
-        assert_eq!(account.acl[0].denied_capabilities, vec![CapabilityType::Calendar]);
-    }
-
-    #[test]
-    fn forgetting_a_program_clears_its_answers() {
-        let mut account = Account::new("Test", "local", HashMap::new());
-        account.record_decision("/usr/bin/mail", CapabilityType::Email, true);
-        account.record_decision("/usr/bin/other", CapabilityType::Drive, true);
-
-        account.forget("/usr/bin/mail");
-
-        assert_eq!(account.acl.len(), 1);
-        assert_eq!(account.acl[0].binary_path, "/usr/bin/other");
-    }
-
-    /// Files written before refusals could be recorded must still load.
-    #[test]
-    fn an_older_accounts_file_still_loads() {
-        let json = r#"{
-            "id": "abc",
-            "display_name": "Old",
-            "provider_type": "google",
-            "capabilities": {},
-            "acl": [{ "binary_path": "/usr/bin/mail", "allowed_capabilities": ["email"] }]
-        }"#;
-
-        let account: Account = serde_json::from_str(json).expect("parse");
-        assert_eq!(account.acl[0].allowed_capabilities, vec![CapabilityType::Email]);
-        assert!(account.acl[0].denied_capabilities.is_empty());
-    }
 
     #[test]
     fn test_capability_type_snake_case() {
