@@ -1,6 +1,6 @@
 [package]
 name = "vasak-accounts"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "VasakOS Account Manager - Demonio centralizado para gestión de cuentas de usuario"
 
