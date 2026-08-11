@@ -30,7 +30,7 @@ pub async fn check(
 
     // The system bus, because that is where a service the user cannot tamper
     // with has to live.
-    let connection = zbus::Connection::system().await.map_err(|e| {
+    let connection = permission_bus().await.map_err(|e| {
         FdoError::Failed(format!(
             "no se pudo contactar al servicio de permisos: {e}. \
              Sin él no se puede autorizar el acceso a la cuenta."
@@ -54,6 +54,22 @@ pub async fn check(
         .body()
         .deserialize::<bool>()
         .map_err(|e| FdoError::Failed(format!("respuesta inválida del servicio de permisos: {e}")))
+}
+
+
+/// Follows the permission service onto the development bus when one is in use.
+/// Compiled out of release: see the note on the daemon's own bus selection.
+#[cfg(debug_assertions)]
+async fn permission_bus() -> zbus::Result<zbus::Connection> {
+    if std::env::var_os("VASAK_ACCOUNTS_TEST_ROOT").is_some() {
+        return zbus::Connection::session().await;
+    }
+    zbus::Connection::system().await
+}
+
+#[cfg(not(debug_assertions))]
+async fn permission_bus() -> zbus::Result<zbus::Connection> {
+    zbus::Connection::system().await
 }
 
 /// The text form the permission service uses for a capability.

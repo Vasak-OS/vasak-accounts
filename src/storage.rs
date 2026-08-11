@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -54,7 +55,6 @@ impl Account {
 pub enum StorageError {
     Io(std::io::Error),
     Json(serde_json::Error),
-    Keyring(keyring::Error),
 }
 
 impl std::fmt::Display for StorageError {
@@ -62,7 +62,6 @@ impl std::fmt::Display for StorageError {
         match self {
             StorageError::Io(e) => write!(f, "IO error: {}", e),
             StorageError::Json(e) => write!(f, "JSON error: {}", e),
-            StorageError::Keyring(e) => write!(f, "Keyring error: {}", e),
         }
     }
 }
@@ -72,7 +71,6 @@ impl std::error::Error for StorageError {
         match self {
             StorageError::Io(e) => Some(e),
             StorageError::Json(e) => Some(e),
-            StorageError::Keyring(e) => Some(e),
         }
     }
 }
@@ -85,10 +83,6 @@ impl From<serde_json::Error> for StorageError {
     fn from(e: serde_json::Error) -> Self { StorageError::Json(e) }
 }
 
-impl From<keyring::Error> for StorageError {
-    fn from(e: keyring::Error) -> Self { StorageError::Keyring(e) }
-}
-
 // ---------------------------------------------------------------------------
 // AccountDatabase — contenedor con persistencia JSON
 // ---------------------------------------------------------------------------
@@ -99,28 +93,46 @@ pub struct AccountDatabase {
 }
 
 impl AccountDatabase {
-    const DIR_NAME: &'static str = "vasakos";
+    /// Root-owned, one directory per user.
+    ///
+    /// This used to live in the user's own configuration directory, which meant
+    /// the tokens beside it were reachable by anything running as that user.
+    /// Now the daemon is the only way in, and the permission service decides
+    /// who gets through.
+    const ROOT: &'static str = "/var/lib/vasak-accounts";
     const FILE_NAME: &'static str = "accounts.json";
 
-    pub fn new() -> Result<Self, StorageError> {
-        Self::with_override(None)
+    /// Where one user's data lives. Nothing outside this directory is ever
+    /// touched on their behalf, so one person's request cannot reach another
+    /// person's accounts.
+    pub fn directory_for(uid: u32) -> PathBuf {
+        Self::root().join(uid.to_string())
     }
 
-    fn with_override(base: Option<PathBuf>) -> Result<Self, StorageError> {
-        let path = base
-            .unwrap_or_else(|| {
-                dirs::config_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join(Self::DIR_NAME)
-                    .join(Self::FILE_NAME)
-            });
-
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+    fn root() -> PathBuf {
+        // Development override, debug builds only: the released daemon has no
+        // way to be pointed at a directory somebody else can write.
+        #[cfg(debug_assertions)]
+        if let Some(root) = std::env::var_os("VASAK_ACCOUNTS_TEST_ROOT") {
+            return PathBuf::from(root);
         }
+        PathBuf::from(Self::ROOT)
+    }
+
+    pub fn for_user(uid: u32) -> Result<Self, StorageError> {
+        Self::in_directory(Self::directory_for(uid))
+    }
+
+    /// Opens a database in a specific directory. The per-user path resolves to
+    /// this; tests use it directly so they do not have to share a process-wide
+    /// setting and can run alongside each other.
+    pub fn in_directory(directory: PathBuf) -> Result<Self, StorageError> {
+        std::fs::create_dir_all(&directory)?;
+        // 0700: the listing alone says which accounts exist.
+        let _ = std::fs::set_permissions(&directory, PermissionsExt::from_mode(0o700));
 
         Ok(AccountDatabase {
-            path,
+            path: directory.join(Self::FILE_NAME),
             accounts: Vec::new(),
         })
     }
@@ -140,7 +152,7 @@ impl AccountDatabase {
     /// Persiste el estado actual de `accounts` a `accounts.json`.
     pub fn save(&self) -> Result<(), StorageError> {
         let data = serde_json::to_string_pretty(&self.accounts)?;
-        std::fs::write(&self.path, data)?;
+        write_private(&self.path, data.as_bytes())?;
         Ok(())
     }
 
@@ -202,53 +214,150 @@ impl AccountDatabase {
 }
 
 // ---------------------------------------------------------------------------
-// SecureKeyringManager — llavero del sistema (Secret Service)
+// SecretStore — tokens del lado de root
 // ---------------------------------------------------------------------------
 
-const KEYRING_SERVICE: &str = "vasakos-account-manager";
+/// Where the tokens live now.
+///
+/// They used to be in the user's own keyring, which meant the permission check
+/// in front of this daemon protected nothing: any program running as that user
+/// could ask the keyring for the token directly and skip the question
+/// entirely. Root-owned files make the daemon the only way to reach them.
+///
+/// The files are not encrypted on top of that, deliberately. A key the daemon
+/// can read unattended has to sit next to what it protects, which buys nothing
+/// against anyone who can already read the file — the same reasoning that has
+/// NetworkManager keep Wi-Fi passwords as root-owned plain text. Protection
+/// against a stolen disk is full-disk encryption's job, not this file's.
+pub struct SecretStore;
 
-pub struct SecureKeyringManager;
+impl SecretStore {
+    const FILE_NAME: &'static str = "secrets.json";
 
-impl SecureKeyringManager {
-    /// Guarda un token OAuth2 / contraseña en el Secret Service de Linux.
-    pub fn store_token(account_id: &str, token: &str) -> Result<(), StorageError> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, account_id)?;
-        entry.set_password(token)?;
+    /// account id → (secret name → value).
+    fn load(directory: &std::path::Path) -> Result<HashMap<String, HashMap<String, String>>, StorageError> {
+        let path = directory.join(Self::FILE_NAME);
+        if !path.exists() {
+            return Ok(HashMap::new());
+        }
+        Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
+    }
+
+    fn persist(
+        directory: &std::path::Path,
+        secrets: &HashMap<String, HashMap<String, String>>,
+    ) -> Result<(), StorageError> {
+        std::fs::create_dir_all(directory)?;
+        let _ = std::fs::set_permissions(directory, PermissionsExt::from_mode(0o700));
+
+        write_private(
+            &directory.join(Self::FILE_NAME),
+            serde_json::to_string(secrets)?.as_bytes(),
+        )
+    }
+
+    pub fn store_secret(
+        uid: u32,
+        account_id: &str,
+        key: &str,
+        secret: &str,
+    ) -> Result<(), StorageError> {
+        Self::store_secret_in(&AccountDatabase::directory_for(uid), account_id, key, secret)
+    }
+
+    /// The per-user calls resolve to these; tests use them directly rather than
+    /// sharing a process-wide setting.
+    pub fn store_secret_in(
+        directory: &std::path::Path,
+        account_id: &str,
+        key: &str,
+        secret: &str,
+    ) -> Result<(), StorageError> {
+        let mut secrets = Self::load(directory)?;
+        secrets
+            .entry(account_id.to_string())
+            .or_default()
+            .insert(key.to_string(), secret.to_string());
+        Self::persist(directory, &secrets)
+    }
+
+    pub fn get_secret(uid: u32, account_id: &str, key: &str) -> Result<String, StorageError> {
+        Self::get_secret_in(&AccountDatabase::directory_for(uid), account_id, key)
+    }
+
+    pub fn get_secret_in(
+        directory: &std::path::Path,
+        account_id: &str,
+        key: &str,
+    ) -> Result<String, StorageError> {
+        Self::load(directory)?
+            .get(account_id)
+            .and_then(|entry| entry.get(key))
+            .cloned()
+            .ok_or_else(|| {
+                StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("no hay '{key}' guardado para la cuenta '{account_id}'"),
+                ))
+            })
+    }
+
+    /// The access token, which is the secret asked for most often.
+    pub fn store_token(uid: u32, account_id: &str, token: &str) -> Result<(), StorageError> {
+        Self::store_secret(uid, account_id, "access", token)
+    }
+
+    pub fn get_token(uid: u32, account_id: &str) -> Result<String, StorageError> {
+        Self::get_secret(uid, account_id, "access")
+    }
+
+    /// Removes everything held for one account.
+    ///
+    /// Called when the account is deleted: leaving the tokens behind would keep
+    /// a live credential on disk for something the user believes is gone.
+    pub fn forget_account(uid: u32, account_id: &str) -> Result<(), StorageError> {
+        Self::forget_account_in(&AccountDatabase::directory_for(uid), account_id)
+    }
+
+    pub fn forget_account_in(
+        directory: &std::path::Path,
+        account_id: &str,
+    ) -> Result<(), StorageError> {
+        let mut secrets = Self::load(directory)?;
+        if secrets.remove(account_id).is_some() {
+            Self::persist(directory, &secrets)?;
+        }
         Ok(())
-    }
-
-    /// Recupera un token previamente guardado.
-    pub fn get_token(account_id: &str) -> Result<String, StorageError> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, account_id)?;
-        let password = entry.get_password()?;
-        Ok(password)
-    }
-
-    /// Elimina un token del llavero.
-    pub fn delete_token(account_id: &str) -> Result<(), StorageError> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, account_id)?;
-        entry.delete_credential()?;
-        Ok(())
-    }
-
-    /// Guarda un secreto identificado por una clave adicional
-    /// (ej. "refresh", "client_secret") en el llavero.
-    pub fn store_secret(account_id: &str, key: &str, secret: &str) -> Result<(), StorageError> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, &format!("{}:{}", account_id, key))?;
-        entry.set_password(secret)?;
-        Ok(())
-    }
-
-    /// Lee un secreto previamente guardado con `store_secret`.
-    pub fn get_secret(account_id: &str, key: &str) -> Result<String, StorageError> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, &format!("{}:{}", account_id, key))?;
-        Ok(entry.get_password()?)
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+/// Writes a file only its owner can read, replacing it in one step.
+///
+/// Created 0600 from the start rather than fixed up afterwards, so a token is
+/// never briefly world-readable; and renamed into place so an interrupted write
+/// cannot leave a half-written file where the credentials used to be.
+fn write_private(path: &std::path::Path, data: &[u8]) -> Result<(), StorageError> {
+    use std::io::Write;
+
+    let temp = path.with_extension("tmp");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temp)?;
+
+    let written = file.write_all(data).and_then(|_| file.sync_all());
+    drop(file);
+
+    match written.and_then(|_| std::fs::rename(&temp, path)) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(StorageError::Io(error))
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -295,7 +404,7 @@ mod tests {
     #[test]
     fn test_update_account() {
         let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-        let mut db = AccountDatabase::with_override(Some(dir.clone())).unwrap();
+        let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
         db.load().unwrap();
         let id = db.add(sample_account()).unwrap();
 
@@ -330,18 +439,115 @@ mod tests {
     fn test_database_load_save_roundtrip() {
         let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
 
-        let mut db = AccountDatabase::with_override(Some(dir.clone())).unwrap();
+        let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
         db.load().unwrap();
         assert!(db.is_empty());
 
         db.add(sample_account()).unwrap();
         assert_eq!(db.len(), 1);
 
-        let mut db2 = AccountDatabase::with_override(Some(dir.clone())).unwrap();
+        let mut db2 = AccountDatabase::in_directory(dir.clone()).unwrap();
         db2.load().unwrap();
         assert_eq!(db2.len(), 1);
         assert_eq!(db2.get(&db.accounts[0].id).unwrap().display_name, "Alice Google");
 
         std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    fn temp_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_secret_survives_being_written_and_read_back() {
+        let dir = temp_dir();
+
+        SecretStore::store_secret_in(&dir, "acct-1", "access", "token-abc").unwrap();
+        SecretStore::store_secret_in(&dir, "acct-1", "refresh", "refresh-xyz").unwrap();
+
+        assert_eq!(
+            SecretStore::get_secret_in(&dir, "acct-1", "access").unwrap(),
+            "token-abc"
+        );
+        assert_eq!(
+            SecretStore::get_secret_in(&dir, "acct-1", "refresh").unwrap(),
+            "refresh-xyz"
+        );
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// The file holds live credentials, so nobody but its owner may read it.
+    /// This is the whole point of moving them out of the user's keyring.
+    #[test]
+    fn the_secret_file_is_readable_only_by_its_owner() {
+        let dir = temp_dir();
+        SecretStore::store_secret_in(&dir, "acct-1", "access", "token").unwrap();
+
+        let mode = std::fs::metadata(dir.join("secrets.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(
+            !dir.join("secrets.tmp").exists(),
+            "no temporary file should be left holding a token"
+        );
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    #[test]
+    fn accounts_do_not_see_each_others_secrets() {
+        let dir = temp_dir();
+        SecretStore::store_secret_in(&dir, "acct-1", "access", "one").unwrap();
+        SecretStore::store_secret_in(&dir, "acct-2", "access", "two").unwrap();
+
+        assert_eq!(SecretStore::get_secret_in(&dir, "acct-1", "access").unwrap(), "one");
+        assert_eq!(SecretStore::get_secret_in(&dir, "acct-2", "access").unwrap(), "two");
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// Deleting an account has to take its credentials with it, or a working
+    /// token stays on disk for something the user believes is gone.
+    #[test]
+    fn deleting_an_account_removes_its_secrets() {
+        let dir = temp_dir();
+        SecretStore::store_secret_in(&dir, "acct-1", "access", "one").unwrap();
+        SecretStore::store_secret_in(&dir, "acct-2", "access", "two").unwrap();
+
+        SecretStore::forget_account_in(&dir, "acct-1").unwrap();
+
+        assert!(SecretStore::get_secret_in(&dir, "acct-1", "access").is_err());
+        assert_eq!(
+            SecretStore::get_secret_in(&dir, "acct-2", "access").unwrap(),
+            "two",
+            "the other account must be untouched"
+        );
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    #[test]
+    fn a_secret_that_was_never_stored_is_an_error_not_an_empty_string() {
+        let dir = temp_dir();
+        assert!(SecretStore::get_secret_in(&dir, "missing", "access").is_err());
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// One person's request must never reach another person's directory.
+    #[test]
+    fn each_user_gets_their_own_directory() {
+        assert_ne!(
+            AccountDatabase::directory_for(1000),
+            AccountDatabase::directory_for(1001)
+        );
+        assert!(AccountDatabase::directory_for(1000)
+            .to_string_lossy()
+            .ends_with("/1000"));
     }
 }

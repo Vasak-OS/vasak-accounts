@@ -1,0 +1,38 @@
+[Unit]
+Description=VasakOS Account Manager (online accounts / OAuth token broker)
+Documentation=https://github.com/Vasak-OS/vasak-accounts
+# The permission service decides who may reach a token, so this cannot start
+# before it is there to ask.
+After=dbus.service vasak-permissions.service
+Requires=dbus.service
+
+[Service]
+Type=dbus
+BusName=ar.net.vasak.os.AccountManager
+ExecStart=/usr/bin/vasak-accounts
+Restart=on-failure
+RestartSec=3
+
+# Runs as root because the tokens live in root-owned files: that is the whole
+# reason a program running as the user can no longer read them directly.
+# Everything not needed for that is taken away.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+StateDirectory=vasak-accounts
+StateDirectoryMode=0700
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+# AF_INET is needed to refresh an expired OAuth token against the provider.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

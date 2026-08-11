@@ -1,4 +1,4 @@
-use crate::storage::{AccountDatabase, CapabilityType, SecureKeyringManager};
+use crate::storage::{AccountDatabase, CapabilityType, SecretStore};
 use chrono::{DateTime, Utc};
 use oauth2::{basic::BasicClient, AuthUrl, ClientId, ClientSecret, RefreshToken, TokenUrl};
 use oauth2::TokenResponse;
@@ -7,18 +7,19 @@ use oauth2::TokenResponse;
 /// capability indicadas.
 ///
 /// 1. Carga los metadatos de la cuenta desde `accounts.json`.
-/// 2. Si el `access_token` almacenado en el llavero tiene más de 5 minutos
+/// 2. Si el `access_token` almacenado en el almacén seguro tiene más de 5 minutos
 ///    de vida restante, lo retorna inmediatamente.
-/// 3. Si expiró, intercambia el `refresh_token` del llavero por uno nuevo
+/// 3. Si expiró, intercambia el `refresh_token` del almacén seguro por uno nuevo
 ///    mediante una petición HTTP POST al servidor OAuth2, persiste el nuevo
 ///    token y su fecha de expiración, y lo retorna.
 pub async fn get_valid_access_token(
+    uid: u32,
     account_id: &str,
     capability: &CapabilityType,
 ) -> Result<String, String> {
     // 1. Cargar metadata de la cuenta
     let mut db =
-        AccountDatabase::new().map_err(|e| format!("Error al abrir base de datos: {}", e))?;
+        AccountDatabase::for_user(uid).map_err(|e| format!("Error al abrir base de datos: {}", e))?;
     db.load()
         .map_err(|e| format!("Error al cargar cuentas: {}", e))?;
 
@@ -40,9 +41,9 @@ pub async fn get_valid_access_token(
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&Utc));
 
-    // 3. Obtener access_token actual del llavero
-    let access_token = SecureKeyringManager::get_token(account_id)
-        .map_err(|e| format!("Error al leer access_token del llavero: {}", e))?;
+    // 3. Obtener access_token actual del almacén seguro
+    let access_token = SecretStore::get_token(uid, account_id)
+        .map_err(|e| format!("Error al leer access_token del almacén seguro: {}", e))?;
 
     // 4. Si sigue siendo válido (más de 5 min de vida), retornar
     if let Some(expires) = expires_at {
@@ -72,12 +73,12 @@ pub async fn get_valid_access_token(
         return Ok(access_token);
     }
 
-    // 5. Recuperar refresh_token + client_secret del llavero
-    let refresh_token_str = SecureKeyringManager::get_secret(account_id, "refresh")
-        .map_err(|e| format!("Error al leer refresh_token del llavero: {}", e))?;
+    // 5. Recuperar refresh_token + client_secret del almacén seguro
+    let refresh_token_str = SecretStore::get_secret(uid, account_id, "refresh")
+        .map_err(|e| format!("Error al leer refresh_token del almacén seguro: {}", e))?;
 
-    let client_secret_str = SecureKeyringManager::get_secret(account_id, "client_secret")
-        .map_err(|e| format!("Error al leer client_secret del llavero: {}", e))?;
+    let client_secret_str = SecretStore::get_secret(uid, account_id, "client_secret")
+        .map_err(|e| format!("Error al leer client_secret del almacén seguro: {}", e))?;
 
     // 6. Leer URLs del provider desde la capability config
     let client_id = config
@@ -120,8 +121,8 @@ pub async fn get_valid_access_token(
     let new_access_token = token_response.access_token().secret().to_string();
     let new_expires_in = token_response.expires_in();
 
-    // 9. Guardar nuevo access_token en el llavero
-    SecureKeyringManager::store_token(account_id, &new_access_token)
+    // 9. Guardar nuevo access_token en el almacén seguro
+    SecretStore::store_token(uid, account_id, &new_access_token)
         .map_err(|e| format!("Error al guardar nuevo access_token: {}", e))?;
 
     // 10. Actualizar expires_at en accounts.json
@@ -143,7 +144,7 @@ pub async fn get_valid_access_token(
             .capabilities
             .insert(capability.clone(), updated_config);
 
-        let mut db = AccountDatabase::new()
+        let mut db = AccountDatabase::for_user(uid)
             .map_err(|e| format!("Error al reabrir base de datos: {}", e))?;
         db.load()
             .map_err(|e| format!("Error al recargar cuentas: {}", e))?;

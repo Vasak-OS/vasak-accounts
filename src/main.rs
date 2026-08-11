@@ -2,6 +2,8 @@ mod auth;
 mod permissions;
 mod protocols;
 mod storage;
+use std::collections::HashMap;
+
 use storage::{AccountDatabase, CapabilityType};
 
 use zbus::fdo::DBusProxy;
@@ -57,10 +59,10 @@ struct AccountManager;
 // Helper: extrae el PID del llamante desde la cabecera D-Bus
 // ---------------------------------------------------------------------------
 
-async fn get_caller_pid(
+async fn caller_pid_and_uid(
     connection: &zbus::Connection,
     header: &Header<'_>,
-) -> zbus::fdo::Result<u32> {
+) -> zbus::fdo::Result<(u32, u32)> {
     let sender = header
         .sender()
         .ok_or_else(|| FdoError::Failed("Sender no presente en la cabecera".into()))?;
@@ -71,14 +73,24 @@ async fn get_caller_pid(
         .await
         .map_err(|e| FdoError::Failed(format!("Error al crear proxy D-Bus: {}", e)))?;
 
+    let name = BusName::from(sender.clone());
     let pid = dbus_proxy
-        .get_connection_unix_process_id(BusName::from(sender.clone()))
+        .get_connection_unix_process_id(name.clone())
         .await
         .map_err(|e| {
             FdoError::Failed(format!("Error al obtener PID para '{}': {}", sender, e))
         })?;
 
-    Ok(pid)
+    // The daemon serves every session on the machine, so the caller's user is
+    // what keeps one person's accounts out of another person's requests.
+    let uid = dbus_proxy
+        .get_connection_unix_user(name)
+        .await
+        .map_err(|e| {
+            FdoError::Failed(format!("Error al obtener usuario para '{}': {}", sender, e))
+        })?;
+
+    Ok((pid, uid))
 }
 
 /// Obtiene el PID del llamante y lo **fija con un pidfd** de inmediato, para que
@@ -87,9 +99,10 @@ async fn get_caller_pid(
 async fn caller_identity(
     connection: &zbus::Connection,
     header: &Header<'_>,
-) -> zbus::fdo::Result<auth::PinnedCaller> {
-    let pid = get_caller_pid(connection, header).await?;
-    auth::PinnedCaller::capture(pid).map_err(FdoError::Failed)
+) -> zbus::fdo::Result<(auth::PinnedCaller, u32)> {
+    let (pid, uid) = caller_pid_and_uid(connection, header).await?;
+    let caller = auth::PinnedCaller::capture(pid).map_err(FdoError::Failed)?;
+    Ok((caller, uid))
 }
 
 #[interface(name = "ar.net.vasak.os.AccountManager")]
@@ -100,7 +113,7 @@ impl AccountManager {
         #[zbus(connection)] connection: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
     ) -> zbus::fdo::Result<String> {
-        let caller = caller_identity(connection, &header).await?;
+        let (caller, _uid) = caller_identity(connection, &header).await?;
 
         tracing::info!(
             "Ping recibido del PID: {} (Ruta: {})",
@@ -124,9 +137,9 @@ impl AccountManager {
         account_id: String,
         capability: String,
     ) -> zbus::fdo::Result<String> {
-        let caller = caller_identity(connection, &header).await?;
+        let (caller, uid) = caller_identity(connection, &header).await?;
 
-        let mut db = AccountDatabase::new()
+        let mut db = AccountDatabase::for_user(uid)
             .map_err(|e| FdoError::Failed(format!("Error al abrir base de datos: {}", e)))?;
         db.load()
             .map_err(|e| FdoError::Failed(format!("Error al cargar cuentas: {}", e)))?;
@@ -153,6 +166,99 @@ impl AccountManager {
             .map_err(|e| FdoError::Failed(format!("Error de serialización: {}", e)))?)
     }
 
+    /// Método `ListAccounts` — las cuentas del usuario que llama.
+    ///
+    /// Metadata only; a token never leaves through here. Listing what accounts
+    /// exist is not the same as being allowed to use them, and only the second
+    /// needs the user's permission.
+    async fn list_accounts(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> zbus::fdo::Result<String> {
+        let (_caller, uid) = caller_identity(connection, &header).await?;
+
+        let mut db = AccountDatabase::for_user(uid)
+            .map_err(|e| FdoError::Failed(format!("Error al abrir base de datos: {}", e)))?;
+        db.load()
+            .map_err(|e| FdoError::Failed(format!("Error al cargar cuentas: {}", e)))?;
+
+        serde_json::to_string(db.all())
+            .map_err(|e| FdoError::Failed(format!("Error de serialización: {e}")))
+    }
+
+    /// Método `RegisterAccount` — agrega una cuenta y guarda sus secretos.
+    ///
+    /// The secrets arrive here and go straight into root-owned storage; the
+    /// program that set the account up cannot read them back afterwards without
+    /// the user's permission, same as anything else.
+    ///
+    /// Adding an account to your *own* user needs no extra authorisation — it is
+    /// your account. What needs permission is a program getting at the token.
+    async fn register_account(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: Header<'_>,
+        display_name: String,
+        provider_type: String,
+        capabilities_json: String,
+        secrets_json: String,
+    ) -> zbus::fdo::Result<String> {
+        let (_caller, uid) = caller_identity(connection, &header).await?;
+
+        let capabilities: HashMap<CapabilityType, serde_json::Value> =
+            serde_json::from_str(&capabilities_json).map_err(|e| {
+                FdoError::InvalidArgs(format!("capabilities inválidas: {e}"))
+            })?;
+        let secrets: HashMap<String, String> = serde_json::from_str(&secrets_json)
+            .map_err(|e| FdoError::InvalidArgs(format!("secretos inválidos: {e}")))?;
+
+        let mut db = AccountDatabase::for_user(uid)
+            .map_err(|e| FdoError::Failed(format!("Error al abrir base de datos: {}", e)))?;
+        db.load()
+            .map_err(|e| FdoError::Failed(format!("Error al cargar cuentas: {}", e)))?;
+
+        let account = storage::Account::new(&display_name, &provider_type, capabilities);
+        let account_id = db
+            .add(account)
+            .map_err(|e| FdoError::Failed(format!("Error al guardar la cuenta: {e}")))?;
+
+        for (key, value) in secrets {
+            storage::SecretStore::store_secret(uid, &account_id, &key, &value)
+                .map_err(|e| FdoError::Failed(format!("Error al guardar el secreto: {e}")))?;
+        }
+
+        tracing::info!("Cuenta '{account_id}' registrada para el usuario {uid}");
+        Ok(account_id)
+    }
+
+    /// Método `RemoveAccount` — borra la cuenta y todos sus secretos.
+    async fn remove_account(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: Header<'_>,
+        account_id: String,
+    ) -> zbus::fdo::Result<bool> {
+        let (_caller, uid) = caller_identity(connection, &header).await?;
+
+        let mut db = AccountDatabase::for_user(uid)
+            .map_err(|e| FdoError::Failed(format!("Error al abrir base de datos: {}", e)))?;
+        db.load()
+            .map_err(|e| FdoError::Failed(format!("Error al cargar cuentas: {}", e)))?;
+
+        let removed = db
+            .remove(&account_id)
+            .map_err(|e| FdoError::Failed(format!("Error al eliminar la cuenta: {e}")))?;
+
+        // Always clear the secrets, even if the metadata was already gone:
+        // otherwise a live credential stays on disk for an account the user
+        // believes no longer exists.
+        storage::SecretStore::forget_account(uid, &account_id)
+            .map_err(|e| FdoError::Failed(format!("Error al borrar los secretos: {e}")))?;
+
+        Ok(removed)
+    }
+
     /// Método `GetAccessToken` — retorna un access_token **válido** para la
     /// cuenta y capability indicadas. El Motor de Protocolo (Stage 4) verifica
     /// la expiración y refresca automáticamente si es necesario.
@@ -163,10 +269,10 @@ impl AccountManager {
         account_id: String,
         capability: String,
     ) -> zbus::fdo::Result<String> {
-        let caller = caller_identity(connection, &header).await?;
+        let (caller, uid) = caller_identity(connection, &header).await?;
 
         // Verificar ACL (reutilizando Stage 3)
-        let mut db = AccountDatabase::new()
+        let mut db = AccountDatabase::for_user(uid)
             .map_err(|e| FdoError::Failed(format!("Error al abrir base de datos: {}", e)))?;
         db.load()
             .map_err(|e| FdoError::Failed(format!("Error al cargar cuentas: {}", e)))?;
@@ -174,7 +280,7 @@ impl AccountManager {
         let cap = authorize(&caller, &db, &account_id, &capability).await?;
 
         // Delegar al Motor de Protocolo OAuth2
-        let token = protocols::oauth2::get_valid_access_token(&account_id, &cap)
+        let token = protocols::oauth2::get_valid_access_token(uid, &account_id, &cap)
             .await
             .map_err(|e| FdoError::Failed(format!("Error al obtener token: {}", e)))?;
 
@@ -182,96 +288,25 @@ impl AccountManager {
     }
 }
 
-/// Siembra una cuenta y tokens de demostración. **Solo en builds de debug**:
-/// nunca se compila ni se ejecuta en release, para no dejar credenciales de
-/// prueba en el binario ni escribirlas en el llavero/`accounts.json` de un
-/// sistema real.
+
+/// The system bus, always, in a released build.
+///
+/// Debug builds can be pointed at a session bus to exercise the whole chain
+/// without root. Compiled out of release entirely rather than guarded at
+/// runtime: a token broker that could be moved onto a bus the user controls
+/// would be handing its requests to whatever claimed the name there.
 #[cfg(debug_assertions)]
-fn init_demo_storage() -> Result<(), Box<dyn std::error::Error>> {
-    use std::collections::HashMap;
-    use storage::{Account, SecureKeyringManager};
-
-    let mut db = AccountDatabase::new()?;
-    db.load()?;
-
-    if !db.is_empty() {
-        // Mostramos el ID de la primera cuenta para facilitar pruebas con busctl
-        if let Some(acct) = db.accounts.first() {
-            tracing::info!("Cuenta existente: id={}", acct.id);
-        }
-        return Ok(());
+fn service_bus() -> zbus::Result<zbus::connection::Builder<'static>> {
+    if std::env::var_os("VASAK_ACCOUNTS_TEST_ROOT").is_some() {
+        tracing::warn!("MODO DE DESARROLLO: usando el bus de sesión");
+        return zbus::connection::Builder::session();
     }
+    zbus::connection::Builder::system()
+}
 
-    let mut caps = HashMap::new();
-    caps.insert(
-        CapabilityType::Email,
-        serde_json::json!({
-            "address": "demo@gmail.com",
-            "imap_host": "imap.gmail.com",
-            "imap_port": 993,
-            "smtp_host": "smtp.gmail.com",
-            "smtp_port": 587,
-            "client_id": "123456789012-xxxxx.apps.googleusercontent.com",
-            "token_url": "https://oauth2.googleapis.com/token",
-            "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
-            "expires_at": null,
-        }),
-    );
-    caps.insert(
-        CapabilityType::Drive,
-        serde_json::json!({
-            "root_folder": "/",
-            "max_storage_gb": 15,
-        }),
-    );
-
-    let account = Account::new("Demo Google", "google", caps);
-    let account_id = db.add(account)?;
-
-    tracing::info!("Metadato guardado en ~/.config/vasakos/accounts.json");
-    tracing::info!("=== ID DE CUENTA (usar en busctl) ===");
-    tracing::info!("{}", account_id);
-    tracing::info!("=====================================");
-    tracing::info!("ACL configurada: /usr/bin/vasak-client → email, drive");
-    tracing::info!("ACL configurada: /usr/bin/authorized-bridge → email");
-    tracing::info!("(busctl NO está en la ACL — las llamadas serán denegadas)");
-
-    SecureKeyringManager::store_token(&account_id, "ya29.abc123-secret-demo-token")?;
-    SecureKeyringManager::store_secret(&account_id, "refresh", "1//0g-abc123-refresh-token-demo")?;
-    SecureKeyringManager::store_secret(
-        &account_id,
-        "client_secret",
-        "GOCSPX-abc123-client-secret-demo",
-    )?;
-    tracing::info!("Token almacenado en el llavero del sistema (Secret Service)");
-
-    let token = SecureKeyringManager::get_token(&account_id)?;
-    tracing::info!(
-        "Token recuperado del llavero: {}… (longitud: {})",
-        &token[..12],
-        token.len(),
-    );
-
-    let refresh = SecureKeyringManager::get_secret(&account_id, "refresh")?;
-    tracing::info!(
-        "Refresh token almacenado: {}… (longitud: {})",
-        &refresh[..12],
-        refresh.len(),
-    );
-
-    let saved = db.get(&account_id).unwrap();
-    let pretty = serde_json::to_string_pretty(saved)?;
-    tracing::info!("Cuenta persistida:\n{}", pretty);
-
-    tracing::info!("--- Motor de Protocolo OAuth2 (Stage 4) ---");
-    tracing::info!("expires_at = null → el token se retorna sin refresco");
-    tracing::info!("Para probar refresco automático:");
-    tracing::info!("  1. Editar ~/.config/vasakos/accounts.json");
-    tracing::info!("  2. Cambiar expires_at a fecha pasada (ISO 8601)");
-    tracing::info!("  3. Llamar GetAccessToken desde busctl");
-    tracing::info!("  4. El daemon refrescará automáticamente");
-
-    Ok(())
+#[cfg(not(debug_assertions))]
+fn service_bus() -> zbus::Result<zbus::connection::Builder<'static>> {
+    zbus::connection::Builder::system()
 }
 
 #[tokio::main]
@@ -290,15 +325,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Iniciando AccountManager…");
 
-    // Demo storage solo en debug (ver init_demo_storage).
-    #[cfg(debug_assertions)]
-    init_demo_storage()?;
-
     // Construimos la conexión D-Bus en el bus de sesión:
     // 1. Solicitamos el nombre well-known 'ar.net.vasak.os.AccountManager'.
     // 2. Registramos nuestro objeto en la ruta '/ar/net/vasak/os/AccountManager'.
-    let _connection = zbus::ConnectionBuilder::session()
-        .map_err(|e| format!("Error al conectar al bus de sesión: {}", e))?
+    // The system bus, as root. The tokens live in root-owned files now, so the
+    // daemon has to be somewhere a program running as the user cannot be: a
+    // service in the session could be replaced by anything that got there
+    // first, and would be able to read the files it serves.
+    let _connection = service_bus()
+        .map_err(|e| format!("Error al conectar al bus del sistema: {}", e))?
         .name("ar.net.vasak.os.AccountManager")
         .map_err(|e| format!("Error al solicitar nombre D-Bus: {}", e))?
         .serve_at("/ar/net/vasak/os/AccountManager", AccountManager)
