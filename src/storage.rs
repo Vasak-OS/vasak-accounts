@@ -172,8 +172,20 @@ impl AccountDatabase {
         self.accounts.iter().find(|a| a.id == id)
     }
 
-    pub fn get_mut(&mut self, id: &str) -> Option<&mut Account> {
-        self.accounts.iter_mut().find(|a| a.id == id)
+
+    /// Sólo para los tests: la aplicación nunca pregunta cuántas cuentas hay.
+    ///
+    /// Con `#[cfg(test)]` en lugar de un `allow(dead_code)`: así no viaja en el
+    /// binario y el aviso de código muerto sigue sirviendo para lo que de verdad
+    /// no se usa.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.accounts.len()
+    }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.accounts.is_empty()
     }
 
     pub fn update_account(&mut self, updated: Account) -> Result<(), StorageError> {
@@ -204,13 +216,7 @@ impl AccountDatabase {
         }
     }
 
-    pub fn len(&self) -> usize {
-        self.accounts.len()
-    }
 
-    pub fn is_empty(&self) -> bool {
-        self.accounts.is_empty()
-    }
 }
 
 // ---------------------------------------------------------------------------

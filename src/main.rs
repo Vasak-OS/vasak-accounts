@@ -162,8 +162,8 @@ impl AccountManager {
             "config": data,
         });
 
-        Ok(serde_json::to_string_pretty(&response)
-            .map_err(|e| FdoError::Failed(format!("Error de serialización: {}", e)))?)
+        serde_json::to_string_pretty(&response)
+            .map_err(|e| FdoError::Failed(format!("Error de serialización: {}", e)))
     }
 
     /// Método `ListAccounts` — las cuentas del usuario que llama.
