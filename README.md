@@ -136,7 +136,7 @@ correo le permite todas tus casillas.
 | `BeginNextcloudLogin` | `s` servidor, `s` nombre | `s` (JSON) | — | Abre un inicio de sesión en un Nextcloud. Devuelve `login_url` y `request_id`. |
 | `PollNextcloudLogin` | `s` request_id | `s` (JSON) | — | Un sondeo: `pending`, o `done` con el `account_id`. |
 | `RegisterAccount` | `s` nombre, `s` proveedor, `s` capacidades JSON, `s` secretos JSON | `s` id | — | Cuenta con credenciales de **contraseña** (IMAP y compañía). No acepta secretos de OAuth2. |
-| `RemoveAccount` | `s` id | `b` | — | Borra la cuenta **y todos sus secretos**. |
+| `RemoveAccount` | `s` id | `s` (JSON) | — | Borra la cuenta, sus secretos, **y le avisa al proveedor**. Devuelve `{removed, revoked, detail}`. |
 | `GetAccountData` | `s` id, `s` capacidad | `s` (JSON) | ✅ | Configuración de esa capacidad. |
 | `GetAccessToken` | `s` id, `s` capacidad | `s` | ✅ | Un access_token **válido**, refrescándolo si hace falta. |
 
@@ -267,6 +267,36 @@ sequenceDiagram
 ```
 
 ---
+
+## Borrar una cuenta le avisa al proveedor
+
+Sin ese aviso, borrar una cuenta borraba lo de acá y del otro lado quedaba todo
+vivo: la autorización seguía figurando entre las aplicaciones con acceso y el
+token servía hasta caducar. Quien borra una cuenta espera que se corte el acceso,
+no que se esconda.
+
+Cada proveedor lo hace distinto:
+
+| | Cómo |
+|---|---|
+| OAuth2 con `revocation_url` | `POST` al endpoint de RFC 7009 con el **refresh_token** |
+| Nextcloud | `DELETE` a `ocs/v2.php/core/apppassword`, autenticado con la propia contraseña de aplicación |
+| IMAP con contraseña | Nada que revocar: la contraseña es de la persona |
+
+Se manda el refresh_token y no el de acceso: revocar el refresh invalida la
+concesión entera, mientras que revocar uno de acceso deja al otro vivo y la
+aplicación seguiría figurando entre las que tienen permiso.
+
+**Si el aviso falla, la cuenta se borra igual.** Negarse dejaría a alguien sin
+poder sacar una cuenta porque no tiene red, o porque el servidor de su casa está
+apagado, y eso es peor que el problema. Lo que sí se hace es decirlo —`revoked`
+viene en `false` con el motivo— porque queda algo que se puede terminar desde la
+web del proveedor. Microsoft es el caso permanente de eso: no expone endpoint de
+revocación, así que el acceso se quita desde la página de la cuenta.
+
+La dirección para avisar se guarda **con la cuenta** y no se busca en el catálogo
+al borrarla: si mañana cambia el archivo de `/etc`, hay que avisarle al servidor
+al que esa cuenta autorizó y no al que diga el archivo nuevo.
 
 ## Almacenamiento
 

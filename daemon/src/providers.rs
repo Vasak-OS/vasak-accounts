@@ -67,6 +67,16 @@ pub struct Provider {
     #[serde(default)]
     pub token_url: Option<String>,
 
+    /// Adónde avisarle al proveedor que la autorización ya no vale (RFC 7009).
+    ///
+    /// Opcional porque no todos lo tienen: Microsoft, por ejemplo, no expone un
+    /// endpoint de revocación — el acceso se quita desde la página de la cuenta.
+    /// Sin él, borrar una cuenta borra lo de acá y el token sigue vivo del otro
+    /// lado hasta que caduque, y eso hay que decirlo en vez de fingir que se
+    /// revocó.
+    #[serde(default)]
+    pub revocation_url: Option<String>,
+
     /// Sin él no se puede empezar ningún flujo. Es opcional porque el archivo
     /// que trae el paquete no puede traerlo: hay que registrar la aplicación
     /// para tenerlo, y el error que devuelve el servicio dice dónde ponerlo.
