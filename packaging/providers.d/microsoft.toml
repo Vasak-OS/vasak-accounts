@@ -1,0 +1,31 @@
+# Microsoft — correo, calendario, contactos y OneDrive.
+#
+# Como Google, sin client_id: hay que registrar la aplicación. A diferencia de
+# Google, el registro en Entra ID es gratis y no hay ninguna auditoría paga de
+# por medio, así que este es el proveedor grande más alcanzable.
+#
+#   1. En https://entra.microsoft.com/ → «Registros de aplicaciones» → nuevo.
+#   2. Elegí cuentas personales y de organización si querés las dos.
+#   3. Agregá una plataforma «Cliente público / nativo» con el URI de
+#      redirección http://localhost.
+#   4. Copiá el archivo a /etc/vasak-accounts/providers.d/microsoft.toml con tu
+#      client_id.
+#
+# Sin client_secret a propósito: Microsoft trata a los clientes públicos como
+# clientes públicos, así que PKCE alcanza y mandar un secreto sería un error.
+
+id = "microsoft"
+display_name = "Microsoft"
+auth_url = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+token_url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+
+# client_id = "00000000-0000-0000-0000-000000000000"
+
+[scopes]
+# `offline_access` es lo que hace que Microsoft devuelva refresh_token. Va en
+# cada capacidad porque los alcances se piden juntos y esta es la lista de la
+# que salen.
+email = ["offline_access", "https://graph.microsoft.com/Mail.ReadWrite", "https://graph.microsoft.com/Mail.Send"]
+calendar = ["offline_access", "https://graph.microsoft.com/Calendars.ReadWrite"]
+contacts = ["offline_access", "https://graph.microsoft.com/Contacts.ReadWrite"]
+drive = ["offline_access", "https://graph.microsoft.com/Files.ReadWrite"]

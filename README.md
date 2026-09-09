@@ -125,11 +125,43 @@ correo le permite todas tus casillas.
 | Método | Entrada | Salida | Permiso | Descripción |
 |---|---|---|---|---|
 | `Ping` | — | `s` | — | Identifica al llamante (PID + binario). Diagnóstico. |
-| `ListAccounts` | — | `s` (JSON) | — | Las cuentas del usuario que llama. **Sólo metadatos**, nunca un token. |
-| `RegisterAccount` | `s` nombre, `s` proveedor, `s` capacidades JSON, `s` secretos JSON | `s` id | — | Agrega una cuenta y guarda sus secretos. Agregar una cuenta *tuya* no necesita autorización: es tuya. Lo que la necesita es que un programa llegue al token. |
+| `ListAccounts` | — | `s` (JSON) | — | Resumen de las cuentas del usuario que llama. Nunca un token. |
+| `ListProviders` | — | `s` (JSON) | — | Qué proveedores hay y cuáles están configurados. |
+| `BeginAuth` | `s` proveedor, `s` capacidades JSON, `s` redirect_uri | `s` (JSON) | — | Empieza a conectar una cuenta OAuth2. Devuelve `auth_url`, `request_id` y `state`. |
+| `CompleteAuth` | `s` request_id, `s` code, `s` state, `s` nombre | `s` id | — | Canjea el código y crea la cuenta. |
+| `CancelAuth` | `s` request_id | `b` | — | Descarta un flujo abandonado. |
+| `RegisterAccount` | `s` nombre, `s` proveedor, `s` capacidades JSON, `s` secretos JSON | `s` id | — | Cuenta con credenciales de **contraseña** (IMAP y compañía). No acepta secretos de OAuth2. |
 | `RemoveAccount` | `s` id | `b` | — | Borra la cuenta **y todos sus secretos**. |
 | `GetAccountData` | `s` id, `s` capacidad | `s` (JSON) | ✅ | Configuración de esa capacidad. |
 | `GetAccessToken` | `s` id, `s` capacidad | `s` | ✅ | Un access_token **válido**, refrescándolo si hace falta. |
+
+### Señal
+
+| Señal | Cuerpo | Cuándo |
+|---|---|---|
+| `AccountsChanged` | `u` uid | Se agregó, se quitó o cambió de estado una cuenta de ese usuario |
+
+Una sola señal y sin detalle, a propósito. Este servicio atiende a todo el
+equipo desde el bus del sistema, así que la señal la reciben todas las sesiones:
+con el identificador de la cuenta adentro, quien escuche se enteraría de que a
+la persona de al lado le cambió tal cuenta. Un `uid` no dice nada que no se vea
+con `who`.
+
+Y funciona mejor: quien la recibe vuelve a llamar `ListAccounts` —que ya está
+acotado a su usuario— y ve el estado completo. Con señales que llevan el cambio
+adentro, una que se pierde deja al cliente creyendo algo que no es.
+
+### Por qué `ListAccounts` no pide permiso
+
+Porque preguntar por algo tan seguido es lo que enseña a apretar «permitir» sin
+leer, y ahí se pierde el valor de preguntar cuando importa: abrir la pantalla de
+cuentas, o que la app de calendario dibuje una lista, no puede costar un diálogo
+por cuenta.
+
+Lo que se paga es que la lista la ve cualquier programa del usuario. Por eso sale
+un **resumen** —id, nombre, proveedor, qué capacidades tiene y si hay que
+reconectarla— y no la cuenta entera. La configuración completa, con el servidor
+y el `client_id`, sigue detrás de `GetAccountData`, que sí pregunta.
 
 Las capacidades se nombran en minúscula: `email`, `calendar`, `contacts`,
 `chat`, `drive`, `tasks`. Cualquier otra cosa devuelve `InvalidArgs` con la
@@ -156,6 +188,43 @@ busctl call ar.net.vasak.os.AccountManager \
 ```
 
 Sin `--user`: es el bus del sistema.
+
+### Flujo de conexión de una cuenta
+
+```mermaid
+sequenceDiagram
+    participant U as Configuración
+    participant D as vasak-accounts
+    participant N as Navegador
+    participant O as Proveedor
+
+    U->>U: abre 127.0.0.1:0 y toma el puerto
+    U->>D: BeginAuth(proveedor, capacidades, redirect_uri)
+    D->>D: ¿el redirect_uri es de este equipo?
+    D->>D: genera code_verifier + desafío PKCE + state
+    Note over D: el verifier se queda acá, en memoria
+    D-->>U: auth_url, request_id, state
+
+    U->>N: abre auth_url
+    N->>O: la persona autoriza
+    O-->>N: redirect a 127.0.0.1 con code y state
+    N-->>U: code, state
+
+    U->>D: CompleteAuth(request_id, code, state, nombre)
+    D->>D: ¿coincide el state? ¿es el mismo usuario?
+    D->>O: POST /token (code + code_verifier)
+    O-->>D: access_token + refresh_token + expires_in
+    D->>D: guarda tokens y las URLs para renovar
+    D-->>U: account_id
+    D-->>U: señal AccountsChanged(uid)
+```
+
+Lo que hace que esto valga la pena: el `code_verifier` se genera en el servicio
+y no sale de ahí. Un código de autorización sin su verifier no sirve para nada,
+así que lo que la ventana de configuración maneja **no es un secreto**. Antes el
+canje ocurría en el webview, y el `refresh_token` terminaba pasando por un
+proceso del usuario — justo lo que se había evitado al mover los tokens a
+archivos de root.
 
 ### Flujo de `GetAccessToken`
 
@@ -232,14 +301,17 @@ vasak-accounts/
 │   ├── vasak-accounts.service                    # unidad de sistema, Type=dbus
 │   ├── ar.net.vasak.os.AccountManager.service    # activación por D-Bus
 │   └── ar.net.vasak.os.AccountManager.conf       # política del bus: sólo root es dueño
+│   └── providers.d/                              # catálogo, sin client_id
 └── src/
     ├── main.rs          # los métodos D-Bus
     ├── storage.rs       # cuentas, secretos y capacidades
     ├── auth.rs          # PinnedCaller: identidad fijada con pidfd
     ├── permissions.rs   # la consulta a vasak-permissions
+    ├── providers.rs     # el catálogo de proveedores OAuth2
+    ├── pending.rs       # flujos a medio terminar (sólo en memoria)
     └── protocols/
         ├── mod.rs
-        └── oauth2.rs    # refresco de tokens
+        └── oauth2.rs    # armado de la URL, canje y refresco
 ```
 
 ---
@@ -254,9 +326,12 @@ cargo build --release
 cargo test
 ```
 
-**27 tests** al 9/09/2026, cubriendo el almacén (permisos de archivo, escritura
+**67 tests** al 9/09/2026, cubriendo el almacén (permisos de archivo, escritura
 atómica, aislamiento entre cuentas y entre usuarios, JSON corrupto), el parseo de
-capacidades y la lectura de `/proc`.
+capacidades, la lectura de `/proc`, el catálogo de proveedores —incluidos los
+archivos que el paquete instala—, el armado de la URL de autorización, y los
+flujos a medio terminar (vencimiento, `state` que no coincide, tope por
+usuario).
 
 Para levantarlo sin root durante el desarrollo, una compilación de depuración
 acepta `VASAK_ACCOUNTS_TEST_ROOT`, que lo mueve al bus de **sesión** y apunta el
@@ -273,6 +348,30 @@ controla le estaría dando sus peticiones a lo que reclame ese nombre.
 `RUST_LOG` acepta `info` (por omisión), `debug` y `trace`.
 
 ---
+
+## Proveedores
+
+Las URLs y el `client_id` de cada proveedor viven en archivos, no en el código:
+
+| Directorio | Qué hay |
+|---|---|
+| `/usr/share/vasak-accounts/providers.d/` | Lo que trae el paquete. **Sin `client_id`.** |
+| `/etc/vasak-accounts/providers.d/` | Lo que agrega quien administra el equipo. Le gana al anterior. |
+
+Los dos son de root. Un proveedor define a qué servidor se le mandan los códigos
+de autorización, así que si el usuario pudiera escribirlos, un programa corriendo
+con su cuenta podría apuntar «Google» a otro lado.
+
+**VasakOS no distribuye un `client_id` propio, y no es un olvido.** Registrar la
+aplicación con Google para llegar al correo exige una evaluación de seguridad
+hecha por un tercero, que se paga y se repite cada año. En vez de prometer algo
+que la distribución no puede sostener, los archivos vienen listos para que quien
+quiera use el suyo — que es gratis y se saca en diez minutos. Cada archivo
+explica cómo adentro, y el error que devuelve el servicio dice dónde dejarlo.
+
+Para el correo de Gmail el camino recomendado **no** es OAuth: es agregar la
+casilla como servidor personalizado por IMAP con una contraseña de aplicación.
+No caduca, no depende de ningún registro y no cuesta nada.
 
 ## Requisitos
 
@@ -293,12 +392,16 @@ controla le estaría dando sus peticiones a lo que reclame ese nombre.
 | Identidad del llamante fijada con `pidfd` (sin TOCTOU) | ✅ |
 | Permisos delegados a `vasak-permissions` | ✅ |
 | Refresco automático de tokens OAuth2 | ✅ |
-| **Flujo de autorización inicial (obtener el primer token)** | ⛔ falta |
-| Señales de ciclo de vida | ⛔ falta |
-| Reautenticación cuando el proveedor revoca | ⛔ falta |
-| Loop de sincronización de correo | ⛔ falta |
+| Flujo de autorización inicial con PKCE del lado del servicio | ✅ |
+| Catálogo de proveedores en archivos, sin recompilar | ✅ |
+| Señal de ciclo de vida | ✅ |
+| Marca de «necesita reautenticación» al revocarse | ✅ |
+| Nextcloud Login Flow v2 | ⛔ falta |
+| Prueba de conexión al registrar IMAP/SMTP | ⛔ falta |
+| Loop de sincronización de correo (`vasak-accounts-sync`) | ⛔ falta |
 
-Hoy el servicio sabe **refrescar** un token pero no **obtenerlo**:
-`RegisterAccount` espera secretos que consiguió alguien más. Conectar una cuenta
-OAuth de punta a punta es el próximo trabajo, y el plan está en el roadmap
-citado arriba.
+El siguiente trabajo son los proveedores que no cuestan nada —Nextcloud primero,
+porque las credenciales las emite el servidor de la propia persona— y después el
+bucle de sincronización, que va en un binario aparte y como servicio **del
+usuario**: parsear correo ajeno no puede pasar por root. El plan está en el
+roadmap citado arriba.
