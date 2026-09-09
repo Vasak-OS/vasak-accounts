@@ -433,16 +433,72 @@ antes de que dependa de él algo que la gente usa.
 
 ### Qué hace el sync hoy, y qué no
 
-Cuenta el correo sin leer de cada cuenta y lo publica en
-`ar.net.vasak.os.AccountsSync` (bus de sesión), con una señal `MailboxChanged`
-cuando cambia.
+Publica en `ar.net.vasak.os.AccountsSync` (bus de sesión):
 
-**No guarda mensajes**, y no es una etapa a medio hacer: un caché sería
-inventarle un formato a una aplicación de correo que todavía no existe, y el día
-que exista va a querer otro. Contar sin leer sirve hoy —el escritorio puede
-mostrar que llegó algo— y se apoya en `STATUS`, que devuelve cuatro números: ni
-una línea de parser sobre lo que escribió un remitente desconocido. Ese parser
-va a llegar, y va a merecer su propia discusión.
+| Método | Qué devuelve |
+|---|---|
+| `MailboxStatus` | Cuánto correo sin leer hay, por cuenta. |
+| `ListMessages(account_id)` | Los últimos 200 mensajes: quién, qué asunto, cuándo, leído o no. Sin cuerpos. |
+| `GetMessage(account_id, uid)` | El texto de un mensaje, si se cortó por tamaño y si trae adjuntos. |
+| `MarkRead(account_id, uid)` | Marca un mensaje como leído **en el servidor**. |
+
+Con dos señales sin detalle —`MailboxChanged` y `MessagesChanged`—: quien las
+recibe vuelve a leer y ve el estado completo, en vez de reconciliar avisos que se
+pueden perder. (`AccountsChanged` es otra cosa y vive en el bus del sistema: la
+manda el servicio de cuentas, y este proceso es uno de los que la escucha.)
+
+**La aplicación de correo nunca toca una credencial.** No pide `account.email`,
+no ve una contraseña y no habla IMAP: le pide a este servicio la lista y el
+texto. Es la aplicación más expuesta del escritorio —lo que muestra lo escribió
+cualquiera que sepa la dirección de la persona— y es la que menos tiene para
+perder. Ésa es la razón de que el correo se lea por acá y no desde la ventana.
+
+**La lista vive en memoria, no en un archivo.** Un caché en disco guardaría el
+remitente y el asunto de todo el correo de la persona en texto plano, para
+siempre, en un archivo que nadie recuerda que existe. A cambio ahorraría los dos
+segundos de la primera lista, que igual se rehace sola en cuanto la cuenta se
+conecta — cosa que pasa al arrancar la sesión. Los cuerpos no se guardan en
+ninguna parte: se traen cuando alguien abre un mensaje.
+
+**Todo se trae con `BODY.PEEK`.** `BODY` a secas marca el mensaje como leído por
+el solo hecho de mirarlo, y que abrir la aplicación vacíe el contador de sin leer
+sin haber leído nada es de los errores más molestos que puede tener un cliente de
+correo — se comete escribiendo cinco letras de menos. Marcar como leído es un
+comando aparte que pide la ventana.
+
+**Hay dos conexiones por cuenta cuando alguien usa el correo**, y una cuando no.
+IMAP no deja mandar un comando mientras la conexión espera en IDLE: hay que
+cortar la espera, hacer lo pedido y volver a entrar. Hacer eso desde otra tarea
+es interrumpir una lectura a mitad de camino, y si el corte cae mal la conexión
+queda desincronizada — el síntoma sería correo que deja de llegar, sin ningún
+error y sin nada en el registro. La segunda conexión se abre la primera vez que
+alguien abre un mensaje.
+
+**El texto se trae de a un megabyte.** Un mensaje con un adjunto de veinticinco
+megas es normal, y traerlo entero para mostrar tres líneas sería gastar la
+conexión de la persona en algo que no se ve. La contra, dicha donde se ve: si el
+texto viene *después* de un adjunto grande, se corta — y la ventana lo dice.
+
+**Todavía no envía.** Mandar correo pasa por SMTP y por una cola que sobreviva a
+que se apague el equipo con algo sin mandar; es su propio trabajo.
+
+#### El parser, que es la parte peligrosa
+
+`mensaje.rs` interpreta cabeceras y MIME. Lo que entra ahí **lo escribió un
+desconocido** —no un servidor con el que la persona decidió tener una cuenta:
+cualquiera que sepa su dirección—, así que es la superficie más expuesta de todo
+el escritorio. Por eso corre como el usuario y nunca como root, no tiene `unsafe`,
+todo lo que no entiende devuelve algo razonable en vez de cortar, y todo tiene
+tope: el tamaño del mensaje, la profundidad de las partes anidadas y cuántas
+partes se miran.
+
+**No se interpreta HTML.** Se extrae texto. Un motor de HTML acá traería imágenes
+remotas —que le confirman al remitente que se leyó y desde qué dirección IP—, CSS
+que puede tapar cosas, y una superficie enorme por nada.
+
+El nombre y la dirección del remitente van **separados**: un remitente que se
+pone de nombre «soporte@banco.com» y escribe desde otra dirección es el fraude
+más común que hay, y juntarlos en una sola línea es lo que lo hace funcionar.
 
 **Espera a que el servidor avise** (IMAP IDLE), así el correo nuevo aparece en el
 momento en vez de hasta cinco minutos después. Hay una conexión viva por cuenta,

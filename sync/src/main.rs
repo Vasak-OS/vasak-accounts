@@ -22,17 +22,36 @@
 //!
 //! ── Qué hace hoy, y qué no ──────────────────────────────────────────────────
 //!
-//! Cuenta el correo sin leer de cada cuenta y lo publica. Nada más.
+//! Cuenta el correo sin leer de cada cuenta, mantiene la lista de los últimos
+//! mensajes y trae el texto de uno cuando la aplicación de correo lo pide.
 //!
-//! No guarda mensajes. Un caché sería inventarle un formato a una aplicación de
-//! correo que todavía no existe, y el día que exista va a querer otro. Contar
-//! sin leer, en cambio, sirve hoy —el escritorio puede mostrar que llegó algo— y
-//! se apoya en `STATUS`, que devuelve cuatro números: ni una línea de parser
-//! sobre lo que escribió un remitente. Ese parser va a llegar, y va a merecer su
-//! propia discusión.
+//! Empezó contando y nada más, a propósito, porque contar no necesita interpretar
+//! nada de lo que escribió un desconocido. Ese parser llegó con la aplicación de
+//! correo y vive en `mensaje.rs`, con su propia discusión escrita arriba.
+//!
+//! **La lista vive en memoria, no en un archivo.** Un caché en disco guardaría el
+//! remitente y el asunto de todo el correo de la persona en texto plano, para
+//! siempre, en un archivo que nadie recuerda que existe. A cambio ahorraría los
+//! dos segundos de la primera lista — que igual se rehace sola en cuanto la
+//! cuenta se conecta, cosa que pasa al arrancar la sesión.
+//!
+//! **Los cuerpos no se guardan en ninguna parte**: se traen del servidor cuando
+//! alguien abre un mensaje.
+//!
+//! ── Lo que gana la aplicación de correo con esto ────────────────────────────
+//!
+//! Que **nunca toca una credencial**. No pide `account.email`, no ve una
+//! contraseña y no habla IMAP: le pide a este servicio, por el bus de sesión, la
+//! lista y el texto. Es la aplicación más expuesta del escritorio —lo que muestra
+//! lo escribió cualquiera que sepa la dirección de la persona— y es la que menos
+//! tiene para perder.
+//!
+//! Todavía **no envía**. Mandar correo pasa por SMTP y por una cola que sobreviva
+//! a que se apague el equipo con algo sin mandar, y eso es su propio trabajo.
 
 mod broker;
 mod imap;
+mod mensaje;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -95,6 +114,16 @@ struct Resumen {
 #[derive(Default)]
 struct Estado {
     por_cuenta: HashMap<String, Resumen>,
+    /// Los últimos mensajes de cada cuenta, para que la aplicación de correo los
+    /// muestre sin abrir su propia conexión.
+    ///
+    /// **En memoria y no en un archivo**, y eso es una decisión y no una etapa
+    /// pendiente. Un caché en disco guardaría el remitente y el asunto de todo
+    /// el correo de la persona en texto plano, para siempre, en un archivo que
+    /// nadie recuerda que existe — y a cambio ahorraría los dos segundos que
+    /// tarda la primera lista. La lista se rehace sola en cuanto la cuenta se
+    /// conecta, que es de todos modos lo que pasa al arrancar la sesión.
+    mensajes: HashMap<String, Vec<mensaje::Resumen>>,
     /// Las cuentas cuyo servidor rechazó las credenciales.
     ///
     /// Sin esta lista, la tarea de una cuenta rechazada termina, deja de figurar
@@ -115,6 +144,144 @@ struct Estado {
 #[derive(Clone, Default)]
 struct Servicio {
     estado: Arc<Mutex<Estado>>,
+    /// La segunda conexión de cada cuenta, la que atiende lo que pide la
+    /// ventana. Se crea cuando alguien abre un mensaje por primera vez.
+    lectores: Arc<Mutex<HashMap<String, Arc<Mutex<Lector>>>>>,
+}
+
+/// Un mensaje abierto, listo para mostrar.
+#[derive(Debug, Clone, serde::Serialize)]
+struct Abierto {
+    texto: String,
+    /// El mensaje era más largo de lo que se trae y hay más. La ventana tiene
+    /// que poder decirlo en vez de dejar el texto terminado a la mitad sin
+    /// explicación.
+    recortado: bool,
+    /// Si trae algo pegado.
+    ///
+    /// Se dice aunque **todavía no se pueda abrir**: alguien que lee un mensaje
+    /// y no se entera de que traía un archivo pierde el archivo. Que la ventana
+    /// diga «tiene un adjunto y esta versión no los muestra» es peor que
+    /// mostrarlo y muchísimo mejor que callarlo.
+    adjuntos: bool,
+}
+
+/// La conexión que atiende los pedidos de la aplicación de correo.
+///
+/// **Aparte de la que espera en IDLE, y no por comodidad.** IMAP no deja mandar
+/// un comando mientras la conexión está esperando: hay que cortar la espera con
+/// `DONE`, hacer lo pedido y volver a entrar. Hacer eso desde otra tarea es
+/// interrumpir una lectura a mitad de camino, y si el corte cae en el lugar
+/// equivocado la conexión queda desincronizada — el síntoma sería correo que
+/// deja de llegar, sin ningún error y sin nada en el registro.
+///
+/// El costo es un login más contra el servidor de la persona, y se paga **sólo
+/// cuando alguien abre un mensaje**: quien no usa la aplicación de correo sigue
+/// teniendo una sola conexión.
+#[derive(Default)]
+struct Lector {
+    sesion: Option<imap::Sesion>,
+}
+
+impl Lector {
+    /// Lo que hace falta para mostrar un mensaje abierto.
+    async fn cuerpo(
+        &mut self,
+        broker: &Broker,
+        cuenta: &broker::Account,
+        uid: u32,
+    ) -> Result<Abierto, String> {
+        let (crudo, recortado) = self
+            .con_reintento(broker, cuenta, |sesion| Box::pin(sesion.cuerpo(uid)))
+            .await?;
+        let crudo = String::from_utf8_lossy(&crudo);
+
+        Ok(Abierto {
+            texto: mensaje::texto_de(&crudo),
+            recortado,
+            adjuntos: mensaje::tiene_adjuntos(&crudo),
+        })
+    }
+
+    /// Marca un mensaje como leído **en el servidor**.
+    ///
+    /// En el servidor y no sólo acá: la persona lee en el teléfono y en el
+    /// escritorio, y un «leído» que no viaja deja el mismo mensaje sin leer del
+    /// otro lado para siempre.
+    async fn marcar_leido(
+        &mut self,
+        broker: &Broker,
+        cuenta: &broker::Account,
+        uid: u32,
+    ) -> Result<(), String> {
+        self.con_reintento(broker, cuenta, |sesion| Box::pin(sesion.marcar_leido(uid)))
+            .await
+    }
+
+    /// Hace algo sobre la sesión, abriéndola si hace falta.
+    ///
+    /// Con **un** reintento, y sólo si la conexión venía de antes: una que estuvo
+    /// quieta un rato la cierra el servidor sin avisar, y el fallo aparece recién
+    /// al usarla. En cambio, una que acaba de abrirse y falla no se reintenta —
+    /// si el servidor rechazó la credencial, insistir es cómo se bloquea una
+    /// cuenta.
+    async fn con_reintento<T, F>(
+        &mut self,
+        broker: &Broker,
+        cuenta: &broker::Account,
+        mut trabajo: F,
+    ) -> Result<T, String>
+    where
+        F: for<'a> FnMut(
+            &'a mut imap::Sesion,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<T, imap::ImapError>> + Send + 'a>,
+        >,
+    {
+        let reusada = self.sesion.is_some();
+
+        match self.intentar(broker, cuenta, &mut trabajo).await {
+            Ok(valor) => Ok(valor),
+            Err(primero) if reusada => {
+                tracing::debug!("'{}': la conexión de lectura estaba muerta: {primero}", cuenta.id);
+                self.sesion = None;
+                self.intentar(broker, cuenta, &mut trabajo).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn intentar<T, F>(
+        &mut self,
+        broker: &Broker,
+        cuenta: &broker::Account,
+        trabajo: &mut F,
+    ) -> Result<T, String>
+    where
+        F: for<'a> FnMut(
+            &'a mut imap::Sesion,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<T, imap::ImapError>> + Send + 'a>,
+        >,
+    {
+        if self.sesion.is_none() {
+            let mut nueva = abrir(broker, cuenta).await?;
+            // `SELECT` y no `EXAMINE`: ésta es la conexión que actúa cuando la
+            // persona pide algo, así que tiene que poder cambiar una bandera. La
+            // que sólo cuenta sigue abriendo en modo lectura.
+            nueva
+                .seleccionar("INBOX")
+                .await
+                .map_err(|e| e.to_string())?;
+            self.sesion = Some(nueva);
+        }
+
+        let sesion = self
+            .sesion
+            .as_mut()
+            .ok_or_else(|| "no hay conexión con el servidor".to_string())?;
+        trabajo(sesion).await.map_err(|e| e.to_string())
+    }
 }
 
 #[interface(name = "ar.net.vasak.os.AccountsSync")]
@@ -138,6 +305,88 @@ impl Servicio {
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
     }
 
+    /// Los últimos mensajes de una cuenta.
+    ///
+    /// Sin cuerpos: la lista de una casilla grande tiene que caber en un mensaje
+    /// de D-Bus, y para pintar una lista alcanzan cuatro campos por mensaje. El
+    /// cuerpo se pide de a uno con `GetMessage`.
+    ///
+    /// Sin pedir permiso, como el contador y por lo mismo: esto vive en el bus
+    /// **de sesión**, es un servicio del usuario, y lo que publica es suyo. Quien
+    /// necesita permiso es este proceso para llegar al token, y ya pasó por ahí.
+    ///
+    /// El efecto de fondo vale decirlo: **la aplicación de correo nunca toca una
+    /// credencial**. No pide `account.email`, no ve una contraseña y no habla
+    /// IMAP. Es la aplicación más expuesta del escritorio —lo que muestra lo
+    /// escribió cualquiera que sepa la dirección de la persona— y es la que menos
+    /// tiene para perder.
+    async fn list_messages(&self, account_id: String) -> zbus::fdo::Result<String> {
+        let estado = self.estado.lock().await;
+        let mensajes = estado.mensajes.get(&account_id).cloned().unwrap_or_default();
+
+        serde_json::to_string(&mensajes)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
+    }
+
+    /// El texto de un mensaje.
+    ///
+    /// Se trae del servidor en el momento: guardar todos los cuerpos sería
+    /// guardar el correo entero de la persona en el disco, y para leer uno hay
+    /// que ir a buscarlo igual la primera vez.
+    ///
+    /// Devuelve `{"texto": …, "recortado": bool, "adjuntos": bool}`. Los dos
+    /// últimos son cosas que la ventana **tiene que poder decir**: un texto
+    /// cortado sin explicación parece un mensaje raro, y un adjunto que no se
+    /// nombra es un archivo que la persona no sabe que recibió.
+    async fn get_message(&self, account_id: String, uid: u32) -> zbus::fdo::Result<String> {
+        let (broker, cuenta) = self.cuenta(&account_id).await?;
+        let lector = self.lector(&account_id).await;
+        let mut lector = lector.lock().await;
+
+        let abierto = lector
+            .cuerpo(&broker, &cuenta, uid)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo traer el mensaje: {e}")))?;
+
+        serde_json::to_string(&abierto)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
+    }
+
+    /// Marca un mensaje como leído en el servidor.
+    ///
+    /// Lo pide la ventana explícitamente y no pasa por haber traído el mensaje:
+    /// todo lo que este proceso trae usa `BODY.PEEK`, que mira sin marcar. Que
+    /// abrir la aplicación te vacíe el contador de sin leer sin haber leído nada
+    /// es de los errores más molestos que puede tener un cliente de correo.
+    async fn mark_read(&self, account_id: String, uid: u32) -> zbus::fdo::Result<()> {
+        let (broker, cuenta) = self.cuenta(&account_id).await?;
+        let lector = self.lector(&account_id).await;
+        let mut lector = lector.lock().await;
+
+        lector
+            .marcar_leido(&broker, &cuenta, uid)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo marcar: {e}")))?;
+
+        // Y acá también, para que la lista no muestre en negrita algo que el
+        // servidor ya sabe que se leyó. La próxima vuelta del bucle lo confirma.
+        let mut estado = self.estado.lock().await;
+        if let Some(mensajes) = estado.mensajes.get_mut(&account_id) {
+            if let Some(m) = mensajes.iter_mut().find(|m| m.uid == uid) {
+                m.sin_leer = false;
+            }
+        }
+        Ok(())
+    }
+
+    /// Señal `MessagesChanged` — cambió la lista de mensajes de alguna cuenta.
+    ///
+    /// Sin detalle, como las otras dos y por lo mismo: quien la recibe vuelve a
+    /// leer y ve el estado completo, en vez de reconciliar señales que se pueden
+    /// perder.
+    #[zbus(signal)]
+    async fn messages_changed(emisor: &SignalContext<'_>) -> zbus::Result<()>;
+
     /// Señal `MailboxChanged` — cambió el correo sin leer de alguna cuenta.
     ///
     /// Sin detalle, como la del servicio de cuentas y por la misma razón: quien
@@ -145,6 +394,49 @@ impl Servicio {
     /// señales que se pueden perder.
     #[zbus(signal)]
     async fn mailbox_changed(emisor: &SignalContext<'_>) -> zbus::Result<()>;
+}
+
+/// Lo que necesita el servicio y no es un método de D-Bus.
+impl Servicio {
+    /// El lector de una cuenta, creándolo si es el primer pedido.
+    ///
+    /// Uno por cuenta y compartido: dos pedidos a la vez sobre la misma conexión
+    /// mezclarían las respuestas —IMAP las devuelve en el orden que quiere—, así
+    /// que el `Mutex` los pone en fila. Es también lo que hace que abrir dos
+    /// mensajes seguidos no abra dos conexiones.
+    async fn lector(&self, account_id: &str) -> Arc<Mutex<Lector>> {
+        let mut lectores = self.lectores.lock().await;
+        Arc::clone(
+            lectores
+                .entry(account_id.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(Lector::default()))),
+        )
+    }
+
+    /// Busca la cuenta que pide la ventana, y una conexión al servicio.
+    ///
+    /// La cuenta se relee del servicio en vez de guardarse: la persona puede
+    /// haberla borrado desde Configuración mientras la aplicación de correo
+    /// estaba abierta, y contestar con datos viejos sería intentar conectarse con
+    /// una credencial que ya no existe.
+    async fn cuenta(&self, account_id: &str) -> zbus::fdo::Result<(Broker, broker::Account)> {
+        let broker = Broker::connect().await.map_err(|e| {
+            zbus::fdo::Error::Failed(format!("no se pudo hablar con el servicio de cuentas: {e}"))
+        })?;
+
+        let cuentas = broker
+            .accounts()
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudieron leer las cuentas: {e}")))?;
+
+        cuentas
+            .into_iter()
+            .find(|c| c.id == account_id)
+            .map(|c| (broker, c))
+            .ok_or_else(|| {
+                zbus::fdo::Error::Failed(format!("la cuenta «{account_id}» ya no existe"))
+            })
+    }
 }
 
 /// Abre la sesión de una cuenta: token, configuración y conexión.
@@ -203,6 +495,29 @@ async fn publicar(
 
     if cambio {
         let _ = Servicio::mailbox_changed(emisor).await;
+    }
+}
+
+/// Publica la lista de mensajes de una cuenta y avisa si cambió.
+///
+/// Se compara con lo que había: sin eso, cada renovación de la espera —cada
+/// veinticuatro minutos, haya novedades o no— despertaría a la aplicación de
+/// correo a redibujar una lista idéntica.
+async fn publicar_mensajes(
+    servicio: &Servicio,
+    emisor: &SignalContext<'_>,
+    account_id: &str,
+    mensajes: Vec<mensaje::Resumen>,
+) {
+    let mut estado = servicio.estado.lock().await;
+    let cambio = estado.mensajes.get(account_id) != Some(&mensajes);
+    if cambio {
+        estado.mensajes.insert(account_id.to_string(), mensajes);
+    }
+    drop(estado);
+
+    if cambio {
+        let _ = Servicio::messages_changed(emisor).await;
     }
 }
 
@@ -273,6 +588,7 @@ async fn sesion_de_cuenta(
 
     let inicial = contar(&mut sesion, mensajes).await;
     publicar(servicio, emisor, cuenta, inicial).await;
+    listar(&mut sesion, servicio, emisor, cuenta, mensajes).await;
 
     let avisa = sesion.soporta_idle();
     if !avisa {
@@ -316,6 +632,27 @@ async fn sesion_de_cuenta(
 
         let ahora = contar(&mut sesion, mensajes).await;
         publicar(servicio, emisor, cuenta, ahora).await;
+        listar(&mut sesion, servicio, emisor, cuenta, mensajes).await;
+    }
+}
+
+/// Trae la lista de mensajes y la publica.
+///
+/// Un fallo acá **no corta la sesión**: el contador de sin leer es lo que hace
+/// este proceso desde que existe y lo que mira el escritorio, y perderlo porque
+/// un servidor contestó raro a un `FETCH` sería cambiar algo que funciona por
+/// algo que recién se estrena. Queda en el registro y se reintenta en la vuelta
+/// siguiente.
+async fn listar(
+    sesion: &mut imap::Sesion,
+    servicio: &Servicio,
+    emisor: &SignalContext<'_>,
+    cuenta: &broker::Account,
+    mensajes: u32,
+) {
+    match sesion.resumenes(mensajes).await {
+        Ok(lista) => publicar_mensajes(servicio, emisor, &cuenta.id, lista).await,
+        Err(e) => tracing::warn!("'{}': no se pudo listar el correo: {e}", cuenta.id),
     }
 }
 
