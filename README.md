@@ -4,10 +4,12 @@ Centro de cuentas de VasakOS. Un servicio **del sistema** que guarda las cuentas
 en línea de cada persona, obtiene y refresca sus tokens, y decide —preguntando a
 `vasak-permissions`— qué aplicación puede usar cuál.
 
-La idea que lo justifica: **la aplicación nunca ve tu token, se lo pide al
-sistema.** Los tokens viven en archivos de root, así que ni la app de correo ni
-nada que corra con tu cuenta puede leerlos por su cuenta; tienen que pasar por
-acá, y acá se pregunta.
+La idea que lo justifica: **una aplicación no puede leer tus tokens, tiene que
+pedirlos — y entonces se te pregunta.** Los archivos son de root, así que ni la
+app de correo ni nada que corra con tu cuenta los abre por su cuenta. Si la
+autorizás, `GetAccessToken` le entrega el token de la capacidad que pidió y de
+ninguna otra; si no, no le entrega nada. El permiso es lo que separa pedirlo de
+tenerlo.
 
 ---
 
@@ -25,8 +27,8 @@ con ellos vive en otras aplicaciones:
 | **App de chats** | Más adelante |
 
 El plan por escrito, con las fases y lo que cuesta cada proveedor, está en
-[`issues/cuentas-en-linea-roadmap.md`](https://github.com/Vasak-OS/VasakOS)
-del workspace.
+`issues/cuentas-en-linea-roadmap.md`, en el workspace de VasakOS — que no es un
+repositorio, así que no hay enlace que poner.
 
 ---
 
@@ -291,7 +293,7 @@ pub struct Account {
 
 ## Estructura
 
-```
+```text
 vasak-accounts/
 ├── Cargo.toml
 ├── README.md
