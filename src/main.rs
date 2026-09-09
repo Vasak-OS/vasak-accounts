@@ -1,16 +1,23 @@
 mod auth;
+mod pending;
 mod permissions;
 mod protocols;
+mod providers;
 mod storage;
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use tokio::sync::Mutex;
+
+use pending::{PendingAuth, PendingAuths};
 use storage::{AccountDatabase, CapabilityType};
 
 use zbus::fdo::DBusProxy;
 use zbus::fdo::Error as FdoError;
-use zbus::interface;
 use zbus::message::Header;
 use zbus::names::BusName;
+use zbus::object_server::SignalContext;
+use zbus::interface;
 
 /// Decides whether `caller` may use `capability` on `account_id`.
 ///
@@ -57,7 +64,32 @@ async fn authorize(
 /// Estructura principal del servicio AccountManager.
 /// Los métodos definidos en el bloque `#[interface]` se exponen como
 /// métodos D-Bus en la interfaz `ar.net.vasak.os.AccountManager`.
-struct AccountManager;
+#[derive(Default)]
+struct AccountManager {
+    /// Los flujos de autorización a medio terminar. Sólo en memoria: ver
+    /// [`pending`].
+    pendientes: Arc<Mutex<PendingAuths>>,
+}
+
+/// Abre la base del usuario y la carga, que es el arranque de casi todo método.
+fn open_db(uid: u32) -> zbus::fdo::Result<AccountDatabase> {
+    let mut db = AccountDatabase::for_user(uid)
+        .map_err(|e| FdoError::Failed(format!("Error al abrir base de datos: {e}")))?;
+    db.load()
+        .map_err(|e| FdoError::Failed(format!("Error al cargar cuentas: {e}")))?;
+    Ok(db)
+}
+
+/// Los nombres de secreto que sólo puede escribir el flujo de autorización.
+///
+/// `RegisterAccount` es para credenciales que la persona escribe —la contraseña
+/// de aplicación de IMAP, por ejemplo—. Un refresh_token o un client_secret no
+/// se escriben a mano: salen de `CompleteAuth`, que es el único que sabe con qué
+/// proveedor se corresponden y guarda junto a ellos las URLs para renovarlos.
+/// Aceptarlos por acá dejaría cuentas OAuth a medio armar, sin la configuración
+/// que el motor de refresco necesita, que es exactamente el estado que hacía que
+/// una cuenta se muriera en una hora.
+const SECRETOS_DE_OAUTH: [&str; 2] = ["refresh", "client_secret"];
 
 // ---------------------------------------------------------------------------
 // Helper: extrae el PID del llamante desde la cabecera D-Bus
@@ -172,37 +204,256 @@ impl AccountManager {
 
     /// Método `ListAccounts` — las cuentas del usuario que llama.
     ///
-    /// Metadata only; a token never leaves through here. Listing what accounts
-    /// exist is not the same as being allowed to use them, and only the second
-    /// needs the user's permission.
+    /// Un resumen, no la cuenta entera, y **sin pedir permiso**. Que la
+    /// pantalla de cuentas o la app de calendario puedan dibujar una lista no
+    /// puede costar un diálogo por cuenta: preguntar por algo tan seguido es lo
+    /// que enseña a apretar «permitir» sin leer, y ahí se pierde el valor de
+    /// preguntar cuando importa.
+    ///
+    /// Lo que se paga por eso es que la lista la ve cualquier programa del
+    /// usuario. Por eso sale un resumen —nombre, proveedor, qué capacidades
+    /// tiene y si hay que reconectarla— y no la configuración completa, que
+    /// sigue detrás de `GetAccountData`. Un token nunca sale por acá.
     async fn list_accounts(
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
     ) -> zbus::fdo::Result<String> {
         let (_caller, uid) = caller_identity(connection, &header).await?;
+        let db = open_db(uid)?;
 
-        let mut db = AccountDatabase::for_user(uid)
-            .map_err(|e| FdoError::Failed(format!("Error al abrir base de datos: {}", e)))?;
-        db.load()
-            .map_err(|e| FdoError::Failed(format!("Error al cargar cuentas: {}", e)))?;
+        let resumenes: Vec<storage::AccountSummary> =
+            db.all().iter().map(storage::Account::summary).collect();
 
-        serde_json::to_string(db.all())
+        serde_json::to_string(&resumenes)
             .map_err(|e| FdoError::Failed(format!("Error de serialización: {e}")))
     }
 
-    /// Método `RegisterAccount` — agrega una cuenta y guarda sus secretos.
+    /// Método `ListProviders` — qué proveedores se pueden conectar.
     ///
-    /// The secrets arrive here and go straight into root-owned storage; the
-    /// program that set the account up cannot read them back afterwards without
-    /// the user's permission, same as anything else.
+    /// Incluye los que **no** están listos, con `configured: false`, para que la
+    /// pantalla pueda mostrarlos apagados y decir por qué en vez de esconderlos.
+    /// Un proveedor que desaparece de la lista parece un proveedor que no existe.
+    async fn list_providers(&self) -> zbus::fdo::Result<String> {
+        let catalogo = providers::load()
+            .map_err(|e| FdoError::Failed(format!("Error al leer el catálogo: {e}")))?;
+
+        let mut lista: Vec<serde_json::Value> = catalogo
+            .values()
+            .map(|proveedor| {
+                serde_json::json!({
+                    "id": proveedor.id,
+                    "display_name": proveedor.display_name,
+                    "capabilities": proveedor.capabilities()
+                        .iter()
+                        .map(|c| c.as_id())
+                        .collect::<Vec<_>>(),
+                    // Sin el client_id no se puede empezar ningún flujo, y eso
+                    // es lo único que la pantalla necesita saber para decidir si
+                    // el botón va encendido.
+                    "configured": proveedor
+                        .client_id
+                        .as_deref()
+                        .is_some_and(|id| !id.is_empty()),
+                })
+            })
+            .collect();
+        lista.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+
+        serde_json::to_string(&lista)
+            .map_err(|e| FdoError::Failed(format!("Error de serialización: {e}")))
+    }
+
+    /// Método `BeginAuth` — empieza a conectar una cuenta OAuth2.
     ///
-    /// Adding an account to your *own* user needs no extra authorisation — it is
-    /// your account. What needs permission is a program getting at the token.
+    /// Devuelve la URL a la que hay que mandar el navegador, un `request_id` y
+    /// el `state` que va a volver en el callback.
+    ///
+    /// El `code_verifier` de PKCE se genera acá y **se queda acá**. Eso es todo
+    /// el motivo de que este método exista: antes el intercambio ocurría en la
+    /// ventana de configuración, así que el refresh_token pasaba por un proceso
+    /// del usuario — justo lo que se había evitado al mover los tokens a
+    /// archivos de root. Un código de autorización sin su verifier no sirve
+    /// para nada, así que lo que la ventana maneja ahora no es un secreto.
+    ///
+    /// Conectar una cuenta *tuya* no pide permiso: es tuya. Lo que lo pide es
+    /// que un programa llegue después al token.
+    async fn begin_auth(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: Header<'_>,
+        provider_id: String,
+        capabilities: String,
+        redirect_uri: String,
+    ) -> zbus::fdo::Result<String> {
+        let (_caller, uid) = caller_identity(connection, &header).await?;
+
+        let capacidades = parse_capabilities(&capabilities)?;
+        if capacidades.is_empty() {
+            return Err(FdoError::InvalidArgs(
+                "hay que pedir al menos una capacidad".into(),
+            ));
+        }
+
+        // Antes de armar nada: adónde vuelve el código de autorización lo elige
+        // quien llama, y sin esto podría pedir que termine en un servidor ajeno
+        // y quedarse con la cuenta.
+        if !pending::is_loopback_redirect(&redirect_uri) {
+            return Err(FdoError::InvalidArgs(format!(
+                "redirect_uri tiene que apuntar a este equipo por http \
+                 (127.0.0.1, localhost o [::1]); llegó '{redirect_uri}'"
+            )));
+        }
+
+        let proveedor = providers::resolve(&provider_id, &capacidades)
+            .map_err(|e| FdoError::Failed(e.to_string()))?;
+
+        let (auth_url, verifier, state) =
+            protocols::oauth2::authorization_url(&proveedor, &capacidades, &redirect_uri)
+                .map_err(|e| FdoError::Failed(e.to_string()))?;
+
+        let request_id = self
+            .pendientes
+            .lock()
+            .await
+            .insert(PendingAuth::new(
+                uid,
+                proveedor.id.clone(),
+                capacidades,
+                redirect_uri,
+                verifier,
+                state.clone(),
+            ))
+            .map_err(FdoError::Failed)?;
+
+        tracing::info!("autorización '{request_id}' iniciada para '{provider_id}' (uid {uid})");
+
+        serde_json::to_string(&serde_json::json!({
+            "request_id": request_id,
+            "auth_url": auth_url,
+            "state": state,
+        }))
+        .map_err(|e| FdoError::Failed(format!("Error de serialización: {e}")))
+    }
+
+    /// Método `CompleteAuth` — canjea el código y crea la cuenta.
+    ///
+    /// El canje lo hace este servicio, contra el proveedor, con el verifier que
+    /// nunca salió de acá. Los tokens van derecho al almacén de root: el
+    /// programa que armó la cuenta no los puede leer después sin permiso, igual
+    /// que cualquier otro.
+    // Tres de estos argumentos no son argumentos: `connection`, `header` y el
+    // emisor de señales los inyecta zbus. Los que la persona manda son los
+    // otros, y son los que la interfaz D-Bus necesita.
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_auth(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(signal_context)] emisor: SignalContext<'_>,
+        request_id: String,
+        code: String,
+        state: String,
+        display_name: String,
+    ) -> zbus::fdo::Result<String> {
+        let (_caller, uid) = caller_identity(connection, &header).await?;
+
+        let pendiente = self
+            .pendientes
+            .lock()
+            .await
+            .take(&request_id, uid, &state)
+            .map_err(|e| FdoError::AccessDenied(e.to_string()))?;
+
+        // Del catálogo otra vez, y no de lo guardado en el pendiente: si el
+        // client_secret cambió entre que se abrió el navegador y volvió, el
+        // canje tiene que usar el de ahora.
+        let proveedor = providers::resolve(&pendiente.provider_id, &pendiente.capabilities)
+            .map_err(|e| FdoError::Failed(e.to_string()))?;
+
+        let frescos = protocols::oauth2::exchange_code(
+            &proveedor,
+            &code,
+            &pendiente.verifier,
+            &pendiente.redirect_uri,
+        )
+        .await
+        .map_err(|e| FdoError::Failed(e.to_string()))?;
+
+        // El nombre que puso la persona, o el del proveedor si dejó el campo
+        // vacío. Sin esto la lista mostraría cuentas sin nombre.
+        let nombre = if display_name.trim().is_empty() {
+            proveedor.display_name.clone()
+        } else {
+            display_name
+        };
+
+        let capabilities: HashMap<CapabilityType, serde_json::Value> = pendiente
+            .capabilities
+            .iter()
+            .map(|capacidad| {
+                (
+                    *capacidad,
+                    protocols::oauth2::capability_config(&proveedor, capacidad, &frescos),
+                )
+            })
+            .collect();
+
+        let mut db = open_db(uid)?;
+        let cuenta = storage::Account::new(&nombre, &proveedor.id, capabilities);
+        let account_id = db
+            .add(cuenta)
+            .map_err(|e| FdoError::Failed(format!("Error al guardar la cuenta: {e}")))?;
+
+        // Los secretos después de la cuenta: si esto falla, queda una cuenta sin
+        // token que la persona puede borrar y rehacer. Al revés quedarían tokens
+        // huérfanos que nada limpia.
+        guardar_secretos_de_oauth(uid, &account_id, &proveedor, &frescos)?;
+
+        tracing::info!("cuenta '{account_id}' conectada a '{}' (uid {uid})", proveedor.id);
+        Self::accounts_changed(&emisor, uid).await?;
+        Ok(account_id)
+    }
+
+    /// Método `CancelAuth` — descarta un flujo que la persona abandonó.
+    ///
+    /// Sin esto habría que esperar cinco minutos a que venza, y mientras tanto
+    /// ocupa lugar contra el tope de flujos simultáneos.
+    async fn cancel_auth(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: Header<'_>,
+        request_id: String,
+    ) -> zbus::fdo::Result<bool> {
+        let (_caller, uid) = caller_identity(connection, &header).await?;
+        Ok(self.pendientes.lock().await.cancel(&request_id, uid))
+    }
+
+    /// Método `RegisterAccount` — agrega una cuenta con credenciales de
+    /// contraseña.
+    ///
+    /// Es el camino de IMAP/SMTP, CalDAV y compañía: la persona escribe un
+    /// servidor y una contraseña de aplicación, y eso va derecho al almacén de
+    /// root. El programa que armó la cuenta no la puede leer después sin
+    /// permiso, igual que cualquier otro.
+    ///
+    /// **No** acepta secretos de OAuth2. Ésos salen de `CompleteAuth`, que es el
+    /// único que sabe con qué proveedor se corresponden y guarda junto a ellos
+    /// las URLs para renovarlos; aceptarlos por acá dejaría cuentas OAuth sin la
+    /// configuración que el motor de refresco necesita, que es exactamente el
+    /// estado en que una cuenta se moría en una hora.
+    ///
+    /// Agregar una cuenta a tu *propio* usuario no pide permiso: es tuya. Lo que
+    /// lo pide es que un programa llegue al token.
+    // Tres de estos argumentos no son argumentos: `connection`, `header` y el
+    // emisor de señales los inyecta zbus. Los que la persona manda son los
+    // otros, y son los que la interfaz D-Bus necesita.
+    #[allow(clippy::too_many_arguments)]
     async fn register_account(
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
+        #[zbus(signal_context)] emisor: SignalContext<'_>,
         display_name: String,
         provider_type: String,
         capabilities_json: String,
@@ -211,28 +462,34 @@ impl AccountManager {
         let (_caller, uid) = caller_identity(connection, &header).await?;
 
         let capabilities: HashMap<CapabilityType, serde_json::Value> =
-            serde_json::from_str(&capabilities_json).map_err(|e| {
-                FdoError::InvalidArgs(format!("capabilities inválidas: {e}"))
-            })?;
+            serde_json::from_str(&capabilities_json)
+                .map_err(|e| FdoError::InvalidArgs(format!("capabilities inválidas: {e}")))?;
         let secrets: HashMap<String, String> = serde_json::from_str(&secrets_json)
             .map_err(|e| FdoError::InvalidArgs(format!("secretos inválidos: {e}")))?;
 
-        let mut db = AccountDatabase::for_user(uid)
-            .map_err(|e| FdoError::Failed(format!("Error al abrir base de datos: {}", e)))?;
-        db.load()
-            .map_err(|e| FdoError::Failed(format!("Error al cargar cuentas: {}", e)))?;
+        for nombre in &SECRETOS_DE_OAUTH {
+            if secrets.contains_key(*nombre) {
+                return Err(FdoError::InvalidArgs(format!(
+                    "'{nombre}' no se puede registrar por acá: las cuentas OAuth2 \
+                     se conectan con BeginAuth y CompleteAuth, que guardan además \
+                     las URLs necesarias para renovar el token"
+                )));
+            }
+        }
 
-        let account = storage::Account::new(&display_name, &provider_type, capabilities);
+        let mut db = open_db(uid)?;
+        let cuenta = storage::Account::new(&display_name, &provider_type, capabilities);
         let account_id = db
-            .add(account)
+            .add(cuenta)
             .map_err(|e| FdoError::Failed(format!("Error al guardar la cuenta: {e}")))?;
 
-        for (key, value) in secrets {
-            storage::SecretStore::store_secret(uid, &account_id, &key, &value)
+        for (clave, valor) in secrets {
+            storage::SecretStore::store_secret(uid, &account_id, &clave, &valor)
                 .map_err(|e| FdoError::Failed(format!("Error al guardar el secreto: {e}")))?;
         }
 
         tracing::info!("Cuenta '{account_id}' registrada para el usuario {uid}");
+        Self::accounts_changed(&emisor, uid).await?;
         Ok(account_id)
     }
 
@@ -241,55 +498,147 @@ impl AccountManager {
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
+        #[zbus(signal_context)] emisor: SignalContext<'_>,
         account_id: String,
     ) -> zbus::fdo::Result<bool> {
         let (_caller, uid) = caller_identity(connection, &header).await?;
 
-        let mut db = AccountDatabase::for_user(uid)
-            .map_err(|e| FdoError::Failed(format!("Error al abrir base de datos: {}", e)))?;
-        db.load()
-            .map_err(|e| FdoError::Failed(format!("Error al cargar cuentas: {}", e)))?;
-
-        let removed = db
+        let mut db = open_db(uid)?;
+        let borrada = db
             .remove(&account_id)
             .map_err(|e| FdoError::Failed(format!("Error al eliminar la cuenta: {e}")))?;
 
-        // Always clear the secrets, even if the metadata was already gone:
-        // otherwise a live credential stays on disk for an account the user
-        // believes no longer exists.
+        // Los secretos se limpian siempre, incluso si los metadatos ya no
+        // estaban: si no, queda una credencial viva en disco para una cuenta que
+        // la persona cree que no existe.
         storage::SecretStore::forget_account(uid, &account_id)
             .map_err(|e| FdoError::Failed(format!("Error al borrar los secretos: {e}")))?;
 
-        Ok(removed)
+        if borrada {
+            Self::accounts_changed(&emisor, uid).await?;
+        }
+        Ok(borrada)
     }
 
-    /// Método `GetAccessToken` — retorna un access_token **válido** para la
-    /// cuenta y capability indicadas. El Motor de Protocolo (Stage 4) verifica
-    /// la expiración y refresca automáticamente si es necesario.
+    /// Señal `AccountsChanged` — algo cambió en las cuentas de este usuario.
+    ///
+    /// Una sola señal sin detalle, y no cuatro con el id de la cuenta adentro.
+    /// Dos razones.
+    ///
+    /// La primera es que este servicio atiende a todo el equipo desde el bus del
+    /// sistema, así que una señal la reciben todas las sesiones. Con el id
+    /// adentro, quien esté escuchando se enteraría de que a la persona de al
+    /// lado le cambió tal cuenta. Un `uid` y nada más no dice nada que no se
+    /// pueda ver con `who`.
+    ///
+    /// La segunda es que funciona mejor. Quien la recibe vuelve a llamar
+    /// `ListAccounts` —que ya está acotado a su usuario— y ve el estado
+    /// completo, incluida la marca de reautenticación. Con señales que llevan el
+    /// cambio adentro, una que se pierde deja al cliente creyendo algo que no
+    /// es, y hay que reconciliar igual.
+    #[zbus(signal)]
+    async fn accounts_changed(emisor: &SignalContext<'_>, uid: u32) -> zbus::Result<()>;
+
+    /// Método `GetAccessToken` — un access_token **válido** para la cuenta y
+    /// capacidad indicadas, refrescándolo si hace falta.
     async fn get_access_token(
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
+        #[zbus(signal_context)] emisor: SignalContext<'_>,
         account_id: String,
         capability: String,
     ) -> zbus::fdo::Result<String> {
         let (caller, uid) = caller_identity(connection, &header).await?;
 
-        // Verificar ACL (reutilizando Stage 3)
-        let mut db = AccountDatabase::for_user(uid)
-            .map_err(|e| FdoError::Failed(format!("Error al abrir base de datos: {}", e)))?;
-        db.load()
-            .map_err(|e| FdoError::Failed(format!("Error al cargar cuentas: {}", e)))?;
-
+        let db = open_db(uid)?;
         let cap = authorize(&caller, &db, &account_id, &capability).await?;
 
-        // Delegar al Motor de Protocolo OAuth2
-        let token = protocols::oauth2::get_valid_access_token(uid, &account_id, &cap)
-            .await
-            .map_err(|e| FdoError::Failed(format!("Error al obtener token: {}", e)))?;
-
-        Ok(token)
+        match protocols::oauth2::get_valid_access_token(uid, &account_id, &cap).await {
+            Ok(token) => {
+                // Una cuenta que vuelve a andar deja de pedir reautenticación.
+                // Pasa cuando la persona la reconecta, y sin esto la pantalla
+                // seguiría diciendo que hay algo que arreglar.
+                if marcar_reauth(uid, &account_id, false)? {
+                    Self::accounts_changed(&emisor, uid).await?;
+                }
+                Ok(token)
+            }
+            // El proveedor dice que la autorización ya no vale. Se anota en la
+            // cuenta y se avisa: es la diferencia entre «reconectá esta cuenta»
+            // y un error de red que se repite para siempre sin decir qué hacer.
+            Err(protocols::oauth2::TokenError::Revoked(detalle)) => {
+                tracing::warn!("'{account_id}' necesita reautenticación: {detalle}");
+                if marcar_reauth(uid, &account_id, true)? {
+                    Self::accounts_changed(&emisor, uid).await?;
+                }
+                Err(FdoError::Failed(format!(
+                    "hay que volver a conectar la cuenta: {detalle}"
+                )))
+            }
+            Err(otro) => Err(FdoError::Failed(format!("Error al obtener token: {otro}"))),
+        }
     }
+}
+
+/// Interpreta la lista de capacidades que llegó como JSON.
+///
+/// Acepta `["email","calendar"]`. Un nombre desconocido se rechaza nombrando los
+/// válidos, en vez de conectar una cuenta a la que después le falte la mitad de
+/// lo que la persona creía haber pedido.
+fn parse_capabilities(json: &str) -> zbus::fdo::Result<Vec<CapabilityType>> {
+    let nombres: Vec<String> = serde_json::from_str(json).map_err(|e| {
+        FdoError::InvalidArgs(format!(
+            "capabilities tiene que ser una lista JSON de nombres, como \
+             [\"email\",\"calendar\"]: {e}"
+        ))
+    })?;
+
+    let mut capacidades = Vec::new();
+    for nombre in nombres {
+        let capacidad: CapabilityType = nombre
+            .parse()
+            .map_err(|e: storage::UnknownCapability| FdoError::InvalidArgs(e.to_string()))?;
+        // Sin repetir: pedir dos veces lo mismo duplicaría los alcances y hay
+        // proveedores que responden error por eso.
+        if !capacidades.contains(&capacidad) {
+            capacidades.push(capacidad);
+        }
+    }
+    Ok(capacidades)
+}
+
+/// Guarda los tokens de una cuenta recién conectada.
+///
+/// El `client_secret` se guarda con la cuenta y no se lee del catálogo cada vez:
+/// si mañana cambia el archivo de `/etc`, las cuentas ya conectadas siguen
+/// renovándose con el secreto con el que se autorizaron.
+fn guardar_secretos_de_oauth(
+    uid: u32,
+    account_id: &str,
+    proveedor: &providers::Provider,
+    frescos: &protocols::oauth2::FreshTokens,
+) -> zbus::fdo::Result<()> {
+    let guardar = |clave: &str, valor: &str| -> zbus::fdo::Result<()> {
+        storage::SecretStore::store_secret(uid, account_id, clave, valor)
+            .map_err(|e| FdoError::Failed(format!("Error al guardar '{clave}': {e}")))
+    };
+
+    guardar("access", &frescos.access)?;
+    if let Some(refresh) = &frescos.refresh {
+        guardar("refresh", refresh)?;
+    }
+    if let Some(secreto) = proveedor.client_secret.as_deref().filter(|s| !s.is_empty()) {
+        guardar("client_secret", secreto)?;
+    }
+    Ok(())
+}
+
+/// Escribe la marca de reautenticación. Devuelve si cambió algo.
+fn marcar_reauth(uid: u32, account_id: &str, necesita: bool) -> zbus::fdo::Result<bool> {
+    let mut db = open_db(uid)?;
+    db.set_needs_reauth(account_id, necesita)
+        .map_err(|e| FdoError::Failed(format!("Error al marcar la cuenta: {e}")))
 }
 
 
@@ -340,7 +689,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("Error al conectar al bus del sistema: {}", e))?
         .name("ar.net.vasak.os.AccountManager")
         .map_err(|e| format!("Error al solicitar nombre D-Bus: {}", e))?
-        .serve_at("/ar/net/vasak/os/AccountManager", AccountManager)
+        .serve_at("/ar/net/vasak/os/AccountManager", AccountManager::default())
         .map_err(|e| format!("Error al registrar el servicio: {}", e))?
         .build()
         .await?;
@@ -358,4 +707,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("AccountManager detenido");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn una_lista_de_capacidades_se_interpreta() {
+        assert_eq!(
+            parse_capabilities(r#"["email","calendar"]"#).unwrap(),
+            vec![CapabilityType::Email, CapabilityType::Calendar],
+        );
+        assert_eq!(parse_capabilities("[]").unwrap(), vec![]);
+    }
+
+    /// Un nombre desconocido se rechaza en vez de ignorarse. Ignorarlo dejaría
+    /// una cuenta conectada a la que le falta la mitad de lo que la persona
+    /// creyó pedir, y el fallo aparecería recién cuando la app de calendario no
+    /// encontrara nada.
+    #[test]
+    fn un_nombre_desconocido_frena_todo() {
+        let error = parse_capabilities(r#"["email","calendario"]"#).unwrap_err();
+        assert!(error.to_string().contains("calendario"), "{error}");
+        assert!(error.to_string().contains("calendar"), "tiene que decir los válidos: {error}");
+    }
+
+    /// Pedir dos veces lo mismo duplicaría los alcances en la URL, y hay
+    /// proveedores que responden error por eso.
+    #[test]
+    fn las_capacidades_repetidas_se_piden_una_sola_vez() {
+        assert_eq!(
+            parse_capabilities(r#"["email","email","calendar"]"#).unwrap(),
+            vec![CapabilityType::Email, CapabilityType::Calendar],
+        );
+    }
+
+    #[test]
+    fn lo_que_no_es_una_lista_de_nombres_se_rechaza() {
+        for malo in ["", "email", "{}", r#"{"email":true}"#, "[1,2]", "[null]", "[[\"email\"]]"] {
+            assert!(
+                parse_capabilities(malo).is_err(),
+                "{malo:?} tenía que rechazarse"
+            );
+        }
+    }
+
+    /// El error de un JSON mal armado tiene que mostrar la forma esperada: es un
+    /// error que ve quien programa una aplicación cliente.
+    #[test]
+    fn el_error_de_formato_muestra_un_ejemplo() {
+        let error = parse_capabilities("no es json").unwrap_err().to_string();
+        assert!(error.contains("[\"email\",\"calendar\"]"), "{error}");
+    }
+
+    /// `RegisterAccount` es para contraseñas escritas a mano. Los secretos de
+    /// OAuth salen de `CompleteAuth`, que además guarda las URLs para renovar:
+    /// aceptarlos por el otro camino dejaría cuentas que no se pueden refrescar.
+    #[test]
+    fn los_secretos_de_oauth_estan_nombrados() {
+        assert!(SECRETOS_DE_OAUTH.contains(&"refresh"));
+        assert!(SECRETOS_DE_OAUTH.contains(&"client_secret"));
+        // `access` no está: una contraseña de aplicación de IMAP se guarda ahí y
+        // sí se registra por RegisterAccount.
+        assert!(!SECRETOS_DE_OAUTH.contains(&"access"));
+    }
 }

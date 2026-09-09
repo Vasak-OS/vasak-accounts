@@ -98,6 +98,19 @@ pub struct Account {
     pub display_name: String,
     pub provider_type: String,
     pub capabilities: HashMap<CapabilityType, Value>,
+
+    /// El proveedor dejó de aceptar el refresh_token y hay que volver a
+    /// autorizar.
+    ///
+    /// Pasa cuando la persona revoca el acceso desde la web del proveedor, o
+    /// cambia la contraseña, o el token caduca por no usarse. Sin esta marca la
+    /// cuenta queda zombi: sigue en la lista, y cada intento de usarla falla
+    /// con un error de red que no dice qué hacer.
+    ///
+    /// `default` porque los archivos escritos antes de que esto existiera no la
+    /// tienen, y una cuenta sin la marca es una cuenta que anda.
+    #[serde(default)]
+    pub needs_reauth: bool,
 }
 
 impl Account {
@@ -111,9 +124,47 @@ impl Account {
             display_name: display_name.to_string(),
             provider_type: provider_type.to_string(),
             capabilities,
+            needs_reauth: false,
         }
     }
 
+    /// Lo que se le cuenta a cualquiera que pregunte qué cuentas hay.
+    pub fn summary(&self) -> AccountSummary {
+        let mut capabilities: Vec<&'static str> = CapabilityType::ALL
+            .into_iter()
+            .filter(|c| self.capabilities.contains_key(c))
+            .map(|c| c.as_id())
+            .collect();
+        capabilities.sort();
+
+        AccountSummary {
+            id: self.id.clone(),
+            display_name: self.display_name.clone(),
+            provider_type: self.provider_type.clone(),
+            capabilities,
+            needs_reauth: self.needs_reauth,
+        }
+    }
+}
+
+/// La versión de una cuenta que `ListAccounts` entrega.
+///
+/// Es un resumen y no la cuenta entera por una razón concreta. Listar no pide
+/// permiso —tiene que poder abrirse la pantalla de cuentas sin que aparezca un
+/// diálogo por cada una—, así que lo que sale por ahí lo ve cualquier programa
+/// del usuario. La configuración completa de una capacidad incluye a qué
+/// servidor se habla, con qué `client_id` y con qué alcances, y eso sólo sale
+/// por `GetAccountData`, que sí pregunta.
+///
+/// Lo que queda acá es lo que una aplicación necesita para dibujar una lista y
+/// saber a qué cuenta pedirle permiso después.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AccountSummary {
+    pub id: String,
+    pub display_name: String,
+    pub provider_type: String,
+    pub capabilities: Vec<&'static str>,
+    pub needs_reauth: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -272,6 +323,23 @@ impl AccountDatabase {
         self.accounts[pos] = updated;
         self.save()?;
         Ok(())
+    }
+
+    /// Marca —o desmarca— que una cuenta necesita volver a autorizarse.
+    ///
+    /// Devuelve si la marca **cambió**: quien llama usa eso para avisar por la
+    /// señal sólo cuando hay algo nuevo, y no en cada refresco fallido de una
+    /// cuenta que ya estaba marcada.
+    pub fn set_needs_reauth(&mut self, id: &str, needs: bool) -> Result<bool, StorageError> {
+        let Some(cuenta) = self.accounts.iter_mut().find(|a| a.id == id) else {
+            return Ok(false);
+        };
+        if cuenta.needs_reauth == needs {
+            return Ok(false);
+        }
+        cuenta.needs_reauth = needs;
+        self.save()?;
+        Ok(true)
     }
 
     pub fn remove(&mut self, id: &str) -> Result<bool, StorageError> {
@@ -669,6 +737,102 @@ mod tests {
         assert_eq!(modo, 0o700);
 
         std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// Lo que sale por `ListAccounts`, que no pide permiso: tiene que alcanzar
+    /// para dibujar una lista y **no** incluir la configuración de la cuenta.
+    #[test]
+    fn el_resumen_no_lleva_la_configuracion_de_la_cuenta() {
+        let cuenta = sample_account();
+        let resumen = cuenta.summary();
+
+        assert_eq!(resumen.display_name, "Alice Google");
+        assert_eq!(resumen.provider_type, "google");
+        assert_eq!(resumen.capabilities, vec!["drive", "email"]);
+        assert!(!resumen.needs_reauth);
+
+        // El servidor de correo, el client_id y los alcances quedan detrás de
+        // GetAccountData, que sí pregunta. Que no se filtren por acá es el
+        // motivo de que el resumen exista.
+        let json = serde_json::to_string(&resumen).unwrap();
+        for secreto in ["imap.gmail.com", "alice@gmail.com", "max_storage_gb"] {
+            assert!(
+                !json.contains(secreto),
+                "el resumen filtró '{secreto}': {json}"
+            );
+        }
+    }
+
+    /// Las capacidades del resumen van ordenadas y sin depender del recorrido de
+    /// un HashMap, o la lista de la pantalla se reordenaría sola entre lecturas.
+    #[test]
+    fn las_capacidades_del_resumen_van_ordenadas() {
+        let mut caps = HashMap::new();
+        for capacidad in CapabilityType::ALL {
+            caps.insert(capacidad, json!({}));
+        }
+        let resumen = Account::new("Todas", "prueba", caps).summary();
+
+        let mut esperado = resumen.capabilities.clone();
+        esperado.sort();
+        assert_eq!(resumen.capabilities, esperado);
+        assert_eq!(resumen.capabilities.len(), 6);
+    }
+
+    #[test]
+    fn marcar_reauth_solo_avisa_cuando_cambia() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
+        db.load().unwrap();
+        let id = db.add(sample_account()).unwrap();
+
+        assert!(db.set_needs_reauth(&id, true).unwrap(), "el primer cambio avisa");
+        // Y el segundo no: si no, cada refresco fallido de una cuenta ya marcada
+        // emitiría una señal y despertaría a todas las aplicaciones.
+        assert!(!db.set_needs_reauth(&id, true).unwrap());
+        assert!(db.get(&id).unwrap().needs_reauth);
+
+        assert!(db.set_needs_reauth(&id, false).unwrap(), "volver a andar avisa");
+        assert!(!db.get(&id).unwrap().needs_reauth);
+
+        // Y una cuenta que no existe no es un error: puede haberse borrado
+        // mientras se hablaba con el proveedor.
+        assert!(!db.set_needs_reauth("no-existe", true).unwrap());
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// La marca tiene que sobrevivir al disco, o la pantalla diría que todo
+    /// está bien después de reiniciar el servicio.
+    #[test]
+    fn la_marca_de_reauth_se_persiste() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
+        db.load().unwrap();
+        let id = db.add(sample_account()).unwrap();
+        db.set_needs_reauth(&id, true).unwrap();
+
+        let mut otra = AccountDatabase::in_directory(dir.clone()).unwrap();
+        otra.load().unwrap();
+        assert!(otra.get(&id).unwrap().needs_reauth);
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// Los archivos escritos antes de que la marca existiera no la tienen, y una
+    /// cuenta sin marca es una cuenta que anda. Sin el `default` de serde, el
+    /// servicio no podría leer ningún accounts.json anterior.
+    #[test]
+    fn una_cuenta_sin_la_marca_se_lee_como_que_anda() {
+        let viejo = r#"[{
+            "id": "abc",
+            "display_name": "Vieja",
+            "provider_type": "custom",
+            "capabilities": {}
+        }]"#;
+
+        let cuentas: Vec<Account> = serde_json::from_str(viejo).unwrap();
+        assert!(!cuentas[0].needs_reauth);
     }
 
     fn temp_dir() -> std::path::PathBuf {

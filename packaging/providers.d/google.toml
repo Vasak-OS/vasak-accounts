@@ -1,0 +1,56 @@
+# Google — calendario, contactos y Drive.
+#
+# ── Falta el client_id, y no es un olvido ───────────────────────────────────
+#
+# VasakOS no distribuye un client_id propio para Google. Tenerlo exige registrar
+# la aplicación y pasar la verificación de Google, y para llegar al **correo**
+# hace falta además una evaluación de seguridad hecha por un tercero, que se
+# paga y se repite todos los años. Es un costo que la distribución no puede
+# sostener, así que en vez de prometerlo se deja el archivo listo para que quien
+# quiera use el suyo.
+#
+# ── Cómo poner el tuyo ──────────────────────────────────────────────────────
+#
+#   1. En https://console.cloud.google.com/ creá un proyecto.
+#   2. Habilitá las APIs que vayas a usar (Calendar, People, Drive).
+#   3. En «Credenciales», creá un ID de cliente de OAuth de tipo
+#      «Aplicación de escritorio».
+#   4. Copiá el archivo a /etc/vasak-accounts/providers.d/google.toml y agregale
+#      tu client_id y tu client_secret.
+#
+# Google llama «secreto» al client_secret de una aplicación de escritorio, pero
+# no lo es: viaja dentro de cualquier programa que lo use y cualquiera lo puede
+# leer. Lo que de verdad protege el flujo es PKCE, que este servicio usa siempre.
+# Se manda igual porque Google lo exige.
+#
+# ── Lo que no vas a poder hacer así ─────────────────────────────────────────
+#
+# Un proyecto propio sin verificar queda en modo «prueba», y ahí Google caduca
+# los permisos a los pocos días: vas a tener que reconectar la cuenta seguido.
+# Para el **correo** de Gmail conviene no usar esto: agregá la casilla como
+# servidor personalizado por IMAP con una contraseña de aplicación, que no
+# caduca y no depende de ningún registro.
+
+id = "google"
+display_name = "Google"
+auth_url = "https://accounts.google.com/o/oauth2/v2/auth"
+token_url = "https://oauth2.googleapis.com/token"
+
+# client_id = "xxxxx.apps.googleusercontent.com"
+# client_secret = "xxxxx"
+
+[scopes]
+calendar = ["https://www.googleapis.com/auth/calendar"]
+contacts = ["https://www.googleapis.com/auth/contacts"]
+# `drive.file` y no `drive`: da acceso sólo a los archivos que se abren o crean
+# desde acá, no a todo el Drive. Es el alcance que Google **no** considera
+# sensible, así que es el único que funciona sin pasar por su verificación.
+drive = ["https://www.googleapis.com/auth/drive.file"]
+
+[extra_auth_params]
+# Sin esto Google no devuelve refresh_token y la cuenta deja de andar en una
+# hora, sin ningún mensaje que lo explique.
+access_type = "offline"
+# Y sin esto sólo lo devuelve la primera vez que la persona autoriza: si
+# reconecta la cuenta, se queda sin refresh_token y vuelve el mismo problema.
+prompt = "consent"
