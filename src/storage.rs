@@ -479,7 +479,7 @@ impl SecretStore {
 /// Created 0600 from the start rather than fixed up afterwards, so a token is
 /// never briefly world-readable; and renamed into place so an interrupted write
 /// cannot leave a half-written file where the credentials used to be.
-fn write_private(path: &std::path::Path, data: &[u8]) -> Result<(), StorageError> {
+pub fn write_private(path: &std::path::Path, data: &[u8]) -> Result<(), StorageError> {
     use std::io::Write;
 
     let temp = path.with_extension("tmp");

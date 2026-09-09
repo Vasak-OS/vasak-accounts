@@ -234,8 +234,16 @@ impl AccountManager {
     /// Incluye los que **no** están listos, con `configured: false`, para que la
     /// pantalla pueda mostrarlos apagados y decir por qué en vez de esconderlos.
     /// Un proveedor que desaparece de la lista parece un proveedor que no existe.
-    async fn list_providers(&self) -> zbus::fdo::Result<String> {
-        let catalogo = providers::load()
+    async fn list_providers(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> zbus::fdo::Result<String> {
+        // Por usuario: el `client_id` de un proveedor puede ser el que esa
+        // persona puso, así que `configured` es distinto para cada una.
+        let (_caller, uid) = caller_identity(connection, &header).await?;
+
+        let catalogo = providers::load_for(uid)
             .map_err(|e| FdoError::Failed(format!("Error al leer el catálogo: {e}")))?;
 
         let mut lista: Vec<serde_json::Value> = catalogo
@@ -266,6 +274,104 @@ impl AccountManager {
 
         serde_json::to_string(&lista)
             .map_err(|e| FdoError::Failed(format!("Error de serialización: {e}")))
+    }
+
+    /// Método `SetProviderCredentials` — guarda **tus** credenciales de un
+    /// proveedor.
+    ///
+    /// VasakOS no distribuye un `client_id` para Google ni para Microsoft:
+    /// registrarlo con Google para llegar al correo exige una evaluación de
+    /// seguridad paga y anual. Lo que sí puede hacer cualquiera, gratis y en
+    /// diez minutos, es registrar su propia aplicación en la consola del
+    /// proveedor. Este método es para pegar eso desde la pantalla, en vez de
+    /// tener que editar un archivo como administrador.
+    ///
+    /// **Sólo el `client_id` y el secreto.** Nunca las URLs ni los alcances:
+    /// eso decide a qué servidor se le manda un código de autorización, y sale
+    /// únicamente de los archivos de root. Con ese límite, lo peor que se puede
+    /// hacer desde acá es poner un identificador equivocado y que el flujo
+    /// falle.
+    ///
+    /// Y por usuario, no del equipo: es una credencial personal, sacada con la
+    /// cuenta de quien la pone. Eso también es lo que hace que no haga falta la
+    /// contraseña de administrador para algo que sólo afecta a quien lo hace.
+    async fn set_provider_credentials(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(signal_context)] emisor: SignalContext<'_>,
+        provider_id: String,
+        client_id: String,
+        client_secret: String,
+    ) -> zbus::fdo::Result<()> {
+        let (_caller, uid) = caller_identity(connection, &header).await?;
+
+        let client_id = client_id.trim().to_string();
+        if client_id.is_empty() {
+            return Err(FdoError::InvalidArgs(
+                "el client_id no puede estar vacío; para quitarlo está \
+                 ClearProviderCredentials"
+                    .into(),
+            ));
+        }
+
+        // Que el proveedor exista y sea de los que usan client_id. Sin esto se
+        // podría dejar credenciales para «nextcloud» —que no las usa— o para un
+        // nombre inventado, y quedarían en el archivo sin que nada las lea ni
+        // avise.
+        let proveedor = providers::load()
+            .map_err(|e| FdoError::Failed(format!("Error al leer el catálogo: {e}")))?
+            .remove(&provider_id)
+            .ok_or_else(|| {
+                FdoError::InvalidArgs(format!("no hay ningún proveedor '{provider_id}'"))
+            })?;
+
+        if proveedor.kind != providers::ProviderKind::Oauth2 {
+            return Err(FdoError::InvalidArgs(format!(
+                "'{provider_id}' no usa client_id: las credenciales las emite el \
+                 servidor de la propia persona"
+            )));
+        }
+
+        let client_secret = client_secret.trim();
+        providers::UserCredentials::store(
+            uid,
+            &provider_id,
+            Some(providers::UserCredentials {
+                client_id,
+                // Vacío es «no tiene», no «es la cadena vacía»: hay proveedores
+                // que rechazan el pedido si se les manda un secreto vacío.
+                client_secret: (!client_secret.is_empty()).then(|| client_secret.to_string()),
+            }),
+        )
+        .map_err(|e| FdoError::Failed(e.to_string()))?;
+
+        tracing::info!("credenciales propias guardadas para '{provider_id}' (uid {uid})");
+        Self::accounts_changed(&emisor, uid).await?;
+        Ok(())
+    }
+
+    /// Método `ClearProviderCredentials` — quita las credenciales propias.
+    ///
+    /// Las cuentas ya conectadas **siguen funcionando**: cada una guarda el
+    /// `client_id` con el que se autorizó, así que renovar su token no depende
+    /// de esto. Lo que deja de poder hacerse es conectar cuentas nuevas con ese
+    /// proveedor.
+    async fn clear_provider_credentials(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(signal_context)] emisor: SignalContext<'_>,
+        provider_id: String,
+    ) -> zbus::fdo::Result<()> {
+        let (_caller, uid) = caller_identity(connection, &header).await?;
+
+        providers::UserCredentials::store(uid, &provider_id, None)
+            .map_err(|e| FdoError::Failed(e.to_string()))?;
+
+        tracing::info!("credenciales propias de '{provider_id}' borradas (uid {uid})");
+        Self::accounts_changed(&emisor, uid).await?;
+        Ok(())
     }
 
     /// Método `BeginAuth` — empieza a conectar una cuenta OAuth2.
@@ -309,9 +415,13 @@ impl AccountManager {
             )));
         }
 
-        let proveedor =
-            providers::resolve(&provider_id, providers::ProviderKind::Oauth2, &capacidades)
-                .map_err(|e| FdoError::Failed(e.to_string()))?;
+        let proveedor = providers::resolve(
+            uid,
+            &provider_id,
+            providers::ProviderKind::Oauth2,
+            &capacidades,
+        )
+        .map_err(|e| FdoError::Failed(e.to_string()))?;
 
         let (auth_url, verifier, state) =
             protocols::oauth2::authorization_url(&proveedor, &capacidades, &redirect_uri)
@@ -376,6 +486,7 @@ impl AccountManager {
         // client_secret cambió entre que se abrió el navegador y volvió, el
         // canje tiene que usar el de ahora.
         let proveedor = providers::resolve(
+            uid,
             &pendiente.provider_id,
             providers::ProviderKind::Oauth2,
             &pendiente.capabilities,
@@ -451,8 +562,9 @@ impl AccountManager {
         // Del catálogo, aunque no aporte URLs: es de ahí que salen las
         // capacidades que una cuenta de Nextcloud va a tener, y así se pueden
         // recortar sin recompilar.
-        let proveedor = providers::resolve("nextcloud", providers::ProviderKind::Nextcloud, &[])
-            .map_err(|e| FdoError::Failed(e.to_string()))?;
+        let proveedor =
+            providers::resolve(uid, "nextcloud", providers::ProviderKind::Nextcloud, &[])
+                .map_err(|e| FdoError::Failed(e.to_string()))?;
 
         let inicio = protocols::nextcloud::start_login(&servidor)
             .await
@@ -651,11 +763,17 @@ impl AccountManager {
     /// lado le cambió tal cuenta. Un `uid` y nada más no dice nada que no se
     /// pueda ver con `who`.
     ///
-    /// La segunda es que funciona mejor. Quien la recibe vuelve a llamar
-    /// `ListAccounts` —que ya está acotado a su usuario— y ve el estado
-    /// completo, incluida la marca de reautenticación. Con señales que llevan el
-    /// cambio adentro, una que se pierde deja al cliente creyendo algo que no
-    /// es, y hay que reconciliar igual.
+    /// La segunda es que funciona mejor. Quien la recibe vuelve a leer —lo que
+    /// le importe— y ve el estado completo, incluida la marca de
+    /// reautenticación. Con señales que llevan el cambio adentro, una que se
+    /// pierde deja al cliente creyendo algo que no es, y hay que reconciliar
+    /// igual.
+    ///
+    /// **Qué hay que releer:** `ListAccounts` **y** `ListProviders`. Las dos
+    /// cosas cambian por acá: agregar o quitar una cuenta mueve la primera, y
+    /// poner o sacar credenciales propias mueve el `configured` de la segunda.
+    /// Releer sólo una deja la pantalla mostrando un proveedor apagado que ya
+    /// está listo, o al revés.
     #[zbus(signal)]
     async fn accounts_changed(emisor: &SignalContext<'_>, uid: u32) -> zbus::Result<()>;
 

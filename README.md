@@ -130,6 +130,8 @@ correo le permite todas tus casillas.
 | `BeginAuth` | `s` proveedor, `s` capacidades JSON, `s` redirect_uri | `s` (JSON) | — | Empieza a conectar una cuenta OAuth2. Devuelve `auth_url`, `request_id` y `state`. |
 | `CompleteAuth` | `s` request_id, `s` code, `s` state, `s` nombre | `s` id | — | Canjea el código y crea la cuenta. |
 | `CancelAuth` | `s` request_id | `b` | — | Descarta un flujo abandonado. |
+| `SetProviderCredentials` | `s` proveedor, `s` client_id, `s` client_secret | — | — | Guarda **tus** credenciales para un proveedor OAuth2. |
+| `ClearProviderCredentials` | `s` proveedor | — | — | Las quita. Las cuentas ya conectadas siguen andando. |
 | `BeginNextcloudLogin` | `s` servidor, `s` nombre | `s` (JSON) | — | Abre un inicio de sesión en un Nextcloud. Devuelve `login_url` y `request_id`. |
 | `PollNextcloudLogin` | `s` request_id | `s` (JSON) | — | Un sondeo: `pending`, o `done` con el `account_id`. |
 | `RegisterAccount` | `s` nombre, `s` proveedor, `s` capacidades JSON, `s` secretos JSON | `s` id | — | Cuenta con credenciales de **contraseña** (IMAP y compañía). No acepta secretos de OAuth2. |
@@ -141,7 +143,7 @@ correo le permite todas tus casillas.
 
 | Señal | Cuerpo | Cuándo |
 |---|---|---|
-| `AccountsChanged` | `u` uid | Se agregó, se quitó o cambió de estado una cuenta de ese usuario |
+| `AccountsChanged` | `u` uid | Cambió algo de ese usuario: una cuenta, o las credenciales de un proveedor |
 
 Una sola señal y sin detalle, a propósito. Este servicio atiende a todo el
 equipo desde el bus del sistema, así que la señal la reciben todas las sesiones:
@@ -149,9 +151,14 @@ con el identificador de la cuenta adentro, quien escuche se enteraría de que a
 la persona de al lado le cambió tal cuenta. Un `uid` no dice nada que no se vea
 con `who`.
 
-Y funciona mejor: quien la recibe vuelve a llamar `ListAccounts` —que ya está
-acotado a su usuario— y ve el estado completo. Con señales que llevan el cambio
-adentro, una que se pierde deja al cliente creyendo algo que no es.
+Y funciona mejor: quien la recibe vuelve a leer y ve el estado completo. Con
+señales que llevan el cambio adentro, una que se pierde deja al cliente creyendo
+algo que no es.
+
+**Hay que releer `ListAccounts` y `ListProviders`.** Las dos cosas cambian por
+esta señal: agregar o quitar una cuenta mueve la primera, y poner o sacar
+credenciales propias mueve el `configured` de la segunda. Releer sólo una deja
+la pantalla mostrando un proveedor apagado que ya está listo, o al revés.
 
 ### Por qué `ListAccounts` no pide permiso
 
@@ -416,10 +423,23 @@ contactos no tienen que saber cómo se construye una ruta de Nextcloud.
 
 Las URLs y el `client_id` de cada proveedor viven en archivos, no en el código:
 
-| Directorio | Qué hay |
-|---|---|
-| `/usr/share/vasak-accounts/providers.d/` | Lo que trae el paquete. **Sin `client_id`.** |
-| `/etc/vasak-accounts/providers.d/` | Lo que agrega quien administra el equipo. Le gana al anterior. |
+| Dónde | Qué hay | Quién escribe |
+|---|---|---|
+| `/usr/share/vasak-accounts/providers.d/` | Lo que trae el paquete. **Sin `client_id`.** | el paquete |
+| `/etc/vasak-accounts/providers.d/` | Lo que agrega quien administra el equipo. | root |
+| `/var/lib/vasak-accounts/<uid>/providers.json` | Las credenciales de esa persona. Le ganan a las dos anteriores. | el servicio, por `SetProviderCredentials` |
+
+**El tercer nivel sólo puede poner el `client_id` y el secreto.** Nunca las URLs
+ni los alcances: eso decide a qué servidor se le manda un código de
+autorización, y sale únicamente de los archivos de root. Con ese límite, lo peor
+que se puede hacer desde la pantalla es poner un identificador equivocado y que
+el flujo falle. El tipo que se guarda no tiene campos para una URL, así que el
+límite lo sostiene el compilador y no una comprobación que alguien pueda
+olvidarse de hacer.
+
+Y es **por persona**, no del equipo, porque eso es lo que es: una credencial que
+cada quien saca con su propia cuenta en la consola del proveedor. Por eso
+tampoco pide la contraseña de administrador — sólo afecta a quien la pone.
 
 Cada archivo declara su `kind`: `oauth2` (por omisión) o `nextcloud`. Un
 proveedor de Nextcloud no lleva URLs ni `client_id` —la dirección la escribe la
