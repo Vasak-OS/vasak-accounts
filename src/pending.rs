@@ -33,14 +33,44 @@ const TTL: Duration = Duration::from_secs(300);
 /// más de lo que cualquier persona va a tener abiertos.
 const MAX_POR_USUARIO: usize = 10;
 
+/// Un flujo OAuth2 esperando el código de autorización.
 #[derive(Debug, Clone)]
-pub struct PendingAuth {
-    pub uid: u32,
+pub struct OAuthFlow {
     pub provider_id: String,
     pub capabilities: Vec<CapabilityType>,
     pub redirect_uri: String,
     pub verifier: String,
     pub state: String,
+}
+
+/// Un inicio de sesión de Nextcloud esperando que la persona lo apruebe.
+///
+/// No tiene `state` ni `verifier`: en el Login Flow v2 no hay código que
+/// canjear, y lo que hay que guardar es adónde sondear. El `request_id` —un
+/// UUID que no se publica y que sólo sirve para su propio usuario— es lo que
+/// identifica el flujo.
+#[derive(Debug, Clone)]
+pub struct NextcloudFlow {
+    pub server: String,
+    pub display_name: String,
+    pub capabilities: Vec<CapabilityType>,
+    pub poll_token: String,
+    pub poll_endpoint: String,
+}
+
+/// Los dos flujos comparten el mismo almacén: mismo vencimiento, mismo tope por
+/// usuario, misma purga. Separarlos habría duplicado esas tres cosas, y el tope
+/// por usuario habría dejado de ser un tope.
+#[derive(Debug, Clone)]
+pub enum Flow {
+    OAuth2(OAuthFlow),
+    Nextcloud(NextcloudFlow),
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingAuth {
+    pub uid: u32,
+    pub flow: Flow,
     creado: Instant,
 }
 
@@ -50,24 +80,8 @@ impl PendingAuth {
     /// La marca de tiempo la pone esta función y no quien llama: si el momento
     /// de creación fuera un campo público, un flujo podría nacer ya vencido —o
     /// no vencer nunca— por un descuido en el lugar que lo construye.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        uid: u32,
-        provider_id: String,
-        capabilities: Vec<CapabilityType>,
-        redirect_uri: String,
-        verifier: String,
-        state: String,
-    ) -> Self {
-        Self {
-            uid,
-            provider_id,
-            capabilities,
-            redirect_uri,
-            verifier,
-            state,
-            creado: Instant::now(),
-        }
+    pub fn new(uid: u32, flow: Flow) -> Self {
+        Self { uid, flow, creado: Instant::now() }
     }
 
     fn vencido(&self, ahora: Instant) -> bool {
@@ -137,27 +151,74 @@ impl PendingAuths {
         Ok(id)
     }
 
-    /// Saca el flujo del mapa si todo cuadra.
+    /// Saca un flujo OAuth2 del mapa si todo cuadra.
     ///
     /// Se **consume**: un código de autorización se canjea una sola vez, y dejar
     /// el verifier disponible para un segundo intento no aportaría nada más que
     /// una ventana para reintentar con otro código.
-    pub fn take(
+    pub fn take_oauth(
         &mut self,
         request_id: &str,
         uid: u32,
         state: &str,
+    ) -> Result<OAuthFlow, TakeError> {
+        self.tomar(request_id, uid, |flow| match flow {
+            // Un flujo del tipo equivocado se responde igual que uno que no
+            // existe: decir «ése es de Nextcloud» le contaría a quien prueba
+            // identificadores qué encontró.
+            Flow::Nextcloud(_) => Err(TakeError::Unknown),
+            Flow::OAuth2(oauth) => {
+                if constant_time_eq(&oauth.state, state) {
+                    Ok(())
+                } else {
+                    Err(TakeError::StateMismatch)
+                }
+            }
+        })
+        .map(|pendiente| match pendiente.flow {
+            Flow::OAuth2(oauth) => oauth,
+            Flow::Nextcloud(_) => unreachable!("ya se comprobó el tipo"),
+        })
+    }
+
+    /// Mira un inicio de sesión de Nextcloud **sin consumirlo**.
+    ///
+    /// El sondeo se repite: mientras la persona no termine, el flujo tiene que
+    /// seguir ahí para el intento siguiente. Se consume con
+    /// [`Self::cancel`] cuando el sondeo por fin entrega las credenciales.
+    pub fn peek_nextcloud(
+        &mut self,
+        request_id: &str,
+        uid: u32,
+    ) -> Result<NextcloudFlow, TakeError> {
+        self.purgar(Instant::now());
+
+        let pendiente = self.por_id.get(request_id).ok_or(TakeError::Unknown)?;
+        if pendiente.uid != uid {
+            return Err(TakeError::WrongUser);
+        }
+        match &pendiente.flow {
+            Flow::Nextcloud(nc) => Ok(nc.clone()),
+            Flow::OAuth2(_) => Err(TakeError::Unknown),
+        }
+    }
+
+    /// El tronco común de sacar algo del mapa: purga, dueño, y la comprobación
+    /// propia del tipo de flujo — que corre **antes** de quitarlo, para que un
+    /// intento fallido no le cancele el flujo a quien lo estaba haciendo bien.
+    fn tomar(
+        &mut self,
+        request_id: &str,
+        uid: u32,
+        comprobar: impl FnOnce(&Flow) -> Result<(), TakeError>,
     ) -> Result<PendingAuth, TakeError> {
         self.purgar(Instant::now());
 
         let pendiente = self.por_id.get(request_id).ok_or(TakeError::Unknown)?;
-
         if pendiente.uid != uid {
             return Err(TakeError::WrongUser);
         }
-        if !constant_time_eq(&pendiente.state, state) {
-            return Err(TakeError::StateMismatch);
-        }
+        comprobar(&pendiente.flow)?;
 
         Ok(self.por_id.remove(request_id).expect("recién se encontró"))
     }
@@ -217,15 +278,29 @@ mod tests {
     use super::*;
 
     fn pendiente(uid: u32) -> PendingAuth {
-        PendingAuth {
+        PendingAuth::new(
             uid,
-            provider_id: "google".into(),
-            capabilities: vec![CapabilityType::Calendar],
-            redirect_uri: "http://127.0.0.1:45321/callback".into(),
-            verifier: "el-verifier".into(),
-            state: "el-state".into(),
-            creado: Instant::now(),
-        }
+            Flow::OAuth2(OAuthFlow {
+                provider_id: "google".into(),
+                capabilities: vec![CapabilityType::Calendar],
+                redirect_uri: "http://127.0.0.1:45321/callback".into(),
+                verifier: "el-verifier".into(),
+                state: "el-state".into(),
+            }),
+        )
+    }
+
+    fn pendiente_nextcloud(uid: u32) -> PendingAuth {
+        PendingAuth::new(
+            uid,
+            Flow::Nextcloud(NextcloudFlow {
+                server: "https://nube.ejemplo.com".into(),
+                display_name: "Mi nube".into(),
+                capabilities: vec![CapabilityType::Drive],
+                poll_token: "el-token".into(),
+                poll_endpoint: "https://nube.ejemplo.com/index.php/login/v2/poll".into(),
+            }),
+        )
     }
 
     #[test]
@@ -233,11 +308,11 @@ mod tests {
         let mut mapa = PendingAuths::default();
         let id = mapa.insert(pendiente(1000)).unwrap();
 
-        let recuperado = mapa.take(&id, 1000, "el-state").unwrap();
+        let recuperado = mapa.take_oauth(&id, 1000, "el-state").unwrap();
         assert_eq!(recuperado.verifier, "el-verifier");
 
         // La segunda vez ya no está: un código se canjea una sola vez.
-        assert_eq!(mapa.take(&id, 1000, "el-state").unwrap_err(), TakeError::Unknown);
+        assert_eq!(mapa.take_oauth(&id, 1000, "el-state").unwrap_err(), TakeError::Unknown);
         assert_eq!(mapa.len(), 0);
     }
 
@@ -248,10 +323,10 @@ mod tests {
         let mut mapa = PendingAuths::default();
         let id = mapa.insert(pendiente(1000)).unwrap();
 
-        assert_eq!(mapa.take(&id, 1000, "otro-state").unwrap_err(), TakeError::StateMismatch);
+        assert_eq!(mapa.take_oauth(&id, 1000, "otro-state").unwrap_err(), TakeError::StateMismatch);
         // Y el flujo sigue vivo: un intento fallido no puede servir para
         // cancelarle la autorización a quien la estaba haciendo bien.
-        assert!(mapa.take(&id, 1000, "el-state").is_ok());
+        assert!(mapa.take_oauth(&id, 1000, "el-state").is_ok());
     }
 
     #[test]
@@ -259,7 +334,7 @@ mod tests {
         let mut mapa = PendingAuths::default();
         let id = mapa.insert(pendiente(1000)).unwrap();
 
-        assert_eq!(mapa.take(&id, 1001, "el-state").unwrap_err(), TakeError::WrongUser);
+        assert_eq!(mapa.take_oauth(&id, 1001, "el-state").unwrap_err(), TakeError::WrongUser);
     }
 
     #[test]
@@ -267,7 +342,7 @@ mod tests {
         let mut mapa = PendingAuths::default();
         mapa.insert(pendiente(1000)).unwrap();
 
-        assert_eq!(mapa.take("inventado", 1000, "el-state").unwrap_err(), TakeError::Unknown);
+        assert_eq!(mapa.take_oauth("inventado", 1000, "el-state").unwrap_err(), TakeError::Unknown);
     }
 
     #[test]
@@ -277,7 +352,7 @@ mod tests {
         viejo.creado = Instant::now() - TTL - Duration::from_secs(1);
         let id = mapa.insert(viejo).unwrap();
 
-        assert_eq!(mapa.take(&id, 1000, "el-state").unwrap_err(), TakeError::Unknown);
+        assert_eq!(mapa.take_oauth(&id, 1000, "el-state").unwrap_err(), TakeError::Unknown);
         assert_eq!(mapa.len(), 0, "tenía que purgarse, no sólo rechazarse");
     }
 
@@ -319,6 +394,64 @@ mod tests {
         assert!(!mapa.cancel(&id, 1001), "otro usuario no puede cancelarlo");
         assert!(mapa.cancel(&id, 1000));
         assert!(!mapa.cancel(&id, 1000), "cancelar dos veces no es cancelar");
+    }
+
+    /// El sondeo se repite, así que mirar el flujo **no** puede consumirlo: si
+    /// lo hiciera, el primer sondeo —que casi siempre da «todavía no»— dejaría
+    /// el inicio de sesión sin nada que buscar en el segundo.
+    #[test]
+    fn mirar_un_inicio_de_nextcloud_no_lo_consume() {
+        let mut mapa = PendingAuths::default();
+        let id = mapa.insert(pendiente_nextcloud(1000)).unwrap();
+
+        for _ in 0..3 {
+            let flujo = mapa.peek_nextcloud(&id, 1000).unwrap();
+            assert_eq!(flujo.poll_token, "el-token");
+        }
+        assert_eq!(mapa.len(), 1);
+
+        // Y se saca cuando corresponde: al terminar, o al cancelar.
+        assert!(mapa.cancel(&id, 1000));
+        assert!(mapa.peek_nextcloud(&id, 1000).is_err());
+    }
+
+    #[test]
+    fn un_inicio_de_nextcloud_de_otro_usuario_no_se_puede_mirar() {
+        let mut mapa = PendingAuths::default();
+        let id = mapa.insert(pendiente_nextcloud(1000)).unwrap();
+
+        assert_eq!(mapa.peek_nextcloud(&id, 1001).unwrap_err(), TakeError::WrongUser);
+    }
+
+    /// Pedir un flujo por el camino del otro tipo se responde como «no existe»
+    /// y no como «es del otro tipo»: distinguirlos le diría a quien prueba
+    /// identificadores al azar qué encontró.
+    #[test]
+    fn un_flujo_del_tipo_equivocado_se_ve_como_inexistente() {
+        let mut mapa = PendingAuths::default();
+        let oauth = mapa.insert(pendiente(1000)).unwrap();
+        let nube = mapa.insert(pendiente_nextcloud(1000)).unwrap();
+
+        assert_eq!(mapa.peek_nextcloud(&oauth, 1000).unwrap_err(), TakeError::Unknown);
+        assert_eq!(
+            mapa.take_oauth(&nube, 1000, "el-state").unwrap_err(),
+            TakeError::Unknown
+        );
+
+        // Y ninguno de los dos intentos consumió nada.
+        assert_eq!(mapa.len(), 2);
+    }
+
+    /// Los dos tipos comparten el tope: si no, un programa abriría diez de cada
+    /// uno y el tope dejaría de ser un tope.
+    #[test]
+    fn los_dos_tipos_de_flujo_comparten_el_tope() {
+        let mut mapa = PendingAuths::default();
+        for i in 0..MAX_POR_USUARIO {
+            let p = if i % 2 == 0 { pendiente(1000) } else { pendiente_nextcloud(1000) };
+            mapa.insert(p).unwrap();
+        }
+        assert!(mapa.insert(pendiente_nextcloud(1000)).is_err());
     }
 
     #[test]

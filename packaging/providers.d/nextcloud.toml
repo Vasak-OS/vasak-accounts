@@ -1,0 +1,40 @@
+# Nextcloud — archivos, calendario, contactos y Talk.
+#
+# ── El único que no hay que configurar ──────────────────────────────────────
+#
+# No lleva client_id ni URLs, y no es que falten: en el Login Flow v2 **no hay
+# nada que registrar**. La persona escribe la dirección de su servidor, ese
+# servidor la autentica en su propia pantalla, y le entrega una contraseña de
+# aplicación. VasakOS no interviene, no tiene que pedir permiso a nadie y no
+# paga nada.
+#
+# Por eso es el primer proveedor que se implementó de verdad: es el único donde
+# el modelo de cuentas funciona de punta a punta sin depender de la buena
+# voluntad ni del arancel de una empresa.
+#
+# ── Lo que se guarda ────────────────────────────────────────────────────────
+#
+# Una contraseña de aplicación, no un token OAuth2. No caduca, así que no hay
+# nada que refrescar; se revoca desde «Dispositivos y sesiones» del propio
+# servidor, donde aparece con el nombre «VasakOS».
+#
+# Al conectar se guarda además la dirección DAV de cada capacidad ya armada, así
+# que el gestor de archivos, el calendario y los contactos no tienen que saber
+# cómo se construye una ruta de Nextcloud.
+#
+# ── Recortar capacidades ────────────────────────────────────────────────────
+#
+# La contraseña de aplicación sirve para todo lo que la cuenta tenga: no hay
+# alcances que pedir por separado, así que esta lista no restringe lo que el
+# servidor permite. Lo que hace es decidir qué capacidades declara la cuenta, y
+# por lo tanto por cuáles se le va a preguntar a la persona cuando una
+# aplicación las pida. Sacar una de acá es una decisión de política del equipo,
+# copiando el archivo a /etc/vasak-accounts/providers.d/nextcloud.toml.
+
+id = "nextcloud"
+display_name = "Nextcloud"
+kind = "nextcloud"
+
+# Sin `chat` todavía: Talk se habla por otra ruta y no hay app que la consuma.
+# Cuando exista, se agrega acá sin recompilar nada.
+capabilities = ["drive", "calendar", "contacts"]

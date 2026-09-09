@@ -130,6 +130,8 @@ correo le permite todas tus casillas.
 | `BeginAuth` | `s` proveedor, `s` capacidades JSON, `s` redirect_uri | `s` (JSON) | — | Empieza a conectar una cuenta OAuth2. Devuelve `auth_url`, `request_id` y `state`. |
 | `CompleteAuth` | `s` request_id, `s` code, `s` state, `s` nombre | `s` id | — | Canjea el código y crea la cuenta. |
 | `CancelAuth` | `s` request_id | `b` | — | Descarta un flujo abandonado. |
+| `BeginNextcloudLogin` | `s` servidor, `s` nombre | `s` (JSON) | — | Abre un inicio de sesión en un Nextcloud. Devuelve `login_url` y `request_id`. |
+| `PollNextcloudLogin` | `s` request_id | `s` (JSON) | — | Un sondeo: `pending`, o `done` con el `account_id`. |
 | `RegisterAccount` | `s` nombre, `s` proveedor, `s` capacidades JSON, `s` secretos JSON | `s` id | — | Cuenta con credenciales de **contraseña** (IMAP y compañía). No acepta secretos de OAuth2. |
 | `RemoveAccount` | `s` id | `b` | — | Borra la cuenta **y todos sus secretos**. |
 | `GetAccountData` | `s` id, `s` capacidad | `s` (JSON) | ✅ | Configuración de esa capacidad. |
@@ -307,10 +309,11 @@ vasak-accounts/
     ├── storage.rs       # cuentas, secretos y capacidades
     ├── auth.rs          # PinnedCaller: identidad fijada con pidfd
     ├── permissions.rs   # la consulta a vasak-permissions
-    ├── providers.rs     # el catálogo de proveedores OAuth2
+    ├── providers.rs     # el catálogo de proveedores
     ├── pending.rs       # flujos a medio terminar (sólo en memoria)
     └── protocols/
         ├── mod.rs
+        ├── nextcloud.rs # Login Flow v2: sin registrar nada con nadie
         └── oauth2.rs    # armado de la URL, canje y refresco
 ```
 
@@ -326,12 +329,13 @@ cargo build --release
 cargo test
 ```
 
-**67 tests** al 9/09/2026, cubriendo el almacén (permisos de archivo, escritura
+**86 tests** al 9/09/2026, cubriendo el almacén (permisos de archivo, escritura
 atómica, aislamiento entre cuentas y entre usuarios, JSON corrupto), el parseo de
 capacidades, la lectura de `/proc`, el catálogo de proveedores —incluidos los
-archivos que el paquete instala—, el armado de la URL de autorización, y los
-flujos a medio terminar (vencimiento, `state` que no coincide, tope por
-usuario).
+archivos que el paquete instala—, el armado de la URL de autorización, los
+flujos a medio terminar (vencimiento, `state` que no coincide, tope por usuario,
+tipo equivocado) y el Login Flow v2 de Nextcloud (validación de la dirección,
+procedencia del sondeo, armado de las rutas DAV).
 
 Para levantarlo sin root durante el desarrollo, una compilación de depuración
 acepta `VASAK_ACCOUNTS_TEST_ROOT`, que lo mueve al bus de **sesión** y apunta el
@@ -349,6 +353,65 @@ controla le estaría dando sus peticiones a lo que reclame ese nombre.
 
 ---
 
+## Nextcloud: el único que no hay que configurar
+
+Nextcloud no usa OAuth2 sino su **Login Flow v2**, y la diferencia es la que
+importa de todo este documento: **no hay nada que registrar**. La persona
+escribe la dirección de su servidor, ese servidor la autentica en su propia
+pantalla y le entrega una contraseña de aplicación. VasakOS no interviene, no
+pide permiso a nadie y no paga nada.
+
+```mermaid
+sequenceDiagram
+    participant U as Configuración
+    participant D as vasak-accounts
+    participant N as Navegador
+    participant S as El servidor de la persona
+
+    U->>D: BeginNextcloudLogin(servidor, nombre)
+    D->>D: ¿es https? ¿sin usuario ni contraseña en la URL?
+    D->>S: POST /index.php/login/v2
+    S-->>D: login_url + token de sondeo
+    D->>D: ¿las direcciones son del mismo servidor?
+    D-->>U: login_url, request_id
+
+    U->>N: abre login_url
+    N->>S: la persona se autentica y aprueba
+
+    loop cada 2 s
+        U->>D: PollNextcloudLogin(request_id)
+        D->>S: POST poll (token)
+        S-->>D: 404 mientras no termine
+        D-->>U: {"status":"pending"}
+    end
+
+    S-->>D: usuario + contraseña de aplicación
+    D->>D: guarda la cuenta y las rutas DAV
+    D-->>U: {"status":"done","account_id":"…"}
+    D-->>U: señal AccountsChanged(uid)
+```
+
+Tres cosas que este flujo hace y conviene saber por qué:
+
+- **Se exige HTTPS**, incluso en la red de casa. El servidor está por entregar
+  una contraseña que **no caduca**: por HTTP viajaría en claro. Un Nextcloud
+  casero sin certificado no es raro, pero conectarlo así sería regalar la
+  credencial.
+- **Se comprueba que las direcciones que devuelve el servidor sean suyas** —
+  esquema, host y puerto. El servidor dice adónde sondear, así que si pudiera
+  nombrar otro host le estaría entregando a un tercero el token de sondeo, y con
+  él las credenciales en cuanto la persona apruebe.
+- **El sondeo es una llamada por vez, no un bucle dentro del servicio.** Un
+  método D-Bus que se queda esperando minutos supera el tiempo de espera del bus
+  y el cliente recibe un error de transporte en lugar de una respuesta. El bucle
+  lo hace el cliente; la contraseña no pasa por él en ningún momento.
+
+Lo que se guarda es una contraseña de aplicación, no un token: no hay nada que
+refrescar, y se revoca desde «Dispositivos y sesiones» del propio servidor, donde
+aparece como «VasakOS». Al conectar se guarda además la **ruta DAV de cada
+capacidad ya armada**, así que el gestor de archivos, el calendario y los
+contactos no tienen que saber cómo se construye una ruta de Nextcloud.
+
 ## Proveedores
 
 Las URLs y el `client_id` de cada proveedor viven en archivos, no en el código:
@@ -357,6 +420,10 @@ Las URLs y el `client_id` de cada proveedor viven en archivos, no en el código:
 |---|---|
 | `/usr/share/vasak-accounts/providers.d/` | Lo que trae el paquete. **Sin `client_id`.** |
 | `/etc/vasak-accounts/providers.d/` | Lo que agrega quien administra el equipo. Le gana al anterior. |
+
+Cada archivo declara su `kind`: `oauth2` (por omisión) o `nextcloud`. Un
+proveedor de Nextcloud no lleva URLs ni `client_id` —la dirección la escribe la
+persona— y por eso está listo desde que se instala.
 
 Los dos son de root. Un proveedor define a qué servidor se le mandan los códigos
 de autorización, así que si el usuario pudiera escribirlos, un programa corriendo
@@ -396,12 +463,14 @@ No caduca, no depende de ningún registro y no cuesta nada.
 | Catálogo de proveedores en archivos, sin recompilar | ✅ |
 | Señal de ciclo de vida | ✅ |
 | Marca de «necesita reautenticación» al revocarse | ✅ |
-| Nextcloud Login Flow v2 | ⛔ falta |
+| Nextcloud Login Flow v2 | ✅ |
 | Prueba de conexión al registrar IMAP/SMTP | ⛔ falta |
+| CalDAV/CardDAV con autodescubrimiento | ⛔ falta |
 | Loop de sincronización de correo (`vasak-accounts-sync`) | ⛔ falta |
 
-El siguiente trabajo son los proveedores que no cuestan nada —Nextcloud primero,
-porque las credenciales las emite el servidor de la propia persona— y después el
-bucle de sincronización, que va en un binario aparte y como servicio **del
-usuario**: parsear correo ajeno no puede pasar por root. El plan está en el
-roadmap citado arriba.
+Con Nextcloud adentro, el modelo de cuentas funciona de punta a punta **sin
+depender de nadie**: es el único proveedor donde eso es posible hoy. Lo que
+sigue es la prueba de conexión al registrar IMAP/SMTP, el autodescubrimiento de
+CalDAV/CardDAV, y después el bucle de sincronización — que va en un binario
+aparte y como servicio **del usuario**, porque parsear correo ajeno no puede
+pasar por root. El plan está en el roadmap citado arriba.
