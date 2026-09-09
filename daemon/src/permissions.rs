@@ -72,9 +72,12 @@ async fn permission_bus() -> zbus::Result<zbus::Connection> {
     zbus::Connection::system().await
 }
 
-/// Field 22 of `/proc/<pid>/stat`, which the permission service compares to
-/// detect a PID that was reused between us seeing it and it being checked.
-fn process_start_time(pid: u32) -> Result<u64, FdoError> {
+/// Field 22 of `/proc/<pid>/stat`, which el servicio de permisos compara para
+/// detectar un PID reciclado entre que lo vimos y lo comprobó.
+///
+/// Público porque polkit necesita lo mismo: identifica al proceso por PID **y**
+/// momento de arranque, o autenticaría al que reciclara ese número.
+pub fn process_start_time(pid: u32) -> Result<u64, FdoError> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
         .map_err(|e| FdoError::Failed(format!("el proceso {pid} ya no existe: {e}")))?;
 

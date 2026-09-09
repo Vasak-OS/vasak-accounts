@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>VasakOS</vendor>
+  <vendor_url>https://vasak.net.ar</vendor_url>
+
+  <action id="ar.net.vasak.os.accounts.remove">
+    <description>Quitar una cuenta en línea</description>
+    <description xml:lang="en">Remove an online account</description>
+    <message>Se requiere autenticación para quitar esta cuenta. Se va a borrar de este equipo y se le va a avisar al proveedor que la autorización terminó.</message>
+    <message xml:lang="en">Authentication is required to remove this account. It will be deleted from this machine and the provider will be told the authorisation has ended.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <!-- La persona se autentica como ella misma y no como administrador: es
+           su cuenta, no una configuración del equipo. Y `keep` recuerda la
+           respuesta un rato, así que quitar tres cuentas seguidas pregunta una
+           vez y no tres. -->
+      <allow_active>auth_self_keep</allow_active>
+    </defaults>
+  </action>
+</policyconfig>
