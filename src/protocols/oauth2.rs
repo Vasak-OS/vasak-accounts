@@ -142,7 +142,7 @@ pub async fn get_valid_access_token(
         let mut updated_account = account.clone();
         updated_account
             .capabilities
-            .insert(capability.clone(), updated_config);
+            .insert(*capability, updated_config);
 
         let mut db = AccountDatabase::for_user(uid)
             .map_err(|e| format!("Error al reabrir base de datos: {}", e))?;

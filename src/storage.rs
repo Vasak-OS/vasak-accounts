@@ -8,7 +8,7 @@ use serde_json::Value;
 // CapabilityType — enum polimórfico snake_case
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityType {
     Email,
@@ -17,6 +17,75 @@ pub enum CapabilityType {
     Chat,
     Drive,
     Tasks,
+}
+
+impl CapabilityType {
+    /// Todas, en el orden en que se muestran.
+    ///
+    /// Existe para que la lista de capacidades esté escrita **una vez**: estaba
+    /// en el `match` de `permissions.rs` y en el `rename_all` de serde, y una
+    /// séptima capacidad habría tenido que agregarse en los dos lugares sin que
+    /// nada avisara si se olvidaba uno.
+    pub const ALL: [CapabilityType; 6] = [
+        CapabilityType::Email,
+        CapabilityType::Calendar,
+        CapabilityType::Contacts,
+        CapabilityType::Chat,
+        CapabilityType::Drive,
+        CapabilityType::Tasks,
+    ];
+
+    /// El nombre con el que viaja por D-Bus, se guarda en `accounts.json` y lo
+    /// espera el servicio de permisos. Un test comprueba que coincida con lo
+    /// que serializa serde, que es la otra mitad de la misma verdad.
+    pub fn as_id(&self) -> &'static str {
+        match self {
+            CapabilityType::Email => "email",
+            CapabilityType::Calendar => "calendar",
+            CapabilityType::Contacts => "contacts",
+            CapabilityType::Chat => "chat",
+            CapabilityType::Drive => "drive",
+            CapabilityType::Tasks => "tasks",
+        }
+    }
+}
+
+/// Lo que devuelve un nombre de capacidad que no existe.
+///
+/// Nombra las válidas: el mensaje termina en el error de D-Bus que ve quien
+/// llamó, y «capability inválida» a secas no le dice qué escribir.
+#[derive(Debug, PartialEq, Eq)]
+pub struct UnknownCapability(pub String);
+
+impl std::fmt::Display for UnknownCapability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let validas: Vec<&str> = CapabilityType::ALL.iter().map(|c| c.as_id()).collect();
+        write!(
+            f,
+            "capacidad '{}' desconocida; las válidas son: {}",
+            self.0,
+            validas.join(", "),
+        )
+    }
+}
+
+impl std::error::Error for UnknownCapability {}
+
+/// Convierte el nombre que llegó por D-Bus en una capacidad.
+///
+/// Antes esto se hacía metiendo el texto recibido dentro de comillas y pasándolo
+/// por `serde_json`. Funcionaba de casualidad: un nombre con una comilla o una
+/// barra invertida producía JSON inválido, y la persona recibía un error de
+/// sintaxis JSON por haber escrito mal «calendar».
+impl std::str::FromStr for CapabilityType {
+    type Err = UnknownCapability;
+
+    fn from_str(nombre: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|capacidad| capacidad.as_id() == nombre)
+            .ok_or_else(|| UnknownCapability(nombre.to_string()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -429,6 +498,72 @@ mod tests {
 
 
 
+    /// Las dos mitades de la misma verdad: `as_id()` es lo que se le manda al
+    /// servicio de permisos y `Serialize` es lo que se escribe en
+    /// `accounts.json`. Si se separan, un permiso concedido deja de encontrar
+    /// la cuenta a la que corresponde y nadie se enteraría.
+    #[test]
+    fn el_nombre_de_la_capacidad_es_el_mismo_para_serde_y_para_los_permisos() {
+        for capacidad in CapabilityType::ALL {
+            let por_serde = serde_json::to_string(&capacidad).unwrap();
+            assert_eq!(
+                por_serde,
+                format!("\"{}\"", capacidad.as_id()),
+                "{capacidad:?} se serializa distinto de su as_id()",
+            );
+        }
+    }
+
+    #[test]
+    fn se_reconocen_las_seis_capacidades_por_su_nombre() {
+        for capacidad in CapabilityType::ALL {
+            assert_eq!(capacidad.as_id().parse::<CapabilityType>(), Ok(capacidad));
+        }
+    }
+
+    /// Antes el nombre recibido por D-Bus se metía entre comillas y se pasaba
+    /// por `serde_json`, así que una comilla o una barra invertida producían
+    /// JSON inválido y la persona recibía un error de sintaxis JSON. Ahora
+    /// cualquier nombre que no esté en la lista da el mismo error claro.
+    #[test]
+    fn un_nombre_con_comillas_o_barras_es_un_nombre_desconocido_y_nada_mas() {
+        for entrada in ["email\"", "\"email\"", "email\\", "e\"mail", "\\", "\""] {
+            assert_eq!(
+                entrada.parse::<CapabilityType>(),
+                Err(UnknownCapability(entrada.to_string())),
+                "{entrada:?} debía rechazarse como desconocido",
+            );
+        }
+    }
+
+    #[test]
+    fn los_nombres_que_no_existen_se_rechazan() {
+        // "Email" incluido: los identificadores son en minúscula y aceptar la
+        // variante en mayúscula grabaría permisos contra un nombre que después
+        // nadie vuelve a encontrar.
+        for entrada in ["", "Email", "EMAIL", "emial", "correo", "account.email"] {
+            assert!(
+                entrada.parse::<CapabilityType>().is_err(),
+                "{entrada:?} no debía aceptarse",
+            );
+        }
+    }
+
+    /// El mensaje va a parar al error de D-Bus que ve quien llamó, así que
+    /// tiene que decirle qué escribir.
+    #[test]
+    fn el_error_nombra_las_capacidades_validas() {
+        let mensaje = "emial".parse::<CapabilityType>().unwrap_err().to_string();
+        assert!(mensaje.contains("emial"), "falta lo que se escribió: {mensaje}");
+        for capacidad in CapabilityType::ALL {
+            assert!(
+                mensaje.contains(capacidad.as_id()),
+                "el mensaje no nombra '{}': {mensaje}",
+                capacidad.as_id(),
+            );
+        }
+    }
+
     #[test]
     fn test_capability_type_snake_case() {
         let json = serde_json::to_string(&CapabilityType::Email).unwrap();
@@ -456,6 +591,82 @@ mod tests {
         db2.load().unwrap();
         assert_eq!(db2.len(), 1);
         assert_eq!(db2.get(&db.accounts[0].id).unwrap().display_name, "Alice Google");
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// Borrar algo que ya no está no es un error, pero tampoco puede decir que
+    /// borró: el llamante usa ese `bool` para avisarle a la persona.
+    #[test]
+    fn borrar_una_cuenta_que_no_existe_devuelve_false() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
+        db.load().unwrap();
+        let id = db.add(sample_account()).unwrap();
+
+        assert!(!db.remove("no-existe").unwrap());
+        assert!(db.get(&id).is_some(), "la otra cuenta tenía que quedar");
+        assert!(db.remove(&id).unwrap());
+        assert!(db.get(&id).is_none());
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// Actualizar una cuenta que no está tiene que fallar y no agregarla en
+    /// silencio: sería una cuenta nueva que nadie pidió.
+    #[test]
+    fn actualizar_una_cuenta_que_no_existe_falla() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
+        db.load().unwrap();
+
+        let huerfana = sample_account();
+        assert!(db.update_account(huerfana).is_err());
+        assert!(db.is_empty(), "no tenía que quedar ninguna cuenta");
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// Un `accounts.json` ilegible tiene que dar error y **no** dejar la lista
+    /// vacía: con una lista vacía el daemon diría que la persona no tiene
+    /// cuentas, y el primer `save()` encima pisaría el archivo dañado con `[]`.
+    #[test]
+    fn un_accounts_json_corrupto_da_error_en_vez_de_lista_vacia() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
+        db.load().unwrap();
+        db.add(sample_account()).unwrap();
+
+        std::fs::write(dir.join("accounts.json"), "{ esto no es json").unwrap();
+
+        let mut otra = AccountDatabase::in_directory(dir.clone()).unwrap();
+        assert!(matches!(otra.load(), Err(StorageError::Json(_))));
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// Un directorio sin `accounts.json` es una cuenta nueva, no un fallo: es
+    /// lo que se encuentra en el primer arranque.
+    #[test]
+    fn un_directorio_vacio_carga_sin_cuentas_y_sin_error() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
+        db.load().unwrap();
+        assert!(db.is_empty());
+        assert!(db.get("cualquiera").is_none());
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// El directorio guarda los tokens de una persona: que otra pueda listarlo
+    /// ya dice qué cuentas tiene.
+    #[test]
+    fn el_directorio_de_la_base_es_solo_para_su_dueno() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        AccountDatabase::in_directory(dir.clone()).unwrap();
+
+        let modo = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(modo, 0o700);
 
         std::fs::remove_dir_all(dir).unwrap_or_default();
     }
