@@ -410,6 +410,12 @@ en su propia tarea; contra un servidor que no sabe avisar se vuelve a mirar cada
 cinco minutos sobre esa misma conexión, que igual es mejor que reconectarse cada
 vez.
 
+Todo intercambio con el servidor tiene tope. Un servidor que deja de escribir
+**sin cerrar el socket** —un NAT que olvidó la conexión, un proceso matado sin
+FIN— no produce ningún error: la lectura no vuelve nunca. En una conexión que
+dura horas eso pasa, y sin tope la cuenta quedaría muda hasta reiniciar el
+proceso. La única espera larga es la de IDLE, que tiene la suya.
+
 La espera se renueva cada veinticuatro minutos —el estándar pide hacerlo antes de
 los veintinueve, o el servidor y cualquier NAT en el medio cortan por
 inactividad—. Esa renovación es además el pulso que mantiene los tokens frescos:
@@ -418,8 +424,10 @@ refresque. Sin eso, una cuenta que anda podría quedarse con un `refresh_token`
 caducado por no usarse.
 
 Una cuenta cuyo servidor rechaza las credenciales **deja de mirarse** hasta que
-algo cambie: su tarea termina y no vuelve hasta que el servicio avise que las
-cuentas cambiaron. Insistir con una credencial rechazada es cómo se bloquea una
+algo cambie: su tarea termina, queda anotada, y no vuelve a arrancar hasta que el
+servicio avise que las cuentas cambiaron — que es cuando la persona pudo haber
+corregido la contraseña. La anotación hace falta: sin ella la revisión periódica
+la levantaría de nuevo cada cinco minutos. Insistir con una credencial rechazada es cómo se bloquea una
 cuenta. Una conexión cortada, en cambio, se reconecta a los treinta segundos: que
 se caiga el wifi o se reinicie el servidor es lo normal en una conexión que dura
 horas, no un error.

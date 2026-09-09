@@ -30,8 +30,19 @@ use tokio_rustls::TlsConnector;
 
 use crate::broker::{Credencial, Destino};
 
-/// Tope de cada operación contra el servidor.
+/// Tope para conectarse y autenticarse.
 const TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Tope de un intercambio con el servidor: mandar un comando y leer su
+/// respuesta.
+///
+/// **Todo lo que no sea la espera de IDLE tiene que tenerlo.** Un servidor que
+/// deja de escribir sin cerrar el socket —un NAT que olvidó la conexión, un
+/// proceso matado sin FIN— no produce ningún error: la lectura simplemente no
+/// vuelve nunca. En una conexión que dura horas eso pasa, y sin este tope la
+/// tarea de esa cuenta se queda esperando para siempre: no publica el fallo, no
+/// llega a reconectar, y la cuenta queda muda hasta que se reinicie el proceso.
+const INTERCAMBIO: Duration = Duration::from_secs(60);
 
 /// Tope de una línea de respuesta.
 ///
@@ -339,6 +350,25 @@ impl Sesion {
         }
     }
 
+    /// Le pone tope a un intercambio.
+    ///
+    /// El error dice que fue un tiempo agotado y no un fallo cualquiera, porque
+    /// quien lo recibe lo trata como conexión cortada y reconecta — que es
+    /// justamente lo que hay que hacer con un servidor que dejó de contestar.
+    async fn con_tope<T>(
+        que: &str,
+        futuro: impl std::future::Future<Output = Result<T, ImapError>>,
+    ) -> Result<T, ImapError> {
+        tokio::time::timeout(INTERCAMBIO, futuro)
+            .await
+            .unwrap_or_else(|_| {
+                Err(ImapError::Fallo(format!(
+                    "el servidor dejó de contestar durante {que} ({}s)",
+                    INTERCAMBIO.as_secs()
+                )))
+            })
+    }
+
     /// Si el servidor sabe avisar en vez de que haya que preguntarle.
     pub fn soporta_idle(&self) -> bool {
         self.capacidades.iter().any(|c| c == "IDLE")
@@ -348,21 +378,24 @@ impl Sesion {
         let etiqueta = self.siguiente_etiqueta();
         self.escribir(&format!("{etiqueta} CAPABILITY")).await?;
 
-        let mut vistas = Vec::new();
-        loop {
-            let linea = self.leer_linea().await?;
-            let anunciadas = capacidades_de(&linea);
-            if !anunciadas.is_empty() {
-                vistas = anunciadas;
-            }
-            match respuesta_de(&linea, &etiqueta) {
-                Some(Respuesta::Ok) => break,
-                Some(Respuesta::No(d)) | Some(Respuesta::Bad(d)) => {
-                    return Err(ImapError::Fallo(format!("CAPABILITY falló: {d}")))
+        let vistas = Self::con_tope("la lista de capacidades", async {
+            let mut vistas = Vec::new();
+            loop {
+                let linea = self.leer_linea().await?;
+                let anunciadas = capacidades_de(&linea);
+                if !anunciadas.is_empty() {
+                    vistas = anunciadas;
                 }
-                None => continue,
+                match respuesta_de(&linea, &etiqueta) {
+                    Some(Respuesta::Ok) => return Ok(vistas),
+                    Some(Respuesta::No(d)) | Some(Respuesta::Bad(d)) => {
+                        return Err(ImapError::Fallo(format!("CAPABILITY falló: {d}")))
+                    }
+                    None => continue,
+                }
             }
-        }
+        })
+        .await?;
 
         if !vistas.is_empty() {
             self.capacidades = vistas;
@@ -383,23 +416,25 @@ impl Sesion {
         let etiqueta = self.siguiente_etiqueta();
         self.escribir(&format!("{etiqueta} EXAMINE {nombre}")).await?;
 
-        let mut mensajes = 0;
-        loop {
-            let linea = self.leer_linea().await?;
-            if let Some(n) = exists_de(&linea) {
-                mensajes = n;
-            }
-            match respuesta_de(&linea, &etiqueta) {
-                Some(Respuesta::Ok) => break,
-                Some(Respuesta::No(d)) | Some(Respuesta::Bad(d)) => {
-                    return Err(ImapError::Fallo(format!(
-                        "no se pudo abrir «{casilla}»: {d}"
-                    )))
+        Self::con_tope("abrir la casilla", async {
+            let mut mensajes = 0;
+            loop {
+                let linea = self.leer_linea().await?;
+                if let Some(n) = exists_de(&linea) {
+                    mensajes = n;
                 }
-                None => continue,
+                match respuesta_de(&linea, &etiqueta) {
+                    Some(Respuesta::Ok) => return Ok(mensajes),
+                    Some(Respuesta::No(d)) | Some(Respuesta::Bad(d)) => {
+                        return Err(ImapError::Fallo(format!(
+                            "no se pudo abrir «{casilla}»: {d}"
+                        )))
+                    }
+                    None => continue,
+                }
             }
-        }
-        Ok(mensajes)
+        })
+        .await
     }
 
     /// Cuántos sin leer hay en la casilla abierta.
@@ -411,21 +446,23 @@ impl Sesion {
         let etiqueta = self.siguiente_etiqueta();
         self.escribir(&format!("{etiqueta} SEARCH UNSEEN")).await?;
 
-        let mut cuantos = 0;
-        loop {
-            let linea = self.leer_linea().await?;
-            if let Some(n) = resultados_de_search(&linea) {
-                cuantos = n;
-            }
-            match respuesta_de(&linea, &etiqueta) {
-                Some(Respuesta::Ok) => break,
-                Some(Respuesta::No(d)) | Some(Respuesta::Bad(d)) => {
-                    return Err(ImapError::Fallo(format!("SEARCH falló: {d}")))
+        Self::con_tope("contar los sin leer", async {
+            let mut cuantos = 0;
+            loop {
+                let linea = self.leer_linea().await?;
+                if let Some(n) = resultados_de_search(&linea) {
+                    cuantos = n;
                 }
-                None => continue,
+                match respuesta_de(&linea, &etiqueta) {
+                    Some(Respuesta::Ok) => return Ok(cuantos),
+                    Some(Respuesta::No(d)) | Some(Respuesta::Bad(d)) => {
+                        return Err(ImapError::Fallo(format!("SEARCH falló: {d}")))
+                    }
+                    None => continue,
+                }
             }
-        }
-        Ok(cuantos)
+        })
+        .await
     }
 
     /// Espera a que el servidor avise que algo cambió.
@@ -440,17 +477,23 @@ impl Sesion {
 
         // El servidor contesta `+ idling` antes de empezar. Si en vez de eso
         // manda un `NO`, es que no acepta IDLE aunque lo haya anunciado.
-        loop {
-            let linea = self.leer_linea().await?;
-            if linea.starts_with('+') {
-                break;
+        //
+        // Con tope: esperar acá sin límite es cómo una cuenta queda muda para
+        // siempre contra un servidor que dejó de escribir sin cerrar.
+        Self::con_tope("el comienzo de la espera", async {
+            loop {
+                let linea = self.leer_linea().await?;
+                if linea.starts_with('+') {
+                    return Ok(());
+                }
+                if let Some(Respuesta::No(d)) | Some(Respuesta::Bad(d)) =
+                    respuesta_de(&linea, &etiqueta)
+                {
+                    return Err(ImapError::Fallo(format!("el servidor no acepta IDLE: {d}")));
+                }
             }
-            if let Some(Respuesta::No(d)) | Some(Respuesta::Bad(d)) =
-                respuesta_de(&linea, &etiqueta)
-            {
-                return Err(ImapError::Fallo(format!("el servidor no acepta IDLE: {d}")));
-            }
-        }
+        })
+        .await?;
 
         let hasta = tokio::time::Instant::now() + maximo;
         let mut novedad = Novedad::Vencio;
@@ -476,16 +519,19 @@ impl Sesion {
         // lleva una, y ponérsela hace que el servidor no la reconozca y la
         // sesión quede colgada esperando.
         self.escribir("DONE").await?;
-        loop {
-            let linea = self.leer_linea().await?;
-            match respuesta_de(&linea, &etiqueta) {
-                Some(Respuesta::Ok) => break,
-                Some(Respuesta::No(d)) | Some(Respuesta::Bad(d)) => {
-                    return Err(ImapError::Fallo(format!("IDLE terminó mal: {d}")))
+        Self::con_tope("el fin de la espera", async {
+            loop {
+                let linea = self.leer_linea().await?;
+                match respuesta_de(&linea, &etiqueta) {
+                    Some(Respuesta::Ok) => return Ok(()),
+                    Some(Respuesta::No(d)) | Some(Respuesta::Bad(d)) => {
+                        return Err(ImapError::Fallo(format!("IDLE terminó mal: {d}")))
+                    }
+                    None => continue,
                 }
-                None => continue,
             }
-        }
+        })
+        .await?;
 
         Ok(novedad)
     }
@@ -500,20 +546,23 @@ impl Sesion {
         let etiqueta = self.siguiente_etiqueta();
         self.escribir(&format!("{etiqueta} {comando}")).await?;
 
-        loop {
-            let linea = self.leer_linea().await?;
-            match respuesta_de(&linea, &etiqueta) {
-                Some(Respuesta::Ok) => return Ok(()),
-                // `NO` es el servidor entendiendo y diciendo que no: casi
-                // siempre, credenciales. Se distingue porque insistir con una
-                // contraseña rechazada es cómo se bloquea una cuenta.
-                Some(Respuesta::No(d)) => return Err(ImapError::Rechazado(d)),
-                Some(Respuesta::Bad(d)) => {
-                    return Err(ImapError::Fallo(format!("el servidor no entendió: {d}")))
+        Self::con_tope("la respuesta al comando", async {
+            loop {
+                let linea = self.leer_linea().await?;
+                match respuesta_de(&linea, &etiqueta) {
+                    Some(Respuesta::Ok) => return Ok(()),
+                    // `NO` es el servidor entendiendo y diciendo que no: casi
+                    // siempre, credenciales. Se distingue porque insistir con una
+                    // contraseña rechazada es cómo se bloquea una cuenta.
+                    Some(Respuesta::No(d)) => return Err(ImapError::Rechazado(d)),
+                    Some(Respuesta::Bad(d)) => {
+                        return Err(ImapError::Fallo(format!("el servidor no entendió: {d}")))
+                    }
+                    None => continue,
                 }
-                None => continue,
             }
-        }
+        })
+        .await
     }
 
     async fn escribir(&mut self, linea: &str) -> Result<(), ImapError> {

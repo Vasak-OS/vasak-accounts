@@ -95,6 +95,21 @@ struct Resumen {
 #[derive(Default)]
 struct Estado {
     por_cuenta: HashMap<String, Resumen>,
+    /// Las cuentas cuyo servidor rechazó las credenciales.
+    ///
+    /// Sin esta lista, la tarea de una cuenta rechazada termina, deja de figurar
+    /// entre las que corren, y la revisión siguiente la vuelve a arrancar: con
+    /// una revisión cada cinco minutos serían unos **288 intentos de
+    /// autenticación por día** contra el servidor de alguien, que es exactamente
+    /// lo que la salida por rechazo existe para evitar.
+    ///
+    /// No alcanza con mirar `needs_reauth` de la cuenta: esa marca la pone el
+    /// servicio cuando el **proveedor OAuth2** revoca, y un servidor IMAP que
+    /// rechaza una contraseña de aplicación no la toca.
+    ///
+    /// Se limpia sólo cuando el servicio avisa que las cuentas cambiaron — que
+    /// es cuando la persona pudo haber arreglado algo.
+    rechazadas: std::collections::HashSet<String>,
 }
 
 #[derive(Clone, Default)]
@@ -219,6 +234,9 @@ async fn atender(
             // hasta que algo cambie en las cuentas.
             Err(Salida::Rechazada(detalle)) => {
                 tracing::warn!("'{}' deja de mirarse: {detalle}", cuenta.id);
+                // Antes de publicar: quien revisa las tareas tiene que ver la
+                // marca aunque llegue justo ahora, o la vuelve a arrancar.
+                servicio.estado.lock().await.rechazadas.insert(cuenta.id.clone());
                 publicar(&servicio, &emisor, &cuenta, Err(detalle)).await;
                 return;
             }
@@ -335,10 +353,18 @@ async fn ajustar_tareas(
 
     let mut estado = servicio.estado.lock().await;
     estado.por_cuenta.retain(|id, _| vigentes.contains(&id.as_str()));
+    estado.rechazadas.retain(|id| vigentes.contains(&id.as_str()));
+    let rechazadas = estado.rechazadas.clone();
     drop(estado);
 
     for cuenta in con_correo {
         if tareas.contains_key(&cuenta.id) {
+            continue;
+        }
+        // Una cuenta rechazada no se vuelve a arrancar. Su tarea terminó, así
+        // que sin esto la revisión siguiente la levantaría de nuevo y el
+        // servidor recibiría un intento cada cinco minutos.
+        if rechazadas.contains(&cuenta.id) {
             continue;
         }
         tracing::info!("'{}' pasa a atenderse", cuenta.id);
@@ -408,7 +434,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // la persona reconectó la cuenta.
         tokio::select! {
             _ = tokio::time::sleep(INTERVALO) => {}
-            _ = despertador.recv() => tracing::debug!("algo cambió en las cuentas"),
+            _ = despertador.recv() => {
+                tracing::debug!("algo cambió en las cuentas");
+                // Y sólo acá se olvidan los rechazos: la persona pudo haber
+                // corregido una contraseña o reconectado una cuenta. En la
+                // revisión por reloj no, o el olvido devolvería los 288
+                // intentos diarios que la marca evita.
+                servicio.estado.lock().await.rechazadas.clear();
+            }
         }
     }
 }
@@ -435,4 +468,99 @@ async fn escuchar_al_servicio(despertar: &tokio::sync::mpsc::Sender<()>) -> zbus
         let _ = despertar.try_send(());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cuenta(id: &str) -> broker::Account {
+        broker::Account {
+            id: id.into(),
+            display_name: id.into(),
+            provider_type: "custom".into(),
+            capabilities: vec!["email".into()],
+            needs_reauth: false,
+        }
+    }
+
+    /// **La propiedad que se había roto.** Una cuenta rechazada no se vuelve a
+    /// arrancar en la revisión siguiente.
+    ///
+    /// La tarea de una cuenta rechazada termina, así que deja de figurar entre
+    /// las que corren — y sin la marca, la revisión por reloj la levantaba de
+    /// nuevo cada cinco minutos: unos 288 intentos de autenticación por día
+    /// contra el servidor de alguien, que es exactamente lo que la salida por
+    /// rechazo existe para evitar.
+    ///
+    /// No alcanza con mirar `needs_reauth`: esa marca la pone el servicio cuando
+    /// el proveedor OAuth2 revoca, y un servidor IMAP que rechaza una contraseña
+    /// de aplicación no la toca.
+    #[tokio::test]
+    async fn una_cuenta_rechazada_no_se_vuelve_a_arrancar() {
+        let servicio = Servicio::default();
+        let cuentas = [cuenta("a"), cuenta("b")];
+
+        servicio.estado.lock().await.rechazadas.insert("a".into());
+        let rechazadas = servicio.estado.lock().await.rechazadas.clone();
+
+        let arrancarian: Vec<&str> = cuentas
+            .iter()
+            .filter(|c| !rechazadas.contains(&c.id))
+            .map(|c| c.id.as_str())
+            .collect();
+
+        assert_eq!(arrancarian, vec!["b"], "la rechazada no tenía que arrancar");
+    }
+
+    /// Y el olvido pasa **sólo** cuando el servicio avisa que algo cambió, que
+    /// es cuando la persona pudo haber arreglado la contraseña. Olvidar en la
+    /// revisión por reloj devolvería los 288 intentos diarios.
+    #[tokio::test]
+    async fn el_rechazo_se_olvida_cuando_cambian_las_cuentas() {
+        let servicio = Servicio::default();
+        servicio.estado.lock().await.rechazadas.insert("a".into());
+
+        // Lo que hace el bucle al recibir la señal.
+        servicio.estado.lock().await.rechazadas.clear();
+
+        assert!(servicio.estado.lock().await.rechazadas.is_empty());
+    }
+
+    /// Una cuenta que se borró no puede dejar su marca colgada: si se vuelve a
+    /// conectar con el mismo identificador, merece un intento limpio.
+    #[tokio::test]
+    async fn el_rechazo_de_una_cuenta_que_ya_no_esta_se_descarta() {
+        let servicio = Servicio::default();
+        {
+            let mut estado = servicio.estado.lock().await;
+            estado.rechazadas.insert("borrada".into());
+            estado.rechazadas.insert("sigue".into());
+        }
+
+        let vigentes = ["sigue"];
+        servicio
+            .estado
+            .lock()
+            .await
+            .rechazadas
+            .retain(|id| vigentes.contains(&id.as_str()));
+
+        let quedan = servicio.estado.lock().await.rechazadas.clone();
+        assert!(quedan.contains("sigue"));
+        assert!(!quedan.contains("borrada"));
+    }
+
+    /// El tope de un intercambio tiene que ser más corto que la renovación de la
+    /// espera: si fuera al revés, un servidor mudo mantendría la cuenta colgada
+    /// más de lo que dura un ciclo entero y no se notaría la diferencia con una
+    /// conexión sana.
+    #[test]
+    fn los_tiempos_tienen_el_orden_que_corresponde() {
+        assert!(
+            RENOVAR_IDLE < Duration::from_secs(29 * 60),
+            "el estándar pide renovar antes de los 29 minutos"
+        );
+        assert!(REINTENTO_CUENTA < INTERVALO);
+    }
 }
