@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::storage::CapabilityType;
 
@@ -179,6 +179,9 @@ impl std::fmt::Display for CatalogError {
 impl std::error::Error for CatalogError {}
 
 /// Todos los proveedores conocidos, con los de `/etc` pisando a los del paquete.
+///
+/// Sin las credenciales propias de nadie: para eso está [`load_for`], que es lo
+/// que hay que usar en cualquier camino donde se sepa de quién es la petición.
 pub fn load() -> Result<HashMap<String, Provider>, CatalogError> {
     let mut catalogo = HashMap::new();
     for directorio in [SHIPPED, LOCAL] {
@@ -187,17 +190,114 @@ pub fn load() -> Result<HashMap<String, Provider>, CatalogError> {
     Ok(catalogo)
 }
 
+/// El catálogo tal como lo ve una persona, con **sus** credenciales aplicadas.
+///
+/// VasakOS no distribuye un `client_id` para Google ni para Microsoft, así que
+/// el de cada quien es suyo: lo saca de la consola del proveedor con su propia
+/// cuenta. Guardarlo por usuario y no en `/etc` es lo que corresponde — es una
+/// credencial personal, no una configuración del equipo— y además evita pedir la
+/// contraseña de administrador para algo que sólo afecta a quien lo pone.
+pub fn load_for(uid: u32) -> Result<HashMap<String, Provider>, CatalogError> {
+    let mut catalogo = load()?;
+    for (id, credenciales) in UserCredentials::load(uid)? {
+        // Sólo si el proveedor existe. Un archivo con credenciales para algo que
+        // no está en el catálogo no crea un proveedor: las URLs y los alcances
+        // sólo salen de los archivos de root.
+        if let Some(proveedor) = catalogo.get_mut(&id) {
+            proveedor.client_id = Some(credenciales.client_id);
+            proveedor.client_secret = credenciales.client_secret;
+        }
+    }
+    Ok(catalogo)
+}
+
+/// Las credenciales que una persona puso para un proveedor.
+///
+/// **Sólo el `client_id` y el secreto.** Nunca las URLs ni los alcances: eso es
+/// lo que decide a qué servidor se le manda un código de autorización, y si
+/// viniera de un archivo que el usuario puede hacer escribir, un programa
+/// corriendo con su cuenta podría apuntar «Google» a otro lado. Con este límite,
+/// lo peor que se puede hacer desde acá es poner un `client_id` equivocado y que
+/// el flujo falle.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserCredentials {
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: Option<String>,
+}
+
+impl UserCredentials {
+    const FILE_NAME: &'static str = "providers.json";
+
+    fn path(uid: u32) -> PathBuf {
+        crate::storage::AccountDatabase::directory_for(uid).join(Self::FILE_NAME)
+    }
+
+    pub fn load(uid: u32) -> Result<HashMap<String, UserCredentials>, CatalogError> {
+        Self::load_from(&Self::path(uid))
+    }
+
+    fn load_from(ruta: &Path) -> Result<HashMap<String, UserCredentials>, CatalogError> {
+        match std::fs::read_to_string(ruta) {
+            Ok(texto) => serde_json::from_str(&texto)
+                .map_err(|e| CatalogError::Io(format!("{}: {e}", ruta.display()))),
+            // Lo normal: nadie puso nada todavía.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+            Err(e) => Err(CatalogError::Io(format!("{}: {e}", ruta.display()))),
+        }
+    }
+
+    /// Guarda —o borra, con `None`— las credenciales de un proveedor.
+    pub fn store(
+        uid: u32,
+        provider_id: &str,
+        credenciales: Option<UserCredentials>,
+    ) -> Result<(), CatalogError> {
+        Self::store_in(&crate::storage::AccountDatabase::directory_for(uid), provider_id, credenciales)
+    }
+
+    /// La versión que nombra el directorio; los tests la usan directamente en
+    /// vez de compartir un ajuste de todo el proceso.
+    pub fn store_in(
+        directorio: &Path,
+        provider_id: &str,
+        credenciales: Option<UserCredentials>,
+    ) -> Result<(), CatalogError> {
+        let ruta = directorio.join(Self::FILE_NAME);
+        let mut todas = Self::load_from(&ruta)?;
+
+        match credenciales {
+            Some(nuevas) => {
+                todas.insert(provider_id.to_string(), nuevas);
+            }
+            None => {
+                todas.remove(provider_id);
+            }
+        }
+
+        let json = serde_json::to_string_pretty(&todas)
+            .map_err(|e| CatalogError::Io(format!("no se pudo serializar: {e}")))?;
+
+        // Con el mismo cuidado que los secretos: un client_secret de escritorio
+        // no es un secreto de verdad, pero el archivo vive al lado de los que sí
+        // lo son y no hay razón para que sea el único legible.
+        crate::storage::write_private(&ruta, json.as_bytes())
+            .map_err(|e| CatalogError::Io(format!("{}: {e}", ruta.display())))
+    }
+}
+
 /// Uno solo, listo para empezar un flujo del tipo pedido.
 ///
 /// Todo se comprueba **antes** de abrir el navegador. Si no, la persona pasa por
 /// toda la pantalla de consentimiento del proveedor para que el fallo aparezca
 /// al volver.
 pub fn resolve(
+    uid: u32,
     id: &str,
     kind: ProviderKind,
     capabilities: &[CapabilityType],
 ) -> Result<Provider, CatalogError> {
-    let proveedor = load()?
+    let proveedor = load_for(uid)?
         .remove(id)
         .ok_or_else(|| CatalogError::Unknown(id.to_string()))?;
 
@@ -382,6 +482,164 @@ mod tests {
         std::fs::write(dir.join("google.toml.bak"), "ni esto").unwrap();
 
         assert_eq!(cargar(&dir).len(), 1);
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// Lo que este archivo existe para permitir: pegar el client_id propio y
+    /// que el proveedor pase a estar listo.
+    #[test]
+    fn las_credenciales_propias_completan_un_proveedor() {
+        let dir = temp_dir();
+        UserCredentials::store_in(
+            &dir,
+            "google",
+            Some(UserCredentials {
+                client_id: "el-mio.apps.googleusercontent.com".into(),
+                client_secret: Some("el-secreto".into()),
+            }),
+        )
+        .unwrap();
+
+        let guardadas = UserCredentials::load_from(&dir.join("providers.json")).unwrap();
+        assert_eq!(guardadas["google"].client_id, "el-mio.apps.googleusercontent.com");
+        assert_eq!(guardadas["google"].client_secret.as_deref(), Some("el-secreto"));
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// Nadie puso nada todavía es el caso normal, no un error: sin esto el
+    /// servicio no podría listar proveedores en un equipo recién instalado.
+    #[test]
+    fn sin_archivo_no_hay_credenciales_y_no_es_un_error() {
+        let dir = temp_dir();
+        assert!(UserCredentials::load_from(&dir.join("providers.json")).unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    #[test]
+    fn se_pueden_quitar_sin_tocar_las_de_otro_proveedor() {
+        let dir = temp_dir();
+        for id in ["google", "microsoft"] {
+            UserCredentials::store_in(
+                &dir,
+                id,
+                Some(UserCredentials { client_id: format!("{id}-id"), client_secret: None }),
+            )
+            .unwrap();
+        }
+
+        UserCredentials::store_in(&dir, "google", None).unwrap();
+
+        let quedan = UserCredentials::load_from(&dir.join("providers.json")).unwrap();
+        assert!(!quedan.contains_key("google"));
+        assert_eq!(quedan["microsoft"].client_id, "microsoft-id");
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// El archivo queda al lado de los tokens, y no hay razón para que sea el
+    /// único legible por todo el mundo.
+    #[test]
+    fn el_archivo_de_credenciales_es_solo_para_su_dueno() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir();
+        UserCredentials::store_in(
+            &dir,
+            "google",
+            Some(UserCredentials { client_id: "x".into(), client_secret: None }),
+        )
+        .unwrap();
+
+        let modo = std::fs::metadata(dir.join("providers.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(modo, 0o600);
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// **El límite que sostiene todo esto**, por el lado del archivo.
+    ///
+    /// Las credenciales propias sólo pueden poner el client_id y el secreto: si
+    /// pudieran traer las URLs, un programa corriendo con la cuenta de alguien
+    /// podría apuntar «Google» a otro servidor y quedarse con el código de
+    /// autorización.
+    ///
+    /// De que el **tipo** no tenga esos campos se ocupa el compilador, y bien:
+    /// agregarle uno rompe todos los sitios donde se construye, así que no pasa
+    /// desapercibido. Comprobado al escribir esto.
+    ///
+    /// Lo que este test cubre es el otro lado, que el compilador no ve: un
+    /// `providers.json` escrito a mano —o dejado por una versión futura del
+    /// formato— con claves de más. Esas claves se ignoran y no llegan a ninguna
+    /// parte.
+    #[test]
+    fn un_archivo_con_urls_de_mas_no_las_cuela() {
+        let json = r#"{"google":{
+            "client_id":"el-mio",
+            "auth_url":"https://atacante.com/auth",
+            "token_url":"https://atacante.com/token",
+            "scopes":{"email":["todo"]}
+        }}"#;
+
+        let leidas: HashMap<String, UserCredentials> = serde_json::from_str(json).unwrap();
+        let google = &leidas["google"];
+
+        assert_eq!(google.client_id, "el-mio");
+        // Y nada más: lo demás del JSON se descartó porque el tipo no lo tiene.
+        let reserializado = serde_json::to_string(google).unwrap();
+        assert!(!reserializado.contains("atacante"), "{reserializado}");
+        assert!(!reserializado.contains("auth_url"), "{reserializado}");
+        assert!(!reserializado.contains("scopes"), "{reserializado}");
+    }
+
+    /// Un archivo de credenciales para un proveedor que no existe **no** crea
+    /// un proveedor: las URLs y los alcances salen sólo de los archivos de root.
+    #[test]
+    fn unas_credenciales_sueltas_no_inventan_un_proveedor() {
+        let paquete = temp_dir();
+        std::fs::write(paquete.join("google.toml"), GOOGLE).unwrap();
+
+        let mut catalogo = HashMap::new();
+        merge_directory(&paquete, &mut catalogo).unwrap();
+
+        // Lo que hace `load_for`, con el catálogo de este test.
+        let inventadas: HashMap<String, UserCredentials> = serde_json::from_str(
+            r#"{"inventado":{"client_id":"x"},"google":{"client_id":"el-mio"}}"#,
+        )
+        .unwrap();
+        for (id, credenciales) in inventadas {
+            if let Some(proveedor) = catalogo.get_mut(&id) {
+                proveedor.client_id = Some(credenciales.client_id);
+                proveedor.client_secret = credenciales.client_secret;
+            }
+        }
+
+        assert!(!catalogo.contains_key("inventado"));
+        assert_eq!(catalogo["google"].client_id.as_deref(), Some("el-mio"));
+        // Y las URLs siguen siendo las del paquete.
+        assert_eq!(
+            catalogo["google"].auth_url.as_deref(),
+            Some("https://accounts.google.com/o/oauth2/v2/auth")
+        );
+
+        std::fs::remove_dir_all(paquete).unwrap_or_default();
+    }
+
+    /// Un JSON roto tiene que decir en qué archivo, no dejar a la persona sin
+    /// sus proveedores en silencio.
+    #[test]
+    fn un_archivo_de_credenciales_roto_dice_cual_es() {
+        let dir = temp_dir();
+        let ruta = dir.join("providers.json");
+        std::fs::write(&ruta, "{ esto no es json").unwrap();
+
+        let error = UserCredentials::load_from(&ruta).unwrap_err();
+        assert!(error.to_string().contains("providers.json"), "{error}");
 
         std::fs::remove_dir_all(dir).unwrap_or_default();
     }
