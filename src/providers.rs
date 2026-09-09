@@ -33,13 +33,39 @@ use crate::storage::CapabilityType;
 const SHIPPED: &str = "/usr/share/vasak-accounts/providers.d";
 const LOCAL: &str = "/etc/vasak-accounts/providers.d";
 
-/// Un proveedor OAuth2 tal como se lee del archivo.
+/// Cómo se conecta una cuenta de este proveedor.
+///
+/// No todos hablan OAuth2, y forzarlos a la misma forma habría significado
+/// inventarle a Nextcloud un `client_id` que no existe.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    /// El flujo de siempre: navegador, código de autorización y PKCE. Necesita
+    /// que alguien haya registrado la aplicación con el proveedor.
+    #[default]
+    Oauth2,
+    /// El Login Flow v2 de Nextcloud, donde **no hay nada que registrar**: la
+    /// persona escribe la dirección de su servidor y ese servidor emite una
+    /// contraseña de aplicación. Por eso es el único proveedor que funciona sin
+    /// que nadie pague ni tramite nada.
+    Nextcloud,
+}
+
+/// Un proveedor tal como se lee del archivo.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct Provider {
     pub id: String,
     pub display_name: String,
-    pub auth_url: String,
-    pub token_url: String,
+
+    #[serde(default)]
+    pub kind: ProviderKind,
+
+    /// Sólo para OAuth2. Nextcloud no las tiene: las arma a partir de la
+    /// dirección que escribe la persona, que no se sabe hasta ese momento.
+    #[serde(default)]
+    pub auth_url: Option<String>,
+    #[serde(default)]
+    pub token_url: Option<String>,
 
     /// Sin él no se puede empezar ningún flujo. Es opcional porque el archivo
     /// que trae el paquete no puede traerlo: hay que registrar la aplicación
@@ -64,17 +90,48 @@ pub struct Provider {
     /// la cuenta se muere en una hora sin que nada avise.
     #[serde(default)]
     pub extra_auth_params: HashMap<String, String>,
+
+    /// Qué capacidades da, para los proveedores que no las expresan como
+    /// alcances. Nextcloud entrega una contraseña de aplicación que sirve para
+    /// todo lo que la cuenta tenga, así que no hay nada que pedir por separado.
+    #[serde(default)]
+    pub capabilities: Vec<CapabilityType>,
 }
 
 impl Provider {
     /// Las capacidades que este proveedor sabe dar.
+    ///
+    /// De la lista explícita si la hay, y si no de los alcances configurados —
+    /// que es como las expresa un proveedor OAuth2, donde cada capacidad es un
+    /// permiso distinto que hay que pedir.
     pub fn capabilities(&self) -> Vec<CapabilityType> {
-        let mut lista: Vec<CapabilityType> = CapabilityType::ALL
-            .into_iter()
-            .filter(|c| self.scopes.contains_key(c))
-            .collect();
+        let mut lista: Vec<CapabilityType> = if self.capabilities.is_empty() {
+            CapabilityType::ALL
+                .into_iter()
+                .filter(|c| self.scopes.contains_key(c))
+                .collect()
+        } else {
+            self.capabilities.clone()
+        };
         lista.sort_by_key(|c| c.as_id());
+        lista.dedup();
         lista
+    }
+
+    /// Si se puede empezar un flujo con este proveedor tal como está.
+    ///
+    /// Para OAuth2 hace falta que alguien haya dejado el `client_id`; para
+    /// Nextcloud no hace falta nada, porque las credenciales las emite el
+    /// servidor de la propia persona.
+    pub fn is_configured(&self) -> bool {
+        match self.kind {
+            ProviderKind::Oauth2 => {
+                self.client_id.as_deref().is_some_and(|id| !id.is_empty())
+                    && self.auth_url.is_some()
+                    && self.token_url.is_some()
+            }
+            ProviderKind::Nextcloud => true,
+        }
     }
 }
 
@@ -82,8 +139,11 @@ impl Provider {
 pub enum CatalogError {
     /// El proveedor no está en ningún archivo.
     Unknown(String),
-    /// Está, pero sin `client_id`: no hay con qué empezar el flujo.
+    /// Está, pero le falta el `client_id`: no hay con qué empezar el flujo.
     NoClientId(String),
+    /// Se lo pidió por un camino que no es el suyo — un flujo OAuth2 sobre un
+    /// proveedor de Nextcloud, o al revés.
+    WrongKind { provider: String, esperado: &'static str },
     /// El proveedor no ofrece alguna de las capacidades pedidas.
     UnsupportedCapability { provider: String, capability: &'static str },
     Io(String),
@@ -107,6 +167,10 @@ impl std::fmt::Display for CatalogError {
                 f,
                 "el proveedor '{provider}' no ofrece '{capability}'",
             ),
+            CatalogError::WrongKind { provider, esperado } => write!(
+                f,
+                "el proveedor '{provider}' no se conecta así; su flujo es '{esperado}'",
+            ),
             CatalogError::Io(mensaje) => write!(f, "no se pudo leer el catálogo: {mensaje}"),
         }
     }
@@ -123,22 +187,37 @@ pub fn load() -> Result<HashMap<String, Provider>, CatalogError> {
     Ok(catalogo)
 }
 
-/// Uno solo, listo para empezar un flujo: existe, tiene `client_id`, y ofrece
-/// todas las capacidades pedidas.
-pub fn resolve(id: &str, capabilities: &[CapabilityType]) -> Result<Provider, CatalogError> {
+/// Uno solo, listo para empezar un flujo del tipo pedido.
+///
+/// Todo se comprueba **antes** de abrir el navegador. Si no, la persona pasa por
+/// toda la pantalla de consentimiento del proveedor para que el fallo aparezca
+/// al volver.
+pub fn resolve(
+    id: &str,
+    kind: ProviderKind,
+    capabilities: &[CapabilityType],
+) -> Result<Provider, CatalogError> {
     let proveedor = load()?
         .remove(id)
         .ok_or_else(|| CatalogError::Unknown(id.to_string()))?;
 
-    if proveedor.client_id.as_deref().unwrap_or_default().is_empty() {
+    if proveedor.kind != kind {
+        return Err(CatalogError::WrongKind {
+            provider: id.to_string(),
+            esperado: match proveedor.kind {
+                ProviderKind::Oauth2 => "oauth2",
+                ProviderKind::Nextcloud => "nextcloud",
+            },
+        });
+    }
+
+    if !proveedor.is_configured() {
         return Err(CatalogError::NoClientId(id.to_string()));
     }
 
-    // Se comprueba antes de abrir el navegador. Si no, la persona pasa por toda
-    // la pantalla de consentimiento del proveedor para que el fallo aparezca al
-    // volver.
+    let ofrece = proveedor.capabilities();
     for capacidad in capabilities {
-        if !proveedor.scopes.contains_key(capacidad) {
+        if !ofrece.contains(capacidad) {
             return Err(CatalogError::UnsupportedCapability {
                 provider: id.to_string(),
                 capability: capacidad.as_id(),
@@ -309,6 +388,90 @@ mod tests {
 
     /// El mensaje va a parar al error de D-Bus que ve la persona, así que tiene
     /// que decirle exactamente dónde dejar el client_id.
+    const NEXTCLOUD: &str = r#"
+        id = "nextcloud"
+        display_name = "Nextcloud"
+        kind = "nextcloud"
+        capabilities = ["drive", "calendar"]
+    "#;
+
+    /// Nextcloud se conecta **sin configurar nada**: las credenciales las emite
+    /// el servidor de la propia persona. Si `is_configured` le exigiera un
+    /// client_id, el único proveedor que funciona gratis quedaría apagado.
+    #[test]
+    fn nextcloud_esta_listo_sin_client_id() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("nextcloud.toml"), NEXTCLOUD).unwrap();
+
+        let nube = &cargar(&dir)["nextcloud"];
+        assert_eq!(nube.kind, ProviderKind::Nextcloud);
+        assert_eq!(nube.client_id, None);
+        assert!(nube.is_configured());
+        assert_eq!(nube.capabilities(), vec![CapabilityType::Calendar, CapabilityType::Drive]);
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// Un proveedor OAuth2 sin client_id no está listo, y ésa es la diferencia
+    /// que hace que la pantalla muestre a Google apagado y a Nextcloud
+    /// encendido.
+    #[test]
+    fn un_oauth2_sin_client_id_no_esta_listo() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("google.toml"), GOOGLE).unwrap();
+
+        let google = &cargar(&dir)["google"];
+        assert_eq!(google.kind, ProviderKind::Oauth2, "oauth2 es el tipo por omisión");
+        assert!(!google.is_configured());
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// Las capacidades explícitas ganan a los alcances, que es como se
+    /// recortaría lo que declara una cuenta de Nextcloud sin recompilar.
+    #[test]
+    fn la_lista_explicita_de_capacidades_gana_a_los_alcances() {
+        let dir = temp_dir();
+        std::fs::write(
+            dir.join("mixto.toml"),
+            r#"
+                id = "mixto"
+                display_name = "Mixto"
+                auth_url = "https://ejemplo.com/auth"
+                token_url = "https://ejemplo.com/token"
+                capabilities = ["email"]
+
+                [scopes]
+                calendar = ["algo"]
+                contacts = ["otro"]
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(cargar(&dir)["mixto"].capabilities(), vec![CapabilityType::Email]);
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// Sin `kind`, un archivo viejo tiene que seguir leyéndose como OAuth2: es
+    /// el tipo que tenían todos antes de que Nextcloud existiera.
+    #[test]
+    fn un_archivo_sin_kind_es_oauth2() {
+        assert_eq!(ProviderKind::default(), ProviderKind::Oauth2);
+    }
+
+    /// El mensaje va a parar al error de D-Bus que ve quien programa el cliente.
+    #[test]
+    fn el_error_de_tipo_equivocado_dice_cual_es_el_flujo() {
+        let mensaje = CatalogError::WrongKind {
+            provider: "nextcloud".into(),
+            esperado: "nextcloud",
+        }
+        .to_string();
+        assert!(mensaje.contains("nextcloud"), "{mensaje}");
+        assert!(mensaje.contains("no se conecta así"), "{mensaje}");
+    }
+
     #[test]
     fn el_error_de_client_id_dice_donde_ponerlo() {
         let mensaje = CatalogError::NoClientId("google".into()).to_string();
@@ -344,11 +507,29 @@ mod tests {
             );
             assert_eq!(proveedor.client_secret, None, "{id} trae un client_secret");
 
-            for url in [&proveedor.auth_url, &proveedor.token_url] {
-                assert!(
-                    url.starts_with("https://"),
-                    "{id} apunta a {url}, que no es https"
-                );
+            match proveedor.kind {
+                ProviderKind::Oauth2 => {
+                    // Un proveedor OAuth2 sin URLs no se puede conectar nunca, y
+                    // por http entregaría el código de autorización en claro.
+                    for (nombre, url) in
+                        [("auth_url", &proveedor.auth_url), ("token_url", &proveedor.token_url)]
+                    {
+                        let url = url
+                            .as_deref()
+                            .unwrap_or_else(|| panic!("{id} no tiene {nombre}"));
+                        assert!(url.starts_with("https://"), "{id}: {nombre}={url} no es https");
+                    }
+                }
+                // Nextcloud no las tiene: la dirección la escribe la persona y
+                // no se sabe hasta ese momento.
+                ProviderKind::Nextcloud => {
+                    assert_eq!(proveedor.auth_url, None, "{id} no debería tener auth_url");
+                    assert_eq!(proveedor.token_url, None, "{id} no debería tener token_url");
+                    assert!(
+                        proveedor.is_configured(),
+                        "{id} tiene que poder conectarse sin configurar nada"
+                    );
+                }
             }
         }
     }
@@ -356,6 +537,25 @@ mod tests {
     /// Google no devuelve refresh_token sin estos dos parámetros, y la cuenta se
     /// muere en una hora sin decir por qué. Es el fallo más caro de diagnosticar
     /// de todo el flujo, así que se comprueba en el archivo.
+    /// El archivo que trae el paquete tiene que declarar las capacidades que la
+    /// pantalla ofrece. Sin ellas la cuenta se conectaría y no serviría para
+    /// nada — ninguna aplicación le podría pedir permiso a algo que no declara.
+    #[test]
+    fn el_archivo_de_nextcloud_declara_sus_capacidades() {
+        let directorio = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/providers.d");
+        let nube = &cargar(&directorio)["nextcloud"];
+
+        assert_eq!(nube.kind, ProviderKind::Nextcloud);
+        assert!(nube.is_configured(), "no tiene que necesitar configuración");
+        for esperada in [CapabilityType::Drive, CapabilityType::Calendar, CapabilityType::Contacts] {
+            assert!(
+                nube.capabilities().contains(&esperada),
+                "falta '{}': una cuenta sin ella no la puede ofrecer a ninguna app",
+                esperada.as_id(),
+            );
+        }
+    }
+
     #[test]
     fn el_archivo_de_google_pide_acceso_sin_conexion() {
         let directorio = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/providers.d");

@@ -71,13 +71,19 @@ fn oauth_client(
         .clone()
         .ok_or_else(|| TokenError::Failed("el proveedor no tiene client_id".into()))?;
 
+    // Obligatorias para OAuth2. Un proveedor sin ellas es de otro tipo de flujo
+    // —el catálogo los distingue— y no tendría que haber llegado hasta acá.
+    let falta = |campo: &str| {
+        TokenError::Failed(format!("el proveedor '{}' no tiene {campo}", provider.id))
+    };
+
     let mut cliente = BasicClient::new(ClientId::new(client_id))
         .set_auth_uri(
-            AuthUrl::new(provider.auth_url.clone())
+            AuthUrl::new(provider.auth_url.clone().ok_or_else(|| falta("auth_url"))?)
                 .map_err(|e| TokenError::Failed(format!("auth_url inválida: {e}")))?,
         )
         .set_token_uri(
-            TokenUrl::new(provider.token_url.clone())
+            TokenUrl::new(provider.token_url.clone().ok_or_else(|| falta("token_url"))?)
                 .map_err(|e| TokenError::Failed(format!("token_url inválida: {e}")))?,
         );
 
@@ -320,14 +326,16 @@ fn provider_desde_config(
     Ok(Provider {
         id: cuenta.provider_type.clone(),
         display_name: cuenta.provider_type.clone(),
-        auth_url: campo("auth_url")?,
-        token_url: campo("token_url")?,
+        kind: crate::providers::ProviderKind::Oauth2,
+        auth_url: Some(campo("auth_url")?),
+        token_url: Some(campo("token_url")?),
         client_id: Some(campo("client_id")?),
         // Si el proveedor no usa secreto no hay ninguno guardado, y eso es
         // normal: no puede ser un error.
         client_secret: SecretStore::get_secret(uid, &cuenta.id, "client_secret").ok(),
         scopes: Default::default(),
         extra_auth_params: Default::default(),
+        capabilities: Default::default(),
     })
 }
 
@@ -427,12 +435,14 @@ mod tests {
         Provider {
             id: "google".into(),
             display_name: "Google".into(),
-            auth_url: "https://accounts.google.com/o/oauth2/v2/auth".into(),
-            token_url: "https://oauth2.googleapis.com/token".into(),
+            kind: crate::providers::ProviderKind::Oauth2,
+            auth_url: Some("https://accounts.google.com/o/oauth2/v2/auth".into()),
+            token_url: Some("https://oauth2.googleapis.com/token".into()),
             client_id: Some("el-client-id".into()),
             client_secret: None,
             scopes,
             extra_auth_params: extra,
+            capabilities: Vec::new(),
         }
     }
 

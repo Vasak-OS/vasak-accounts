@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use pending::{PendingAuth, PendingAuths};
+use pending::{Flow, NextcloudFlow, OAuthFlow, PendingAuth, PendingAuths};
 use storage::{AccountDatabase, CapabilityType};
 
 use zbus::fdo::DBusProxy;
@@ -251,10 +251,14 @@ impl AccountManager {
                     // Sin el client_id no se puede empezar ningún flujo, y eso
                     // es lo único que la pantalla necesita saber para decidir si
                     // el botón va encendido.
-                    "configured": proveedor
-                        .client_id
-                        .as_deref()
-                        .is_some_and(|id| !id.is_empty()),
+                    // Sin lo que le falte no se puede empezar ningún flujo, y
+                    // eso es lo único que la pantalla necesita saber para
+                    // decidir si el botón va encendido.
+                    "configured": proveedor.is_configured(),
+                    "kind": match proveedor.kind {
+                        providers::ProviderKind::Oauth2 => "oauth2",
+                        providers::ProviderKind::Nextcloud => "nextcloud",
+                    },
                 })
             })
             .collect();
@@ -305,8 +309,9 @@ impl AccountManager {
             )));
         }
 
-        let proveedor = providers::resolve(&provider_id, &capacidades)
-            .map_err(|e| FdoError::Failed(e.to_string()))?;
+        let proveedor =
+            providers::resolve(&provider_id, providers::ProviderKind::Oauth2, &capacidades)
+                .map_err(|e| FdoError::Failed(e.to_string()))?;
 
         let (auth_url, verifier, state) =
             protocols::oauth2::authorization_url(&proveedor, &capacidades, &redirect_uri)
@@ -318,11 +323,13 @@ impl AccountManager {
             .await
             .insert(PendingAuth::new(
                 uid,
-                proveedor.id.clone(),
-                capacidades,
-                redirect_uri,
-                verifier,
-                state.clone(),
+                Flow::OAuth2(OAuthFlow {
+                    provider_id: proveedor.id.clone(),
+                    capabilities: capacidades,
+                    redirect_uri,
+                    verifier,
+                    state: state.clone(),
+                }),
             ))
             .map_err(FdoError::Failed)?;
 
@@ -362,14 +369,18 @@ impl AccountManager {
             .pendientes
             .lock()
             .await
-            .take(&request_id, uid, &state)
+            .take_oauth(&request_id, uid, &state)
             .map_err(|e| FdoError::AccessDenied(e.to_string()))?;
 
         // Del catálogo otra vez, y no de lo guardado en el pendiente: si el
         // client_secret cambió entre que se abrió el navegador y volvió, el
         // canje tiene que usar el de ahora.
-        let proveedor = providers::resolve(&pendiente.provider_id, &pendiente.capabilities)
-            .map_err(|e| FdoError::Failed(e.to_string()))?;
+        let proveedor = providers::resolve(
+            &pendiente.provider_id,
+            providers::ProviderKind::Oauth2,
+            &pendiente.capabilities,
+        )
+        .map_err(|e| FdoError::Failed(e.to_string()))?;
 
         let frescos = protocols::oauth2::exchange_code(
             &proveedor,
@@ -413,6 +424,115 @@ impl AccountManager {
         tracing::info!("cuenta '{account_id}' conectada a '{}' (uid {uid})", proveedor.id);
         Self::accounts_changed(&emisor, uid).await?;
         Ok(account_id)
+    }
+
+    /// Método `BeginNextcloudLogin` — empieza a conectar un Nextcloud.
+    ///
+    /// Otro flujo, y por buenas razones: en Nextcloud **no hay nada que
+    /// registrar**. La persona escribe la dirección de su servidor y ese
+    /// servidor emite una contraseña de aplicación. Ni `client_id`, ni
+    /// verificación, ni auditoría — es el único proveedor que funciona sin que
+    /// nadie pague ni tramite nada, y por eso fue el primero en entrar.
+    ///
+    /// Devuelve la URL que hay que abrir en el navegador y un `request_id` con
+    /// el que después se sondea.
+    async fn begin_nextcloud_login(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: Header<'_>,
+        server: String,
+        display_name: String,
+    ) -> zbus::fdo::Result<String> {
+        let (_caller, uid) = caller_identity(connection, &header).await?;
+
+        let servidor = protocols::nextcloud::normalize_server(&server)
+            .map_err(|e| FdoError::InvalidArgs(e.to_string()))?;
+
+        // Del catálogo, aunque no aporte URLs: es de ahí que salen las
+        // capacidades que una cuenta de Nextcloud va a tener, y así se pueden
+        // recortar sin recompilar.
+        let proveedor = providers::resolve("nextcloud", providers::ProviderKind::Nextcloud, &[])
+            .map_err(|e| FdoError::Failed(e.to_string()))?;
+
+        let inicio = protocols::nextcloud::start_login(&servidor)
+            .await
+            .map_err(|e| FdoError::Failed(e.to_string()))?;
+
+        let request_id = self
+            .pendientes
+            .lock()
+            .await
+            .insert(PendingAuth::new(
+                uid,
+                Flow::Nextcloud(NextcloudFlow {
+                    server: servidor.clone(),
+                    display_name,
+                    capabilities: proveedor.capabilities(),
+                    poll_token: inicio.poll_token,
+                    poll_endpoint: inicio.poll_endpoint,
+                }),
+            ))
+            .map_err(FdoError::Failed)?;
+
+        tracing::info!("inicio de sesión '{request_id}' abierto en {servidor} (uid {uid})");
+
+        serde_json::to_string(&serde_json::json!({
+            "request_id": request_id,
+            "login_url": inicio.login_url,
+        }))
+        .map_err(|e| FdoError::Failed(format!("Error de serialización: {e}")))
+    }
+
+    /// Método `PollNextcloudLogin` — un sondeo.
+    ///
+    /// Devuelve `{"status":"pending"}` mientras la persona no haya terminado en
+    /// el navegador, y `{"status":"done","account_id":"…"}` cuando el servidor
+    /// entrega las credenciales.
+    ///
+    /// Un sondeo por llamada y no un bucle acá adentro: un método D-Bus que se
+    /// queda esperando minutos supera el tiempo de espera del bus y el cliente
+    /// recibe un error de transporte en vez de una respuesta. El bucle lo hace
+    /// el cliente, con llamadas cortas.
+    ///
+    /// La contraseña de aplicación no pasa por quien llama: se guarda acá y lo
+    /// que vuelve es el identificador de la cuenta.
+    async fn poll_nextcloud_login(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(signal_context)] emisor: SignalContext<'_>,
+        request_id: String,
+    ) -> zbus::fdo::Result<String> {
+        let (_caller, uid) = caller_identity(connection, &header).await?;
+
+        let flujo = self
+            .pendientes
+            .lock()
+            .await
+            .peek_nextcloud(&request_id, uid)
+            .map_err(|e| FdoError::AccessDenied(e.to_string()))?;
+
+        let credenciales =
+            match protocols::nextcloud::poll(&flujo.poll_endpoint, &flujo.poll_token).await {
+                Ok(credenciales) => credenciales,
+                // Todavía no terminó. No es un error: es el caso normal de los
+                // primeros sondeos, y el flujo tiene que seguir esperando.
+                Err(protocols::nextcloud::NextcloudError::Pending) => {
+                    return Ok(serde_json::json!({ "status": "pending" }).to_string())
+                }
+                Err(otro) => return Err(FdoError::Failed(otro.to_string())),
+            };
+
+        let account_id = self.guardar_nextcloud(uid, &flujo, &credenciales)?;
+
+        // Se saca recién ahora: el sondeo se repite, y quitarlo antes habría
+        // dejado sin nada que buscar al intento siguiente.
+        self.pendientes.lock().await.cancel(&request_id, uid);
+
+        tracing::info!("cuenta '{account_id}' conectada a {} (uid {uid})", flujo.server);
+        Self::accounts_changed(&emisor, uid).await?;
+
+        Ok(serde_json::json!({ "status": "done", "account_id": account_id }).to_string())
     }
 
     /// Método `CancelAuth` — descarta un flujo que la persona abandonó.
@@ -578,6 +698,90 @@ impl AccountManager {
             }
             Err(otro) => Err(FdoError::Failed(format!("Error al obtener token: {otro}"))),
         }
+    }
+}
+
+/// Lo que hace falta para dejar armada una cuenta de Nextcloud.
+///
+/// Va aparte del bloque de la interfaz porque no es un método D-Bus.
+impl AccountManager {
+    /// Guarda la cuenta y su contraseña de aplicación.
+    ///
+    /// Cada capacidad se guarda con **su** dirección DAV ya armada, para que las
+    /// aplicaciones no tengan que saber cómo se construye: el gestor de archivos
+    /// pide la configuración de `drive`, el calendario la de `calendar`, y ahí
+    /// está la URL contra la que hablar.
+    ///
+    /// Sin `expires_at`, y eso es a propósito: una contraseña de aplicación no
+    /// caduca, así que no hay nada que refrescar. El motor de tokens ya trata la
+    /// ausencia de vencimiento como «entregala tal cual», que es exactamente lo
+    /// correcto acá.
+    fn guardar_nextcloud(
+        &self,
+        uid: u32,
+        flujo: &NextcloudFlow,
+        credenciales: &protocols::nextcloud::Credentials,
+    ) -> zbus::fdo::Result<String> {
+        // El servidor que dice el servidor, no el que escribió la persona: si
+        // Nextcloud vive detrás de un nombre distinto del que se tipeó, las
+        // rutas DAV tienen que armarse con el que él mismo declara.
+        let servidor = protocols::nextcloud::normalize_server(&credenciales.server)
+            .unwrap_or_else(|_| flujo.server.clone());
+        let rutas = protocols::nextcloud::dav_urls(&servidor, &credenciales.login_name);
+
+        let capabilities: HashMap<CapabilityType, serde_json::Value> = flujo
+            .capabilities
+            .iter()
+            .map(|capacidad| {
+                let url = match capacidad {
+                    CapabilityType::Drive => Some(rutas.files.as_str()),
+                    CapabilityType::Calendar => Some(rutas.calendars.as_str()),
+                    CapabilityType::Contacts => Some(rutas.addressbooks.as_str()),
+                    // Talk y las tareas se hablan por otras rutas que todavía no
+                    // consume nadie. Se guarda el servidor y el usuario, que es
+                    // lo que hará falta cuando exista la app de chats.
+                    _ => None,
+                };
+                (
+                    *capacidad,
+                    serde_json::json!({
+                        "server": servidor,
+                        "username": credenciales.login_name,
+                        "url": url,
+                        // Autenticación básica con la contraseña de aplicación:
+                        // así lo espera WebDAV, y decirlo acá evita que cada
+                        // aplicación lo adivine.
+                        "auth": "basic",
+                    }),
+                )
+            })
+            .collect();
+
+        let nombre = if flujo.display_name.trim().is_empty() {
+            // El usuario y el host, que es más útil que «Nextcloud» a secas
+            // cuando alguien conecta dos servidores.
+            let host = url::Url::parse(&servidor)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+                .unwrap_or_else(|| servidor.clone());
+            format!("{} en {host}", credenciales.login_name)
+        } else {
+            flujo.display_name.clone()
+        };
+
+        let mut db = open_db(uid)?;
+        let cuenta = storage::Account::new(&nombre, "nextcloud", capabilities);
+        let account_id = db
+            .add(cuenta)
+            .map_err(|e| FdoError::Failed(format!("Error al guardar la cuenta: {e}")))?;
+
+        // El secreto después de la cuenta: si esto falla, queda una cuenta sin
+        // credencial que la persona puede borrar y rehacer. Al revés quedaría
+        // una credencial huérfana que nada limpia.
+        storage::SecretStore::store_token(uid, &account_id, &credenciales.app_password)
+            .map_err(|e| FdoError::Failed(format!("Error al guardar la contraseña: {e}")))?;
+
+        Ok(account_id)
     }
 }
 
