@@ -763,11 +763,17 @@ impl AccountManager {
     /// lado le cambió tal cuenta. Un `uid` y nada más no dice nada que no se
     /// pueda ver con `who`.
     ///
-    /// La segunda es que funciona mejor. Quien la recibe vuelve a llamar
-    /// `ListAccounts` —que ya está acotado a su usuario— y ve el estado
-    /// completo, incluida la marca de reautenticación. Con señales que llevan el
-    /// cambio adentro, una que se pierde deja al cliente creyendo algo que no
-    /// es, y hay que reconciliar igual.
+    /// La segunda es que funciona mejor. Quien la recibe vuelve a leer —lo que
+    /// le importe— y ve el estado completo, incluida la marca de
+    /// reautenticación. Con señales que llevan el cambio adentro, una que se
+    /// pierde deja al cliente creyendo algo que no es, y hay que reconciliar
+    /// igual.
+    ///
+    /// **Qué hay que releer:** `ListAccounts` **y** `ListProviders`. Las dos
+    /// cosas cambian por acá: agregar o quitar una cuenta mueve la primera, y
+    /// poner o sacar credenciales propias mueve el `configured` de la segunda.
+    /// Releer sólo una deja la pantalla mostrando un proveedor apagado que ya
+    /// está listo, o al revés.
     #[zbus(signal)]
     async fn accounts_changed(emisor: &SignalContext<'_>, uid: u32) -> zbus::Result<()>;
 

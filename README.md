@@ -143,7 +143,7 @@ correo le permite todas tus casillas.
 
 | Señal | Cuerpo | Cuándo |
 |---|---|---|
-| `AccountsChanged` | `u` uid | Se agregó, se quitó o cambió de estado una cuenta de ese usuario |
+| `AccountsChanged` | `u` uid | Cambió algo de ese usuario: una cuenta, o las credenciales de un proveedor |
 
 Una sola señal y sin detalle, a propósito. Este servicio atiende a todo el
 equipo desde el bus del sistema, así que la señal la reciben todas las sesiones:
@@ -151,9 +151,14 @@ con el identificador de la cuenta adentro, quien escuche se enteraría de que a
 la persona de al lado le cambió tal cuenta. Un `uid` no dice nada que no se vea
 con `who`.
 
-Y funciona mejor: quien la recibe vuelve a llamar `ListAccounts` —que ya está
-acotado a su usuario— y ve el estado completo. Con señales que llevan el cambio
-adentro, una que se pierde deja al cliente creyendo algo que no es.
+Y funciona mejor: quien la recibe vuelve a leer y ve el estado completo. Con
+señales que llevan el cambio adentro, una que se pierde deja al cliente creyendo
+algo que no es.
+
+**Hay que releer `ListAccounts` y `ListProviders`.** Las dos cosas cambian por
+esta señal: agregar o quitar una cuenta mueve la primera, y poner o sacar
+credenciales propias mueve el `configured` de la segunda. Releer sólo una deja
+la pantalla mostrando un proveedor apagado que ya está listo, o al revés.
 
 ### Por qué `ListAccounts` no pide permiso
 

@@ -199,16 +199,32 @@ pub fn load() -> Result<HashMap<String, Provider>, CatalogError> {
 /// contraseña de administrador para algo que sólo afecta a quien lo pone.
 pub fn load_for(uid: u32) -> Result<HashMap<String, Provider>, CatalogError> {
     let mut catalogo = load()?;
-    for (id, credenciales) in UserCredentials::load(uid)? {
+    aplicar_credenciales(&mut catalogo, UserCredentials::load(uid)?);
+    Ok(catalogo)
+}
+
+/// Pone las credenciales de una persona sobre el catálogo.
+///
+/// Aparte de [`load_for`] para que los tests ejerciten **esta** función y no una
+/// copia suya: con el bucle escrito adentro, un test que lo repitiera probaría
+/// que la copia está bien, y seguiría pasando si acá se agregara la asignación
+/// de una URL — que es justo lo que no puede pasar.
+fn aplicar_credenciales(
+    catalogo: &mut HashMap<String, Provider>,
+    credenciales: HashMap<String, UserCredentials>,
+) {
+    for (id, propias) in credenciales {
         // Sólo si el proveedor existe. Un archivo con credenciales para algo que
         // no está en el catálogo no crea un proveedor: las URLs y los alcances
         // sólo salen de los archivos de root.
-        if let Some(proveedor) = catalogo.get_mut(&id) {
-            proveedor.client_id = Some(credenciales.client_id);
-            proveedor.client_secret = credenciales.client_secret;
-        }
+        let Some(proveedor) = catalogo.get_mut(&id) else {
+            continue;
+        };
+        // Y sólo estos dos campos. Lo demás del proveedor —las URLs, los
+        // alcances— queda como lo dejó el archivo de root.
+        proveedor.client_id = Some(propias.client_id);
+        proveedor.client_secret = propias.client_secret;
     }
-    Ok(catalogo)
 }
 
 /// Las credenciales que una persona puso para un proveedor.
@@ -263,6 +279,19 @@ impl UserCredentials {
         provider_id: &str,
         credenciales: Option<UserCredentials>,
     ) -> Result<(), CatalogError> {
+        // El directorio puede no existir: es la primera vez que esta persona
+        // guarda algo, y quien lo crea es `AccountDatabase::in_directory`, que
+        // en este camino no se llamó. Sin esto, poner el primer client_id falla
+        // con «no such file or directory» sobre el archivo temporal.
+        //
+        // 0700 como el resto, porque el archivo termina al lado de los tokens.
+        std::fs::create_dir_all(directorio)
+            .map_err(|e| CatalogError::Io(format!("{}: {e}", directorio.display())))?;
+        let _ = std::fs::set_permissions(
+            directorio,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        );
+
         let ruta = directorio.join(Self::FILE_NAME);
         let mut todas = Self::load_from(&ruta)?;
 
@@ -508,6 +537,38 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap_or_default();
     }
 
+    /// La primera vez que alguien guarda un client_id, su directorio puede no
+    /// existir todavía: lo crea la base de cuentas, y este camino no la abre.
+    ///
+    /// Los otros tests no lo cazaban porque `temp_dir()` crea el directorio
+    /// antes. Lo encontró la revisión del PR #8, y sin el arreglo el primer
+    /// client_id de una persona fallaba con «no such file or directory» sobre el
+    /// archivo temporal.
+    #[test]
+    fn se_puede_guardar_aunque_el_directorio_no_exista() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Sin crearlo, a propósito.
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        assert!(!dir.exists());
+
+        UserCredentials::store_in(
+            &dir,
+            "google",
+            Some(UserCredentials { client_id: "el-mio".into(), client_secret: None }),
+        )
+        .unwrap();
+
+        let guardadas = UserCredentials::load_from(&dir.join("providers.json")).unwrap();
+        assert_eq!(guardadas["google"].client_id, "el-mio");
+
+        // Y creado con el modo que corresponde: queda al lado de los tokens.
+        let modo = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(modo, 0o700);
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
     /// Nadie puso nada todavía es el caso normal, no un error: sin esto el
     /// servicio no podría listar proveedores en un equipo recién instalado.
     #[test]
@@ -607,17 +668,14 @@ mod tests {
         let mut catalogo = HashMap::new();
         merge_directory(&paquete, &mut catalogo).unwrap();
 
-        // Lo que hace `load_for`, con el catálogo de este test.
+        // La misma función que usa `load_for`, no una copia suya: si acá se
+        // repitiera el bucle, el test probaría que la copia está bien y seguiría
+        // pasando aunque producción empezara a asignar una URL.
         let inventadas: HashMap<String, UserCredentials> = serde_json::from_str(
             r#"{"inventado":{"client_id":"x"},"google":{"client_id":"el-mio"}}"#,
         )
         .unwrap();
-        for (id, credenciales) in inventadas {
-            if let Some(proveedor) = catalogo.get_mut(&id) {
-                proveedor.client_id = Some(credenciales.client_id);
-                proveedor.client_secret = credenciales.client_secret;
-            }
-        }
+        aplicar_credenciales(&mut catalogo, inventadas);
 
         assert!(!catalogo.contains_key("inventado"));
         assert_eq!(catalogo["google"].client_id.as_deref(), Some("el-mio"));
