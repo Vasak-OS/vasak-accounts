@@ -404,14 +404,33 @@ mostrar que llegó algo— y se apoya en `STATUS`, que devuelve cuatro números:
 una línea de parser sobre lo que escribió un remitente desconocido. Ese parser
 va a llegar, y va a merecer su propia discusión.
 
-Mira cada cinco minutos, y también cuando el servicio avisa que cambió algo —así
-conectar una cuenta muestra su correo en el momento—. Ese mismo intervalo es lo
-que mantiene los tokens frescos: pedirlos es lo que hace que el servicio los
-refresque, así que no hace falta una tarea aparte.
+**Espera a que el servidor avise** (IMAP IDLE), así el correo nuevo aparece en el
+momento en vez de hasta cinco minutos después. Hay una conexión viva por cuenta,
+en su propia tarea; contra un servidor que no sabe avisar se vuelve a mirar cada
+cinco minutos sobre esa misma conexión, que igual es mejor que reconectarse cada
+vez.
+
+Todo intercambio con el servidor tiene tope. Un servidor que deja de escribir
+**sin cerrar el socket** —un NAT que olvidó la conexión, un proceso matado sin
+FIN— no produce ningún error: la lectura no vuelve nunca. En una conexión que
+dura horas eso pasa, y sin tope la cuenta quedaría muda hasta reiniciar el
+proceso. La única espera larga es la de IDLE, que tiene la suya.
+
+La espera se renueva cada veinticuatro minutos —el estándar pide hacerlo antes de
+los veintinueve, o el servidor y cualquier NAT en el medio cortan por
+inactividad—. Esa renovación es además el pulso que mantiene los tokens frescos:
+en cada una se le vuelve a pedir el token al servicio, que es lo que hace que lo
+refresque. Sin eso, una cuenta que anda podría quedarse con un `refresh_token`
+caducado por no usarse.
 
 Una cuenta cuyo servidor rechaza las credenciales **deja de mirarse** hasta que
-algo cambie. Insistir con una contraseña rechazada es cómo se bloquea una
-cuenta, y en un bucle de cinco minutos serían casi trescientos intentos por día.
+algo cambie: su tarea termina, queda anotada, y no vuelve a arrancar hasta que el
+servicio avise que las cuentas cambiaron — que es cuando la persona pudo haber
+corregido la contraseña. La anotación hace falta: sin ella la revisión periódica
+la levantaría de nuevo cada cinco minutos. Insistir con una credencial rechazada es cómo se bloquea una
+cuenta. Una conexión cortada, en cambio, se reconecta a los treinta segundos: que
+se caiga el wifi o se reinicie el servidor es lo normal en una conexión que dura
+horas, no un error.
 
 ## Nextcloud: el único que no hay que configurar
 
@@ -540,7 +559,7 @@ No caduca, no depende de ningún registro y no cuesta nada.
 | Prueba de conexión al registrar IMAP/SMTP | ⛔ falta |
 | CalDAV/CardDAV con autodescubrimiento | ⛔ falta |
 | Contador de correo sin leer (`vasak-accounts-sync`) | ✅ |
-| IMAP IDLE, para que avise en vez de preguntar | ⛔ falta |
+| IMAP IDLE, para que avise en vez de preguntar | ✅ |
 | Caché de mensajes para la aplicación de correo | ⛔ falta (y a propósito: no existe la app) |
 
 Con Nextcloud adentro, el modelo de cuentas funciona de punta a punta **sin

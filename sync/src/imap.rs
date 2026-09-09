@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
-use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
@@ -30,8 +30,19 @@ use tokio_rustls::TlsConnector;
 
 use crate::broker::{Credencial, Destino};
 
-/// Tope de cada operación contra el servidor.
+/// Tope para conectarse y autenticarse.
 const TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Tope de un intercambio con el servidor: mandar un comando y leer su
+/// respuesta.
+///
+/// **Todo lo que no sea la espera de IDLE tiene que tenerlo.** Un servidor que
+/// deja de escribir sin cerrar el socket —un NAT que olvidó la conexión, un
+/// proceso matado sin FIN— no produce ningún error: la lectura simplemente no
+/// vuelve nunca. En una conexión que dura horas eso pasa, y sin este tope la
+/// tarea de esa cuenta se queda esperando para siempre: no publica el fallo, no
+/// llega a reconectar, y la cuenta queda muda hasta que se reinicie el proceso.
+const INTERCAMBIO: Duration = Duration::from_secs(60);
 
 /// Tope de una línea de respuesta.
 ///
@@ -59,6 +70,15 @@ impl std::fmt::Display for ImapError {
 }
 
 impl std::error::Error for ImapError {}
+
+/// Por qué volvió la espera.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Novedad {
+    /// El servidor avisó que algo cambió.
+    Cambio,
+    /// Se cumplió el tiempo y hay que renovar la espera.
+    Vencio,
+}
 
 /// Lo que se sabe de una casilla después de mirarla.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
@@ -121,28 +141,87 @@ pub fn carga_xoauth2(usuario: &str, token: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(crudo)
 }
 
-/// Lee los contadores de una respuesta `* STATUS`.
+/// Las capacidades que anuncia el servidor.
 ///
-/// El orden de los elementos lo elige el servidor —el estándar no lo fija— así
-/// que se buscan por nombre. Leerlos por posición anda contra unos servidores y
-/// contra otros no, que es la peor clase de error.
-pub fn estado_de(linea: &str) -> Option<Estado> {
-    let dentro = linea.rsplit_once('(')?.1;
-    let dentro = dentro.split_once(')')?.0;
+/// Llegan en una línea `* CAPABILITY IMAP4rev1 IDLE …`, y también pegadas al
+/// saludo entre corchetes: `* OK [CAPABILITY …] listo`. Se leen de las dos
+/// formas porque hay servidores que sólo las dan en el saludo, y preguntar de
+/// nuevo por algo que ya dijeron es una vuelta de más en cada conexión.
+pub fn capacidades_de(linea: &str) -> Vec<String> {
+    let mayusculas = linea.to_ascii_uppercase();
 
-    let partes: Vec<&str> = dentro.split_whitespace().collect();
-    let buscar = |nombre: &str| -> Option<u32> {
-        partes
-            .iter()
-            .position(|p| p.eq_ignore_ascii_case(nombre))
-            .and_then(|i| partes.get(i + 1))
-            .and_then(|v| v.parse().ok())
+    let lista = if let Some(desde) = mayusculas.find("[CAPABILITY ") {
+        let resto = &mayusculas[desde + "[CAPABILITY ".len()..];
+        resto.split_once(']').map(|(dentro, _)| dentro)
+    } else {
+        mayusculas.strip_prefix("* CAPABILITY ")
     };
 
-    Some(Estado {
-        mensajes: buscar("MESSAGES")?,
-        sin_leer: buscar("UNSEEN").unwrap_or(0),
-    })
+    lista
+        .map(|l| l.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// Cuántos mensajes anuncia un `* n EXISTS`.
+pub fn exists_de(linea: &str) -> Option<u32> {
+    let sin_asterisco = linea.strip_prefix("* ")?;
+    let (numero, resto) = sin_asterisco.split_once(' ')?;
+    resto
+        .trim()
+        .eq_ignore_ascii_case("EXISTS")
+        .then(|| numero.parse().ok())
+        .flatten()
+}
+
+/// Cuántos resultados trae un `* SEARCH 3 5 9`.
+///
+/// Se cuentan y no se leen: los números son identificadores de mensaje y lo
+/// único que hace falta es cuántos hay.
+pub fn resultados_de_search(linea: &str) -> Option<u32> {
+    let sin_asterisco = linea.strip_prefix("* ")?;
+    let resto = sin_asterisco.strip_prefix("SEARCH").or_else(|| {
+        sin_asterisco
+            .to_ascii_uppercase()
+            .starts_with("SEARCH")
+            .then(|| &sin_asterisco["SEARCH".len()..])
+    })?;
+    Some(resto.split_whitespace().count() as u32)
+}
+
+/// Saca una línea del búfer, si ya hay una entera.
+///
+/// Aparte de la sesión para poder probarla: el búfer es lo que hace que esperar
+/// con reloj sea seguro, y esa propiedad merece un test que no necesite una
+/// conexión de verdad.
+pub fn linea_del_buffer(pendiente: &mut Vec<u8>) -> Option<String> {
+    let fin = pendiente.iter().position(|b| *b == b'\n')?;
+    let linea: Vec<u8> = pendiente.drain(..=fin).collect();
+    Some(String::from_utf8_lossy(&linea).trim_end().to_string())
+}
+
+/// Si una línea que llegó durante IDLE dice que algo cambió.
+///
+/// `EXISTS` es correo nuevo, `EXPUNGE` es un mensaje borrado y `FETCH` es una
+/// marca que cambió —leído, sin leer— desde otro dispositivo. Los tres importan
+/// para el contador.
+///
+/// `RECENT` **no** alcanza por sí solo: hay servidores que lo mandan junto con
+/// el `EXISTS` y otros que lo repiten sin que haya nada nuevo, así que actuar
+/// sobre él sería despertarse de más. Cuando hay algo de verdad, viene el
+/// `EXISTS`.
+pub fn anuncia_cambio(linea: &str) -> bool {
+    let Some(resto) = linea.strip_prefix("* ") else {
+        return false;
+    };
+    let mayusculas = resto.to_ascii_uppercase();
+    // `n EXISTS`, `n EXPUNGE`, `n FETCH (...)`: siempre el número primero.
+    let Some((numero, cola)) = mayusculas.split_once(' ') else {
+        return false;
+    };
+    if numero.parse::<u32>().is_err() {
+        return false;
+    }
+    cola.starts_with("EXISTS") || cola.starts_with("EXPUNGE") || cola.starts_with("FETCH")
 }
 
 // ---------------------------------------------------------------------------
@@ -169,8 +248,20 @@ fn tls() -> Result<TlsConnector, ImapError> {
 type Flujo = tokio_rustls::client::TlsStream<TcpStream>;
 
 pub struct Sesion {
-    lector: BufReader<Flujo>,
+    flujo: Flujo,
+    /// Lo que se leyó del socket y todavía no se consumió como línea.
+    ///
+    /// El búfer es **nuestro** y no de un `BufReader`, y eso es lo que hace que
+    /// leer con tiempo límite sea seguro. `read_line` no se puede cancelar sin
+    /// perder datos: si el temporizador gana, lo que ya había leído en la cadena
+    /// se pierde. Con IDLE eso pasaría cada vez que hay que renovar la espera, y
+    /// el síntoma sería una respuesta cortada al azar cada media hora.
+    ///
+    /// `read_buf` sobre un búfer propio sí se puede cancelar: lo leído queda
+    /// acá, y la próxima lectura sigue donde iba.
+    pendiente: Vec<u8>,
     etiqueta: u32,
+    capacidades: Vec<String>,
 }
 
 impl Sesion {
@@ -212,14 +303,26 @@ impl Sesion {
             .await
             .map_err(|e| ImapError::Fallo(format!("no se pudo cifrar la conexión: {e}")))?;
 
-        let mut sesion = Sesion { lector: BufReader::new(cifrado), etiqueta: 0 };
+        let mut sesion = Sesion {
+            flujo: cifrado,
+            pendiente: Vec::new(),
+            etiqueta: 0,
+            capacidades: Vec::new(),
+        };
 
         let saludo = sesion.leer_linea().await?;
         if saludo.starts_with("* BYE") {
             return Err(ImapError::Fallo(format!("el servidor cerró la conexión: {saludo}")));
         }
+        // Muchos servidores las pegan al saludo; si vienen, una vuelta menos.
+        sesion.capacidades = capacidades_de(&saludo);
 
         sesion.autenticar(&destino.credencial).await?;
+
+        // Después de autenticarse las capacidades pueden cambiar —IDLE suele
+        // anunciarse recién ahí— así que se vuelven a pedir. Preguntarlo antes
+        // sería quedarse con una lista que no vale.
+        sesion.refrescar_capacidades().await?;
         Ok(sesion)
     }
 
@@ -247,41 +350,190 @@ impl Sesion {
         }
     }
 
-    /// Cuántos mensajes y cuántos sin leer hay en una casilla.
-    pub async fn estado(&mut self, casilla: &str) -> Result<Estado, ImapError> {
+    /// Le pone tope a un intercambio.
+    ///
+    /// El error dice que fue un tiempo agotado y no un fallo cualquiera, porque
+    /// quien lo recibe lo trata como conexión cortada y reconecta — que es
+    /// justamente lo que hay que hacer con un servidor que dejó de contestar.
+    async fn con_tope<T>(
+        que: &str,
+        futuro: impl std::future::Future<Output = Result<T, ImapError>>,
+    ) -> Result<T, ImapError> {
+        tokio::time::timeout(INTERCAMBIO, futuro)
+            .await
+            .unwrap_or_else(|_| {
+                Err(ImapError::Fallo(format!(
+                    "el servidor dejó de contestar durante {que} ({}s)",
+                    INTERCAMBIO.as_secs()
+                )))
+            })
+    }
+
+    /// Si el servidor sabe avisar en vez de que haya que preguntarle.
+    pub fn soporta_idle(&self) -> bool {
+        self.capacidades.iter().any(|c| c == "IDLE")
+    }
+
+    async fn refrescar_capacidades(&mut self) -> Result<(), ImapError> {
+        let etiqueta = self.siguiente_etiqueta();
+        self.escribir(&format!("{etiqueta} CAPABILITY")).await?;
+
+        let vistas = Self::con_tope("la lista de capacidades", async {
+            let mut vistas = Vec::new();
+            loop {
+                let linea = self.leer_linea().await?;
+                let anunciadas = capacidades_de(&linea);
+                if !anunciadas.is_empty() {
+                    vistas = anunciadas;
+                }
+                match respuesta_de(&linea, &etiqueta) {
+                    Some(Respuesta::Ok) => return Ok(vistas),
+                    Some(Respuesta::No(d)) | Some(Respuesta::Bad(d)) => {
+                        return Err(ImapError::Fallo(format!("CAPABILITY falló: {d}")))
+                    }
+                    None => continue,
+                }
+            }
+        })
+        .await?;
+
+        if !vistas.is_empty() {
+            self.capacidades = vistas;
+        }
+        Ok(())
+    }
+
+    /// Abre una casilla **en sólo lectura** y devuelve cuántos mensajes tiene.
+    ///
+    /// `EXAMINE` y no `SELECT`: los dos sirven para IDLE, pero `SELECT` puede
+    /// borrar la marca de reciente y, según el servidor, tocar banderas. Este
+    /// proceso cuenta correo; no tiene por qué cambiar nada de la casilla de
+    /// nadie.
+    pub async fn examinar(&mut self, casilla: &str) -> Result<u32, ImapError> {
         let nombre = comillas(casilla)
             .ok_or_else(|| ImapError::Fallo("el nombre de la casilla no es válido".into()))?;
 
         let etiqueta = self.siguiente_etiqueta();
-        self.escribir(&format!("{etiqueta} STATUS {nombre} (MESSAGES UNSEEN)"))
-            .await?;
+        self.escribir(&format!("{etiqueta} EXAMINE {nombre}")).await?;
 
-        let mut estado = None;
-        loop {
-            let linea = self.leer_linea().await?;
-            if linea.to_uppercase().starts_with("* STATUS") {
-                estado = estado_de(&linea);
-                continue;
-            }
-            match respuesta_de(&linea, &etiqueta) {
-                Some(Respuesta::Ok) => break,
-                Some(Respuesta::No(d)) | Some(Respuesta::Bad(d)) => {
-                    return Err(ImapError::Fallo(format!(
-                        "el servidor no pudo mirar «{casilla}»: {d}"
-                    )))
+        Self::con_tope("abrir la casilla", async {
+            let mut mensajes = 0;
+            loop {
+                let linea = self.leer_linea().await?;
+                if let Some(n) = exists_de(&linea) {
+                    mensajes = n;
                 }
-                None => continue,
+                match respuesta_de(&linea, &etiqueta) {
+                    Some(Respuesta::Ok) => return Ok(mensajes),
+                    Some(Respuesta::No(d)) | Some(Respuesta::Bad(d)) => {
+                        return Err(ImapError::Fallo(format!(
+                            "no se pudo abrir «{casilla}»: {d}"
+                        )))
+                    }
+                    None => continue,
+                }
+            }
+        })
+        .await
+    }
+
+    /// Cuántos sin leer hay en la casilla abierta.
+    ///
+    /// Con `SEARCH` y no con `STATUS`: el estándar dice que `STATUS` no se use
+    /// sobre la casilla que está abierta, y hay servidores que directamente
+    /// contestan un error.
+    pub async fn sin_leer(&mut self) -> Result<u32, ImapError> {
+        let etiqueta = self.siguiente_etiqueta();
+        self.escribir(&format!("{etiqueta} SEARCH UNSEEN")).await?;
+
+        Self::con_tope("contar los sin leer", async {
+            let mut cuantos = 0;
+            loop {
+                let linea = self.leer_linea().await?;
+                if let Some(n) = resultados_de_search(&linea) {
+                    cuantos = n;
+                }
+                match respuesta_de(&linea, &etiqueta) {
+                    Some(Respuesta::Ok) => return Ok(cuantos),
+                    Some(Respuesta::No(d)) | Some(Respuesta::Bad(d)) => {
+                        return Err(ImapError::Fallo(format!("SEARCH falló: {d}")))
+                    }
+                    None => continue,
+                }
+            }
+        })
+        .await
+    }
+
+    /// Espera a que el servidor avise que algo cambió.
+    ///
+    /// Vuelve cuando hay novedades o cuando se cumple `maximo`, lo que pase
+    /// primero. **Hay que volver a llamarla**: el estándar pide renovar la
+    /// espera al menos cada veintinueve minutos, porque si no el servidor —o
+    /// cualquier NAT en el medio— corta la conexión por inactividad.
+    pub async fn esperar(&mut self, maximo: Duration) -> Result<Novedad, ImapError> {
+        let etiqueta = self.siguiente_etiqueta();
+        self.escribir(&format!("{etiqueta} IDLE")).await?;
+
+        // El servidor contesta `+ idling` antes de empezar. Si en vez de eso
+        // manda un `NO`, es que no acepta IDLE aunque lo haya anunciado.
+        //
+        // Con tope: esperar acá sin límite es cómo una cuenta queda muda para
+        // siempre contra un servidor que dejó de escribir sin cerrar.
+        Self::con_tope("el comienzo de la espera", async {
+            loop {
+                let linea = self.leer_linea().await?;
+                if linea.starts_with('+') {
+                    return Ok(());
+                }
+                if let Some(Respuesta::No(d)) | Some(Respuesta::Bad(d)) =
+                    respuesta_de(&linea, &etiqueta)
+                {
+                    return Err(ImapError::Fallo(format!("el servidor no acepta IDLE: {d}")));
+                }
+            }
+        })
+        .await?;
+
+        let hasta = tokio::time::Instant::now() + maximo;
+        let mut novedad = Novedad::Vencio;
+        loop {
+            let queda = hasta.saturating_duration_since(tokio::time::Instant::now());
+            if queda.is_zero() {
+                break;
+            }
+            // Cancelar esta lectura no pierde nada: el búfer es nuestro.
+            match tokio::time::timeout(queda, self.leer_linea()).await {
+                Err(_) => break,
+                Ok(Err(e)) => return Err(e),
+                Ok(Ok(linea)) => {
+                    if anuncia_cambio(&linea) {
+                        novedad = Novedad::Cambio;
+                        break;
+                    }
+                }
             }
         }
 
-        estado.ok_or_else(|| {
-            ImapError::Fallo(format!("el servidor no dijo el estado de «{casilla}»"))
+        // `DONE` va **sin etiqueta**: es la única línea del protocolo que no
+        // lleva una, y ponérsela hace que el servidor no la reconozca y la
+        // sesión quede colgada esperando.
+        self.escribir("DONE").await?;
+        Self::con_tope("el fin de la espera", async {
+            loop {
+                let linea = self.leer_linea().await?;
+                match respuesta_de(&linea, &etiqueta) {
+                    Some(Respuesta::Ok) => return Ok(()),
+                    Some(Respuesta::No(d)) | Some(Respuesta::Bad(d)) => {
+                        return Err(ImapError::Fallo(format!("IDLE terminó mal: {d}")))
+                    }
+                    None => continue,
+                }
+            }
         })
-    }
+        .await?;
 
-    pub async fn cerrar(mut self) {
-        let etiqueta = self.siguiente_etiqueta();
-        let _ = self.escribir(&format!("{etiqueta} LOGOUT")).await;
+        Ok(novedad)
     }
 
     fn siguiente_etiqueta(&mut self) -> String {
@@ -294,50 +546,62 @@ impl Sesion {
         let etiqueta = self.siguiente_etiqueta();
         self.escribir(&format!("{etiqueta} {comando}")).await?;
 
-        loop {
-            let linea = self.leer_linea().await?;
-            match respuesta_de(&linea, &etiqueta) {
-                Some(Respuesta::Ok) => return Ok(()),
-                // `NO` es el servidor entendiendo y diciendo que no: casi
-                // siempre, credenciales. Se distingue porque insistir con una
-                // contraseña rechazada es cómo se bloquea una cuenta.
-                Some(Respuesta::No(d)) => return Err(ImapError::Rechazado(d)),
-                Some(Respuesta::Bad(d)) => {
-                    return Err(ImapError::Fallo(format!("el servidor no entendió: {d}")))
+        Self::con_tope("la respuesta al comando", async {
+            loop {
+                let linea = self.leer_linea().await?;
+                match respuesta_de(&linea, &etiqueta) {
+                    Some(Respuesta::Ok) => return Ok(()),
+                    // `NO` es el servidor entendiendo y diciendo que no: casi
+                    // siempre, credenciales. Se distingue porque insistir con una
+                    // contraseña rechazada es cómo se bloquea una cuenta.
+                    Some(Respuesta::No(d)) => return Err(ImapError::Rechazado(d)),
+                    Some(Respuesta::Bad(d)) => {
+                        return Err(ImapError::Fallo(format!("el servidor no entendió: {d}")))
+                    }
+                    None => continue,
                 }
-                None => continue,
             }
-        }
+        })
+        .await
     }
 
     async fn escribir(&mut self, linea: &str) -> Result<(), ImapError> {
-        let flujo: &mut (dyn AsyncWrite + Unpin + Send) = self.lector.get_mut();
-        flujo
-            .write_all(linea.as_bytes())
-            .await
-            .and_then(|_| std::future::ready(Ok(())).into_inner())
-            .map_err(|e| ImapError::Fallo(format!("no se pudo escribir: {e}")))?;
-        flujo
-            .write_all(b"\r\n")
-            .await
-            .map_err(|e| ImapError::Fallo(format!("no se pudo escribir: {e}")))?;
-        flujo
-            .flush()
+        let escribir = async {
+            self.flujo.write_all(linea.as_bytes()).await?;
+            self.flujo.write_all(b"\r\n").await?;
+            self.flujo.flush().await
+        };
+        escribir
             .await
             .map_err(|e| ImapError::Fallo(format!("no se pudo escribir: {e}")))
     }
 
+    /// Lee una línea, y **se puede cancelar sin perder nada**.
+    ///
+    /// Todo lo que llega del socket va a un búfer propio antes de partirse en
+    /// líneas, así que si quien llama abandona la espera —con un tiempo límite,
+    /// por ejemplo— lo leído sigue ahí para la próxima. Es lo que hace posible
+    /// esperar en IDLE con un reloj al lado.
     async fn leer_linea(&mut self) -> Result<String, ImapError> {
-        let mut linea = String::new();
-        let leidos = tokio::io::AsyncReadExt::take(&mut self.lector, MAX_LINEA)
-            .read_line(&mut linea)
-            .await
-            .map_err(|e| ImapError::Fallo(format!("no se pudo leer: {e}")))?;
+        loop {
+            if let Some(linea) = linea_del_buffer(&mut self.pendiente) {
+                return Ok(linea);
+            }
+            if self.pendiente.len() as u64 > MAX_LINEA {
+                return Err(ImapError::Fallo(
+                    "el servidor mandó una línea sin fin".into(),
+                ));
+            }
 
-        if leidos == 0 {
-            return Err(ImapError::Fallo("el servidor cortó la conexión".into()));
+            let leidos = self
+                .flujo
+                .read_buf(&mut self.pendiente)
+                .await
+                .map_err(|e| ImapError::Fallo(format!("no se pudo leer: {e}")))?;
+            if leidos == 0 {
+                return Err(ImapError::Fallo("el servidor cortó la conexión".into()));
+            }
         }
-        Ok(linea.trim_end().to_string())
     }
 }
 
@@ -394,60 +658,119 @@ mod tests {
         assert_eq!(respuesta_de("+ continuá", "a1"), None);
     }
 
-    /// El orden de los elementos del STATUS lo elige el servidor: el estándar no
-    /// lo fija. Leerlos por posición anda contra unos y contra otros no, que es
-    /// la peor clase de error.
-    #[test]
-    fn el_estado_se_lee_por_nombre_y_no_por_posicion() {
-        let esperado = Estado { mensajes: 42, sin_leer: 7 };
 
-        assert_eq!(
-            estado_de("* STATUS \"INBOX\" (MESSAGES 42 UNSEEN 7)"),
-            Some(esperado)
-        );
-        // Al revés, y con algo más en el medio.
-        assert_eq!(
-            estado_de("* STATUS INBOX (UNSEEN 7 RECENT 3 MESSAGES 42)"),
-            Some(esperado)
-        );
-        // Y sin importar mayúsculas.
-        assert_eq!(
-            estado_de("* status INBOX (messages 42 unseen 7)"),
-            Some(esperado)
-        );
+
+
+
+    /// Las capacidades llegan de dos formas y hay servidores que sólo usan una:
+    /// pegadas al saludo entre corchetes, o en su propia línea. Leer sólo una
+    /// haría que IDLE se diera por no soportado contra la mitad de los
+    /// servidores que sí lo tienen.
+    #[test]
+    fn las_capacidades_se_leen_del_saludo_y_de_su_propia_linea() {
+        let del_saludo = capacidades_de("* OK [CAPABILITY IMAP4rev1 IDLE LITERAL+] listo");
+        assert!(del_saludo.contains(&"IDLE".to_string()));
+        assert!(del_saludo.contains(&"IMAP4REV1".to_string()));
+        // Y no se lleva lo que viene después del corchete.
+        assert!(!del_saludo.iter().any(|c| c.contains("LISTO")));
+
+        let de_su_linea = capacidades_de("* CAPABILITY IMAP4rev1 IDLE UIDPLUS");
+        assert!(de_su_linea.contains(&"IDLE".to_string()));
+        assert!(de_su_linea.contains(&"UIDPLUS".to_string()));
     }
 
-    /// Un servidor puede no informar UNSEEN. Cero es la respuesta correcta —no
-    /// hay nada que avisar— y no un fallo que deje la cuenta sin sincronizar.
+    /// En minúsculas también: el protocolo no distingue, y un servidor que
+    /// anuncie `idle` soporta IDLE igual.
     #[test]
-    fn sin_unseen_no_hay_nada_sin_leer() {
-        assert_eq!(
-            estado_de("* STATUS INBOX (MESSAGES 5)"),
-            Some(Estado { mensajes: 5, sin_leer: 0 })
-        );
-    }
-
-    /// Una casilla con paréntesis en el nombre no puede correr los campos: se
-    /// lee desde el **último** paréntesis de apertura.
-    #[test]
-    fn un_nombre_con_parentesis_no_corre_los_campos() {
-        assert_eq!(
-            estado_de("* STATUS \"Archivo (viejo)\" (MESSAGES 3 UNSEEN 1)"),
-            Some(Estado { mensajes: 3, sin_leer: 1 })
-        );
+    fn las_capacidades_no_distinguen_mayusculas() {
+        assert!(capacidades_de("* capability imap4rev1 idle").contains(&"IDLE".to_string()));
     }
 
     #[test]
-    fn lo_que_no_es_un_estado_no_devuelve_nada() {
-        for basura in [
-            "",
-            "* STATUS INBOX",
-            "* STATUS INBOX ()",
-            "* STATUS INBOX (UNSEEN 7)",
-            "* OK otra cosa",
-            "* STATUS INBOX (MESSAGES muchos)",
-        ] {
-            assert_eq!(estado_de(basura), None, "{basura:?} no es un estado");
+    fn una_linea_sin_capacidades_no_devuelve_ninguna() {
+        for otra in ["", "* OK listo", "a1 OK", "* 5 EXISTS"] {
+            assert!(capacidades_de(otra).is_empty(), "{otra:?}");
         }
+    }
+
+    #[test]
+    fn se_lee_cuantos_mensajes_hay() {
+        assert_eq!(exists_de("* 42 EXISTS"), Some(42));
+        assert_eq!(exists_de("* 0 EXISTS"), Some(0));
+        // Y no se confunde con otras respuestas que también llevan un número.
+        for otra in ["* 3 RECENT", "* 7 EXPUNGE", "* OK listo", "", "* EXISTS"] {
+            assert_eq!(exists_de(otra), None, "{otra:?}");
+        }
+    }
+
+    /// Los números del SEARCH son identificadores de mensaje: lo único que hace
+    /// falta es cuántos hay. Sumarlos, que es el error fácil, daría un contador
+    /// disparatado.
+    #[test]
+    fn del_search_se_cuentan_los_resultados() {
+        assert_eq!(resultados_de_search("* SEARCH 3 5 9"), Some(3));
+        assert_eq!(resultados_de_search("* SEARCH 100"), Some(1));
+        // Sin resultados: la casilla está toda leída.
+        assert_eq!(resultados_de_search("* SEARCH"), Some(0));
+        assert_eq!(resultados_de_search("* search 1 2"), Some(2));
+        assert_eq!(resultados_de_search("* OK listo"), None);
+    }
+
+    /// Qué avisos hacen que valga la pena volver a contar.
+    ///
+    /// `EXISTS` es correo nuevo, `EXPUNGE` un borrado y `FETCH` una marca que
+    /// cambió desde otro dispositivo. `RECENT` **no**: hay servidores que lo
+    /// repiten sin que haya nada nuevo, y despertarse por él sería contar de más
+    /// sin motivo.
+    #[test]
+    fn se_reconoce_lo_que_cambia_de_lo_que_no() {
+        for cambio in ["* 5 EXISTS", "* 3 EXPUNGE", "* 2 FETCH (FLAGS (\\Seen))", "* 12 exists"] {
+            assert!(anuncia_cambio(cambio), "{cambio:?} tenía que despertar");
+        }
+        for quieto in [
+            "* 3 RECENT",
+            "* OK todavía nada",
+            "+ idling",
+            "a1 OK IDLE terminated",
+            "",
+            "* CAPABILITY IMAP4rev1",
+        ] {
+            assert!(!anuncia_cambio(quieto), "{quieto:?} no tenía que despertar");
+        }
+    }
+
+    /// El búfer propio es lo que hace que se pueda esperar con reloj: sin él,
+    /// cancelar una lectura a medias perdería lo leído y la respuesta siguiente
+    /// llegaría cortada.
+    #[test]
+    fn las_lineas_salen_del_buffer_de_a_una() {
+        let mut pendiente = b"* OK uno\r\n* OK dos\r\n* OK incom".to_vec();
+
+        assert_eq!(linea_del_buffer(&mut pendiente).as_deref(), Some("* OK uno"));
+        assert_eq!(linea_del_buffer(&mut pendiente).as_deref(), Some("* OK dos"));
+        // La tercera está a medias: no se entrega hasta que llegue su fin de
+        // línea, y lo leído sigue en el búfer esperándola.
+        assert_eq!(linea_del_buffer(&mut pendiente), None);
+        assert_eq!(pendiente, b"* OK incom");
+    }
+
+    /// La propiedad que hace posible esperar con reloj: si la espera se
+    /// abandona a mitad de una línea, lo leído **no se pierde**.
+    ///
+    /// Con el `read_line` de un `BufReader` esto no se cumple —está documentado
+    /// que cancelar pierde lo leído— y el síntoma sería una respuesta cortada al
+    /// azar cada media hora, cuando IDLE renueva la espera.
+    #[test]
+    fn lo_leido_a_medias_sigue_ahi_para_la_proxima() {
+        let mut pendiente = Vec::new();
+
+        // Llega media línea y la espera se abandona.
+        pendiente.extend_from_slice(b"* 5 EX");
+        assert_eq!(linea_del_buffer(&mut pendiente), None);
+
+        // Llega el resto: la línea sale entera.
+        pendiente.extend_from_slice(b"ISTS\r\n");
+        assert_eq!(linea_del_buffer(&mut pendiente).as_deref(), Some("* 5 EXISTS"));
+        assert!(pendiente.is_empty());
     }
 }
