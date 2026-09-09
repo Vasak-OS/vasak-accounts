@@ -1,0 +1,40 @@
+[Unit]
+Description=VasakOS — mantiene al día el correo de las cuentas en línea
+Documentation=https://github.com/Vasak-OS/vasak-accounts
+# Una unidad **de usuario**, no del sistema, y ésa es la decisión de diseño
+# entera: este proceso habla IMAP con los servidores de correo de la persona, o
+# sea que lee lo que manda un servidor cualquiera. El servicio de cuentas corre
+# como root —los tokens están en archivos de root— y meter ahí un cliente de
+# correo sería poner un parser de red detrás de los permisos más altos del
+# sistema.
+#
+# Le pide los tokens al servicio por D-Bus, como cualquier otra aplicación, y
+# pasando por la puerta de permisos.
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/vasak-accounts-sync
+Restart=on-failure
+RestartSec=10
+
+# Corre con la cuenta de la persona, así que lo que se le puede sacar es lo que
+# no necesita. Nada de esto reemplaza al motivo de que sea un proceso aparte:
+# eso lo da el usuario bajo el que corre.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+# AF_INET para hablar con los servidores de correo; AF_UNIX para los dos buses.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=graphical-session.target
