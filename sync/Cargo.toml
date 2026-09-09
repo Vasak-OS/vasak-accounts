@@ -1,0 +1,23 @@
+[package]
+name = "vasak-accounts-sync"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Mantiene al día el correo de las cuentas en línea, como servicio del usuario"
+
+[dependencies]
+zbus.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tokio-rustls.workspace = true
+rustls-native-certs.workspace = true
+# Para el usuario y la contraseña de las cuentas con contraseña de aplicación,
+# y para el XOAUTH2 de las que usan token.
+base64 = "0.22"
+# Para el flujo de señales de D-Bus.
+futures-util = "0.3"

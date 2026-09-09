@@ -20,7 +20,8 @@ con ellos vive en otras aplicaciones:
 
 | Pieza | Qué hace |
 |---|---|
-| **Este servicio** + su pantalla en `vasak-settings` | Alta y baja de cuentas, secretos, OAuth, y **qué apps tienen acceso** |
+| **`vasak-accounts`** (root) + su pantalla en `vasak-settings` | Alta y baja de cuentas, secretos, OAuth, y **qué apps tienen acceso** |
+| **`vasak-accounts-sync`** (el usuario) | Mantiene al día el correo. Ver abajo. |
 | **App de calendario** | Ver y crear eventos de las distintas cuentas |
 | **App de correo** | Ver el correo y redactar/enviar |
 | **File manager** | Discos en la nube |
@@ -304,24 +305,32 @@ pub struct Account {
 
 ```text
 vasak-accounts/
-├── Cargo.toml
+├── Cargo.toml            # el workspace
 ├── README.md
-├── packaging/
-│   ├── vasak-accounts.service                    # unidad de sistema, Type=dbus
-│   ├── ar.net.vasak.os.AccountManager.service    # activación por D-Bus
-│   └── ar.net.vasak.os.AccountManager.conf       # política del bus: sólo root es dueño
-│   └── providers.d/                              # catálogo, sin client_id
-└── src/
-    ├── main.rs          # los métodos D-Bus
-    ├── storage.rs       # cuentas, secretos y capacidades
-    ├── auth.rs          # PinnedCaller: identidad fijada con pidfd
-    ├── permissions.rs   # la consulta a vasak-permissions
-    ├── providers.rs     # el catálogo de proveedores
-    ├── pending.rs       # flujos a medio terminar (sólo en memoria)
-    └── protocols/
-        ├── mod.rs
-        ├── nextcloud.rs # Login Flow v2: sin registrar nada con nadie
-        └── oauth2.rs    # armado de la URL, canje y refresco
+├── daemon/               # el servicio de root
+│   ├── packaging/
+│   │   ├── vasak-accounts.service                 # unidad de sistema, Type=dbus
+│   │   ├── ar.net.vasak.os.AccountManager.service # activación por D-Bus
+│   │   ├── ar.net.vasak.os.AccountManager.conf    # política: sólo root es dueño
+│   │   └── providers.d/                           # catálogo, sin client_id
+│   └── src/
+│       ├── main.rs          # los métodos D-Bus
+│       ├── storage.rs       # cuentas, secretos y capacidades
+│       ├── auth.rs          # PinnedCaller: identidad fijada con pidfd
+│       ├── permissions.rs   # la consulta a vasak-permissions
+│       ├── providers.rs     # el catálogo y las credenciales propias
+│       ├── pending.rs       # flujos a medio terminar (sólo en memoria)
+│       └── protocols/
+│           ├── nextcloud.rs # Login Flow v2: sin registrar nada con nadie
+│           └── oauth2.rs    # armado de la URL, canje y refresco
+└── sync/                 # el servicio del usuario
+    ├── packaging/
+    │   ├── vasak-accounts-sync.service            # unidad de **usuario**
+    │   └── ar.net.vasak.os.AccountsSync.service   # activación por D-Bus
+    └── src/
+        ├── main.rs          # el bucle y la interfaz de sesión
+        ├── broker.rs        # le pide al servicio, como cualquier aplicación
+        └── imap.rs          # lo justo para contar el correo sin leer
 ```
 
 ---
@@ -359,6 +368,50 @@ controla le estaría dando sus peticiones a lo que reclame ese nombre.
 `RUST_LOG` acepta `info` (por omisión), `debug` y `trace`.
 
 ---
+
+## Los dos binarios
+
+El repositorio tiene dos, y hacen cosas deliberadamente distintas.
+
+| | Corre como | Bus | Qué toca |
+|---|---|---|---|
+| `vasak-accounts` | **root** | sistema | Cuentas, tokens, permisos. De la red, sólo el JSON de un endpoint de OAuth2. |
+| `vasak-accounts-sync` | **la persona** | sesión | Habla IMAP con los servidores de correo de la persona. |
+
+La separación es el punto. Hablar IMAP es leer lo que manda un servidor
+cualquiera, y eso no puede pasar por un proceso de root: si un parser falla, lo
+que se compromete son los permisos más altos del sistema. Es el mismo criterio
+por el que la prueba de conexión y el autodescubrimiento viven en la ventana de
+configuración.
+
+**El sync no tiene ningún atajo por estar en el mismo repositorio.** Le pide los
+tokens al servicio por el mismo método D-Bus que usaría una aplicación de
+terceros, y la primera vez la persona ve el mismo diálogo de permiso. Eso es
+media razón de que se haya escrito antes que la aplicación de correo: es el
+primer cliente real del modelo de permisos, así que lo ejercita de punta a punta
+antes de que dependa de él algo que la gente usa.
+
+### Qué hace el sync hoy, y qué no
+
+Cuenta el correo sin leer de cada cuenta y lo publica en
+`ar.net.vasak.os.AccountsSync` (bus de sesión), con una señal `MailboxChanged`
+cuando cambia.
+
+**No guarda mensajes**, y no es una etapa a medio hacer: un caché sería
+inventarle un formato a una aplicación de correo que todavía no existe, y el día
+que exista va a querer otro. Contar sin leer sirve hoy —el escritorio puede
+mostrar que llegó algo— y se apoya en `STATUS`, que devuelve cuatro números: ni
+una línea de parser sobre lo que escribió un remitente desconocido. Ese parser
+va a llegar, y va a merecer su propia discusión.
+
+Mira cada cinco minutos, y también cuando el servicio avisa que cambió algo —así
+conectar una cuenta muestra su correo en el momento—. Ese mismo intervalo es lo
+que mantiene los tokens frescos: pedirlos es lo que hace que el servicio los
+refresque, así que no hace falta una tarea aparte.
+
+Una cuenta cuyo servidor rechaza las credenciales **deja de mirarse** hasta que
+algo cambie. Insistir con una contraseña rechazada es cómo se bloquea una
+cuenta, y en un bucle de cinco minutos serían casi trescientos intentos por día.
 
 ## Nextcloud: el único que no hay que configurar
 
@@ -486,7 +539,9 @@ No caduca, no depende de ningún registro y no cuesta nada.
 | Nextcloud Login Flow v2 | ✅ |
 | Prueba de conexión al registrar IMAP/SMTP | ⛔ falta |
 | CalDAV/CardDAV con autodescubrimiento | ⛔ falta |
-| Loop de sincronización de correo (`vasak-accounts-sync`) | ⛔ falta |
+| Contador de correo sin leer (`vasak-accounts-sync`) | ✅ |
+| IMAP IDLE, para que avise en vez de preguntar | ⛔ falta |
+| Caché de mensajes para la aplicación de correo | ⛔ falta (y a propósito: no existe la app) |
 
 Con Nextcloud adentro, el modelo de cuentas funciona de punta a punta **sin
 depender de nadie**: es el único proveedor donde eso es posible hoy. Lo que

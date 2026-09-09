@@ -1,0 +1,42 @@
+# Dos binarios que hacen cosas deliberadamente distintas.
+#
+# `daemon` corre como **root** en el bus del sistema: guarda las cuentas, los
+# tokens, y decide quién llega a ellos. Es chico a propósito y lo único que
+# parsea de la red son las respuestas JSON de un endpoint de OAuth2.
+#
+# `sync` corre como **el usuario**, en su propia sesión: habla IMAP con los
+# servidores de correo de la persona. Eso es parsear lo que manda un servidor
+# cualquiera, y no puede pasar por un proceso de root — es la misma razón por la
+# que la prueba de conexión y el autodescubrimiento viven en la ventana de
+# configuración y no en el servicio.
+#
+# El sync le pide los tokens al daemon **pasando por la puerta de permisos, como
+# cualquier otra aplicación**. No tiene ningún atajo por estar en el mismo
+# repositorio, y eso es a propósito: es el primer cliente real del modelo de
+# permisos y sirve para ejercitarlo de punta a punta.
+[workspace]
+resolver = "2"
+members = ["daemon", "sync"]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2021"
+authors = ["Vasak Group", "Joaquin (Pato) Decima"]
+license = "GPL-3.0-only"
+
+[workspace.dependencies]
+zbus = { version = "4", features = ["tokio"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+url = "2"
+# rustls y no native-tls: es Rust puro, así que no suma bibliotecas compartidas
+# al paquete.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-native-certs = "0.8"
+
+[profile.release]
+opt-level = 2
