@@ -275,6 +275,49 @@ fn misma_procedencia(a: &str, b: &str) -> bool {
         && a.port_or_known_default() == b.port_or_known_default()
 }
 
+/// Borra en el servidor la contraseña de aplicación que se está usando.
+///
+/// Nextcloud no habla RFC 7009 —no hay tokens que revocar— pero tiene lo
+/// equivalente: un `DELETE` que borra la credencial con la que se hace el
+/// pedido. Se autentica con esa misma contraseña, así que el efecto es que la
+/// credencial se borra a sí misma.
+///
+/// Sin esto, borrar la cuenta acá deja la entrada viva en «Dispositivos y
+/// sesiones» del servidor de la persona, con el nombre «VasakOS» y una
+/// contraseña que sigue funcionando.
+pub async fn revoke_app_password(
+    server: &str,
+    usuario: &str,
+    app_password: &str,
+) -> Result<(), NextcloudError> {
+    let url = format!("{server}/ocs/v2.php/core/apppassword");
+
+    let respuesta = cliente()?
+        .delete(&url)
+        .basic_auth(usuario, Some(app_password))
+        // Sin esta cabecera Nextcloud rechaza cualquier pedido a la API de OCS
+        // con un 412, y el mensaje no dice que falta.
+        .header("OCS-APIRequest", "true")
+        .send()
+        .await
+        .map_err(|e| NextcloudError::Failed(format!("no se pudo avisar a {server}: {e}")))?;
+
+    let estado = respuesta.status();
+    if estado.is_success() {
+        return Ok(());
+    }
+
+    // 401 es «esa contraseña ya no vale»: alguien la borró desde el servidor,
+    // que es lo que se quería lograr.
+    if estado == reqwest::StatusCode::UNAUTHORIZED {
+        return Ok(());
+    }
+
+    Err(NextcloudError::Failed(format!(
+        "{server} respondió {estado} al borrar la contraseña de aplicación"
+    )))
+}
+
 /// Las rutas DAV de una cuenta, a partir del servidor y el usuario.
 ///
 /// Se guardan al conectar para que las aplicaciones no tengan que saber cómo se

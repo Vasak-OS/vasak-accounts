@@ -21,6 +21,11 @@ token_url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 
 # client_id = "00000000-0000-0000-0000-000000000000"
 
+# Sin revocation_url: Microsoft no expone un endpoint de revocación como el que
+# define RFC 7009. El acceso se quita desde la página de la cuenta, en
+# «Aplicaciones y servicios con acceso». Al borrar una cuenta acá se dice que eso
+# quedó pendiente, en vez de fingir que se revocó.
+
 [scopes]
 # `offline_access` es lo que hace que Microsoft devuelva refresh_token. Va en
 # cada capacidad porque los alcances se piden juntos y esta es la lista de la

@@ -304,7 +304,7 @@ async fn refresh(
 }
 
 /// Reconstruye el proveedor desde lo que quedó guardado al conectar la cuenta.
-fn provider_desde_config(
+pub fn provider_desde_config(
     uid: u32,
     cuenta: &Account,
     config: &serde_json::Value,
@@ -329,6 +329,12 @@ fn provider_desde_config(
         kind: crate::providers::ProviderKind::Oauth2,
         auth_url: Some(campo("auth_url")?),
         token_url: Some(campo("token_url")?),
+        // Opcional: hay proveedores que no tienen dónde avisar, y una cuenta
+        // guardada antes de que esto existiera tampoco lo tiene.
+        revocation_url: config
+            .get("revocation_url")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
         client_id: Some(campo("client_id")?),
         // Si el proveedor no usa secreto no hay ninguno guardado, y eso es
         // normal: no puede ser un error.
@@ -388,6 +394,63 @@ pub fn persistir(
     Ok(())
 }
 
+/// Le avisa al proveedor que esta autorización ya no vale (RFC 7009).
+///
+/// Se manda el **refresh_token** y no el de acceso: revocar el refresh invalida
+/// toda la concesión —incluidos los de acceso que salieron de él—, mientras que
+/// revocar uno de acceso deja al otro vivo y la aplicación seguiría figurando
+/// entre las que tienen permiso.
+///
+/// El estándar pide que el servidor conteste 200 aunque el token ya no valga, así
+/// que un token vencido no es un fallo: es el resultado que se buscaba.
+pub async fn revoke(provider: &Provider, refresh_token: &str) -> Result<(), TokenError> {
+    let url = provider
+        .revocation_url
+        .as_deref()
+        .ok_or_else(|| TokenError::Failed(format!(
+            "'{}' no tiene dónde avisar que la autorización terminó",
+            provider.id
+        )))?;
+
+    let client_id = provider
+        .client_id
+        .as_deref()
+        .ok_or_else(|| TokenError::Failed("el proveedor no tiene client_id".into()))?;
+
+    let mut formulario = vec![
+        ("token", refresh_token),
+        ("token_type_hint", "refresh_token"),
+        ("client_id", client_id),
+    ];
+    if let Some(secreto) = provider.client_secret.as_deref().filter(|s| !s.is_empty()) {
+        formulario.push(("client_secret", secreto));
+    }
+
+    let respuesta = http_client()?
+        .post(url)
+        .form(&formulario)
+        .send()
+        .await
+        .map_err(|e| TokenError::Failed(format!("no se pudo avisar a {url}: {e}")))?;
+
+    if respuesta.status().is_success() {
+        return Ok(());
+    }
+
+    // 400 con `invalid_token` es «ese token ya no existe», que para lo que se
+    // quería es lo mismo que haberlo revocado.
+    let estado = respuesta.status();
+    let cuerpo = respuesta.text().await.unwrap_or_default();
+    if estado == reqwest::StatusCode::BAD_REQUEST && cuerpo.contains("invalid_token") {
+        return Ok(());
+    }
+
+    Err(TokenError::Failed(format!(
+        "{url} respondió {estado} al revocar: {}",
+        cuerpo.trim()
+    )))
+}
+
 /// La configuración que se guarda en la capacidad al conectar una cuenta.
 ///
 /// Es lo que hace que el refresco pueda funcionar más adelante: sin `client_id`,
@@ -403,6 +466,10 @@ pub fn capability_config(
         "client_id": provider.client_id,
         "auth_url": provider.auth_url,
         "token_url": provider.token_url,
+        // Se guarda con la cuenta y no se busca en el catálogo al borrarla: si
+        // mañana cambia el archivo de /etc, hay que avisarle al servidor al que
+        // esta cuenta autorizó y no al que diga el archivo nuevo.
+        "revocation_url": provider.revocation_url,
         "scopes": provider.scopes.get(capability).cloned().unwrap_or_default(),
         "expires_at": frescos.expires_at.map(|e| e.to_rfc3339()),
     })
@@ -438,6 +505,7 @@ mod tests {
             kind: crate::providers::ProviderKind::Oauth2,
             auth_url: Some("https://accounts.google.com/o/oauth2/v2/auth".into()),
             token_url: Some("https://oauth2.googleapis.com/token".into()),
+            revocation_url: Some("https://oauth2.googleapis.com/revoke".into()),
             client_id: Some("el-client-id".into()),
             client_secret: None,
             scopes,
@@ -561,6 +629,58 @@ mod tests {
         // Y ningún token adentro: accounts.json no es donde viven los secretos.
         let texto = config.to_string();
         assert!(!texto.contains("el-access") && !texto.contains("el-refresh"), "{texto}");
+    }
+
+    /// La dirección para avisar se guarda **con la cuenta**.
+    ///
+    /// Si se buscara en el catálogo al borrarla, un cambio en el archivo de
+    /// `/etc` haría que se le avisara al servidor equivocado — o a ninguno, si
+    /// alguien lo sacó. La cuenta autorizó a un servidor y a ése hay que
+    /// avisarle.
+    #[test]
+    fn la_direccion_para_revocar_se_guarda_con_la_cuenta() {
+        let frescos = FreshTokens {
+            access: "el-access".into(),
+            refresh: Some("el-refresh".into()),
+            expires_at: None,
+        };
+        let config = capability_config(&proveedor(), &CapabilityType::Calendar, &frescos);
+
+        assert_eq!(config["revocation_url"], "https://oauth2.googleapis.com/revoke");
+    }
+
+    /// Un proveedor sin dónde avisar deja el campo nulo, y eso hay que poder
+    /// distinguirlo de «se avisó»: Microsoft no expone endpoint de revocación,
+    /// así que la autorización queda viva y la persona tiene que quitarla desde
+    /// la página de su cuenta.
+    #[test]
+    fn un_proveedor_sin_donde_avisar_lo_deja_nulo() {
+        let mut sin_revocacion = proveedor();
+        sin_revocacion.revocation_url = None;
+
+        let frescos = FreshTokens {
+            access: "a".into(),
+            refresh: None,
+            expires_at: None,
+        };
+        let config = capability_config(&sin_revocacion, &CapabilityType::Calendar, &frescos);
+        assert!(config["revocation_url"].is_null());
+    }
+
+    /// Una cuenta guardada antes de que esto existiera no tiene la dirección, y
+    /// eso no puede impedir que se la borre ni que se refresque su token.
+    #[test]
+    fn una_cuenta_vieja_sin_direccion_de_revocacion_sigue_sirviendo() {
+        let cuenta = Account::new("Vieja", "google", Default::default());
+        let config = serde_json::json!({
+            "client_id": "el-mio",
+            "auth_url": "https://ejemplo.com/auth",
+            "token_url": "https://ejemplo.com/token",
+        });
+
+        let provider = provider_desde_config(1000, &cuenta, &config).unwrap();
+        assert_eq!(provider.revocation_url, None);
+        assert_eq!(provider.client_id.as_deref(), Some("el-mio"));
     }
 
     /// Un proveedor que no dice cuándo expira deja `expires_at` en nulo, y eso

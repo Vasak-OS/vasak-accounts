@@ -725,17 +725,38 @@ impl AccountManager {
         Ok(account_id)
     }
 
-    /// Método `RemoveAccount` — borra la cuenta y todos sus secretos.
+    /// Método `RemoveAccount` — borra la cuenta, sus secretos, y **le avisa al
+    /// proveedor**.
+    ///
+    /// Sin el aviso, borrar una cuenta borraba lo de acá y del otro lado
+    /// quedaba todo vivo: la autorización seguía figurando entre las
+    /// aplicaciones con acceso, y el token servía hasta caducar. Quien borra una
+    /// cuenta espera que se corte el acceso, no que se esconda.
+    ///
+    /// **Si el aviso falla, la cuenta se borra igual.** Negarse dejaría a
+    /// alguien sin poder sacar una cuenta porque no tiene red, o porque el
+    /// servidor de su casa está apagado — y eso es peor que el problema. Lo que
+    /// sí se hace es decirlo, porque queda algo que la persona puede terminar de
+    /// hacer desde la web del proveedor.
+    ///
+    /// Devuelve JSON: `{"removed":bool,"revoked":bool,"detail":"…"}`.
     async fn remove_account(
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_context)] emisor: SignalContext<'_>,
         account_id: String,
-    ) -> zbus::fdo::Result<bool> {
+    ) -> zbus::fdo::Result<String> {
         let (_caller, uid) = caller_identity(connection, &header).await?;
 
         let mut db = open_db(uid)?;
+
+        // El aviso va **antes** de borrar: hace falta el secreto para mandarlo.
+        let revocacion = match db.get(&account_id).cloned() {
+            Some(cuenta) => revocar(uid, &cuenta).await,
+            None => Revocacion::NoHaceFalta,
+        };
+
         let borrada = db
             .remove(&account_id)
             .map_err(|e| FdoError::Failed(format!("Error al eliminar la cuenta: {e}")))?;
@@ -749,7 +770,22 @@ impl AccountManager {
         if borrada {
             Self::accounts_changed(&emisor, uid).await?;
         }
-        Ok(borrada)
+
+        let (revocada, detalle) = match revocacion {
+            Revocacion::Hecha => (true, String::new()),
+            Revocacion::NoHaceFalta => (true, String::new()),
+            Revocacion::Fallo(detalle) => {
+                tracing::warn!("'{account_id}' se borró sin poder avisarle al proveedor: {detalle}");
+                (false, detalle)
+            }
+        };
+
+        serde_json::to_string(&serde_json::json!({
+            "removed": borrada,
+            "revoked": revocada,
+            "detail": detalle,
+        }))
+        .map_err(|e| FdoError::Failed(format!("Error de serialización: {e}")))
     }
 
     /// Señal `AccountsChanged` — algo cambió en las cuentas de este usuario.
@@ -900,6 +936,104 @@ impl AccountManager {
             .map_err(|e| FdoError::Failed(format!("Error al guardar la contraseña: {e}")))?;
 
         Ok(account_id)
+    }
+}
+
+/// Cómo salió el aviso al proveedor.
+enum Revocacion {
+    Hecha,
+    /// No había a quién avisarle: una cuenta con contraseña de aplicación de
+    /// IMAP no tiene ninguna autorización del otro lado — la contraseña es de la
+    /// persona y la revoca desde su proveedor si quiere.
+    NoHaceFalta,
+    Fallo(String),
+}
+
+/// Cuánto se espera al proveedor antes de seguir sin él.
+///
+/// Corto: borrar una cuenta tiene que sentirse inmediato, y el aviso es algo que
+/// conviene hacer pero que no puede demorar la respuesta. Si no llega a tiempo,
+/// se borra igual y se dice.
+const ESPERA_DE_REVOCACION: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Le avisa al proveedor que la autorización de esta cuenta ya no vale.
+async fn revocar(uid: u32, cuenta: &storage::Account) -> Revocacion {
+    let intento = tokio::time::timeout(ESPERA_DE_REVOCACION, revocar_sin_tope(uid, cuenta)).await;
+
+    match intento {
+        Err(_) => Revocacion::Fallo(format!(
+            "el proveedor no contestó en {} segundos",
+            ESPERA_DE_REVOCACION.as_secs()
+        )),
+        Ok(resultado) => resultado,
+    }
+}
+
+async fn revocar_sin_tope(uid: u32, cuenta: &storage::Account) -> Revocacion {
+    // Nextcloud no tiene tokens que revocar: lo que hay es una contraseña de
+    // aplicación, y el servidor la borra si se le pide con ella misma.
+    if cuenta.provider_type == "nextcloud" {
+        return revocar_nextcloud(uid, cuenta).await;
+    }
+
+    // El resto: sólo las que pasaron por un flujo OAuth2 tienen algo que
+    // revocar. Una de IMAP con contraseña de aplicación no autorizó nada — la
+    // contraseña es de la persona.
+    let Some((capacidad, config)) = cuenta
+        .capabilities
+        .iter()
+        .find(|(_, c)| c.get("client_id").is_some())
+    else {
+        return Revocacion::NoHaceFalta;
+    };
+
+    let provider = match protocols::oauth2::provider_desde_config(uid, cuenta, config) {
+        Ok(provider) => provider,
+        Err(e) => return Revocacion::Fallo(e.to_string()),
+    };
+
+    if provider.revocation_url.is_none() {
+        // Se dice, no se calla: la autorización queda viva del otro lado y la
+        // persona puede quitarla desde la página de su cuenta.
+        return Revocacion::Fallo(format!(
+            "{} no tiene dónde avisar que la autorización terminó; \
+             quitala desde la página de tu cuenta",
+            cuenta.provider_type,
+        ));
+    }
+
+    let refresh = match storage::SecretStore::get_secret(uid, &cuenta.id, "refresh") {
+        Ok(refresh) => refresh,
+        // Sin refresh_token no hay concesión que revocar: o nunca vino uno, o la
+        // cuenta ya estaba muerta.
+        Err(_) => return Revocacion::NoHaceFalta,
+    };
+
+    tracing::debug!("avisando a '{}' que '{}' termina", cuenta.provider_type, capacidad.as_id());
+    match protocols::oauth2::revoke(&provider, &refresh).await {
+        Ok(()) => Revocacion::Hecha,
+        Err(e) => Revocacion::Fallo(e.to_string()),
+    }
+}
+
+async fn revocar_nextcloud(uid: u32, cuenta: &storage::Account) -> Revocacion {
+    let Some(config) = cuenta.capabilities.values().next() else {
+        return Revocacion::NoHaceFalta;
+    };
+    let (Some(server), Some(usuario)) = (
+        config.get("server").and_then(|v| v.as_str()),
+        config.get("username").and_then(|v| v.as_str()),
+    ) else {
+        return Revocacion::Fallo("la cuenta no guardó el servidor ni el usuario".into());
+    };
+
+    let Ok(app_password) = storage::SecretStore::get_token(uid, &cuenta.id) else {
+        return Revocacion::NoHaceFalta;
+    };
+
+    match protocols::nextcloud::revoke_app_password(server, usuario, &app_password).await {
+        Ok(()) => Revocacion::Hecha,
+        Err(e) => Revocacion::Fallo(e.to_string()),
     }
 }
 

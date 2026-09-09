@@ -35,6 +35,9 @@ id = "google"
 display_name = "Google"
 auth_url = "https://accounts.google.com/o/oauth2/v2/auth"
 token_url = "https://oauth2.googleapis.com/token"
+# Al borrar la cuenta se le avisa acá que la autorización ya no vale, así no
+# queda colgada en «aplicaciones con acceso» de la cuenta de Google.
+revocation_url = "https://oauth2.googleapis.com/revoke"
 
 # client_id = "xxxxx.apps.googleusercontent.com"
 # client_secret = "xxxxx"
