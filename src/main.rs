@@ -24,8 +24,12 @@ async fn authorize(
     account_id: &str,
     capability: &str,
 ) -> zbus::fdo::Result<CapabilityType> {
-    let cap: CapabilityType = serde_json::from_str(&format!("\"{capability}\""))
-        .map_err(|e| FdoError::Failed(format!("Capability inválida '{capability}': {e}")))?;
+    // `InvalidArgs` y no `Failed`: un nombre de capacidad mal escrito es un
+    // argumento malo, y el cliente que lo mandó puede distinguirlo de un fallo
+    // del servicio y arreglarlo.
+    let cap: CapabilityType = capability
+        .parse()
+        .map_err(|e: storage::UnknownCapability| FdoError::InvalidArgs(e.to_string()))?;
 
     let account = db
         .get(account_id)

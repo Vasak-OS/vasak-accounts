@@ -25,7 +25,7 @@ pub async fn check(
     capability: &CapabilityType,
     account_name: &str,
 ) -> Result<bool, FdoError> {
-    let resource_id = format!("account.{}", capability_id(capability));
+    let resource_id = format!("account.{}", capability.as_id());
     let start_time = process_start_time(subject_pid)?;
 
     // The system bus, because that is where a service the user cannot tamper
@@ -72,18 +72,6 @@ async fn permission_bus() -> zbus::Result<zbus::Connection> {
     zbus::Connection::system().await
 }
 
-/// The text form the permission service uses for a capability.
-fn capability_id(capability: &CapabilityType) -> &'static str {
-    match capability {
-        CapabilityType::Email => "email",
-        CapabilityType::Calendar => "calendar",
-        CapabilityType::Contacts => "contacts",
-        CapabilityType::Chat => "chat",
-        CapabilityType::Drive => "drive",
-        CapabilityType::Tasks => "tasks",
-    }
-}
-
 /// Field 22 of `/proc/<pid>/stat`, which the permission service compares to
 /// detect a PID that was reused between us seeing it and it being checked.
 fn process_start_time(pid: u32) -> Result<u64, FdoError> {
@@ -106,14 +94,31 @@ fn parse_start_time(stat: &str) -> Option<u64> {
 mod tests {
     use super::*;
 
+    /// Los identificadores que el servicio de permisos guarda en su política.
+    /// Cambiar uno acá deja sin efecto los permisos ya concedidos: la decisión
+    /// quedó grabada contra el nombre viejo y nadie la volvería a encontrar.
     #[test]
     fn capability_ids_match_what_the_permission_service_expects() {
-        assert_eq!(capability_id(&CapabilityType::Email), "email");
-        assert_eq!(capability_id(&CapabilityType::Calendar), "calendar");
-        assert_eq!(capability_id(&CapabilityType::Contacts), "contacts");
-        assert_eq!(capability_id(&CapabilityType::Chat), "chat");
-        assert_eq!(capability_id(&CapabilityType::Drive), "drive");
-        assert_eq!(capability_id(&CapabilityType::Tasks), "tasks");
+        assert_eq!(CapabilityType::Email.as_id(), "email");
+        assert_eq!(CapabilityType::Calendar.as_id(), "calendar");
+        assert_eq!(CapabilityType::Contacts.as_id(), "contacts");
+        assert_eq!(CapabilityType::Chat.as_id(), "chat");
+        assert_eq!(CapabilityType::Drive.as_id(), "drive");
+        assert_eq!(CapabilityType::Tasks.as_id(), "tasks");
+    }
+
+    /// El servicio de permisos reconoce `account.<capacidad>` y nada más, así
+    /// que el prefijo es parte del contrato entre los dos servicios.
+    #[test]
+    fn every_capability_maps_to_an_account_resource_id() {
+        for capacidad in CapabilityType::ALL {
+            let recurso = format!("account.{}", capacidad.as_id());
+            assert!(
+                recurso.starts_with("account."),
+                "{recurso} no es un recurso de cuentas"
+            );
+            assert!(!capacidad.as_id().is_empty());
+        }
     }
 
     #[test]
