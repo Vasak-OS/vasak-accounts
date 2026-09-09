@@ -1,6 +1,7 @@
 mod auth;
 mod pending;
 mod permissions;
+mod polkit;
 mod protocols;
 mod providers;
 mod storage;
@@ -739,6 +740,11 @@ impl AccountManager {
     /// sí se hace es decirlo, porque queda algo que la persona puede terminar de
     /// hacer desde la web del proveedor.
     ///
+    /// Pasa por polkit, y eso es nuevo: antes cualquier programa corriendo con
+    /// tu cuenta podía llamar acá y dejarte sin cuentas en silencio. Agregar una
+    /// se deshace sola —la borrás—; borrarla no: se va la credencial y, desde
+    /// que se le avisa al proveedor, además se corta el acceso del otro lado.
+    ///
     /// Devuelve JSON: `{"removed":bool,"revoked":bool,"detail":"…"}`.
     async fn remove_account(
         &self,
@@ -747,7 +753,11 @@ impl AccountManager {
         #[zbus(signal_context)] emisor: SignalContext<'_>,
         account_id: String,
     ) -> zbus::fdo::Result<String> {
-        let (_caller, uid) = caller_identity(connection, &header).await?;
+        let (caller, uid) = caller_identity(connection, &header).await?;
+
+        // Antes que nada: si la persona cancela el diálogo no hay que haberle
+        // avisado al proveedor ni haber tocado el disco.
+        polkit::authorize_removal(connection, &caller).await?;
 
         let mut db = open_db(uid)?;
 

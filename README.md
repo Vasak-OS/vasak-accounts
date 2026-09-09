@@ -136,7 +136,7 @@ correo le permite todas tus casillas.
 | `BeginNextcloudLogin` | `s` servidor, `s` nombre | `s` (JSON) | — | Abre un inicio de sesión en un Nextcloud. Devuelve `login_url` y `request_id`. |
 | `PollNextcloudLogin` | `s` request_id | `s` (JSON) | — | Un sondeo: `pending`, o `done` con el `account_id`. |
 | `RegisterAccount` | `s` nombre, `s` proveedor, `s` capacidades JSON, `s` secretos JSON | `s` id | — | Cuenta con credenciales de **contraseña** (IMAP y compañía). No acepta secretos de OAuth2. |
-| `RemoveAccount` | `s` id | `s` (JSON) | — | Borra la cuenta, sus secretos, **y le avisa al proveedor**. Devuelve `{removed, revoked, detail}`. |
+| `RemoveAccount` | `s` id | `s` (JSON) | 🔑 polkit | Borra la cuenta, sus secretos, **y le avisa al proveedor**. Devuelve `{removed, revoked, detail}`. |
 | `GetAccountData` | `s` id, `s` capacidad | `s` (JSON) | ✅ | Configuración de esa capacidad. |
 | `GetAccessToken` | `s` id, `s` capacidad | `s` | ✅ | Un access_token **válido**, refrescándolo si hace falta. |
 
@@ -172,6 +172,16 @@ Lo que se paga es que la lista la ve cualquier programa del usuario. Por eso sal
 un **resumen** —id, nombre, proveedor, qué capacidades tiene y si hay que
 reconectarla— y no la cuenta entera. La configuración completa, con el servidor
 y el `client_id`, sigue detrás de `GetAccountData`, que sí pregunta.
+
+🔑 quiere decir que pasa por polkit: la persona se autentica en un diálogo sobre
+el que el programa que llamó no tiene ningún control. Agregar una cuenta no lo
+necesita —si te arrepentís, la borrás— pero borrarla no se deshace: se va la
+credencial y se corta el acceso del otro lado. Sin esto, cualquier programa
+corriendo con tu cuenta podía dejarte sin cuentas en silencio.
+
+Se autentica como **la propia persona** y no como administrador: es su cuenta, no
+una configuración del equipo. La respuesta se recuerda un rato, así que quitar
+tres cuentas seguidas pregunta una vez.
 
 Las capacidades se nombran en minúscula: `email`, `calendar`, `contacts`,
 `chat`, `drive`, `tasks`. Cualquier otra cosa devuelve `InvalidArgs` con la
@@ -568,6 +578,7 @@ No caduca, no depende de ningún registro y no cuesta nada.
 - D-Bus del sistema
 - `vasak-permissions` corriendo — **sin él no se autoriza nada**: el servicio
   rechaza toda petición que necesite permiso
+- `polkit` — quitar una cuenta pasa por ahí
 - systemd (la unidad es `Type=dbus`, se activa sola con la primera petición)
 
 ---
