@@ -452,6 +452,21 @@ mod tests {
         assert!(s.le_toca(ahora + chrono::Duration::hours(2)));
     }
 
+    /// Mandar varios mensajes contra un servidor que no contesta tarda minutos.
+    /// Con la hora del principio de la vuelta, el último quedaría con su
+    /// próximo intento ya cumplido — o sea, reintentos seguidos contra un
+    /// servidor que justamente no está.
+    #[test]
+    fn el_proximo_intento_se_cuenta_desde_que_fallo() {
+        let empezo = chrono::Utc::now();
+        let diez_minutos_despues = empezo + chrono::Duration::minutes(10);
+
+        let mut s = salida("0001");
+        s.fallo("el servidor no contestó".into(), diez_minutos_despues);
+
+        assert!(!s.le_toca(diez_minutos_despues), "no tendría que tocarle ya");
+    }
+
     /// Una fecha que no se entiende —un archivo tocado a mano, una versión
     /// anterior— no puede dejar un mensaje encerrado para siempre.
     #[test]

@@ -682,7 +682,12 @@ async fn vaciar_la_cola(servicio: &Servicio) -> bool {
                 cambio = true;
             }
             Err(e) => {
-                salida.fallo(e.to_string(), ahora);
+                // La hora **de ahora** y no la del principio de la vuelta:
+                // mandar cinco mensajes contra un servidor que no contesta
+                // tarda diez minutos, y con la hora vieja el último quedaría
+                // con su próximo intento ya cumplido. O sea, reintentos
+                // seguidos contra un servidor que justamente no está.
+                salida.fallo(e.to_string(), chrono::Utc::now());
                 // Se deja de intentar cuando el servidor dijo que no va a
                 // aceptarlo nunca, o cuando se acabaron los intentos. En los dos
                 // casos hace falta que la persona haga algo, y seguir golpeando
