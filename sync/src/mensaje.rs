@@ -204,7 +204,7 @@ fn partir_palabra(desde: &str) -> Option<(String, &str)> {
 
     let bytes = match como.to_ascii_uppercase().as_str() {
         "B" => base64_de(texto)?,
-        "Q" => Some(imprimible_de(texto, true))?,
+        "Q" => Some(imprimible_de(texto.as_bytes(), true))?,
         _ => return None,
     };
 
@@ -224,13 +224,42 @@ fn base64_de(texto: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
+/// Los bytes de un mensaje como texto, **sin perder ninguno**.
+///
+/// Latin-1 es la única codificación donde cada byte es exactamente un carácter y
+/// la vuelta es exacta: el byte `n` es `U+00n` y nada más. Sirve para recorrer la
+/// estructura del mensaje —que es ASCII: las fronteras, los nombres de las
+/// cabeceras, el `base64`— **sin decidir todavía en qué idioma está escrito el
+/// cuerpo**.
+///
+/// Eso es lo que hace que se pueda usar `&str` en todo el recorrido sin romper
+/// nada. Convertir con `from_utf8_lossy` en cambio reemplaza cada byte que no es
+/// UTF-8 por un rombo, y ahí ya no hay vuelta atrás: un mensaje en `iso-8859-1`
+/// pierde el `0xF3` de la «ó» **antes** de que se sepa que había que leerlo como
+/// latin-1. En la hoja se vuelven a sacar los bytes originales con `de_latin1` y
+/// recién ahí se usa el juego que declaró el mensaje.
+pub fn como_latin1(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| char::from(*b)).collect()
+}
+
+/// La vuelta de `como_latin1`, exacta.
+///
+/// Los caracteres que no salieron de un byte —no pueden aparecer si el texto
+/// viene de `como_latin1`, pero la función es pública— se descartan en vez de
+/// recortarse: inventar un byte sería peor que perderlo.
+pub fn de_latin1(texto: &str) -> Vec<u8> {
+    texto
+        .chars()
+        .filter_map(|c| u8::try_from(c as u32).ok())
+        .collect()
+}
+
 /// Deshace `quoted-printable`.
 ///
 /// `en_cabecera` cambia una sola cosa: dentro de una cabecera el `_` es un
 /// espacio. En un cuerpo es un guión bajo, y confundirlos llena el texto de
 /// espacios donde había nombres_con_guion.
-pub fn imprimible_de(texto: &str, en_cabecera: bool) -> Vec<u8> {
-    let bytes = texto.as_bytes();
+pub fn imprimible_de(bytes: &[u8], en_cabecera: bool) -> Vec<u8> {
     let mut salida = Vec::with_capacity(bytes.len());
     let mut i = 0;
 
@@ -377,14 +406,23 @@ fn sin_comillas(valor: &str) -> &str {
 }
 
 /// Deshace la codificación de transporte de un cuerpo.
-pub fn destransportar(cuerpo: &str, codificacion: &str) -> Vec<u8> {
+///
+/// Sobre **bytes** y no sobre texto: `8bit` y `binary` quieren decir exactamente
+/// que el cuerpo trae bytes que no son ASCII, y en qué idioma están lo dice el
+/// `charset`, que se aplica después.
+pub fn destransportar(cuerpo: &[u8], codificacion: &str) -> Vec<u8> {
     match codificacion.trim().to_ascii_lowercase().as_str() {
-        "base64" => base64_de(cuerpo).unwrap_or_else(|| cuerpo.as_bytes().to_vec()),
+        // El base64 es ASCII por definición, así que leerlo como texto es
+        // seguro; si trae algo que no lo es, no es base64 y se deja crudo.
+        "base64" => std::str::from_utf8(cuerpo)
+            .ok()
+            .and_then(base64_de)
+            .unwrap_or_else(|| cuerpo.to_vec()),
         "quoted-printable" => imprimible_de(cuerpo, false),
         // `7bit`, `8bit`, `binary` y cualquier cosa que no se conozca: los bytes
         // tal cual. Es lo correcto para los tres primeros, y para el resto es
         // mejor mostrar algo raro que no mostrar nada.
-        _ => cuerpo.as_bytes().to_vec(),
+        _ => cuerpo.to_vec(),
     }
 }
 
@@ -453,8 +491,11 @@ pub fn partes_de<'a>(cuerpo: &'a str, frontera: &str) -> Vec<&'a str> {
 /// Busca la mejor parte legible: primero `text/plain`, y si no hay, el
 /// `text/html` con las etiquetas sacadas. Los adjuntos no entran — un PDF
 /// convertido a caracteres es ruido.
-pub fn texto_de(crudo: &str) -> String {
-    let (cabeceras, cuerpo) = partir(crudo);
+pub fn texto_de(crudo: &[u8]) -> String {
+    // La vista latin-1 conserva cada byte tal cual mientras se recorre la
+    // estructura. Ver `como_latin1`.
+    let vista = como_latin1(crudo);
+    let (cabeceras, cuerpo) = partir(&vista);
     let mut texto = buscar_texto(&cabeceras, cuerpo, 0).unwrap_or_default();
 
     if texto.len() > MAX_TEXTO {
@@ -516,7 +557,10 @@ fn buscar_texto(cabeceras: &Cabeceras, cuerpo: &str, profundidad: usize) -> Opti
     let codificacion = cabeceras
         .valor("content-transfer-encoding")
         .unwrap_or("7bit");
-    let bytes = destransportar(cuerpo, codificacion);
+    // Acá se sale de la vista latin-1 y se vuelve a los bytes que mandó el
+    // servidor. Es el único lugar donde se decide en qué idioma está escrito
+    // esto, y es el último momento en que los bytes originales todavía existen.
+    let bytes = destransportar(&de_latin1(cuerpo), codificacion);
     let texto = a_texto(&bytes, &tipo.juego);
 
     match tipo.medio.as_str() {
@@ -535,8 +579,9 @@ fn es_adjunto(cabeceras: &Cabeceras) -> bool {
 }
 
 /// Si el mensaje trae algo pegado.
-pub fn tiene_adjuntos(crudo: &str) -> bool {
-    let (cabeceras, cuerpo) = partir(crudo);
+pub fn tiene_adjuntos(crudo: &[u8]) -> bool {
+    let vista = como_latin1(crudo);
+    let (cabeceras, cuerpo) = partir(&vista);
     buscar_adjunto(&cabeceras, cuerpo, 0)
 }
 
@@ -563,6 +608,14 @@ fn buscar_adjunto(cabeceras: &Cabeceras, cuerpo: &str, profundidad: usize) -> bo
 }
 
 /// Saca las etiquetas de un HTML y deja el texto.
+///
+/// **Lo que devuelve es texto plano y hay que tratarlo como tal.** Puede
+/// contener `<` y `>`: las entidades se deshacen *después* de sacar las
+/// etiquetas, así que un mensaje con el texto literal `&lt;script&gt;` sale como
+/// `<script>`. Eso es correcto para mostrarlo como texto —que es lo único que
+/// hace esta aplicación— y **no** lo es para nadie que después lo meta en un
+/// marcado sin escaparlo: le estaría devolviendo las etiquetas que esta función
+/// sacó.
 ///
 /// **No es un motor de HTML y no quiere serlo.** Es lo que hace que un mensaje
 /// que sólo viene en HTML se pueda leer sin traer imágenes remotas —que le
@@ -629,21 +682,64 @@ pub fn sin_etiquetas(html: &str) -> String {
     entidades(&salida)
 }
 
-/// Deshace las entidades más comunes.
+/// Deshace las entidades: las cinco con nombre que aparecen siempre, y todas las
+/// numéricas.
 ///
-/// Sólo las cinco que aparecen siempre y las numéricas. Una tabla completa sería
-/// mil quinientas entradas para un caso que el texto plano ya resuelve.
+/// Las numéricas importan más de lo que parece. El correo en HTML de los
+/// remitentes viejos escribe los acentos así —`&#243;` por «ó»—, y sin
+/// deshacerlas un mensaje en español se lee lleno de números en el medio de las
+/// palabras. Una tabla completa de nombres, en cambio, serían mil quinientas
+/// entradas para casos que casi no aparecen.
 fn entidades(texto: &str) -> String {
-    let mut salida = texto
+    let con_nombre = texto
         .replace("&nbsp;", " ")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
-        .replace("&#39;", "'")
         .replace("&apos;", "'");
+
+    let numericas = numericas_de(&con_nombre);
     // `&amp;` al final: si fuera primero, un `&amp;lt;` —que es el texto
     // literal «&lt;»— terminaría convertido en `<`.
-    salida = salida.replace("&amp;", "&");
+    numericas.replace("&amp;", "&")
+}
+
+/// Deshace `&#243;` y `&#xF3;`.
+fn numericas_de(texto: &str) -> String {
+    let mut salida = String::with_capacity(texto.len());
+    let mut resto = texto;
+
+    while let Some(inicio) = resto.find("&#") {
+        salida.push_str(&resto[..inicio]);
+        let cuerpo = &resto[inicio + 2..];
+
+        // Una entidad numérica termina en `;` y es corta. El tope evita
+        // recorrer el mensaje entero buscando un `;` que no está.
+        let fin = cuerpo.char_indices().take(10).find(|(_, c)| *c == ';');
+        let convertida = fin.and_then(|(f, _)| {
+            let digitos = &cuerpo[..f];
+            let numero = match digitos.strip_prefix(['x', 'X']) {
+                Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                None => digitos.parse().ok()?,
+            };
+            char::from_u32(numero).map(|c| (c, f + 3))
+        });
+
+        match convertida {
+            Some((caracter, avance)) => {
+                salida.push(caracter);
+                resto = &resto[inicio + avance..];
+            }
+            // Un `&#` que no abre una entidad es texto: se copia y se sigue
+            // después de él, o el bucle no avanza nunca.
+            None => {
+                salida.push_str("&#");
+                resto = cuerpo;
+            }
+        }
+    }
+
+    salida.push_str(resto);
     salida
 }
 
@@ -657,21 +753,32 @@ fn entidades(texto: &str) -> String {
 /// que hay: un remitente que se pone de nombre «soporte@banco.com» y escribe
 /// desde otra dirección. Mostrados aparte, no se puede hacer pasar uno por otro.
 pub fn remitente_de(valor: &str) -> (String, String) {
-    let legible = decodificar_palabras(valor);
-
-    // `Nombre <alguien@ejemplo.com>`. El último `<`, porque un nombre puede
-    // contener uno —y ése es justamente el truco.
-    if let Some(abre) = legible.rfind('<') {
-        if let Some(cierra) = legible[abre..].find('>') {
-            let direccion = legible[abre + 1..abre + cierra].trim().to_string();
-            let nombre = legible[..abre].trim().trim_matches('"').trim().to_string();
+    // **Se parte primero y se decodifica después.**
+    //
+    // Al revés —decodificando la cabecera entera y buscando el `<` en el
+    // resultado— alcanzaría con ponerse de nombre una palabra codificada que
+    // contenga `<algo@banco.com>` para que la dirección que se muestra sea una
+    // que nunca estuvo en el mensaje. O sea: exactamente el engaño que esta
+    // función existe para impedir, servido por la función misma.
+    //
+    // Los `<` y `>` que delimitan la dirección son ASCII y están en el texto
+    // crudo, así que buscarlos ahí no pierde nada. El último, porque un nombre
+    // puede contener uno.
+    if let Some(abre) = valor.rfind('<') {
+        if let Some(cierra) = valor[abre..].find('>') {
+            let direccion = valor[abre + 1..abre + cierra].trim().to_string();
+            // El nombre sí se decodifica: es texto para leer, y ahí una palabra
+            // codificada es lo normal y no un truco.
+            let nombre = decodificar_palabras(&valor[..abre]);
+            let nombre = nombre.trim().trim_matches('"').trim().to_string();
             let nombre = if nombre.is_empty() { direccion.clone() } else { nombre };
             return (nombre, direccion);
         }
     }
 
-    // Una dirección pelada: el nombre es la dirección.
-    let direccion = legible.trim().to_string();
+    // Una dirección pelada: el nombre es la dirección. Se decodifica igual, por
+    // si es un nombre suelto sin dirección.
+    let direccion = decodificar_palabras(valor).trim().to_string();
     (direccion.clone(), direccion)
 }
 
@@ -799,23 +906,57 @@ mod tests {
     /// Confundirlos llena el texto de espacios donde había nombres_así.
     #[test]
     fn el_guion_bajo_es_un_espacio_solo_en_la_cabecera() {
-        assert_eq!(imprimible_de("a_b", true), b"a b");
-        assert_eq!(imprimible_de("a_b", false), b"a_b");
+        assert_eq!(imprimible_de(b"a_b", true), b"a b");
+        assert_eq!(imprimible_de(b"a_b", false), b"a_b");
     }
 
     /// Un `=` al final de línea es un corte blando: la línea sigue y no va nada
     /// al texto. Sin esto, un párrafo largo aparece con `=` cada 76 caracteres.
     #[test]
     fn el_corte_blando_de_quoted_printable_desaparece() {
-        assert_eq!(imprimible_de("hola =\r\nmundo", false), b"hola mundo");
-        assert_eq!(imprimible_de("hola =\nmundo", false), b"hola mundo");
+        assert_eq!(imprimible_de(b"hola =\r\nmundo", false), b"hola mundo");
+        assert_eq!(imprimible_de(b"hola =\nmundo", false), b"hola mundo");
     }
 
     /// Un `=` que no es un escape válido se deja: es un dato de alguien.
     #[test]
     fn un_igual_suelto_no_se_come_nada() {
-        assert_eq!(imprimible_de("2 = 2", false), b"2 = 2");
-        assert_eq!(imprimible_de("termina en =", false), b"termina en =");
+        assert_eq!(imprimible_de(b"2 = 2", false), b"2 = 2");
+        assert_eq!(imprimible_de(b"termina en =", false), b"termina en =");
+    }
+
+    /// **El byte tiene que llegar vivo hasta que se sepa cómo leerlo.**
+    ///
+    /// Recorrer la estructura del mensaje como texto es cómodo, pero convertir
+    /// con `from_utf8_lossy` reemplaza cada byte que no es UTF-8 por un rombo, y
+    /// ahí ya no hay vuelta: el `0xF3` de la «ó» se pierde **antes** de que el
+    /// `charset` diga que había que leerlo como latin-1. La vista latin-1 es la
+    /// única que conserva cada byte y vuelve exacta.
+    #[test]
+    fn la_vista_latin1_conserva_todos_los_bytes() {
+        let bytes: Vec<u8> = (0u8..=255).collect();
+        assert_eq!(de_latin1(&como_latin1(&bytes)), bytes);
+    }
+
+    /// El caso de punta a punta: un mensaje en latin-1 con bytes que no son
+    /// UTF-8 válido llega entero al final.
+    #[test]
+    fn un_cuerpo_en_latin1_sobrevive_el_recorrido() {
+        let mut crudo = b"Content-Type: text/plain; charset=iso-8859-1\r\n\r\n".to_vec();
+        crudo.extend_from_slice(b"Reuni\xf3n de ma\xf1ana");
+
+        assert_eq!(texto_de(&crudo), "Reunión de mañana");
+    }
+
+    /// Y dentro de un multiparte, que es el recorrido largo.
+    #[test]
+    fn un_latin1_adentro_de_un_multiparte_tambien_sobrevive() {
+        let mut crudo = b"Content-Type: multipart/mixed; boundary=\"lim\"\r\n\r\n\
+            --lim\r\nContent-Type: text/plain; charset=iso-8859-1\r\n\r\n"
+            .to_vec();
+        crudo.extend_from_slice(b"caf\xe9\r\n--lim--\r\n");
+
+        assert!(texto_de(&crudo).contains("café"));
     }
 
     // ── Juegos de caracteres ───────────────────────────────────────────────
@@ -868,7 +1009,7 @@ mod tests {
     #[test]
     fn sin_content_type_es_texto_plano() {
         assert_eq!(Tipo::default().medio, "text/plain");
-        assert_eq!(texto_de("From: ana@x\r\n\r\nHola"), "Hola");
+        assert_eq!(texto_de(b"From: ana@x\r\n\r\nHola"), "Hola");
     }
 
     const MULTIPARTE: &str = "Content-Type: multipart/alternative; boundary=\"lim\"\r\n\
@@ -889,7 +1030,7 @@ mod tests {
     /// plano — venga en el orden que venga.
     #[test]
     fn en_un_alternative_gana_el_texto_plano() {
-        let texto = texto_de(MULTIPARTE);
+        let texto = texto_de(MULTIPARTE.as_bytes());
         assert!(texto.contains("Hola en texto"), "{texto:?}");
         assert!(!texto.contains("HTML"), "{texto:?}");
     }
@@ -898,7 +1039,7 @@ mod tests {
     /// MIME, y mostrarlo sería mostrar texto que no escribió nadie.
     #[test]
     fn el_preambulo_no_se_muestra() {
-        assert!(!texto_de(MULTIPARTE).contains("preámbulo"));
+        assert!(!texto_de(MULTIPARTE.as_bytes()).contains("preámbulo"));
     }
 
     /// Si sólo hay HTML se muestra igual, sin etiquetas: es preferible a un
@@ -907,7 +1048,7 @@ mod tests {
     fn si_solo_hay_html_se_muestra_sin_etiquetas() {
         let solo_html = "Content-Type: text/html; charset=utf-8\r\n\r\n\
             <p>Hola <b>Ana</b></p>";
-        let texto = texto_de(solo_html);
+        let texto = texto_de(solo_html.as_bytes());
         assert!(texto.contains("Hola"), "{texto:?}");
         assert!(texto.contains("Ana"), "{texto:?}");
         assert!(!texto.contains('<'), "{texto:?}");
@@ -930,15 +1071,15 @@ mod tests {
             a,b,c\r\n\
             --lim--\r\n";
 
-        let texto = texto_de(con_adjunto);
+        let texto = texto_de(con_adjunto.as_bytes());
         assert!(texto.contains("El cuerpo de verdad"), "{texto:?}");
         assert!(!texto.contains("a,b,c"), "{texto:?}");
-        assert!(tiene_adjuntos(con_adjunto));
+        assert!(tiene_adjuntos(con_adjunto.as_bytes()));
     }
 
     #[test]
     fn un_mensaje_simple_no_tiene_adjuntos() {
-        assert!(!tiene_adjuntos("Content-Type: text/plain\r\n\r\nHola"));
+        assert!(!tiene_adjuntos(b"Content-Type: text/plain\r\n\r\nHola"));
     }
 
     /// Un mensaje armado para anidar mil veces reventaría la pila. El tope corta
@@ -954,8 +1095,8 @@ mod tests {
         crudo.push_str("Content-Type: text/plain\r\n\r\nal fondo\r\n");
 
         // Lo único que importa es que vuelva.
-        let _ = texto_de(&crudo);
-        let _ = tiene_adjuntos(&crudo);
+        let _ = texto_de(crudo.as_bytes());
+        let _ = tiene_adjuntos(crudo.as_bytes());
     }
 
     /// Un mensaje sin la línea de cierre está mal formado, pero perder el cuerpo
@@ -964,7 +1105,7 @@ mod tests {
     fn un_multiparte_sin_cierre_muestra_lo_que_hay() {
         let sin_cierre = "Content-Type: multipart/mixed; boundary=\"lim\"\r\n\
             \r\n--lim\r\nContent-Type: text/plain\r\n\r\nAlgo quedó\r\n";
-        assert!(texto_de(sin_cierre).contains("Algo quedó"));
+        assert!(texto_de(sin_cierre.as_bytes()).contains("Algo quedó"));
     }
 
     /// Una frontera vacía partiría el mensaje en cada línea.
@@ -978,7 +1119,7 @@ mod tests {
         let crudo = "Content-Type: text/plain; charset=utf-8\r\n\
             Content-Transfer-Encoding: base64\r\n\r\n\
             UmV1bmnDs24gZGUgbWHDsWFuYQ==";
-        assert_eq!(texto_de(crudo), "Reunión de mañana");
+        assert_eq!(texto_de(crudo.as_bytes()), "Reunión de mañana");
     }
 
     // ── HTML ───────────────────────────────────────────────────────────────
@@ -1019,6 +1160,27 @@ mod tests {
         assert_eq!(entidades("a &lt; b &amp; c"), "a < b & c");
     }
 
+    /// El correo en HTML de los remitentes viejos escribe los acentos como
+    /// entidades numéricas. Sin deshacerlas, un mensaje en español se lee lleno
+    /// de números en el medio de las palabras.
+    #[test]
+    fn las_entidades_numericas_se_deshacen() {
+        assert_eq!(entidades("Reuni&#243;n"), "Reunión");
+        assert_eq!(entidades("Reuni&#xF3;n"), "Reunión");
+        assert_eq!(entidades("comilla&#8217;s"), "comilla\u{2019}s");
+    }
+
+    /// Un `&#` que no abre una entidad es texto, y el bucle tiene que avanzar
+    /// igual: si no, un mensaje con un `&#` suelto cuelga el proceso.
+    #[test]
+    fn una_entidad_numerica_rota_no_cuelga_ni_se_come_el_texto() {
+        for basura in ["&#", "&#;", "&#xZZ;", "&#99999999999;", "a &# b", "&#123456789012345;"] {
+            let salida = entidades(basura);
+            assert!(!salida.is_empty(), "{basura:?}");
+        }
+        assert_eq!(entidades("a &# b"), "a &# b");
+    }
+
     /// Un `<` sin su `>` es una etiqueta abierta, no texto: lo que sigue no se
     /// muestra, y sobre todo el bucle termina.
     #[test]
@@ -1026,6 +1188,33 @@ mod tests {
         for basura in ["<", "<p", "<script>sin cierre", "<<<<", "a < b"] {
             let _ = sin_etiquetas(basura);
         }
+    }
+
+    /// **El caso que destapó el orden de las operaciones.**
+    ///
+    /// Decodificando la cabecera entera y buscando el `<` en el resultado,
+    /// alcanza con ponerse de nombre una palabra codificada que contenga
+    /// `<algo@banco.com>` para que la dirección que se muestra sea una que nunca
+    /// estuvo en el mensaje — o sea, exactamente el engaño que esta función
+    /// existe para impedir, servido por la función misma.
+    #[test]
+    fn un_nombre_codificado_no_puede_inventar_una_direccion() {
+        // «<soporte@banco.com>» en base64.
+        let disfraz = "=?UTF-8?B?PHNvcG9ydGVAYmFuY28uY29tPg==?= <atacante@otro.net>";
+        let (nombre, direccion) = remitente_de(disfraz);
+
+        assert_eq!(direccion, "atacante@otro.net");
+        // El nombre se sigue mostrando decodificado, que es lo correcto: es
+        // texto para leer. Lo que no puede es pasar por dirección.
+        assert_eq!(nombre, "<soporte@banco.com>");
+    }
+
+    /// Y sin dirección de verdad, una palabra codificada tampoco se convierte en
+    /// una: el nombre es el nombre.
+    #[test]
+    fn una_cabecera_con_un_menor_codificado_y_nada_mas() {
+        let (_, direccion) = remitente_de("=?UTF-8?B?PGFuYUB4Pg==?=");
+        assert_eq!(direccion, "<ana@x>");
     }
 
     // ── Remitente y fecha ──────────────────────────────────────────────────
@@ -1123,7 +1312,7 @@ mod tests {
         let cuerpo = "ñ".repeat(MAX_TEXTO);
         let crudo = format!("Content-Type: text/plain; charset=utf-8\r\n\r\n{cuerpo}");
 
-        let texto = texto_de(&crudo);
+        let texto = texto_de(crudo.as_bytes());
         assert!(texto.len() <= MAX_TEXTO + 16, "{}", texto.len());
         assert!(texto.ends_with("[…]"));
         // Que sea un `String` válido ya lo garantiza el tipo; esto comprueba que

@@ -442,6 +442,12 @@ Publica en `ar.net.vasak.os.AccountsSync` (bus de sesión):
 | `GetMessage(account_id, uid)` | El texto de un mensaje, si se cortó por tamaño y si trae adjuntos. |
 | `MarkRead(account_id, uid)` | Marca un mensaje como leído **en el servidor**. |
 
+Los cuerpos viajan como bytes hasta el último momento. Convertirlos a texto
+apenas llegan —con la conversión «tolerante» que es lo natural en Rust—
+reemplazaría cada byte que no es UTF-8 por un rombo, y un mensaje en `iso-8859-1`
+perdería el `0xF3` de la «ó» **antes** de que se supiera que había que leerlo
+como latin-1. En qué idioma está escrito lo dice el propio mensaje.
+
 Con dos señales sin detalle —`MailboxChanged` y `MessagesChanged`—: quien las
 recibe vuelve a leer y ve el estado completo, en vez de reconciliar avisos que se
 pueden perder. (`AccountsChanged` es otra cosa y vive en el bus del sistema: la

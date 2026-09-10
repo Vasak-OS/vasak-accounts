@@ -194,8 +194,13 @@ impl Lector {
         let (crudo, recortado) = self
             .con_reintento(broker, cuenta, |sesion| Box::pin(sesion.cuerpo(uid)))
             .await?;
-        let crudo = String::from_utf8_lossy(&crudo);
 
+        // Los bytes se le pasan **crudos** al parser. Convertirlos a texto acá
+        // —con `from_utf8_lossy`, que es lo que pide el tipo— reemplazaría cada
+        // byte que no es UTF-8 por un rombo, y un mensaje en `iso-8859-1`
+        // perdería el `0xF3` de la «ó» antes de que se supiera que había que
+        // leerlo como latin-1. En qué idioma está escrito lo dice el propio
+        // mensaje, y eso se resuelve adentro.
         Ok(Abierto {
             texto: mensaje::texto_de(&crudo),
             recortado,
@@ -242,12 +247,26 @@ impl Lector {
 
         match self.intentar(broker, cuenta, &mut trabajo).await {
             Ok(valor) => Ok(valor),
-            Err(primero) if reusada => {
-                tracing::debug!("'{}': la conexión de lectura estaba muerta: {primero}", cuenta.id);
+            Err(primero) => {
+                // **La sesión se tira siempre**, se reintente o no. Un error de
+                // protocolo puede haberla dejado a mitad de camino de algo, y
+                // guardarla para el próximo pedido es guardar una conexión que
+                // va a leer el correo de alguien como si fueran líneas del
+                // protocolo. Abrir otra cuesta un login; usar una rota no se
+                // arregla nunca.
                 self.sesion = None;
+
+                if !reusada {
+                    return Err(primero);
+                }
+                // Se reintenta sólo si la conexión venía de antes: una que
+                // estuvo quieta un rato la cierra el servidor sin avisar, y el
+                // fallo aparece recién al usarla. Una recién abierta que falló
+                // no se reintenta — si el servidor rechazó la credencial,
+                // insistir es cómo se bloquea una cuenta.
+                tracing::debug!("'{}': la conexión de lectura estaba muerta: {primero}", cuenta.id);
                 self.intentar(broker, cuenta, &mut trabajo).await
             }
-            Err(e) => Err(e),
         }
     }
 
@@ -358,7 +377,12 @@ impl Servicio {
     /// todo lo que este proceso trae usa `BODY.PEEK`, que mira sin marcar. Que
     /// abrir la aplicación te vacíe el contador de sin leer sin haber leído nada
     /// es de los errores más molestos que puede tener un cliente de correo.
-    async fn mark_read(&self, account_id: String, uid: u32) -> zbus::fdo::Result<()> {
+    async fn mark_read(
+        &self,
+        #[zbus(signal_context)] emisor: SignalContext<'_>,
+        account_id: String,
+        uid: u32,
+    ) -> zbus::fdo::Result<()> {
         let (broker, cuenta) = self.cuenta(&account_id).await?;
         let lector = self.lector(&account_id).await;
         let mut lector = lector.lock().await;
@@ -371,10 +395,19 @@ impl Servicio {
         // Y acá también, para que la lista no muestre en negrita algo que el
         // servidor ya sabe que se leyó. La próxima vuelta del bucle lo confirma.
         let mut estado = self.estado.lock().await;
-        if let Some(mensajes) = estado.mensajes.get_mut(&account_id) {
-            if let Some(m) = mensajes.iter_mut().find(|m| m.uid == uid) {
-                m.sin_leer = false;
-            }
+        let cambio = estado
+            .mensajes
+            .get_mut(&account_id)
+            .and_then(|mensajes| mensajes.iter_mut().find(|m| m.uid == uid))
+            .is_some_and(|m| std::mem::replace(&mut m.sin_leer, false));
+        drop(estado);
+
+        // Con aviso: la ventana que pidió esto ya lo sabe, pero puede haber otra
+        // abierta —o el escritorio mirando el contador— y sin la señal se
+        // quedarían mostrando en negrita algo que ya se leyó hasta la próxima
+        // vuelta del bucle, que puede tardar veinticuatro minutos.
+        if cambio {
+            let _ = Servicio::messages_changed(&emisor).await;
         }
         Ok(())
     }
@@ -588,7 +621,7 @@ async fn sesion_de_cuenta(
 
     let inicial = contar(&mut sesion, mensajes).await;
     publicar(servicio, emisor, cuenta, inicial).await;
-    listar(&mut sesion, servicio, emisor, cuenta, mensajes).await;
+    listar(&mut sesion, servicio, emisor, cuenta, mensajes).await?;
 
     let avisa = sesion.soporta_idle();
     if !avisa {
@@ -632,7 +665,7 @@ async fn sesion_de_cuenta(
 
         let ahora = contar(&mut sesion, mensajes).await;
         publicar(servicio, emisor, cuenta, ahora).await;
-        listar(&mut sesion, servicio, emisor, cuenta, mensajes).await;
+        listar(&mut sesion, servicio, emisor, cuenta, mensajes).await?;
     }
 }
 
@@ -643,16 +676,28 @@ async fn sesion_de_cuenta(
 /// un servidor contestó raro a un `FETCH` sería cambiar algo que funciona por
 /// algo que recién se estrena. Queda en el registro y se reintenta en la vuelta
 /// siguiente.
+///
+/// **Salvo que la conexión haya quedado desincronizada**, que es la única
+/// excepción y no admite otra: seguir usándola leería el correo de alguien como
+/// si fueran líneas del protocolo, y el contador que se quería salvar pasaría a
+/// decir cualquier cosa. Ahí se corta y se reconecta.
 async fn listar(
     sesion: &mut imap::Sesion,
     servicio: &Servicio,
     emisor: &SignalContext<'_>,
     cuenta: &broker::Account,
     mensajes: u32,
-) {
+) -> Result<(), Salida> {
     match sesion.resumenes(mensajes).await {
-        Ok(lista) => publicar_mensajes(servicio, emisor, &cuenta.id, lista).await,
-        Err(e) => tracing::warn!("'{}': no se pudo listar el correo: {e}", cuenta.id),
+        Ok(lista) => {
+            publicar_mensajes(servicio, emisor, &cuenta.id, lista).await;
+            Ok(())
+        }
+        Err(e @ imap::ImapError::Desincronizada(_)) => Err(Salida::Cortada(e.to_string())),
+        Err(e) => {
+            tracing::warn!("'{}': no se pudo listar el correo: {e}", cuenta.id);
+            Ok(())
+        }
     }
 }
 
@@ -690,9 +735,24 @@ async fn ajustar_tareas(
 
     let mut estado = servicio.estado.lock().await;
     estado.por_cuenta.retain(|id, _| vigentes.contains(&id.as_str()));
+    // Los mensajes de una cuenta que ya no está **se van con ella**. Sin esto,
+    // borrar una cuenta desde Configuración dejaba en memoria el remitente y el
+    // asunto de sus últimos doscientos mensajes, y `ListMessages` los seguía
+    // entregando a quien preguntara por ese identificador. Alguien que quita una
+    // cuenta espera que se vaya el correo también.
+    estado.mensajes.retain(|id, _| vigentes.contains(&id.as_str()));
     estado.rechazadas.retain(|id| vigentes.contains(&id.as_str()));
     let rechazadas = estado.rechazadas.clone();
     drop(estado);
+
+    // Y su conexión de lectura, que está autenticada contra el servidor. Una
+    // cuenta borrada no puede dejar una sesión IMAP viva: al soltar el `Lector`
+    // se cierra el socket.
+    servicio
+        .lectores
+        .lock()
+        .await
+        .retain(|id, _| vigentes.contains(&id.as_str()));
 
     for cuenta in con_correo {
         if tareas.contains_key(&cuenta.id) {

@@ -84,6 +84,11 @@ pub enum ImapError {
     /// caso en que hay que avisar y **dejar de reintentar**: insistir con una
     /// contraseña que el servidor rechaza es cómo se bloquea una cuenta.
     Rechazado(String),
+    /// La conexión quedó a mitad de camino de algo y lo que venga después se
+    /// va a leer corrido. **No se puede seguir usando**: hay que tirarla y abrir
+    /// otra. Se distingue de `Fallo` porque un fallo cualquiera deja la sesión
+    /// utilizable y éste no.
+    Desincronizada(String),
     Fallo(String),
 }
 
@@ -91,6 +96,7 @@ impl std::fmt::Display for ImapError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ImapError::Rechazado(d) => write!(f, "el servidor rechazó las credenciales: {d}"),
+            ImapError::Desincronizada(d) => write!(f, "la conexión quedó desincronizada: {d}"),
             ImapError::Fallo(d) => write!(f, "{d}"),
         }
     }
@@ -668,11 +674,14 @@ impl Sesion {
             loop {
                 let (linea, literales) = self.leer_respuesta().await?;
 
-                if let Some(uid) = uid_de(&linea) {
-                    let cabeceras = literales
-                        .first()
-                        .map(|b| String::from_utf8_lossy(b).into_owned())
-                        .unwrap_or_default();
+                // **Sólo si trajo las cabeceras.** Mientras este comando corre, el
+                // servidor puede intercalar un `FETCH` que nadie pidió: es cómo
+                // avisa que otro dispositivo marcó algo como leído, y viene con
+                // UID y sin literal. Tomarlo por un mensaje dejaba una fila en
+                // blanco en la lista, y si después llegaba el de verdad, el
+                // mismo mensaje aparecía dos veces.
+                if let (Some(uid), Some(bloque)) = (uid_de(&linea), literales.first()) {
+                    let cabeceras = crate::mensaje::como_latin1(bloque);
                     let adjuntos = cabeceras.to_ascii_lowercase().contains("multipart/mixed");
                     resumenes.push(crate::mensaje::resumen_de(
                         uid,
@@ -774,7 +783,19 @@ impl Sesion {
             };
 
             if cuantos > MAX_CUERPO {
-                return Err(ImapError::Fallo(format!(
+                // **Esta conexión ya no sirve.**
+                //
+                // El servidor escribió esos bytes en el socket antes de que este
+                // control corriera. Volver sin leerlos los deja ahí, y la
+                // próxima lectura arranca en el medio del mensaje e interpreta
+                // el correo de alguien como si fueran líneas del protocolo — que
+                // es exactamente el desastre que este lector existe para evitar.
+                //
+                // Leerlos igual tampoco sirve: son más de los que se pidieron,
+                // así que el número lo elige el servidor y podrían ser
+                // gigabytes. Se avisa que la sesión quedó rota, y quien la tenga
+                // la tira y abre otra.
+                return Err(ImapError::Desincronizada(format!(
                     "el servidor anunció {cuantos} bytes, más de los {MAX_CUERPO} que se piden"
                 )));
             }
@@ -920,6 +941,35 @@ mod tests {
         assert!(!esta_visto("* 1 FETCH (FLAGS () UID 3)"));
         // El asunto viene en un literal aparte, pero por las dudas.
         assert!(!esta_visto("* 1 FETCH (FLAGS () BODY[HEADER] Seen this?)"));
+    }
+
+    /// Mientras corre el `FETCH`, el servidor puede intercalar uno que nadie
+    /// pidió: es cómo avisa que otro dispositivo marcó algo como leído. Viene
+    /// con UID y **sin literal**, y tomarlo por un mensaje dejaba una fila en
+    /// blanco en la lista — y si después llegaba el de verdad, el mismo mensaje
+    /// aparecía dos veces.
+    #[test]
+    fn un_fetch_sin_literal_no_es_un_mensaje() {
+        // El aviso trae UID, así que `uid_de` lo reconoce: lo que lo distingue
+        // es que no viene con cabeceras.
+        let aviso = "* 7 FETCH (UID 12 FLAGS (\\Seen))";
+        assert_eq!(uid_de(aviso), Some(12));
+        assert_eq!(literal_de(aviso), None);
+    }
+
+    /// Un literal más grande de lo que se pidió deja la conexión inservible: sus
+    /// bytes ya están en el socket, y lo que venga después se va a leer corrido.
+    /// Tiene que distinguirse de un fallo cualquiera, que sí deja seguir.
+    #[test]
+    fn una_desincronizacion_no_es_un_fallo_cualquiera() {
+        let rota = ImapError::Desincronizada("anunció de más".into());
+        assert!(matches!(rota, ImapError::Desincronizada(_)));
+        assert!(rota.to_string().contains("desincronizada"), "{rota}");
+
+        // Y no se confunde con las otras dos, que son las que dejan la sesión
+        // utilizable o mandan a dejar de reintentar.
+        assert!(!matches!(ImapError::Fallo("x".into()), ImapError::Desincronizada(_)));
+        assert!(!matches!(ImapError::Rechazado("x".into()), ImapError::Desincronizada(_)));
     }
 
     /// Pedir `1:0` es un error de sintaxis, y hay servidores que ante uno cortan
