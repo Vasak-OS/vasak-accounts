@@ -147,6 +147,18 @@ pub fn puntos_protegidos(mensaje: &str) -> String {
         .join("\r\n")
 }
 
+/// Si una dirección se puede escribir dentro de un comando sin partirlo.
+///
+/// No valida que sea una dirección —de eso se ocupa `redactar`— sino que **no
+/// pueda salirse del comando**: un salto de línea la convierte en un comando
+/// SMTP más, y desde ahí se manda lo que sea en nombre de la persona.
+pub fn cabe_en_un_comando(direccion: &str) -> bool {
+    !direccion.is_empty()
+        && direccion.len() <= 320
+        && !direccion.chars().any(|c| c.is_control() || c.is_whitespace())
+        && !direccion.contains(['<', '>'])
+}
+
 /// La carga de `AUTH PLAIN`: `\0usuario\0secreto`, en base64.
 pub fn carga_plain(usuario: &str, secreto: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(format!("\0{usuario}\0{secreto}"))
@@ -311,6 +323,23 @@ impl Sesion {
         destinatarios: &[String],
         mensaje: &str,
     ) -> Result<(), SmtpError> {
+        // **Las direcciones se revisan otra vez acá.** Ya pasaron por
+        // `redactar::revisar` antes de encolarse, así que esto no debería
+        // encontrar nada — y por eso mismo va: que `entregar` sea segura no
+        // puede depender de que quien la llame se haya acordado de validar
+        // primero. Una dirección con un salto de línea es un comando SMTP
+        // inyectado, y desde ahí se manda cualquier cosa en nombre de la
+        // persona. El archivo de la cola además vive en el disco y se puede
+        // haber tocado a mano.
+        for direccion in std::iter::once(remitente).chain(destinatarios.iter().map(String::as_str))
+        {
+            if !cabe_en_un_comando(direccion) {
+                return Err(SmtpError::Permanente(format!(
+                    "«{direccion}» no se puede usar como dirección"
+                )));
+            }
+        }
+
         self.mandar(&format!("MAIL FROM:<{remitente}>"), &["250"]).await?;
 
         for destinatario in destinatarios {
@@ -523,6 +552,26 @@ mod tests {
         // Y el de credenciales es su propio caso, porque lo arregla la persona.
         assert!(matches!(clasificar(535, "x".into()), SmtpError::Rechazado(_)));
         assert!(!clasificar(535, "x".into()).se_reintenta());
+    }
+
+    /// Un salto de línea en una dirección la convierte en un comando SMTP más,
+    /// y desde ahí se manda lo que sea en nombre de la persona. La validación
+    /// de `redactar` ya lo impide antes de encolar; ésta está para que
+    /// `entregar` sea segura **sola**, porque el archivo de la cola vive en el
+    /// disco y se puede haber tocado a mano.
+    #[test]
+    fn una_direccion_no_puede_partir_el_comando() {
+        for mala in [
+            "juan@otro.com\r\nRCPT TO:<espia@ajeno.com>",
+            "juan@otro.com\nDATA",
+            "juan@otro.com>\r\n",
+            "<juan@otro.com>",
+            "juan @otro.com",
+            "",
+        ] {
+            assert!(!cabe_en_un_comando(mala), "{mala:?} tendría que rechazarse");
+        }
+        assert!(cabe_en_un_comando("juan.perez+x@sub.otro.com"));
     }
 
     /// **Una de las cosas más viejas y más olvidadas del protocolo.** Sin
