@@ -21,3 +21,8 @@ rustls-native-certs.workspace = true
 base64 = "0.22"
 # Para el flujo de señales de D-Bus.
 futures-util = "0.3"
+# Los juegos de caracteres del correo. Medio correo viejo viene en latin-1, y sin
+# convertirlo un mensaje en español de hace quince años se ve con un rombo en
+# cada acento. Es Rust puro —el mismo motor de codificaciones de Firefox—, así
+# que no suma ninguna biblioteca compartida al paquete.
+encoding_rs = "0.8"

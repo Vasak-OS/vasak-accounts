@@ -1,17 +1,24 @@
-//! Lo justo de IMAP para saber cuánto correo sin leer hay.
+//! Lo de IMAP que hace falta para saber qué correo hay y leerlo.
 //!
-//! ── Por qué tan poco ────────────────────────────────────────────────────────
+//! ── Cómo creció esto ────────────────────────────────────────────────────────
 //!
-//! Todavía no existe la aplicación de correo, así que un caché de mensajes sería
-//! inventarle un formato a un consumidor que no está. Lo que **sí** sirve hoy y
-//! no depende de nadie es el contador de sin leer: alcanza para que el
-//! escritorio muestre que llegó algo.
+//! Empezó contando sin leer y nada más, a propósito: `STATUS` y `SEARCH`
+//! devuelven números, así que no había que tocar ni una cabecera ni un cuerpo —o
+//! sea, ni una línea de parser sobre lo que escribió un desconocido—. Ese módulo
+//! decía que el día que hubiera que leer mensajes de verdad el parser sería la
+//! parte peligrosa y merecería su propia discusión. Ese día llegó con la
+//! aplicación de correo, y esa discusión está en `mensaje.rs`.
 //!
-//! Y hay una razón de fondo para empezar por ahí: `STATUS` devuelve cuatro
-//! números y nada más. No hay que tocar un cuerpo de mensaje, ni una cabecera,
-//! ni MIME — o sea, ni una línea de parser sobre lo que escribió un remitente
-//! desconocido. El día que haya que leer mensajes de verdad, ese parser va a ser
-//! la parte peligrosa y va a merecer su propia discusión.
+//! Acá sigue viviendo sólo el **protocolo**: pedirle cosas al servidor y
+//! entender su respuesta. Lo que dice el mensaje se interpreta en el otro lado.
+//!
+//! ── Literales ───────────────────────────────────────────────────────────────
+//!
+//! IMAP es un protocolo de líneas hasta que se piden cuerpos. Ahí el servidor
+//! anuncia `{1234}` al final de una línea y manda esos bytes crudos: pueden
+//! contener saltos de línea, comillas y bytes que no son texto. Leerlos como
+//! líneas parte el mensaje en pedazos y desincroniza la conexión para siempre —
+//! todo lo que venga después se lee corrido. Por eso hay un lector aparte.
 //!
 //! ── Sobre el proceso donde corre ────────────────────────────────────────────
 //!
@@ -51,12 +58,37 @@ const INTERCAMBIO: Duration = Duration::from_secs(60);
 /// crecer la memoria del proceso sin límite.
 const MAX_LINEA: u64 = 64 * 1024;
 
+/// Tope de un literal: lo que el servidor manda como bloque de bytes.
+///
+/// Un mensaje con un adjunto de veinticinco megas es normal, y traerlo entero
+/// para mostrar tres líneas de texto sería gastar la conexión de la persona en
+/// algo que no se va a ver. Se pide **de a un pedazo** con `<0.N>`, que el
+/// protocolo permite, y esto es ese pedazo.
+///
+/// La contra, dicha donde se ve: si el texto del mensaje viene **después** de un
+/// adjunto grande, se corta. Los clientes ponen el texto primero, así que en la
+/// práctica no pasa; cuando haya un lector de adjuntos de verdad va a mirar la
+/// estructura del mensaje y a pedir sólo la parte que se muestra.
+pub const MAX_CUERPO: usize = 1024 * 1024;
+
+/// Cuántos mensajes se traen de la casilla.
+///
+/// No todos: una casilla de veinte años tiene decenas de miles, y traerlos en el
+/// arranque haría esperar minutos para ver el correo de hoy. Los últimos
+/// doscientos son varias pantallas y llegan en un segundo.
+pub const CUANTOS: u32 = 200;
+
 #[derive(Debug)]
 pub enum ImapError {
     /// El servidor dijo que no a las credenciales. Se distingue porque es el
     /// caso en que hay que avisar y **dejar de reintentar**: insistir con una
     /// contraseña que el servidor rechaza es cómo se bloquea una cuenta.
     Rechazado(String),
+    /// La conexión quedó a mitad de camino de algo y lo que venga después se
+    /// va a leer corrido. **No se puede seguir usando**: hay que tirarla y abrir
+    /// otra. Se distingue de `Fallo` porque un fallo cualquiera deja la sesión
+    /// utilizable y éste no.
+    Desincronizada(String),
     Fallo(String),
 }
 
@@ -64,6 +96,7 @@ impl std::fmt::Display for ImapError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ImapError::Rechazado(d) => write!(f, "el servidor rechazó las credenciales: {d}"),
+            ImapError::Desincronizada(d) => write!(f, "la conexión quedó desincronizada: {d}"),
             ImapError::Fallo(d) => write!(f, "{d}"),
         }
     }
@@ -222,6 +255,72 @@ pub fn anuncia_cambio(linea: &str) -> bool {
         return false;
     }
     cola.starts_with("EXISTS") || cola.starts_with("EXPUNGE") || cola.starts_with("FETCH")
+}
+
+/// Cuántos bytes anuncia un literal al final de una línea.
+///
+/// `{1234}` o `{1234+}`: la segunda forma es la de los servidores que no esperan
+/// confirmación. Las dos significan lo mismo para quien lee.
+///
+/// Sin esto, esos bytes se leerían como si fueran líneas del protocolo: el
+/// mensaje se parte en pedazos y la conexión queda desincronizada para siempre,
+/// porque todo lo que venga después se interpreta corrido.
+pub fn literal_de(linea: &str) -> Option<usize> {
+    let sin_llave = linea.strip_suffix('}')?;
+    let inicio = sin_llave.rfind('{')?;
+    let numero = &sin_llave[inicio + 1..];
+    // El `+` de LITERAL+ va pegado al número.
+    numero.strip_suffix('+').unwrap_or(numero).parse().ok()
+}
+
+/// El UID que trae una respuesta de `FETCH`.
+///
+/// El UID y no el número de secuencia: el número cambia en cuanto se borra
+/// cualquier mensaje anterior, así que guardarlo sería guardar algo que mañana
+/// apunta a otro mensaje.
+pub fn uid_de(respuesta: &str) -> Option<u32> {
+    let mayusculas = respuesta.to_ascii_uppercase();
+    let mut desde = 0;
+    while let Some(posicion) = mayusculas[desde..].find("UID ") {
+        let absoluta = desde + posicion;
+        // Que sea la palabra «UID» y no el final de otra, como «BODYUID».
+        let anterior = mayusculas[..absoluta].chars().next_back();
+        if anterior.is_none_or(|c| c == '(' || c == ' ') {
+            let cola = &respuesta[absoluta + "UID ".len()..];
+            let digitos: String = cola.chars().take_while(char::is_ascii_digit).collect();
+            if let Ok(uid) = digitos.parse() {
+                return Some(uid);
+            }
+        }
+        desde = absoluta + "UID ".len();
+    }
+    None
+}
+
+/// Si el mensaje está marcado como leído.
+///
+/// Se mira `\Seen` dentro de `FLAGS (...)` y no en la respuesta entera: un
+/// asunto que diga «Seen» no puede marcar un mensaje como leído.
+pub fn esta_visto(respuesta: &str) -> bool {
+    let mayusculas = respuesta.to_ascii_uppercase();
+    let Some(inicio) = mayusculas.find("FLAGS (") else {
+        return false;
+    };
+    let desde = inicio + "FLAGS (".len();
+    let hasta = mayusculas[desde..].find(')').map(|f| desde + f).unwrap_or(mayusculas.len());
+    mayusculas[desde..hasta].split_whitespace().any(|b| b == "\\SEEN")
+}
+
+/// El rango de secuencia de los últimos `cuantos` mensajes de una casilla.
+///
+/// `None` si la casilla está vacía: pedir `1:0` es un error de sintaxis, y un
+/// servidor que lo recibe puede cortar la sesión en vez de contestar.
+pub fn ultimos(mensajes: u32, cuantos: u32) -> Option<String> {
+    if mensajes == 0 || cuantos == 0 {
+        return None;
+    }
+    let desde = mensajes.saturating_sub(cuantos - 1).max(1);
+    Some(format!("{desde}:{mensajes}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -410,11 +509,17 @@ impl Sesion {
     /// proceso cuenta correo; no tiene por qué cambiar nada de la casilla de
     /// nadie.
     pub async fn examinar(&mut self, casilla: &str) -> Result<u32, ImapError> {
+        self.abrir_casilla("EXAMINE", casilla).await
+    }
+
+    /// Abre una casilla con el comando que se le diga y devuelve cuántos
+    /// mensajes tiene.
+    async fn abrir_casilla(&mut self, comando: &str, casilla: &str) -> Result<u32, ImapError> {
         let nombre = comillas(casilla)
             .ok_or_else(|| ImapError::Fallo("el nombre de la casilla no es válido".into()))?;
 
         let etiqueta = self.siguiente_etiqueta();
-        self.escribir(&format!("{etiqueta} EXAMINE {nombre}")).await?;
+        self.escribir(&format!("{etiqueta} {comando} {nombre}")).await?;
 
         Self::con_tope("abrir la casilla", async {
             let mut mensajes = 0;
@@ -536,6 +641,199 @@ impl Sesion {
         Ok(novedad)
     }
 
+    /// Los últimos mensajes de la casilla abierta, con lo que hace falta para
+    /// listarlos.
+    ///
+    /// Sólo las cabeceras que se muestran, y no el mensaje entero: una casilla
+    /// con diez mil mensajes son gigabytes, y para pintar una lista alcanzan
+    /// cuatro campos. El cuerpo se pide de a uno, cuando alguien abre algo.
+    ///
+    /// `BODY.PEEK` y no `BODY`: el segundo **marca el mensaje como leído** por el
+    /// solo hecho de mirarlo. Que abrir la aplicación te vacíe el contador de sin
+    /// leer sin que hayas leído nada es de los errores más molestos que puede
+    /// tener un cliente de correo, y se comete escribiendo cuatro letras de
+    /// menos.
+    pub async fn resumenes(&mut self, mensajes: u32) -> Result<Vec<crate::mensaje::Resumen>, ImapError> {
+        let Some(rango) = ultimos(mensajes, CUANTOS) else {
+            return Ok(Vec::new());
+        };
+
+        let etiqueta = self.siguiente_etiqueta();
+        // `CONTENT-TYPE` viene para saber si hay algo pegado. Es una pista y no
+        // una certeza —un `multipart/mixed` puede ser texto con una imagen
+        // incrustada—, pero cuesta cero y acierta casi siempre; saberlo de verdad
+        // pide traer la estructura completa del mensaje.
+        self.escribir(&format!(
+            "{etiqueta} FETCH {rango} (UID FLAGS \
+             BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE CONTENT-TYPE)])"
+        ))
+        .await?;
+
+        Self::con_tope("la lista de mensajes", async {
+            let mut resumenes = Vec::new();
+            loop {
+                let (linea, literales) = self.leer_respuesta().await?;
+
+                // **Sólo si trajo las cabeceras.** Mientras este comando corre, el
+                // servidor puede intercalar un `FETCH` que nadie pidió: es cómo
+                // avisa que otro dispositivo marcó algo como leído, y viene con
+                // UID y sin literal. Tomarlo por un mensaje dejaba una fila en
+                // blanco en la lista, y si después llegaba el de verdad, el
+                // mismo mensaje aparecía dos veces.
+                if let (Some(uid), Some(bloque)) = (uid_de(&linea), literales.first()) {
+                    // Sin etiqueta de juego de caracteres, que es lo correcto
+                    // acá: una cabecera **no** vuelve a bytes nunca —lo que sale
+                    // de `resumen_de` es lo que se muestra—, así que la vista
+                    // latin-1 que sirve para recorrer un cuerpo acá dejaría un
+                    // `Subject` en UTF-8 crudo mostrándose como «ReuniÃ³n».
+                    //
+                    // Las palabras codificadas son ASCII y no se ven afectadas;
+                    // lo que esto arregla son las cabeceras con bytes de ocho
+                    // bits sin codificar, que el estándar no permite y los
+                    // clientes mandan igual.
+                    let cabeceras = crate::mensaje::a_texto(bloque, "");
+                    let adjuntos = cabeceras.to_ascii_lowercase().contains("multipart/mixed");
+                    resumenes.push(crate::mensaje::resumen_de(
+                        uid,
+                        &cabeceras,
+                        !esta_visto(&linea),
+                        adjuntos,
+                    ));
+                }
+
+                match respuesta_de(&linea, &etiqueta) {
+                    Some(Respuesta::Ok) => return Ok(resumenes),
+                    Some(Respuesta::No(d)) | Some(Respuesta::Bad(d)) => {
+                        return Err(ImapError::Fallo(format!("no se pudo listar: {d}")))
+                    }
+                    None => continue,
+                }
+            }
+        })
+        .await
+    }
+
+    /// El mensaje entero de un UID, tal como lo mandaron.
+    ///
+    /// Devuelve además si se cortó: se pide sólo el primer pedazo (ver
+    /// `MAX_CUERPO`), y quien muestra el mensaje tiene que poder decir que hay
+    /// más en vez de dejar el texto terminado a la mitad sin explicación.
+    ///
+    /// `BODY.PEEK` otra vez: abrir un mensaje **sí** lo marca como leído, pero eso
+    /// lo decide la aplicación con un comando explícito, no el efecto secundario
+    /// de haberlo traído.
+    pub async fn cuerpo(&mut self, uid: u32) -> Result<(Vec<u8>, bool), ImapError> {
+        let etiqueta = self.siguiente_etiqueta();
+        self.escribir(&format!(
+            "{etiqueta} UID FETCH {uid} (BODY.PEEK[]<0.{MAX_CUERPO}>)"
+        ))
+        .await?;
+
+        Self::con_tope("traer el mensaje", async {
+            let mut crudo: Vec<u8> = Vec::new();
+            loop {
+                let (linea, literales) = self.leer_respuesta().await?;
+                if let Some(bytes) = literales.into_iter().next() {
+                    crudo = bytes;
+                }
+                match respuesta_de(&linea, &etiqueta) {
+                    Some(Respuesta::Ok) => {
+                        let recortado = crudo.len() >= MAX_CUERPO;
+                        return Ok((crudo, recortado));
+                    }
+                    Some(Respuesta::No(d)) | Some(Respuesta::Bad(d)) => {
+                        return Err(ImapError::Fallo(format!("no se pudo traer: {d}")))
+                    }
+                    None => continue,
+                }
+            }
+        })
+        .await
+    }
+
+    /// Marca un mensaje como leído en el servidor.
+    ///
+    /// En el servidor y no sólo acá: la persona lee en el teléfono y en el
+    /// escritorio, y un «leído» que no viaja hace que el mismo mensaje aparezca
+    /// sin leer en el otro lado para siempre.
+    ///
+    /// Necesita la casilla abierta con `SELECT`. Con `EXAMINE` —que es como la
+    /// abre el bucle que sólo cuenta— el servidor contesta que es de sólo
+    /// lectura, y eso es correcto: cambiar banderas es una decisión de la
+    /// persona, no un efecto de estar sincronizando.
+    pub async fn marcar_leido(&mut self, uid: u32) -> Result<(), ImapError> {
+        self.mandar(&format!("UID STORE {uid} +FLAGS (\\Seen)")).await
+    }
+
+    /// Abre una casilla **para escribir** y devuelve cuántos mensajes tiene.
+    ///
+    /// Se usa sólo cuando hay que cambiar una bandera. El resto del tiempo la
+    /// casilla se abre con `EXAMINE`, que no puede tocar nada.
+    pub async fn seleccionar(&mut self, casilla: &str) -> Result<u32, ImapError> {
+        self.abrir_casilla("SELECT", casilla).await
+    }
+
+    /// Lee una respuesta entera, con sus literales.
+    ///
+    /// Una respuesta puede ocupar varias líneas: cada `{N}` al final de una
+    /// significa que siguen N bytes crudos y después continúa la respuesta. Se
+    /// devuelven el texto —con los literales sacados— y los bloques de bytes
+    /// aparte, **sin convertirlos a texto**: el juego de caracteres de un
+    /// mensaje lo decide el mensaje, y pasarlos por UTF-8 acá destruiría los
+    /// acentos de todo el correo viejo antes de que nadie pueda arreglarlo.
+    async fn leer_respuesta(&mut self) -> Result<(String, Vec<Vec<u8>>), ImapError> {
+        let mut texto = String::new();
+        let mut literales: Vec<Vec<u8>> = Vec::new();
+
+        loop {
+            let linea = self.leer_linea().await?;
+            let Some(cuantos) = literal_de(&linea) else {
+                texto.push_str(&linea);
+                return Ok((texto, literales));
+            };
+
+            if cuantos > MAX_CUERPO {
+                // **Esta conexión ya no sirve.**
+                //
+                // El servidor escribió esos bytes en el socket antes de que este
+                // control corriera. Volver sin leerlos los deja ahí, y la
+                // próxima lectura arranca en el medio del mensaje e interpreta
+                // el correo de alguien como si fueran líneas del protocolo — que
+                // es exactamente el desastre que este lector existe para evitar.
+                //
+                // Leerlos igual tampoco sirve: son más de los que se pidieron,
+                // así que el número lo elige el servidor y podrían ser
+                // gigabytes. Se avisa que la sesión quedó rota, y quien la tenga
+                // la tira y abre otra.
+                return Err(ImapError::Desincronizada(format!(
+                    "el servidor anunció {cuantos} bytes, más de los {MAX_CUERPO} que se piden"
+                )));
+            }
+            // Sin la marca `{N}`: es del protocolo y no del mensaje.
+            if let Some(marca) = linea.rfind('{') {
+                texto.push_str(&linea[..marca]);
+            }
+            literales.push(self.leer_bytes(cuantos).await?);
+        }
+    }
+
+    /// Lee exactamente `cuantos` bytes, empezando por lo que ya esté en el búfer.
+    async fn leer_bytes(&mut self, cuantos: usize) -> Result<Vec<u8>, ImapError> {
+        while self.pendiente.len() < cuantos {
+            let leidos = self
+                .flujo
+                .read_buf(&mut self.pendiente)
+                .await
+                .map_err(|e| ImapError::Fallo(format!("no se pudo leer: {e}")))?;
+            if leidos == 0 {
+                return Err(ImapError::Fallo(
+                    "el servidor cortó la conexión en medio de un mensaje".into(),
+                ));
+            }
+        }
+        Ok(self.pendiente.drain(..cuantos).collect())
+    }
+
     fn siguiente_etiqueta(&mut self) -> String {
         self.etiqueta += 1;
         format!("a{}", self.etiqueta)
@@ -608,6 +906,99 @@ impl Sesion {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sin reconocer el literal, esos bytes se leen como si fueran líneas del
+    /// protocolo: el mensaje se parte en pedazos y la conexión queda
+    /// desincronizada **para siempre**, porque todo lo que venga después se
+    /// interpreta corrido.
+    #[test]
+    fn se_reconoce_el_anuncio_de_un_literal() {
+        assert_eq!(literal_de("* 1 FETCH (UID 5 BODY[] {1234}"), Some(1234));
+        // LITERAL+: el servidor no espera confirmación. Significa lo mismo para
+        // quien lee, y no reconocerlo es el mismo desastre.
+        assert_eq!(literal_de("* 1 FETCH (UID 5 BODY[] {1234+}"), Some(1234));
+        assert_eq!(literal_de("* 1 FETCH (UID 5 FLAGS (\\Seen))"), None);
+        assert_eq!(literal_de("a1 OK FETCH completado"), None);
+        assert_eq!(literal_de("{no es un número}"), None);
+        assert_eq!(literal_de(""), None);
+    }
+
+    /// El UID y no el número de secuencia: el número cambia en cuanto se borra
+    /// cualquier mensaje anterior, así que guardarlo sería guardar algo que
+    /// mañana apunta a otro mensaje.
+    #[test]
+    fn se_saca_el_uid_de_un_fetch() {
+        assert_eq!(uid_de("* 12 FETCH (UID 345 FLAGS (\\Seen))"), Some(345));
+        // El orden de los campos lo elige el servidor.
+        assert_eq!(uid_de("* 12 FETCH (FLAGS () UID 7)"), Some(7));
+        assert_eq!(uid_de("* 12 FETCH (FLAGS ())"), None);
+    }
+
+    /// «UID» tiene que ser la palabra y no el final de otra, o cualquier campo
+    /// que termine así daría un identificador inventado.
+    #[test]
+    fn una_palabra_que_termina_en_uid_no_es_el_uid() {
+        assert_eq!(uid_de("* 1 FETCH (X-MYUID 999 UID 3)"), Some(3));
+        assert_eq!(uid_de("* 1 FETCH (X-MYUID 999)"), None);
+    }
+
+    /// Se mira dentro de `FLAGS (...)`: un asunto que diga «Seen» no puede
+    /// marcar un mensaje como leído.
+    #[test]
+    fn lo_leido_se_mira_solo_en_las_banderas() {
+        assert!(esta_visto("* 1 FETCH (FLAGS (\\Seen \\Answered) UID 3)"));
+        assert!(!esta_visto("* 1 FETCH (FLAGS (\\Answered) UID 3)"));
+        assert!(!esta_visto("* 1 FETCH (FLAGS () UID 3)"));
+        // El asunto viene en un literal aparte, pero por las dudas.
+        assert!(!esta_visto("* 1 FETCH (FLAGS () BODY[HEADER] Seen this?)"));
+    }
+
+    /// Mientras corre el `FETCH`, el servidor puede intercalar uno que nadie
+    /// pidió: es cómo avisa que otro dispositivo marcó algo como leído. Viene
+    /// con UID y **sin literal**, y tomarlo por un mensaje dejaba una fila en
+    /// blanco en la lista — y si después llegaba el de verdad, el mismo mensaje
+    /// aparecía dos veces.
+    #[test]
+    fn un_fetch_sin_literal_no_es_un_mensaje() {
+        // El aviso trae UID, así que `uid_de` lo reconoce: lo que lo distingue
+        // es que no viene con cabeceras.
+        let aviso = "* 7 FETCH (UID 12 FLAGS (\\Seen))";
+        assert_eq!(uid_de(aviso), Some(12));
+        assert_eq!(literal_de(aviso), None);
+    }
+
+    /// Un literal más grande de lo que se pidió deja la conexión inservible: sus
+    /// bytes ya están en el socket, y lo que venga después se va a leer corrido.
+    /// Tiene que distinguirse de un fallo cualquiera, que sí deja seguir.
+    #[test]
+    fn una_desincronizacion_no_es_un_fallo_cualquiera() {
+        let rota = ImapError::Desincronizada("anunció de más".into());
+        assert!(matches!(rota, ImapError::Desincronizada(_)));
+        assert!(rota.to_string().contains("desincronizada"), "{rota}");
+
+        // Y no se confunde con las otras dos, que son las que dejan la sesión
+        // utilizable o mandan a dejar de reintentar.
+        assert!(!matches!(ImapError::Fallo("x".into()), ImapError::Desincronizada(_)));
+        assert!(!matches!(ImapError::Rechazado("x".into()), ImapError::Desincronizada(_)));
+    }
+
+    /// Pedir `1:0` es un error de sintaxis, y hay servidores que ante uno cortan
+    /// la sesión en vez de contestar. Una casilla vacía es de lo más común: una
+    /// carpeta recién creada, o una cuenta nueva.
+    #[test]
+    fn una_casilla_vacia_no_genera_un_rango_invalido() {
+        assert_eq!(ultimos(0, CUANTOS), None);
+        assert_eq!(ultimos(10, 0), None);
+    }
+
+    #[test]
+    fn el_rango_toma_los_ultimos_y_no_se_pasa_del_principio() {
+        assert_eq!(ultimos(1000, 200), Some("801:1000".into()));
+        // Con menos mensajes que el tope, se piden todos: no hay un `0:` ni un
+        // número negativo dado vuelta.
+        assert_eq!(ultimos(5, 200), Some("1:5".into()));
+        assert_eq!(ultimos(1, 200), Some("1:1".into()));
+    }
 
     /// El formato del XOAUTH2 lo fijan Google y Microsoft y no se parece a nada
     /// más del protocolo. Escribirlo con espacios o dos puntos, que es lo
