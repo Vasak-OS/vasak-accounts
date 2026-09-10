@@ -441,6 +441,9 @@ Publica en `ar.net.vasak.os.AccountsSync` (bus de sesión):
 | `ListMessages(account_id)` | Los últimos 200 mensajes: quién, qué asunto, cuándo, leído o no. Sin cuerpos. |
 | `GetMessage(account_id, uid)` | El texto de un mensaje, si se cortó por tamaño y si trae adjuntos. |
 | `MarkRead(account_id, uid)` | Marca un mensaje como leído **en el servidor**. |
+| `SendMessage(account_id, borrador)` | Pone un mensaje en la cola de salida. Devuelve su identificador. |
+| `ListOutbox` | Lo que está esperando salir, y lo que se trabó. |
+| `DiscardOutgoing(id)` | Saca un mensaje de la cola sin mandarlo. |
 
 Los cuerpos viajan como bytes hasta el último momento. Convertirlos a texto
 apenas llegan —con la conversión «tolerante» que es lo natural en Rust—
@@ -485,8 +488,63 @@ megas es normal, y traerlo entero para mostrar tres líneas sería gastar la
 conexión de la persona en algo que no se ve. La contra, dicha donde se ve: si el
 texto viene *después* de un adjunto grande, se corta — y la ventana lo dice.
 
-**Todavía no envía.** Mandar correo pasa por SMTP y por una cola que sobreviva a
-que se apague el equipo con algo sin mandar; es su propio trabajo.
+### Mandar correo
+
+`SendMessage` **encola, no manda**. La respuesta vuelve en cuanto el mensaje está
+a salvo en el disco y el envío pasa después, por dos razones: apretar «Enviar» no
+puede dejar la ventana esperando a un servidor que tarda un minuto, y sobre todo
+cerrar la sesión o quedarse sin luz en el medio no puede perder lo que la persona
+escribió. Lo que **sí** se revisa antes de contestar es que el mensaje se pueda
+armar: una dirección mal escrita tiene que decirlo mientras está en pantalla.
+
+**La cola va al disco**, y sí, la lista de mensajes recibidos no. No es una
+inconsistencia: guardar lo que se recibe sería dejar el remitente y el asunto de
+todo el correo de la persona en un archivo para siempre a cambio de ahorrar dos
+segundos, y guardar lo que se escribió es lo único que impide perderlo. La
+diferencia es que este archivo **se borra en cuanto el mensaje sale**: no es un
+registro, es una escala. Va en los datos del usuario y no en la caché —una caché
+se puede borrar entera sin avisar—, el directorio en 0700 y cada archivo en 0600.
+
+**El `Message-ID` y la fecha se deciden al encolar**, no al mandar. Si se
+calcularan en cada intento, un mensaje que se entrega y cuya confirmación se
+pierde entraría dos veces en el buzón de quien lo recibe con dos identificadores
+distintos, y ningún cliente podría darse cuenta de que es el mismo.
+
+**Los errores se separan en tres** porque la cola necesita saber si vale la pena
+insistir: un 4xx es «ahora no» y se reintenta con la espera duplicándose hasta
+una hora; un 5xx es «esto no va a andar nunca» y reintentarlo quema la reputación
+de la cuenta contra el servidor; y un rechazo de credenciales no se arregla
+insistiendo. Después de diez intentos —más de un día— el mensaje queda trabado y
+se lo dice, en vez de seguir golpeando el servidor de alguien.
+
+**Cifrado siempre.** O el puerto habla TLS desde el primer byte (465) o se
+negocia `STARTTLS` antes de decir nada. Un servidor que no lo ofrece en un puerto
+en claro se rechaza: no hay salida para «servidores viejos», porque un correo sin
+cifrar es la contraseña de la cuenta viajando en claro y la persona no tiene forma
+de saber que pasó. Después del `STARTTLS` se vuelve a saludar y se descarta lo que
+el servidor había anunciado antes, que es lo que impide que alguien en el camino
+degrade la autenticación a algo que manda la contraseña en claro.
+
+Todavía no manda adjuntos ni HTML, y no guarda copia en «Enviados».
+
+#### La inyección de cabeceras
+
+`redactar.rs` arma el mensaje, y ahí está el agujero clásico de cualquier cosa que
+arma correo: un mensaje son cabeceras, una línea vacía y el cuerpo, y **el asunto
+lo escribe la persona**. Un asunto con un salto de línea y `Bcc: alguien@ajeno.com`
+manda una copia oculta que quien escribió el mensaje no ve ni en su carpeta de
+enviados; con dos saltos seguidos se corta el bloque de cabeceras y se reemplaza
+el mensaje entero.
+
+No hace falta que la persona sea la atacante: alcanza con que pegue un asunto
+copiado de una página, o que la aplicación rellene el de una respuesta con el de
+un mensaje que mandó cualquiera. Nada que venga de afuera se escribe crudo en una
+cabecera: los saltos y los controles se convierten en espacios, y lo que no es
+ASCII va como palabra codificada, que por construcción no puede contener ni un
+salto ni un dos puntos suelto.
+
+Las direcciones se validan por lo mismo: no se comprueba que el buzón exista —eso
+lo dice el servidor— sino que **no puedan salirse de su renglón**.
 
 #### El parser, que es la parte peligrosa
 

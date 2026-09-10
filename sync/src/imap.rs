@@ -25,15 +25,12 @@
 //! Como el usuario, nunca como root. Es la razón de que este binario exista
 //! aparte del servicio de cuentas.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::rustls::{ClientConfig, RootCertStore};
-use tokio_rustls::TlsConnector;
 
 use crate::broker::{Credencial, Destino};
 
@@ -327,23 +324,6 @@ pub fn ultimos(mensajes: u32, cuantos: u32) -> Option<String> {
 // La parte que habla por la red
 // ---------------------------------------------------------------------------
 
-fn tls() -> Result<TlsConnector, ImapError> {
-    let mut raices = RootCertStore::empty();
-    for certificado in rustls_native_certs::load_native_certs().certs {
-        let _ = raices.add(certificado);
-    }
-    if raices.is_empty() {
-        return Err(ImapError::Fallo(
-            "no hay certificados de confianza instalados en el equipo".into(),
-        ));
-    }
-    Ok(TlsConnector::from(Arc::new(
-        ClientConfig::builder()
-            .with_root_certificates(raices)
-            .with_no_client_auth(),
-    )))
-}
-
 type Flujo = tokio_rustls::client::TlsStream<TcpStream>;
 
 pub struct Sesion {
@@ -397,7 +377,7 @@ impl Sesion {
         let nombre = ServerName::try_from(destino.host.clone()).map_err(|e| {
             ImapError::Fallo(format!("«{}» no es un nombre de servidor: {e}", destino.host))
         })?;
-        let cifrado = tls()?
+        let cifrado = crate::tls::conector().map_err(ImapError::Fallo)?
             .connect(nombre, tcp)
             .await
             .map_err(|e| ImapError::Fallo(format!("no se pudo cifrar la conexión: {e}")))?;

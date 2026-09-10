@@ -50,8 +50,12 @@
 //! a que se apague el equipo con algo sin mandar, y eso es su propio trabajo.
 
 mod broker;
+mod cola;
 mod imap;
 mod mensaje;
+mod redactar;
+mod smtp;
+mod tls;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -97,6 +101,13 @@ const REINTENTO_CUENTA: Duration = Duration::from_secs(30);
 /// Corto, porque el caso normal es que todavía esté arrancando: este servicio
 /// puede levantar antes que el bus del sistema termine de activarlo.
 const REINTENTO: Duration = Duration::from_secs(15);
+
+/// Cada cuánto se mira la cola de salida por las dudas.
+///
+/// El caso normal es que se despierte en el momento, cuando alguien encola algo.
+/// Esto es para lo otro: un mensaje que quedó esperando porque el servidor
+/// estaba caído tiene que salir solo cuando vuelva, sin que nadie apriete nada.
+const REVISAR_COLA: Duration = Duration::from_secs(60);
 
 /// Lo que se sabe de una cuenta después de mirarla.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -147,6 +158,12 @@ struct Servicio {
     /// La segunda conexión de cada cuenta, la que atiende lo que pide la
     /// ventana. Se crea cuando alguien abre un mensaje por primera vez.
     lectores: Arc<Mutex<HashMap<String, Arc<Mutex<Lector>>>>>,
+    /// Con qué se le avisa al despachador que hay algo nuevo para mandar.
+    ///
+    /// Sin esto habría que esperar a la revisión por reloj, y apretar «Enviar»
+    /// tardaría hasta un minuto en hacer algo visible — que se siente como que
+    /// el botón no anduvo.
+    hay_algo_que_mandar: Arc<tokio::sync::Notify>,
 }
 
 /// Un mensaje abierto, listo para mostrar.
@@ -412,6 +429,123 @@ impl Servicio {
         Ok(())
     }
 
+    /// Pone un mensaje en la cola de salida.
+    ///
+    /// **Encola, no manda.** La respuesta vuelve en cuanto el mensaje está a
+    /// salvo en el disco, y el envío pasa después: así apretar «Enviar» no deja
+    /// la ventana esperando a un servidor que puede tardar un minuto, y sobre
+    /// todo, cerrar la sesión o quedarse sin luz en el medio no pierde lo que la
+    /// persona escribió.
+    ///
+    /// Lo que **sí** se revisa antes de contestar es que el mensaje se pueda
+    /// armar: una dirección mal escrita tiene que decirlo mientras la persona lo
+    /// tiene en pantalla, no tres minutos después desde una cola que no está
+    /// mirando.
+    ///
+    /// El `de` no lo elige la ventana: se toma de la cuenta. Mandar desde una
+    /// dirección que no es la que autentica hace que el servidor rechace, o peor,
+    /// que el mensaje llegue y lo marquen como falsificado.
+    async fn send_message(
+        &self,
+        #[zbus(signal_context)] emisor: SignalContext<'_>,
+        account_id: String,
+        borrador: String,
+    ) -> zbus::fdo::Result<String> {
+        let mut borrador: redactar::Borrador = serde_json::from_str(&borrador)
+            .map_err(|e| zbus::fdo::Error::InvalidArgs(format!("el borrador no se entiende: {e}")))?;
+
+        let (broker, cuenta) = self.cuenta(&account_id).await?;
+        let config = broker
+            .account_data(&cuenta.id, "email")
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo leer la cuenta: {e}")))?;
+        let config = config.get("config").cloned().unwrap_or(config);
+
+        borrador.de = config
+            .get("username")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                zbus::fdo::Error::Failed("la cuenta no tiene una dirección guardada".into())
+            })?
+            .to_string();
+        if borrador.nombre.trim().is_empty() {
+            borrador.nombre = cuenta.display_name.clone();
+        }
+
+        redactar::revisar(&borrador).map_err(zbus::fdo::Error::InvalidArgs)?;
+
+        let ahora = chrono::Utc::now();
+        let unico = siguiente_unico();
+        let salida = cola::Salida {
+            id: cola::nuevo_id(ahora, unico),
+            account_id,
+            identificador: redactar::identificador(&borrador.de, ahora, unico),
+            // La fecha de cuando se escribió y no de cuando sale: un mensaje
+            // redactado anoche que sale a la mañana tiene que decir anoche.
+            fecha: redactar::fecha_de_cabecera(chrono::Local::now()),
+            borrador,
+            intentos: 0,
+            estado: cola::Estado::Pendiente,
+            ultimo_error: String::new(),
+            proximo_intento: String::new(),
+        };
+
+        cola::Cola::nueva(cola::directorio())
+            .and_then(|c| c.encolar(&salida))
+            .map_err(zbus::fdo::Error::Failed)?;
+
+        // Recién ahora, con el mensaje ya en el disco: si el aviso se perdiera,
+        // la revisión por reloj lo levanta igual.
+        self.hay_algo_que_mandar.notify_one();
+        let _ = Servicio::outbox_changed(&emisor).await;
+        Ok(salida.id)
+    }
+
+    /// Lo que está esperando salir, y lo que se trabó.
+    async fn list_outbox(&self) -> zbus::fdo::Result<String> {
+        let salidas = cola::Cola::nueva(cola::directorio())
+            .and_then(|c| c.todos())
+            .map_err(zbus::fdo::Error::Failed)?;
+
+        serde_json::to_string(&salidas)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
+    }
+
+    /// Saca un mensaje de la cola sin mandarlo.
+    ///
+    /// Hace falta: un mensaje trabado —una dirección que no existe, un servidor
+    /// que lo rechaza— se queda ahí para siempre, y la persona tiene que poder
+    /// sacarlo. **Se pierde lo escrito**, así que quien llama tiene que
+    /// preguntar antes; acá no hay forma de preguntar.
+    async fn discard_outgoing(
+        &self,
+        #[zbus(signal_context)] emisor: SignalContext<'_>,
+        id: String,
+    ) -> zbus::fdo::Result<()> {
+        // Sin barras ni puntos: el identificador viene de afuera y se convierte
+        // en un nombre de archivo. Sin esto, un «id» como `../../algo` borraría
+        // lo que quisiera de la carpeta de la persona.
+        if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "ese identificador no es válido".into(),
+            ));
+        }
+
+        cola::Cola::nueva(cola::directorio())
+            .and_then(|c| c.quitar(&id))
+            .map_err(zbus::fdo::Error::Failed)?;
+
+        let _ = Servicio::outbox_changed(&emisor).await;
+        Ok(())
+    }
+
+    /// Señal `OutboxChanged` — cambió algo en la cola de salida.
+    ///
+    /// Sin detalle, como las otras: quien la recibe vuelve a leer y ve el
+    /// estado completo.
+    #[zbus(signal)]
+    async fn outbox_changed(emisor: &SignalContext<'_>) -> zbus::Result<()>;
+
     /// Señal `MessagesChanged` — cambió la lista de mensajes de alguna cuenta.
     ///
     /// Sin detalle, como las otras dos y por lo mismo: quien la recibe vuelve a
@@ -470,6 +604,133 @@ impl Servicio {
                 zbus::fdo::Error::Failed(format!("la cuenta «{account_id}» ya no existe"))
             })
     }
+}
+
+/// Un número que no se repite en la vida del proceso.
+///
+/// Va junto a la hora en los identificadores: dos mensajes encolados en el mismo
+/// microsegundo tendrían el mismo nombre de archivo y el mismo `Message-ID`, y
+/// el segundo pisaría al primero — o sea, se perdería un mensaje que alguien
+/// escribió.
+fn siguiente_unico() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CONTADOR: AtomicU64 = AtomicU64::new(0);
+    CONTADOR.fetch_add(1, Ordering::Relaxed)
+}
+
+/// El bucle que vacía la cola de salida.
+///
+/// Una sola tarea para todas las cuentas, y de a un mensaje por vez. Mandar
+/// varios a la vez contra el mismo servidor no acelera nada —el cuello es la
+/// red— y sí multiplica las conexiones contra el proveedor de la persona, que
+/// es exactamente lo que hace que una cuenta parezca un emisor masivo.
+///
+/// Se despierta cuando alguien encola algo y, si no, cada tanto: un mensaje
+/// que quedó esperando por un servidor caído tiene que salir solo cuando el
+/// servidor vuelva, sin que nadie apriete nada.
+async fn despachar(servicio: Servicio, emisor: SignalContext<'static>) {
+    loop {
+        let hubo_cambios = vaciar_la_cola(&servicio).await;
+        if hubo_cambios {
+            let _ = Servicio::outbox_changed(&emisor).await;
+        }
+
+        // Lo que sea que pase primero: alguien escribió algo, o pasó el rato.
+        tokio::select! {
+            _ = tokio::time::sleep(REVISAR_COLA) => {}
+            _ = servicio.hay_algo_que_mandar.notified() => {}
+        }
+    }
+}
+
+/// Intenta mandar lo que esté listo. Devuelve si cambió algo.
+async fn vaciar_la_cola(servicio: &Servicio) -> bool {
+    let Ok(cola) = cola::Cola::nueva(cola::directorio()) else {
+        return false;
+    };
+    let Ok(pendientes) = cola.todos() else {
+        return false;
+    };
+
+    let ahora = chrono::Utc::now();
+    let mut cambio = false;
+
+    for mut salida in pendientes {
+        if salida.estado == cola::Estado::Trabado {
+            continue;
+        }
+        // Todavía no le toca: la espera crece con cada intento fallido.
+        if !salida.le_toca(ahora) {
+            continue;
+        }
+
+        match mandar_uno(servicio, &salida).await {
+            Ok(()) => {
+                tracing::info!("mensaje {} entregado", salida.id);
+                let _ = cola.quitar(&salida.id);
+                cambio = true;
+            }
+            Err(e) => {
+                salida.fallo(e.to_string(), ahora);
+                // Se deja de intentar cuando el servidor dijo que no va a
+                // aceptarlo nunca, o cuando se acabaron los intentos. En los dos
+                // casos hace falta que la persona haga algo, y seguir golpeando
+                // el servidor de alguien no ayuda.
+                if !e.se_reintenta() || salida.intentos >= cola::MAX_INTENTOS {
+                    salida.estado = cola::Estado::Trabado;
+                    tracing::warn!("el mensaje {} no se pudo mandar: {e}", salida.id);
+                } else {
+                    tracing::info!("el mensaje {} espera otro intento: {e}", salida.id);
+                }
+                let _ = cola.guardar(&salida);
+                cambio = true;
+            }
+        }
+    }
+
+    cambio
+}
+
+/// Manda un mensaje, de principio a fin.
+async fn mandar_uno(servicio: &Servicio, salida: &cola::Salida) -> Result<(), smtp::SmtpError> {
+    let (broker, cuenta) = servicio
+        .cuenta(&salida.account_id)
+        .await
+        .map_err(|e| smtp::SmtpError::Permanente(e.to_string()))?;
+
+    let token = broker
+        .access_token(&cuenta.id, "email")
+        .await
+        .map_err(|e| match e {
+            // Sin permiso no es un problema pasajero: hasta que la persona lo
+            // dé, este mensaje no va a salir.
+            BrokerError::Denied(d) => smtp::SmtpError::Rechazado(d),
+            otro => smtp::SmtpError::Temporal(otro.to_string()),
+        })?;
+
+    let config = broker
+        .account_data(&cuenta.id, "email")
+        .await
+        .map_err(|e| smtp::SmtpError::Temporal(e.to_string()))?;
+    let config = config.get("config").cloned().unwrap_or(config);
+
+    // Una cuenta sin servidor de salida no se arregla esperando.
+    let destino = broker::destino_smtp_de(&config, Some(token))
+        .map_err(smtp::SmtpError::Permanente)?;
+
+    let mensaje = redactar::armar(&salida.borrador, &salida.identificador, &salida.fecha)
+        .map_err(smtp::SmtpError::Permanente)?;
+
+    let mut sesion = smtp::Sesion::abrir(&destino).await?;
+    let resultado = sesion
+        .entregar(
+            &salida.borrador.de,
+            &salida.borrador.destinatarios(),
+            &mensaje,
+        )
+        .await;
+    sesion.cerrar().await;
+    resultado
 }
 
 /// Abre la sesión de una cuenta: token, configuración y conexión.
@@ -807,6 +1068,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::time::sleep(REINTENTO).await;
         }
     });
+
+    // El despachador de la cola de salida: una sola tarea para todas las
+    // cuentas. Arranca antes que nada porque lo primero que hace es intentar
+    // mandar lo que haya quedado de la sesión anterior.
+    tokio::spawn(despachar(servicio.clone(), emisor.clone()));
 
     // El hilo principal ya no mira casillas: sólo se asegura de que haya una
     // tarea por cuenta. Cada tarea se queda conectada y avisa por su cuenta.
