@@ -204,7 +204,7 @@ fn partir_palabra(desde: &str) -> Option<(String, &str)> {
 
     let bytes = match como.to_ascii_uppercase().as_str() {
         "B" => base64_de(texto)?,
-        "Q" => Some(imprimible_de(texto.as_bytes(), true))?,
+        "Q" => imprimible_de(texto.as_bytes(), true),
         _ => return None,
     };
 
@@ -936,6 +936,25 @@ mod tests {
     fn la_vista_latin1_conserva_todos_los_bytes() {
         let bytes: Vec<u8> = (0u8..=255).collect();
         assert_eq!(de_latin1(&como_latin1(&bytes)), bytes);
+    }
+
+    /// Una cabecera **no vuelve a bytes nunca**: lo que sale del resumen es lo
+    /// que se muestra. Por eso la vista latin-1, que sirve para recorrer un
+    /// cuerpo, ahí sería un error — un `Subject` con UTF-8 crudo se vería como
+    /// «ReuniÃ³n». Los clientes mandan esas cabeceras aunque el estándar no las
+    /// permita.
+    #[test]
+    fn una_cabecera_con_utf8_crudo_se_lee_bien() {
+        let cabeceras = a_texto("Subject: Reunión de mañana\r\n".as_bytes(), "");
+        let resumen = resumen_de(1, &cabeceras, false, false);
+        assert_eq!(resumen.asunto, "Reunión de mañana");
+    }
+
+    /// Y una en latin-1 crudo también, que es el otro caso que aparece.
+    #[test]
+    fn una_cabecera_con_latin1_crudo_tambien() {
+        let cabeceras = a_texto(b"Subject: Reuni\xf3n\r\n", "");
+        assert_eq!(resumen_de(1, &cabeceras, false, false).asunto, "Reunión");
     }
 
     /// El caso de punta a punta: un mensaje en latin-1 con bytes que no son

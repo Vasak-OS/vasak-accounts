@@ -681,7 +681,17 @@ impl Sesion {
                 // blanco en la lista, y si después llegaba el de verdad, el
                 // mismo mensaje aparecía dos veces.
                 if let (Some(uid), Some(bloque)) = (uid_de(&linea), literales.first()) {
-                    let cabeceras = crate::mensaje::como_latin1(bloque);
+                    // Sin etiqueta de juego de caracteres, que es lo correcto
+                    // acá: una cabecera **no** vuelve a bytes nunca —lo que sale
+                    // de `resumen_de` es lo que se muestra—, así que la vista
+                    // latin-1 que sirve para recorrer un cuerpo acá dejaría un
+                    // `Subject` en UTF-8 crudo mostrándose como «ReuniÃ³n».
+                    //
+                    // Las palabras codificadas son ASCII y no se ven afectadas;
+                    // lo que esto arregla son las cabeceras con bytes de ocho
+                    // bits sin codificar, que el estándar no permite y los
+                    // clientes mandan igual.
+                    let cabeceras = crate::mensaje::a_texto(bloque, "");
                     let adjuntos = cabeceras.to_ascii_lowercase().contains("multipart/mixed");
                     resumenes.push(crate::mensaje::resumen_de(
                         uid,
