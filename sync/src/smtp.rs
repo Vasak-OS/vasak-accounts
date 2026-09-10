@@ -234,13 +234,32 @@ enum Flujo {
 }
 
 impl Flujo {
+    /// Escribe, **con plazo**.
+    ///
+    /// Sin él, un servidor que deja de leer sin cerrar el socket llena el búfer
+    /// del sistema y `write_all` se queda esperando para siempre. Pasa con un
+    /// NAT que olvidó la conexión o un proceso matado sin FIN, y como el
+    /// despachador manda de a un mensaje por vez, esa espera **frena la cola
+    /// entera**: todo lo que la persona escriba después se queda sin salir, sin
+    /// ningún error y sin nada en el diario.
     async fn escribir(&mut self, datos: &[u8]) -> Result<(), SmtpError> {
-        let resultado = match self {
-            Flujo::Claro(f) => f.write_all(datos).await,
-            Flujo::Cifrado(f) => f.write_all(datos).await,
-            Flujo::Ninguno => return Err(SmtpError::Temporal("no hay conexión".into())),
+        let escritura = async {
+            match self {
+                Flujo::Claro(f) => f.write_all(datos).await,
+                Flujo::Cifrado(f) => f.write_all(datos).await,
+                Flujo::Ninguno => Err(std::io::Error::other("no hay conexión")),
+            }
         };
-        resultado.map_err(|e| SmtpError::Temporal(format!("no se pudo escribir: {e}")))
+
+        tokio::time::timeout(INTERCAMBIO, escritura)
+            .await
+            .map_err(|_| {
+                SmtpError::Temporal(format!(
+                    "el servidor dejó de recibir (más de {} segundos)",
+                    INTERCAMBIO.as_secs()
+                ))
+            })?
+            .map_err(|e| SmtpError::Temporal(format!("no se pudo escribir: {e}")))
     }
 
     async fn leer(&mut self, destino: &mut Vec<u8>) -> Result<usize, SmtpError> {
@@ -404,9 +423,14 @@ impl Sesion {
             ));
         };
 
-        let cifrado = conector
-            .connect(nombre, tcp)
+        // Con plazo, como todo lo demás: un servidor que acepta la conexión y no
+        // completa el saludo de TLS deja el apretón de manos colgado, y con él
+        // la cola entera.
+        let cifrado = tokio::time::timeout(TIMEOUT, conector.connect(nombre, tcp))
             .await
+            .map_err(|_| {
+                SmtpError::Temporal(format!("{host} no completó el cifrado a tiempo"))
+            })?
             .map_err(|e| SmtpError::Temporal(format!("no se pudo cifrar con {host}: {e}")))?;
         self.flujo = Flujo::Cifrado(Box::new(cifrado));
         Ok(())

@@ -158,7 +158,17 @@ impl Cola {
         // permisos abiertos —de una versión anterior, de una copia de
         // seguridad restaurada— dejaría el correo de la persona legible para
         // cualquier otra cuenta del equipo.
-        let _ = std::fs::set_permissions(&raiz, std::fs::Permissions::from_mode(0o700));
+        //
+        // Y si no se puede, **no se sigue**. Tragarse el fallo dejaba una cola
+        // que anda perfectamente y que cualquiera del equipo puede leer, sin
+        // que nada lo diga: es peor que no tener cola.
+        std::fs::set_permissions(&raiz, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+            format!(
+                "no se pudo cerrar el acceso a {}: {e}. \
+                 Sin eso el correo sin mandar quedaría legible para otras cuentas del equipo",
+                raiz.display()
+            )
+        })?;
         Ok(Cola { raiz })
     }
 
@@ -204,13 +214,29 @@ impl Cola {
         drop(archivo);
 
         std::fs::rename(&temporal, self.ruta(&salida.id))
-            .map_err(|e| format!("no se pudo guardar el mensaje: {e}"))
+            .map_err(|e| format!("no se pudo guardar el mensaje: {e}"))?;
+
+        self.sincronizar_directorio()
+    }
+
+    /// Fuerza al disco el **directorio**, no el archivo.
+    ///
+    /// El contenido ya está en disco: eso lo hizo el `sync_all` del temporal.
+    /// Lo que falta es la entrada del directorio, que es lo que dice que el
+    /// archivo se llama así. Sin esto, un corte de luz justo después del
+    /// renombre puede dejar el contenido escrito y el nombre no — o sea, un
+    /// mensaje aceptado que al arrancar no está, o uno ya entregado que
+    /// reaparece y se manda dos veces.
+    fn sincronizar_directorio(&self) -> Result<(), String> {
+        std::fs::File::open(&self.raiz)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| format!("no se pudo asegurar la cola en el disco: {e}"))
     }
 
     /// Saca un mensaje de la cola. Se llama cuando salió.
     pub fn quitar(&self, id: &str) -> Result<(), String> {
         match std::fs::remove_file(self.ruta(id)) {
-            Ok(()) => Ok(()),
+            Ok(()) => self.sincronizar_directorio(),
             // Que ya no esté es el resultado que se buscaba.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(format!("no se pudo quitar el mensaje: {e}")),
@@ -297,6 +323,19 @@ mod tests {
             ultimo_error: String::new(),
             proximo_intento: String::new(),
         }
+    }
+
+    /// Si no se puede cerrar el acceso, **no se sigue**. Una cola que anda
+    /// perfectamente y que cualquiera del equipo puede leer, sin que nada lo
+    /// diga, es peor que no tener cola.
+    #[test]
+    fn una_cola_que_no_se_puede_cerrar_no_se_abre() {
+        // Un archivo donde tendría que ir el directorio: `create_dir_all`
+        // falla, que es el otro camino de salida del constructor.
+        let raiz = temporal();
+        std::fs::write(&raiz, "no soy un directorio").unwrap();
+        assert!(Cola::nueva(raiz.clone()).is_err());
+        let _ = std::fs::remove_file(&raiz);
     }
 
     /// Lo que se escribió tiene que seguir ahí después de reiniciar. Es la

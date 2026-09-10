@@ -40,6 +40,28 @@ const LARGO_DE_LINEA: usize = 76;
 /// un archivo pegado en el cuerpo, que es justo lo que esta versión no hace.
 const MAX_CUERPO: usize = 1024 * 1024;
 
+/// Tope de una línea de cabecera, en octetos.
+///
+/// El estándar prohíbe pasar de 998 sin contar el salto. 78 es el tope
+/// «recomendado», y es lo que usan los clientes: una cabecera más corta que eso
+/// se ve entera en cualquier lado y ningún servidor la toca.
+const LARGO_DE_CABECERA: usize = 78;
+
+/// Topes de lo que llega de afuera y termina en una cabecera.
+///
+/// Nada de esto lo escribe una persona: un asunto de mil caracteres es un
+/// programa mal hecho o alguien probando, y una respuesta hereda el asunto de un
+/// mensaje que mandó cualquiera. Sin tope, un asunto de un megabyte se convierte
+/// en un `DATA` de un megabyte que el servidor rechaza **después** de recibirlo
+/// entero — o sea, después de gastar la conexión de la persona.
+///
+/// Se rechaza en vez de recortar: recortar cambia en silencio lo que alguien
+/// escribió, y estos tamaños no los alcanza nadie escribiendo.
+const MAX_ASUNTO: usize = 512;
+const MAX_NOMBRE: usize = 128;
+const MAX_IDENTIFICADOR: usize = 512;
+const MAX_REFERENCIAS: usize = 20;
+
 /// Cuántos destinatarios se aceptan.
 ///
 /// Cien es más de lo que nadie escribe a mano y menos de lo que un servidor
@@ -154,6 +176,34 @@ pub fn revisar(borrador: &Borrador) -> Result<(), String> {
     if borrador.cuerpo.len() > MAX_CUERPO {
         return Err("el mensaje es demasiado largo".into());
     }
+
+    // Lo que termina en una cabecera, con su tope. Ver el comentario de las
+    // constantes: sin esto un asunto de un megabyte se convierte en un `DATA`
+    // de un megabyte que el servidor rechaza después de recibirlo entero.
+    for (que, largo, tope) in [
+        ("el asunto", borrador.asunto.len(), MAX_ASUNTO),
+        ("el nombre del remitente", borrador.nombre.len(), MAX_NOMBRE),
+        (
+            "el identificador del mensaje al que responde",
+            borrador.en_respuesta_a.len(),
+            MAX_IDENTIFICADOR,
+        ),
+    ] {
+        if largo > tope {
+            return Err(format!("{que} es demasiado largo ({largo} de {tope})"));
+        }
+    }
+
+    if borrador.referencias.len() > MAX_REFERENCIAS {
+        return Err(format!(
+            "la conversación arrastra {} referencias y el tope es {MAX_REFERENCIAS}",
+            borrador.referencias.len()
+        ));
+    }
+    if let Some(larga) = borrador.referencias.iter().find(|r| r.len() > MAX_IDENTIFICADOR) {
+        return Err(format!("una referencia es demasiado larga ({})", larga.len()));
+    }
+
     Ok(())
 }
 
@@ -332,11 +382,11 @@ pub fn armar(borrador: &Borrador, identificador: &str, fecha: &str) -> Result<St
     let mut cabeceras: Vec<String> = vec![
         format!("Date: {}", cabecera_segura(fecha)),
         format!("From: {}", buzon(&borrador.nombre, &borrador.de)),
-        format!("To: {}", lista_de_buzones(&borrador.para)),
+        plegada("To", &borrador.para, ","),
     ];
 
     if !borrador.cc.is_empty() {
-        cabeceras.push(format!("Cc: {}", lista_de_buzones(&borrador.cc)));
+        cabeceras.push(plegada("Cc", &borrador.cc, ","));
     }
 
     cabeceras.push(format!("Subject: {}", cabecera_segura(&borrador.asunto)));
@@ -353,8 +403,10 @@ pub fn armar(borrador: &Borrador, identificador: &str, fecha: &str) -> Result<St
         ));
     }
     if !borrador.referencias.is_empty() {
+        // Sin separador: las referencias van una atrás de otra, separadas por el
+        // espacio que ya pone el plegado.
         let cadena: Vec<String> = borrador.referencias.iter().map(|r| cabecera_segura(r)).collect();
-        cabeceras.push(format!("References: {}", cadena.join(" ")));
+        cabeceras.push(plegada("References", &cadena, ""));
     }
 
     cabeceras.push("MIME-Version: 1.0".into());
@@ -368,12 +420,46 @@ pub fn armar(borrador: &Borrador, identificador: &str, fecha: &str) -> Result<St
     ))
 }
 
-fn lista_de_buzones(direcciones: &[String]) -> String {
-    direcciones
-        .iter()
-        .map(|d| d.trim().to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
+/// Escribe una cabecera de varios valores, partida en renglones.
+///
+/// **Una cabecera de cien destinatarios no entra en una línea.** Cien
+/// direcciones de hasta 320 octetos son treinta y dos mil, y el estándar corta
+/// en 998: un servidor rechaza el mensaje, o peor, lo trunca y entrega una lista
+/// de destinatarios distinta de la que la persona escribió.
+///
+/// Se parte poniendo un espacio al principio de cada renglón que sigue, que es
+/// como el formato dice que continúa una cabecera. El que la lee vuelve a
+/// juntarlas — es lo mismo que hace `mensaje.rs` al leer.
+/// `separador` es lo que va **pegado** al valor cuando no es el último: una coma
+/// para una lista de direcciones, y nada para una cadena de referencias, donde
+/// el espacio que ya pone el plegado alcanza. Pasar un espacio acá daría dos.
+fn plegada(etiqueta: &str, partes: &[String], separador: &str) -> String {
+    let mut salida = format!("{etiqueta}:");
+    let mut en_la_linea = salida.len();
+
+    for (i, parte) in partes.iter().enumerate() {
+        let ultima = i + 1 == partes.len();
+        let pieza = if ultima {
+            parte.trim().to_string()
+        } else {
+            format!("{}{separador}", parte.trim())
+        };
+
+        // Un valor que solo ya no entra igual va en su propio renglón: partirlo
+        // por la mitad lo rompería, y una dirección no se puede partir.
+        if en_la_linea + 1 + pieza.len() > LARGO_DE_CABECERA && en_la_linea > 1 {
+            salida.push_str("\r\n ");
+            en_la_linea = 1;
+        } else {
+            salida.push(' ');
+            en_la_linea += 1;
+        }
+
+        salida.push_str(&pieza);
+        en_la_linea += pieza.len();
+    }
+
+    salida
 }
 
 /// Un identificador único para el mensaje.
@@ -556,6 +642,93 @@ mod tests {
         let mensaje = armar(&b, "<x@y>", "Thu, 10 Sep 2026 12:00:00 +0000").unwrap();
         assert!(mensaje.contains("Cc: copia@otro.com"), "{mensaje}");
         assert_eq!(b.destinatarios(), vec!["juan@otro.com", "copia@otro.com"]);
+    }
+
+    // ── Renglones ──────────────────────────────────────────────────────────
+
+    /// **Cien destinatarios no entran en una línea.** Cien direcciones de hasta
+    /// 320 octetos son treinta y dos mil, y el estándar corta en 998: un
+    /// servidor rechaza el mensaje, o peor, lo trunca y entrega una lista de
+    /// destinatarios distinta de la que la persona escribió.
+    #[test]
+    fn una_lista_larga_de_destinatarios_se_parte_en_renglones() {
+        let mut b = borrador();
+        b.para = (0..60).map(|i| format!("destinatario.numero{i}@ejemplo.com")).collect();
+
+        let mensaje = armar(&b, "<x@y>", "Thu, 10 Sep 2026 12:00:00 +0000").unwrap();
+        for linea in mensaje.split("\r\n") {
+            assert!(linea.len() <= 998, "línea de {} octetos", linea.len());
+        }
+
+        // Y se vuelve a juntar como una sola cabecera: los renglones que siguen
+        // empiezan con un espacio, que es lo que el que lee reconoce.
+        let cabeceras = crate::mensaje::Cabeceras::leer(&mensaje);
+        let to = cabeceras.valor("to").unwrap();
+        assert_eq!(to.matches('@').count(), 60, "se perdió algún destinatario");
+        assert!(to.contains("destinatario.numero59@ejemplo.com"), "{to}");
+    }
+
+    /// Lo mismo con la cadena de la conversación, que llega de afuera.
+    #[test]
+    fn una_cadena_larga_de_referencias_se_parte() {
+        let mut b = borrador();
+        b.referencias = (0..20).map(|i| format!("<mensaje.numero{i}@ejemplo.com>")).collect();
+
+        let mensaje = armar(&b, "<x@y>", "Thu, 10 Sep 2026 12:00:00 +0000").unwrap();
+        for linea in mensaje.split("\r\n") {
+            assert!(linea.len() <= 998, "línea de {} octetos", linea.len());
+        }
+        let cabeceras = crate::mensaje::Cabeceras::leer(&mensaje);
+        assert_eq!(cabeceras.valor("references").unwrap().matches('<').count(), 20);
+    }
+
+    /// Una dirección que sola no entra en el renglón recomendado va en el suyo:
+    /// partirla la rompería.
+    #[test]
+    fn una_direccion_larga_no_se_parte_por_la_mitad() {
+        let larga = format!("{}@ejemplo.com", "a".repeat(200));
+        let plegada_ = plegada("To", std::slice::from_ref(&larga), ",");
+        assert!(plegada_.contains(&larga), "{plegada_}");
+    }
+
+    // ── Lo que llega de afuera, con tope ───────────────────────────────────
+
+    /// Nada de esto lo escribe una persona: una respuesta hereda el asunto de
+    /// un mensaje que mandó cualquiera. Sin tope, un asunto de un megabyte se
+    /// convierte en un `DATA` de un megabyte que el servidor rechaza
+    /// **después** de recibirlo entero.
+    #[test]
+    fn una_cabecera_desmedida_se_rechaza_antes_de_gastar_la_conexion() {
+        let mut b = borrador();
+        b.asunto = "a".repeat(MAX_ASUNTO + 1);
+        assert!(armar(&b, "<x@y>", "Thu, 10 Sep 2026 12:00:00 +0000").is_err());
+
+        let mut b = borrador();
+        b.nombre = "a".repeat(MAX_NOMBRE + 1);
+        assert!(armar(&b, "<x@y>", "Thu, 10 Sep 2026 12:00:00 +0000").is_err());
+
+        let mut b = borrador();
+        b.en_respuesta_a = format!("<{}@x>", "a".repeat(MAX_IDENTIFICADOR));
+        assert!(armar(&b, "<x@y>", "Thu, 10 Sep 2026 12:00:00 +0000").is_err());
+    }
+
+    /// La cadena de una conversación llega de afuera y no tiene por qué venir
+    /// recortada: quien llama puede ser cualquier cosa en el bus de sesión.
+    #[test]
+    fn una_cadena_de_referencias_desmedida_se_rechaza() {
+        let mut b = borrador();
+        b.referencias = (0..MAX_REFERENCIAS + 1).map(|i| format!("<{i}@x>")).collect();
+        let error = armar(&b, "<x@y>", "Thu, 10 Sep 2026 12:00:00 +0000").unwrap_err();
+        assert!(error.contains("referencias"), "{error}");
+    }
+
+    /// Y lo normal sigue pasando: los topes están para lo absurdo, no para
+    /// molestar a nadie.
+    #[test]
+    fn un_asunto_normal_no_se_rechaza() {
+        let mut b = borrador();
+        b.asunto = "Re: ".to_string() + &"palabra ".repeat(30);
+        assert!(armar(&b, "<x@y>", "Thu, 10 Sep 2026 12:00:00 +0000").is_ok());
     }
 
     // ── Cabeceras con acentos ──────────────────────────────────────────────

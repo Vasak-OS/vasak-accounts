@@ -233,8 +233,12 @@ pub fn destino_smtp_de(
     let usuario = campo("username")
         .ok_or("la cuenta no tiene usuario guardado")?
         .to_string();
+    // Recortado: se comprobaba con `trim` y se guardaba igual, así que un
+    // « smtp.ejemplo.com » con espacios pasaba el control y después fallaba al
+    // resolver el nombre, con un error que no dice nada del espacio.
     let host = campo("smtp_server")
-        .filter(|s| !s.trim().is_empty())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         .ok_or(
             "esta cuenta no tiene servidor de salida configurado,              así que no se puede mandar correo desde ella",
         )?
@@ -284,6 +288,14 @@ mod tests {
         // error de resolución de nombres que no explica nada.
         let vacio = serde_json::json!({ "username": "ana", "smtp_server": "  " });
         assert!(destino_smtp_de(&vacio, Some("c".into())).is_err());
+
+        // Y uno con espacios alrededor se guarda recortado: si no, pasa el
+        // control y falla después al resolver el nombre.
+        let con_espacios = serde_json::json!({
+            "username": "ana", "smtp_server": " smtp.ejemplo.com ",
+        });
+        let destino = destino_smtp_de(&con_espacios, Some("c".into())).unwrap();
+        assert_eq!(destino.host, "smtp.ejemplo.com");
     }
 
     /// 587 es el puerto de envío con `STARTTLS`, y es el que pone el formulario.

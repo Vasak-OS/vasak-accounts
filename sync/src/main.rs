@@ -536,7 +536,10 @@ impl Servicio {
         // Sin barras ni puntos: el identificador viene de afuera y se convierte
         // en un nombre de archivo. Sin esto, un «id» como `../../algo` borraría
         // lo que quisiera de la carpeta de la persona.
-        if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        //
+        // Y no vacío, que `all` acepta: la ruta quedaría en «.json», un archivo
+        // que no es de nadie y que se borraría igual.
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
             return Err(zbus::fdo::Error::InvalidArgs(
                 "ese identificador no es válido".into(),
             ));
@@ -678,7 +681,17 @@ async fn vaciar_la_cola(servicio: &Servicio) -> bool {
         match mandar_uno(servicio, &salida).await {
             Ok(()) => {
                 tracing::info!("mensaje {} entregado", salida.id);
-                let _ = cola.quitar(&salida.id);
+                // **El error de sacarlo importa.** Un mensaje entregado que
+                // sigue en la cola se vuelve a mandar en la vuelta siguiente, y
+                // quien lo recibe lo ve dos veces. Que quede en el diario es lo
+                // único que permite entender después por qué pasó.
+                if let Err(e) = cola.quitar(&salida.id) {
+                    tracing::error!(
+                        "el mensaje {} se entregó pero no se pudo sacar de la cola: {e}. \
+                         Se va a volver a mandar",
+                        salida.id
+                    );
+                }
                 cambio = true;
             }
             Err(e) => {
