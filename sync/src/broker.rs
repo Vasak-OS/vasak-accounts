@@ -214,9 +214,133 @@ pub fn destino_de(config: &serde_json::Value, secreto: Option<String>) -> Result
     Ok(Destino { host, puerto, credencial })
 }
 
+/// Lo mismo, pero para el servidor por el que se manda.
+///
+/// Aparte de `destino_de` y no un parámetro suyo, porque lo que falta cuando
+/// falta es distinto: una cuenta puede leer correo sin poder mandarlo —el
+/// formulario deja el servidor de salida vacío, o la cuenta viene de una
+/// versión anterior a que se guardara—, y el mensaje tiene que decir eso y no
+/// «la cuenta no tiene servidor».
+///
+/// 587 por omisión: es el puerto de envío con `STARTTLS` y el que pone el
+/// formulario. El otro que existe es el 465, que habla TLS desde el primer byte.
+pub fn destino_smtp_de(
+    config: &serde_json::Value,
+    secreto: Option<String>,
+) -> Result<Destino, String> {
+    let campo = |nombre: &str| config.get(nombre).and_then(|v| v.as_str());
+
+    let usuario = campo("username")
+        .ok_or("la cuenta no tiene usuario guardado")?
+        .to_string();
+    // Recortado: se comprobaba con `trim` y se guardaba igual, así que un
+    // « smtp.ejemplo.com » con espacios pasaba el control y después fallaba al
+    // resolver el nombre, con un error que no dice nada del espacio.
+    let host = campo("smtp_server")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or(
+            "esta cuenta no tiene servidor de salida configurado,              así que no se puede mandar correo desde ella",
+        )?
+        .to_string();
+
+    let puerto = config
+        .get("smtp_port")
+        .and_then(|v| v.as_u64())
+        .and_then(|p| u16::try_from(p).ok())
+        .filter(|p| *p != 0)
+        .unwrap_or(587);
+
+    let Some(secreto) = secreto else {
+        return Err("no se obtuvo ninguna credencial para la cuenta".into());
+    };
+
+    // La misma regla que para leer: la marca es el `client_id`, que sólo lo
+    // tienen las cuentas que pasaron por un flujo OAuth2. Confundirlas manda una
+    // contraseña donde va un token.
+    let credencial = if campo("client_id").is_some() {
+        Credencial::Token { usuario, token: secreto }
+    } else {
+        Credencial::Contrasena { usuario, secreto }
+    };
+
+    Ok(Destino { host, puerto, credencial })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Una cuenta puede leer correo sin poder mandarlo: el formulario deja el
+    /// servidor de salida vacío, o la cuenta viene de una versión anterior a
+    /// que se guardara. El mensaje tiene que decir **eso** y no «la cuenta no
+    /// tiene servidor», que manda a mirar el lugar equivocado.
+    #[test]
+    fn una_cuenta_sin_servidor_de_salida_lo_dice() {
+        let config = serde_json::json!({
+            "username": "ana@ejemplo.com",
+            "imap_server": "imap.ejemplo.com",
+        });
+        let error = destino_smtp_de(&config, Some("c".into())).unwrap_err();
+        assert!(error.contains("servidor de salida"), "{error}");
+
+        // Y uno en blanco es lo mismo que no tenerlo: conectarse a "" da un
+        // error de resolución de nombres que no explica nada.
+        let vacio = serde_json::json!({ "username": "ana", "smtp_server": "  " });
+        assert!(destino_smtp_de(&vacio, Some("c".into())).is_err());
+
+        // Y uno con espacios alrededor se guarda recortado: si no, pasa el
+        // control y falla después al resolver el nombre.
+        let con_espacios = serde_json::json!({
+            "username": "ana", "smtp_server": " smtp.ejemplo.com ",
+        });
+        let destino = destino_smtp_de(&con_espacios, Some("c".into())).unwrap();
+        assert_eq!(destino.host, "smtp.ejemplo.com");
+    }
+
+    /// 587 es el puerto de envío con `STARTTLS`, y es el que pone el formulario.
+    /// Una cuenta guardada sin puerto es de una versión anterior.
+    #[test]
+    fn sin_puerto_de_salida_se_usa_el_de_siempre() {
+        let config = serde_json::json!({
+            "username": "ana@ejemplo.com",
+            "smtp_server": "smtp.ejemplo.com",
+        });
+        let destino = destino_smtp_de(&config, Some("c".into())).unwrap();
+        assert_eq!(destino.puerto, 587);
+        assert_eq!(destino.host, "smtp.ejemplo.com");
+    }
+
+    /// El puerto guardado manda, incluido el 465, que habla TLS desde el primer
+    /// byte y se trata distinto.
+    #[test]
+    fn el_puerto_guardado_se_respeta() {
+        let config = serde_json::json!({
+            "username": "ana", "smtp_server": "smtp.x.com", "smtp_port": 465,
+        });
+        assert_eq!(destino_smtp_de(&config, Some("c".into())).unwrap().puerto, 465);
+    }
+
+    /// La misma regla que para leer: el `client_id` es lo que distingue una
+    /// cuenta con token de una con contraseña. Confundirlas manda una
+    /// contraseña donde va un token, y el rechazo que vuelve parece de
+    /// credenciales sin serlo.
+    #[test]
+    fn el_client_id_decide_como_autenticarse_tambien_al_mandar() {
+        let con_token = serde_json::json!({
+            "username": "ana", "smtp_server": "smtp.x.com", "client_id": "abc",
+        });
+        assert!(matches!(
+            destino_smtp_de(&con_token, Some("t".into())).unwrap().credencial,
+            Credencial::Token { .. }
+        ));
+
+        let con_clave = serde_json::json!({ "username": "ana", "smtp_server": "smtp.x.com" });
+        assert!(matches!(
+            destino_smtp_de(&con_clave, Some("c".into())).unwrap().credencial,
+            Credencial::Contrasena { .. }
+        ));
+    }
     use serde_json::json;
 
     #[test]
