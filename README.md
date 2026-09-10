@@ -439,7 +439,7 @@ Publica en `ar.net.vasak.os.AccountsSync` (bus de sesión):
 |---|---|
 | `MailboxStatus` | Cuánto correo sin leer hay, por cuenta. |
 | `ListMessages(account_id)` | Los últimos 200 mensajes: quién, qué asunto, cuándo, leído o no. Sin cuerpos. |
-| `GetMessage(account_id, uid)` | El texto de un mensaje, si se cortó por tamaño y si trae adjuntos. |
+| `GetMessage(account_id, uid)` | El texto, si se cortó, si trae adjuntos, y lo que hace falta para responderlo. |
 | `MarkRead(account_id, uid)` | Marca un mensaje como leído **en el servidor**. |
 | `SendMessage(account_id, borrador)` | Pone un mensaje en la cola de salida. Devuelve su identificador. |
 | `ListOutbox` | Lo que está esperando salir, y lo que se trabó. |

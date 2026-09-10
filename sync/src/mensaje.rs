@@ -46,6 +46,13 @@ const MAX_PROFUNDIDAD: usize = 8;
 /// recorrer. Ninguno legítimo pasa de unas decenas.
 const MAX_PARTES: usize = 64;
 
+/// Cuántas referencias se copian a una respuesta.
+///
+/// Una conversación de años acumula cientos, y la cadena entera se copia en cada
+/// mensaje: sin tope, la cabecera crece hasta que algún servidor del camino
+/// rechaza el mensaje por el tamaño de sus cabeceras.
+const MAX_REFERENCIAS: usize = 20;
+
 /// Tope del texto que se devuelve para mostrar.
 ///
 /// Un megabyte de texto son unas doscientas mil palabras: nadie escribe eso y
@@ -795,6 +802,71 @@ pub fn fecha_de(valor: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Lo que hace falta para responder un mensaje.
+///
+/// Sale de las cabeceras del original y va derecho a las del que se escribe, así
+/// que **todo esto lo escribió quien mandó el mensaje**: puede traer saltos de
+/// línea puestos a propósito. No se limpia acá sino al armar la respuesta, que
+/// es donde está la función que sabe hacerlo y donde el peligro es visible; acá
+/// se dejaría a medias y con dos lugares que arreglar.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParaResponder {
+    /// El identificador del original. Es lo que engancha la respuesta a la
+    /// conversación en el cliente de quien la recibe; sin esto, la respuesta
+    /// aparece como un mensaje suelto y la conversación se parte.
+    pub message_id: String,
+    /// La cadena de la conversación, ya con el original al final.
+    pub referencias: Vec<String>,
+    /// A dónde va la respuesta.
+    ///
+    /// `Reply-To` si el mensaje lo trae, y `From` si no. La diferencia importa:
+    /// las listas de correo y los sistemas de tickets ponen `Reply-To`
+    /// justamente para que la respuesta no le llegue sólo a quien apretó el
+    /// botón de mandar.
+    pub responder_a: String,
+    pub nombre: String,
+}
+
+/// Lee de un mensaje lo que hace falta para responderlo.
+pub fn para_responder(crudo: &[u8]) -> ParaResponder {
+    let vista = como_latin1(crudo);
+    let (cabeceras, _) = partir(&vista);
+
+    let message_id = cabeceras.valor("message-id").unwrap_or_default().trim().to_string();
+
+    // `References` es la cadena entera; si no está, la arma el `In-Reply-To`.
+    // Y el original va al final: es el que sigue en la conversación.
+    let mut referencias: Vec<String> = cabeceras
+        .valor("references")
+        .or_else(|| cabeceras.valor("in-reply-to"))
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    if !message_id.is_empty() && referencias.last() != Some(&message_id) {
+        referencias.push(message_id.clone());
+    }
+
+    // Un `References` de una conversación de años puede tener cientos de
+    // entradas, y se copia entera en cada respuesta. Se recortan las del medio
+    // —que es lo que hacen los clientes— dejando el principio, que es lo que
+    // identifica la conversación, y el final, que es lo que la engancha.
+    if referencias.len() > MAX_REFERENCIAS {
+        let cola = referencias.split_off(referencias.len() - (MAX_REFERENCIAS - 1));
+        referencias.truncate(1);
+        referencias.extend(cola);
+    }
+
+    let de = cabeceras
+        .valor("reply-to")
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| cabeceras.valor("from"))
+        .unwrap_or_default();
+    let (nombre, responder_a) = remitente_de(de);
+
+    ParaResponder { message_id, referencias, responder_a, nombre }
+}
+
 /// Arma el resumen de un mensaje a partir de sus cabeceras.
 pub fn resumen_de(uid: u32, cabeceras_crudas: &str, sin_leer: bool, con_adjuntos: bool) -> Resumen {
     let cabeceras = Cabeceras::leer(cabeceras_crudas);
@@ -1295,6 +1367,78 @@ mod tests {
         for basura in ["", "ayer", "2026-09-15", "Tue, 99 Xxx 2026"] {
             assert_eq!(fecha_de(basura), "", "{basura:?}");
         }
+    }
+
+    // ── Responder ──────────────────────────────────────────────────────────
+
+    /// Sin el `Message-ID` del original, la respuesta aparece como un mensaje
+    /// suelto y la conversación se parte en el cliente de quien la recibe.
+    #[test]
+    fn se_saca_lo_que_hace_falta_para_responder() {
+        let crudo = b"From: Ana=?x?= <ana@ejemplo.com>\r\n\
+            Message-ID: <original@ejemplo.com>\r\n\
+            References: <uno@x.com> <dos@x.com>\r\n\r\nHola";
+
+        let r = para_responder(crudo);
+        assert_eq!(r.message_id, "<original@ejemplo.com>");
+        assert_eq!(r.responder_a, "ana@ejemplo.com");
+        // El original va al final: es el que sigue en la conversación.
+        assert_eq!(
+            r.referencias,
+            vec!["<uno@x.com>", "<dos@x.com>", "<original@ejemplo.com>"]
+        );
+    }
+
+    /// **Las listas de correo y los sistemas de tickets ponen `Reply-To`**
+    /// justamente para que la respuesta no le llegue sólo a quien apretó
+    /// mandar. Ignorarlo manda la respuesta al lugar equivocado.
+    #[test]
+    fn el_reply_to_gana_sobre_el_from() {
+        let crudo = b"From: Ana <ana@ejemplo.com>\r\n\
+            Reply-To: lista@grupo.com\r\n\r\nHola";
+        assert_eq!(para_responder(crudo).responder_a, "lista@grupo.com");
+
+        // Vacío no cuenta: hay clientes que lo mandan así.
+        let vacio = b"From: Ana <ana@ejemplo.com>\r\nReply-To:   \r\n\r\nHola";
+        assert_eq!(para_responder(vacio).responder_a, "ana@ejemplo.com");
+    }
+
+    /// Sin `References`, la cadena la arma el `In-Reply-To`: hay clientes que
+    /// mandan sólo ése.
+    #[test]
+    fn sin_references_alcanza_el_in_reply_to() {
+        let crudo = b"Message-ID: <b@x>\r\nIn-Reply-To: <a@x>\r\n\r\nHola";
+        assert_eq!(para_responder(crudo).referencias, vec!["<a@x>", "<b@x>"]);
+    }
+
+    /// Una conversación de años acumula cientos de referencias y la cadena se
+    /// copia entera en cada mensaje: sin tope, la cabecera crece hasta que algún
+    /// servidor del camino rechaza el mensaje.
+    #[test]
+    fn una_conversacion_larga_no_arrastra_todo() {
+        let largas: Vec<String> = (0..500).map(|i| format!("<{i}@x>")).collect();
+        let crudo = format!(
+            "Message-ID: <ultimo@x>\r\nReferences: {}\r\n\r\nHola",
+            largas.join(" ")
+        );
+
+        let r = para_responder(crudo.as_bytes());
+        assert_eq!(r.referencias.len(), MAX_REFERENCIAS);
+        // Se conserva la primera, que identifica la conversación…
+        assert_eq!(r.referencias[0], "<0@x>");
+        // …y la última, que es la que la engancha.
+        assert_eq!(r.referencias.last().unwrap(), "<ultimo@x>");
+    }
+
+    /// Un mensaje sin `Message-ID` existe —los hay mal armados—, y responderlo
+    /// tiene que poder pasar igual: sin cabecera de conversación, pero con
+    /// destinatario.
+    #[test]
+    fn un_mensaje_sin_identificador_se_puede_responder_igual() {
+        let r = para_responder(b"From: ana@ejemplo.com\r\n\r\nHola");
+        assert_eq!(r.message_id, "");
+        assert!(r.referencias.is_empty());
+        assert_eq!(r.responder_a, "ana@ejemplo.com");
     }
 
     // ── El resumen entero ──────────────────────────────────────────────────

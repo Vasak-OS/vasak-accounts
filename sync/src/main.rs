@@ -181,6 +181,15 @@ struct Abierto {
     /// diga «tiene un adjunto y esta versión no los muestra» es peor que
     /// mostrarlo y muchísimo mejor que callarlo.
     adjuntos: bool,
+    /// Lo que hace falta para responderlo: a quién, y con qué cabeceras para que
+    /// la respuesta quede enganchada a la conversación.
+    ///
+    /// Viaja con el mensaje y no en un método aparte porque se necesita en el
+    /// mismo momento —al abrirlo aparece el botón de responder— y porque sale de
+    /// las mismas cabeceras que ya se trajeron: pedirlo después sería volver al
+    /// servidor por algo que ya está en memoria.
+    #[serde(flatten)]
+    responder: mensaje::ParaResponder,
 }
 
 /// La conexión que atiende los pedidos de la aplicación de correo.
@@ -222,6 +231,7 @@ impl Lector {
             texto: mensaje::texto_de(&crudo),
             recortado,
             adjuntos: mensaje::tiene_adjuntos(&crudo),
+            responder: mensaje::para_responder(&crudo),
         })
     }
 
@@ -370,10 +380,11 @@ impl Servicio {
     /// guardar el correo entero de la persona en el disco, y para leer uno hay
     /// que ir a buscarlo igual la primera vez.
     ///
-    /// Devuelve `{"texto": …, "recortado": bool, "adjuntos": bool}`. Los dos
-    /// últimos son cosas que la ventana **tiene que poder decir**: un texto
-    /// cortado sin explicación parece un mensaje raro, y un adjunto que no se
-    /// nombra es un archivo que la persona no sabe que recibió.
+    /// Devuelve el texto, si se cortó, si trae adjuntos, y lo que hace falta
+    /// para responderlo. Los dos del medio son cosas que la ventana **tiene que
+    /// poder decir**: un texto cortado sin explicación parece un mensaje raro, y
+    /// un adjunto que no se nombra es un archivo que la persona no sabe que
+    /// recibió.
     async fn get_message(&self, account_id: String, uid: u32) -> zbus::fdo::Result<String> {
         let (broker, cuenta) = self.cuenta(&account_id).await?;
         let lector = self.lector(&account_id).await;
