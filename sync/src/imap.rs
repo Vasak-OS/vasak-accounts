@@ -33,6 +33,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 
 use crate::broker::{Credencial, Destino};
+use crate::casillas::{casilla_de_list, uidvalidity_de, Casilla};
 
 /// Tope para conectarse y autenticarse.
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -341,6 +342,13 @@ pub struct Sesion {
     pendiente: Vec<u8>,
     etiqueta: u32,
     capacidades: Vec<String>,
+    /// El `UIDVALIDITY` de la última casilla que se abrió.
+    ///
+    /// Se guarda porque es lo único que dice si los UID que tenemos siguen
+    /// valiendo. Cuando el servidor lo cambia, el 412 de ayer **no** es el 412
+    /// de hoy: quien tenga una lista vieja tiene que tirarla. Sin esto, un
+    /// «borrar» le puede caer a otro mensaje.
+    uidvalidity: Option<u32>,
 }
 
 impl Sesion {
@@ -387,6 +395,7 @@ impl Sesion {
             pendiente: Vec::new(),
             etiqueta: 0,
             capacidades: Vec::new(),
+            uidvalidity: None,
         };
 
         let saludo = sesion.leer_linea().await?;
@@ -492,8 +501,54 @@ impl Sesion {
         self.abrir_casilla("EXAMINE", casilla).await
     }
 
+    /// El `UIDVALIDITY` de la casilla abierta, si el servidor lo dijo.
+    ///
+    /// Hay que compararlo con el que se tenía guardado para esa casilla
+    /// **antes** de usar ningún UID: si cambió, la lista guardada no sirve.
+    pub fn uidvalidity(&self) -> Option<u32> {
+        self.uidvalidity
+    }
+
+    /// Enumera las casillas del servidor.
+    ///
+    /// `LIST "" "*"`: todas, desde la raíz. Las que el servidor marca
+    /// `\Noselect` vienen igual y marcadas — existen sólo como rama de la
+    /// jerarquía, y hace falta saber que están para dibujar el árbol.
+    ///
+    /// Las líneas que no se entienden se descartan en vez de cortar la
+    /// enumeración: perder una casilla rara es mejor que quedarse sin ninguna.
+    /// Un nombre como literal `{N}` es una de ésas — se resolvería leyendo más
+    /// líneas, y todavía no apareció ningún servidor que los mande para esto.
+    pub async fn listar_casillas(&mut self) -> Result<Vec<Casilla>, ImapError> {
+        let etiqueta = self.siguiente_etiqueta();
+        self.escribir(&format!("{etiqueta} LIST \"\" \"*\"")).await?;
+
+        Self::con_tope("listar las casillas", async {
+            let mut casillas = Vec::new();
+            loop {
+                let linea = self.leer_linea().await?;
+                if let Some(casilla) = casilla_de_list(&linea) {
+                    casillas.push(casilla);
+                }
+                match respuesta_de(&linea, &etiqueta) {
+                    Some(Respuesta::Ok) => return Ok(casillas),
+                    Some(Respuesta::No(d)) | Some(Respuesta::Bad(d)) => {
+                        return Err(ImapError::Fallo(format!("LIST falló: {d}")))
+                    }
+                    None => continue,
+                }
+            }
+        })
+        .await
+    }
+
     /// Abre una casilla con el comando que se le diga y devuelve cuántos
     /// mensajes tiene.
+    ///
+    /// `casilla` es la **ruta**, o sea el nombre tal como lo escribe el
+    /// servidor: la que trae `Casilla::ruta`, ya en UTF-7 modificado si hacía
+    /// falta. No se codifica acá porque codificar dos veces rompería el nombre,
+    /// y los nombres siempre vienen de un `LIST`.
     async fn abrir_casilla(&mut self, comando: &str, casilla: &str) -> Result<u32, ImapError> {
         let nombre = comillas(casilla)
             .ok_or_else(|| ImapError::Fallo("el nombre de la casilla no es válido".into()))?;
@@ -507,6 +562,9 @@ impl Sesion {
                 let linea = self.leer_linea().await?;
                 if let Some(n) = exists_de(&linea) {
                     mensajes = n;
+                }
+                if let Some(v) = uidvalidity_de(&linea) {
+                    self.uidvalidity = Some(v);
                 }
                 match respuesta_de(&linea, &etiqueta) {
                     Some(Respuesta::Ok) => return Ok(mensajes),

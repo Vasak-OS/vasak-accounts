@@ -50,6 +50,7 @@
 //! a que se apague el equipo con algo sin mandar, y eso es su propio trabajo.
 
 mod broker;
+mod casillas;
 mod cola;
 mod imap;
 mod mensaje;
@@ -210,6 +211,20 @@ struct Lector {
 }
 
 impl Lector {
+    /// Las casillas del servidor.
+    ///
+    /// Se piden en el momento y no se guardan: son unas pocas y cambian cuando
+    /// la persona crea una carpeta desde otro lado. Un caché acá sería una
+    /// lista que se queda vieja sin que nada la invalide.
+    async fn casillas(
+        &mut self,
+        broker: &Broker,
+        cuenta: &broker::Account,
+    ) -> Result<Vec<casillas::Casilla>, String> {
+        self.con_reintento(broker, cuenta, |sesion| Box::pin(sesion.listar_casillas()))
+            .await
+    }
+
     /// Lo que hace falta para mostrar un mensaje abierto.
     async fn cuerpo(
         &mut self,
@@ -371,6 +386,34 @@ impl Servicio {
         let mensajes = estado.mensajes.get(&account_id).cloned().unwrap_or_default();
 
         serde_json::to_string(&mensajes)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
+    }
+
+    /// Las casillas de una cuenta: la de entrada, enviados, papelera y las que
+    /// haya creado la persona.
+    ///
+    /// Hasta ahora el escritorio sólo conocía `INBOX`, escrito a mano, así que
+    /// el correo enviado, el archivado, el spam y la papelera **no existían**.
+    ///
+    /// Cada casilla trae su `uso`, que sale de `SPECIAL-USE` cuando el servidor
+    /// lo anuncia y de comparar nombres conocidos cuando no. Eso es lo que
+    /// permite que la ventana sepa cuál es la papelera sin que la persona se lo
+    /// diga, y sin que la ventana tenga que saber que en Gmail se llama
+    /// `[Gmail]/Trash` y en un Exchange en español «Elementos eliminados».
+    ///
+    /// **Sólo lee.** Mover y borrar no están todavía, a propósito: mueven correo
+    /// ajeno de lugar y esta parte no se ejerció nunca contra un servidor real.
+    async fn list_mailboxes(&self, account_id: String) -> zbus::fdo::Result<String> {
+        let (broker, cuenta) = self.cuenta(&account_id).await?;
+        let lector = self.lector(&account_id).await;
+        let mut lector = lector.lock().await;
+
+        let casillas = lector
+            .casillas(&broker, &cuenta)
+            .await
+            .map_err(zbus::fdo::Error::Failed)?;
+
+        serde_json::to_string(&casillas)
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
     }
 
@@ -909,6 +952,13 @@ async fn sesion_de_cuenta(
         .await
         .map_err(|e| Salida::Cortada(e.to_string()))?;
 
+    // El `UIDVALIDITY` con el que se abrió. Si el servidor lo cambia a mitad de
+    // la sesión, los UID que ya publicamos dejan de valer: el 412 de ayer no es
+    // el 412 de hoy. Pasa cuando la casilla se recrea del otro lado —una
+    // restauración, una migración de servidor— y es raro, pero el síntoma es
+    // que abrir un mensaje trae otro.
+    let mut uidvalidity = sesion.uidvalidity();
+
     let inicial = contar(&mut sesion, mensajes).await;
     publicar(servicio, emisor, cuenta, inicial).await;
     listar(&mut sesion, servicio, emisor, cuenta, mensajes).await?;
@@ -952,6 +1002,21 @@ async fn sesion_de_cuenta(
             .examinar("INBOX")
             .await
             .map_err(|e| Salida::Cortada(e.to_string()))?;
+
+        // Si cambió, lo guardado no sirve. Se tira y se vuelve a listar en vez
+        // de intentar arreglarlo: la lista se rehace en un pedido, y quedarse
+        // con UID que apuntan a otra cosa es peor que esperar dos segundos.
+        let ahora_vale = sesion.uidvalidity();
+        if ahora_vale != uidvalidity {
+            tracing::info!(
+                "'{}': el servidor cambió el UIDVALIDITY de INBOX ({:?} -> {:?}); se rehace la lista",
+                cuenta.id,
+                uidvalidity,
+                ahora_vale,
+            );
+            uidvalidity = ahora_vale;
+            servicio.estado.lock().await.mensajes.remove(&cuenta.id);
+        }
 
         let ahora = contar(&mut sesion, mensajes).await;
         publicar(servicio, emisor, cuenta, ahora).await;
