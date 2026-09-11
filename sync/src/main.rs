@@ -50,6 +50,7 @@
 //! a que se apague el equipo con algo sin mandar, y eso es su propio trabajo.
 
 mod adjuntos;
+mod avisos;
 mod broker;
 mod casillas;
 mod cola;
@@ -166,6 +167,11 @@ struct Servicio {
     /// tardaría hasta un minuto en hacer algo visible — que se siente como que
     /// el botón no anduvo.
     hay_algo_que_mandar: Arc<tokio::sync::Notify>,
+    /// Los carteles de correo nuevo que ya se mostraron, por cuenta.
+    ///
+    /// Sirven para reemplazar el anterior en vez de apilar: veinte mensajes que
+    /// llegan juntos son un cartel que dice cuántos, no veinte carteles.
+    carteles: Arc<Mutex<avisos::Carteles>>,
 }
 
 /// Un mensaje abierto, listo para mostrar.
@@ -968,14 +974,40 @@ async fn publicar_mensajes(
     mensajes: Vec<mensaje::Resumen>,
 ) {
     let mut estado = servicio.estado.lock().await;
-    let cambio = estado.mensajes.get(account_id) != Some(&mensajes);
+    let anterior = estado.mensajes.get(account_id);
+    let cambio = anterior != Some(&mensajes);
+    // Cuántos son nuevos se calcula **antes** de reemplazar la lista, que es la
+    // única forma: después ya no hay con qué comparar. Y sale `0` la primera
+    // vez, porque no había lista anterior — que es justo lo que evita veinte
+    // carteles de correo de la semana pasada al conectarse.
+    let nuevos = avisos::cuantos_nuevos(anterior.map(|v| v.as_slice()), &mensajes);
     if cambio {
         estado.mensajes.insert(account_id.to_string(), mensajes);
     }
     drop(estado);
 
-    if cambio {
-        let _ = Servicio::messages_changed(emisor).await;
+    if !cambio {
+        return;
+    }
+    let _ = Servicio::messages_changed(emisor).await;
+
+    if nuevos == 0 {
+        return;
+    }
+
+    // El cartel, por el bus de sesión. La ventana puede estar cerrada —que es lo
+    // normal— y ésta es la única forma de que alguien se entere.
+    let (titulo, cuerpo) = avisos::texto(nuevos, account_id);
+    let mut carteles = servicio.carteles.lock().await;
+    if let Some(id) = avisos::mostrar(
+        emisor.connection(),
+        carteles.anterior(account_id),
+        &titulo,
+        &cuerpo,
+    )
+    .await
+    {
+        carteles.recordar(account_id, id);
     }
 }
 
