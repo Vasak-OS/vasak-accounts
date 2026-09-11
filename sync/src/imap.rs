@@ -28,7 +28,7 @@
 use std::time::Duration;
 
 use base64::Engine;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 
@@ -327,8 +327,16 @@ pub fn ultimos(mensajes: u32, cuantos: u32) -> Option<String> {
 
 type Flujo = tokio_rustls::client::TlsStream<TcpStream>;
 
-pub struct Sesion {
-    flujo: Flujo,
+/// Una sesión IMAP abierta.
+///
+/// El flujo es un parámetro con valor por omisión, y eso es lo que hace que
+/// esto se pueda probar. En producción siempre es el TLS de arriba; en las
+/// pruebas es un par de tuberías en memoria contra un servidor de mentira, y
+/// así se puede ejercer la conversación entera —qué comando se manda, en qué
+/// orden, qué se hace con las respuestas sin etiqueta— que es exactamente lo
+/// que un analizador suelto no comprueba.
+pub struct Sesion<F = Flujo> {
+    flujo: F,
     /// Lo que se leyó del socket y todavía no se consumió como línea.
     ///
     /// El búfer es **nuestro** y no de un `BufReader`, y eso es lo que hace que
@@ -351,7 +359,7 @@ pub struct Sesion {
     uidvalidity: Option<u32>,
 }
 
-impl Sesion {
+impl Sesion<Flujo> {
     /// Abre la sesión y se autentica.
     ///
     /// Siempre sobre TLS desde el primer byte. STARTTLS no se implementa acá a
@@ -413,7 +421,11 @@ impl Sesion {
         sesion.refrescar_capacidades().await?;
         Ok(sesion)
     }
+}
 
+/// Todo lo demás no necesita saber que abajo hay TLS: le alcanza con poder leer
+/// y escribir bytes.
+impl<F: AsyncRead + AsyncWrite + Unpin + Send> Sesion<F> {
     async fn autenticar(&mut self, credencial: &Credencial) -> Result<(), ImapError> {
         match credencial {
             Credencial::Contrasena { usuario, secreto } => {
@@ -943,6 +955,210 @@ impl Sesion {
 
 #[cfg(test)]
 mod tests {
+
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt as _, BufReader};
+
+    /// Una sesión contra un servidor de mentira, para ejercer la conversación.
+    ///
+    /// # Por qué hace falta
+    ///
+    /// Todas las pruebas de este archivo eran de analizadores sueltos: se les
+    /// da una línea y se mira qué devuelven. Eso no comprueba **la
+    /// conversación**, que es donde están los errores que importan: mandar
+    /// `FETCH` sin haber abierto la casilla, confundir una respuesta sin
+    /// etiqueta con la del comando en curso, o quedarse esperando una línea que
+    /// ya llegó. El issue que pide todo esto dice que la fase está sin verificar
+    /// contra un servidor real, y esto no lo reemplaza — pero cubre lo que sí se
+    /// puede comprobar sin uno.
+    ///
+    /// `guion` son pares de «lo que se espera recibir» y «lo que se contesta».
+    /// El servidor de mentira comprueba que el comando contenga lo esperado y
+    /// falla la prueba si no, así que el orden de los comandos queda fijado.
+    fn con_servidor(
+        saludo: &str,
+        guion: Vec<(&'static str, Vec<&'static str>)>,
+    ) -> (
+        Sesion<tokio::io::DuplexStream>,
+        tokio::task::JoinHandle<Vec<String>>,
+    ) {
+        let (cliente, servidor) = tokio::io::duplex(64 * 1024);
+        let saludo = saludo.to_string();
+
+        let tarea = tokio::spawn(async move {
+            let (lectura, mut escritura) = tokio::io::split(servidor);
+            let mut lineas = BufReader::new(lectura).lines();
+            let mut recibidos = Vec::new();
+
+            escritura.write_all(saludo.as_bytes()).await.unwrap();
+            escritura.write_all(b"\r\n").await.unwrap();
+
+            for (esperado, respuesta) in guion {
+                let Ok(Some(linea)) = lineas.next_line().await else {
+                    break;
+                };
+                assert!(
+                    linea.contains(esperado),
+                    "se esperaba un comando con «{esperado}» y llegó «{linea}»"
+                );
+                recibidos.push(linea.clone());
+
+                // La etiqueta que mandó el cliente, para poder contestarle con
+                // la suya: usar una fija haría pasar una prueba que en la vida
+                // real se colgaría esperando.
+                let etiqueta = linea.split_whitespace().next().unwrap_or("a1").to_string();
+                for l in respuesta {
+                    let l = l.replace("{etiqueta}", &etiqueta);
+                    escritura.write_all(l.as_bytes()).await.unwrap();
+                    escritura.write_all(b"\r\n").await.unwrap();
+                }
+            }
+
+            recibidos
+        });
+
+        let sesion = Sesion {
+            flujo: cliente,
+            pendiente: Vec::new(),
+            etiqueta: 0,
+            capacidades: Vec::new(),
+            uidvalidity: None,
+        };
+        (sesion, tarea)
+    }
+
+    #[tokio::test]
+    async fn listar_casillas_manda_list_y_junta_lo_que_vuelve() {
+        let (mut sesion, tarea) = con_servidor(
+            "* OK listo",
+            vec![(
+                "LIST \"\" \"*\"",
+                vec![
+                    r#"* LIST (\HasNoChildren) "/" "INBOX""#,
+                    r#"* LIST (\HasNoChildren \Sent) "/" "[Gmail]/Sent Mail""#,
+                    r#"* LIST (\Noselect \HasChildren) "/" "[Gmail]""#,
+                    "{etiqueta} OK LIST completado",
+                ],
+            )],
+        );
+
+        let casillas = sesion.listar_casillas().await.unwrap();
+        tarea.await.unwrap();
+
+        assert_eq!(casillas.len(), 3);
+        assert_eq!(casillas[0].ruta, "INBOX");
+        assert_eq!(casillas[1].uso, crate::casillas::Uso::Enviados);
+        // La `\Noselect` viene igual y marcada: hace falta para dibujar el
+        // árbol, y quien la muestre decide si la ofrece.
+        assert!(!casillas[2].seleccionable);
+    }
+
+    /// Es el caso que un analizador suelto no puede cubrir: las respuestas sin
+    /// etiqueta se juntan y el comando termina **cuando llega la suya**, no con
+    /// la primera línea que se parezca.
+    #[tokio::test]
+    async fn una_respuesta_sin_etiqueta_no_termina_el_comando() {
+        let (mut sesion, tarea) = con_servidor(
+            "* OK listo",
+            vec![(
+                "LIST",
+                vec![
+                    "* 4 EXISTS",
+                    "* OK [UNSEEN 2] algo",
+                    r#"* LIST (\HasNoChildren) "/" "Trabajo""#,
+                    "* 1 RECENT",
+                    "{etiqueta} OK LIST completado",
+                ],
+            )],
+        );
+
+        let casillas = sesion.listar_casillas().await.unwrap();
+        tarea.await.unwrap();
+        assert_eq!(casillas.len(), 1);
+        assert_eq!(casillas[0].ruta, "Trabajo");
+    }
+
+    #[tokio::test]
+    async fn abrir_una_casilla_lee_cuantos_hay_y_el_uidvalidity() {
+        let (mut sesion, tarea) = con_servidor(
+            "* OK listo",
+            vec![(
+                "EXAMINE \"INBOX\"",
+                vec![
+                    "* FLAGS (\\Seen \\Answered)",
+                    "* 42 EXISTS",
+                    "* OK [UIDVALIDITY 3857529045] UIDs valid",
+                    "* OK [UIDNEXT 4392] Predicted next UID",
+                    "{etiqueta} OK [READ-ONLY] EXAMINE completado",
+                ],
+            )],
+        );
+
+        let cuantos = sesion.examinar("INBOX").await.unwrap();
+        tarea.await.unwrap();
+
+        assert_eq!(cuantos, 42);
+        assert_eq!(sesion.uidvalidity(), Some(3857529045));
+    }
+
+    /// La casilla va **entre comillas** en el comando. Sin ellas, una con
+    /// espacios —«Sent Mail», que es la de Gmail— se lee como dos argumentos y
+    /// el servidor contesta un error.
+    #[tokio::test]
+    async fn una_casilla_con_espacios_va_entre_comillas() {
+        let (mut sesion, tarea) = con_servidor(
+            "* OK listo",
+            vec![(
+                "EXAMINE \"[Gmail]/Sent Mail\"",
+                vec!["* 3 EXISTS", "{etiqueta} OK completado"],
+            )],
+        );
+
+        assert_eq!(sesion.examinar("[Gmail]/Sent Mail").await.unwrap(), 3);
+        tarea.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn un_no_del_servidor_es_un_error_y_no_una_lista_vacia() {
+        let (mut sesion, tarea) = con_servidor(
+            "* OK listo",
+            vec![(
+                "EXAMINE",
+                vec!["{etiqueta} NO [NONEXISTENT] Unknown Mailbox"],
+            )],
+        );
+
+        let fallo = sesion.examinar("NoExiste").await.unwrap_err();
+        tarea.await.unwrap();
+
+        // Devolver cero mensajes diría «esta carpeta está vacía», que es otra
+        // cosa muy distinta de «esta carpeta no existe».
+        assert!(
+            fallo.to_string().contains("NoExiste"),
+            "el error tiene que nombrar la casilla: {fallo}"
+        );
+    }
+
+    /// Cada comando lleva su propia etiqueta, creciente. Repetirlas haría que
+    /// la respuesta de uno se tome como la del siguiente.
+    #[tokio::test]
+    async fn cada_comando_lleva_su_etiqueta() {
+        let (mut sesion, tarea) = con_servidor(
+            "* OK listo",
+            vec![
+                ("EXAMINE", vec!["* 1 EXISTS", "{etiqueta} OK completado"]),
+                ("LIST", vec!["{etiqueta} OK completado"]),
+            ],
+        );
+
+        sesion.examinar("INBOX").await.unwrap();
+        sesion.listar_casillas().await.unwrap();
+        let recibidos = tarea.await.unwrap();
+
+        assert_eq!(recibidos.len(), 2);
+        let primera = recibidos[0].split_whitespace().next().unwrap();
+        let segunda = recibidos[1].split_whitespace().next().unwrap();
+        assert_ne!(primera, segunda, "dos comandos con la misma etiqueta");
+    }
     use super::*;
 
     /// Sin reconocer el literal, esos bytes se leen como si fueran líneas del
