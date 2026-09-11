@@ -2078,7 +2078,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vasak-accounts"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "dirs",
@@ -2098,7 +2098,7 @@ dependencies = [
 
 [[package]]
 name = "vasak-accounts-sync"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "base64",
  "chrono",

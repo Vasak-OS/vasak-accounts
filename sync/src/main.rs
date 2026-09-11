@@ -53,6 +53,7 @@ mod adjuntos;
 mod avisos;
 mod broker;
 mod casillas;
+mod consulta;
 mod cola;
 mod imap;
 mod mensaje;
@@ -236,6 +237,33 @@ impl Lector {
     ) -> Result<Vec<casillas::Casilla>, String> {
         self.con_reintento(broker, cuenta, |sesion| Box::pin(sesion.listar_casillas()))
             .await
+    }
+
+    /// Busca en una casilla y devuelve los resúmenes que coinciden.
+    ///
+    /// La búsqueda la hace el servidor, que es el único que tiene el correo
+    /// entero: en memoria están los últimos doscientos de la de entrada y nada
+    /// más. Después hay que traer los encabezados de lo que encontró, porque
+    /// `SEARCH` devuelve números y no mensajes.
+    async fn buscar_en(
+        &mut self,
+        broker: &Broker,
+        cuenta: &broker::Account,
+        casilla: &str,
+        terminos: Vec<consulta::Termino>,
+    ) -> Result<Vec<mensaje::Resumen>, String> {
+        let casilla = casilla.to_string();
+        self.con_reintento(broker, cuenta, move |sesion| {
+            let casilla = casilla.clone();
+            let terminos = terminos.clone();
+            Box::pin(async move {
+                // `EXAMINE`: buscar no tiene por qué marcar nada como leído.
+                sesion.examinar(&casilla).await?;
+                let uids = sesion.buscar(&terminos).await?;
+                sesion.resumenes_de(&uids).await
+            })
+        })
+        .await
     }
 
     /// Los últimos mensajes de una casilla que no es la de entrada.
@@ -496,6 +524,41 @@ impl Servicio {
             .map_err(zbus::fdo::Error::Failed)?;
 
         serde_json::to_string(&casillas)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
+    }
+
+    /// Busca mensajes en una casilla.
+    ///
+    /// # Por qué recibe términos y no un criterio de IMAP
+    ///
+    /// Lo que llega es lo que alguien escribió en un campo de texto. Si viajara
+    /// como criterio crudo, un término con palabras clave del protocolo sería un
+    /// comando distinto del que se quiso mandar — contra la casilla de la propia
+    /// persona, pero igual: sería la ventana decidiendo qué comando IMAP se
+    /// ejecuta. Acá llega **qué** se busca y el criterio se arma en `consulta`.
+    ///
+    /// Un término que no se entiende hace fallar la llamada entera en vez de
+    /// saltearse: buscar algo distinto de lo que se pidió y no decirlo es peor
+    /// que no buscar.
+    async fn search_messages(
+        &self,
+        account_id: String,
+        mailbox: String,
+        query: String,
+    ) -> zbus::fdo::Result<String> {
+        let terminos: Vec<consulta::Termino> = serde_json::from_str(&query)
+            .map_err(|e| zbus::fdo::Error::InvalidArgs(format!("consulta inválida: {e}")))?;
+
+        let (broker, cuenta) = self.cuenta(&account_id).await?;
+        let lector = self.lector(&account_id).await;
+        let mut lector = lector.lock().await;
+
+        let encontrados = lector
+            .buscar_en(&broker, &cuenta, &casilla_o_entrada(&mailbox), terminos)
+            .await
+            .map_err(zbus::fdo::Error::Failed)?;
+
+        serde_json::to_string(&encontrados)
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
     }
 

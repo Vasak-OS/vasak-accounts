@@ -34,6 +34,7 @@ use tokio_rustls::rustls::pki_types::ServerName;
 
 use crate::broker::{Credencial, Destino};
 use crate::casillas::{casilla_de_list, uidvalidity_de, Casilla};
+use crate::consulta::{armar, uids_de_search, Termino, Trozo};
 
 /// Tope para conectarse y autenticarse.
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -209,14 +210,11 @@ pub fn exists_de(linea: &str) -> Option<u32> {
 /// Se cuentan y no se leen: los números son identificadores de mensaje y lo
 /// único que hace falta es cuántos hay.
 pub fn resultados_de_search(linea: &str) -> Option<u32> {
-    let sin_asterisco = linea.strip_prefix("* ")?;
-    let resto = sin_asterisco.strip_prefix("SEARCH").or_else(|| {
-        sin_asterisco
-            .to_ascii_uppercase()
-            .starts_with("SEARCH")
-            .then(|| &sin_asterisco["SEARCH".len()..])
-    })?;
-    Some(resto.split_whitespace().count() as u32)
+    // El corte después de la palabra lo comprueba `tras_search`. Sin eso,
+    // `* SEARCHING 1` pasaba por una respuesta de `SEARCH` con un resultado —
+    // la misma clase de error que el de las etiquetas, que ya tiene su prueba
+    // más abajo.
+    Some(crate::consulta::tras_search(linea)?.split_whitespace().count() as u32)
 }
 
 /// Saca una línea del búfer, si ya hay una entera.
@@ -592,6 +590,139 @@ impl<F: AsyncRead + AsyncWrite + Unpin + Send> Sesion<F> {
         .await
     }
 
+    /// Busca en la casilla abierta y devuelve los UID que coinciden.
+    ///
+    /// `UID SEARCH` y no `SEARCH`: los números que vuelven tienen que ser los
+    /// mismos que usa el resto del servicio. `SEARCH` a secas devuelve números
+    /// de secuencia, que cambian cuando se borra cualquier mensaje anterior.
+    ///
+    /// # Los dos intentos
+    ///
+    /// Primero con `CHARSET UTF-8`, que es lo que hace falta para que «reunión»
+    /// encuentre algo. Hay servidores viejos que lo rechazan con
+    /// `NO [BADCHARSET]`; para ésos se reintenta sin declararlo, que es lo que
+    /// el estándar permite y lo que hacen todos los clientes.
+    ///
+    /// Se reintenta **una vez** y sólo ante ese error. Insistir con otros es
+    /// mandar dos veces un comando que ya se sabe que falla.
+    pub async fn buscar(&mut self, terminos: &[Termino]) -> Result<Vec<u32>, ImapError> {
+        let trozos = armar(terminos);
+        if trozos.is_empty() {
+            // Sin criterio, `SEARCH` devuelve la casilla entera. Eso no es una
+            // búsqueda vacía, es todo: contestar nada es más honesto.
+            return Ok(Vec::new());
+        }
+
+        match self.buscar_con(&trozos, true).await {
+            Err(ImapError::Rechazado(detalle)) if detalle.contains("BADCHARSET") => {
+                self.buscar_con(&trozos, false).await
+            }
+            otro => otro,
+        }
+    }
+
+    /// Un intento de búsqueda, declarando el juego de caracteres o no.
+    async fn buscar_con(
+        &mut self,
+        trozos: &[Trozo],
+        con_charset: bool,
+    ) -> Result<Vec<u32>, ImapError> {
+        let etiqueta = self.siguiente_etiqueta();
+        let mut linea = format!("{etiqueta} UID SEARCH");
+        if con_charset {
+            linea.push_str(" CHARSET UTF-8");
+        }
+
+        // Los trozos que son literales de IMAP interrumpen la línea: se anuncia
+        // el largo **en bytes**, el servidor contesta `+` y recién ahí van los
+        // bytes. Un `chars().count()` acá mandaría un largo que no es el que el
+        // servidor va a leer, y la sesión queda desincronizada.
+        for trozo in trozos {
+            match trozo {
+                Trozo::Literal(texto) => {
+                    linea.push(' ');
+                    linea.push_str(texto);
+                }
+                Trozo::Cadena(texto) => {
+                    linea.push_str(&format!(" {{{}}}", texto.len()));
+                    self.escribir(&linea).await?;
+                    self.esperar_continuacion().await?;
+                    linea = texto.clone();
+                }
+            }
+        }
+        self.escribir(&linea).await?;
+
+        Self::con_tope("buscar", async {
+            let mut uids = Vec::new();
+            loop {
+                let linea = self.leer_linea().await?;
+                if let Some(encontrados) = uids_de_search(&linea) {
+                    uids.extend(encontrados);
+                }
+                match respuesta_de(&linea, &etiqueta) {
+                    Some(Respuesta::Ok) => return Ok(uids),
+                    // `No` va como `Rechazado` y no como `Fallo` para que el
+                    // reintento sin `CHARSET` pueda reconocerlo.
+                    Some(Respuesta::No(d)) => return Err(ImapError::Rechazado(d)),
+                    Some(Respuesta::Bad(d)) => {
+                        return Err(ImapError::Fallo(format!("SEARCH falló: {d}")))
+                    }
+                    None => continue,
+                }
+            }
+        })
+        .await
+    }
+
+    /// Espera el `+` con el que el servidor pide los bytes de un literal.
+    ///
+    /// Sin esperarlo, los bytes salen antes de que el servidor esté listo para
+    /// leerlos y los toma como el comando siguiente.
+    async fn esperar_continuacion(&mut self) -> Result<(), ImapError> {
+        Self::con_tope("esperar la continuación", async {
+            loop {
+                let linea = self.leer_linea().await?;
+                if linea.starts_with('+') {
+                    return Ok(());
+                }
+                // Un `NO` o un `BAD` acá quieren decir que el comando no va a
+                // pasar. Seguir esperando el `+` sería esperar para siempre.
+                let mayusculas = linea.to_ascii_uppercase();
+                if mayusculas.contains(" NO ") || mayusculas.contains(" BAD ") {
+                    return Err(ImapError::Rechazado(linea));
+                }
+            }
+        })
+        .await
+    }
+
+    /// Los resúmenes de unos UID puntuales.
+    ///
+    /// Mismo `FETCH` que `resumenes`, pero por UID en vez de por rango de
+    /// secuencia: es lo que hace falta después de un `SEARCH`.
+    pub async fn resumenes_de(
+        &mut self,
+        uids: &[u32],
+    ) -> Result<Vec<crate::mensaje::Resumen>, ImapError> {
+        if uids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Los más nuevos primero y con tope: una búsqueda amplia puede traer
+        // diez mil, y pedir los encabezados de todos tarda lo que tarda y llena
+        // la memoria de la ventana con algo que nadie va a leer entero.
+        let mut recientes: Vec<u32> = uids.to_vec();
+        recientes.sort_unstable_by(|a, b| b.cmp(a));
+        recientes.truncate(CUANTOS as usize);
+
+        let lista = recientes
+            .iter()
+            .map(|u| u.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        self.fetch_de_resumenes(&format!("UID FETCH {lista}")).await
+    }
+
     /// Cuántos sin leer hay en la casilla abierta.
     ///
     /// Con `SEARCH` y no con `STATUS`: el estándar dice que `STATUS` no se use
@@ -708,13 +839,26 @@ impl<F: AsyncRead + AsyncWrite + Unpin + Send> Sesion<F> {
             return Ok(Vec::new());
         };
 
+        self.fetch_de_resumenes(&format!("FETCH {rango}")).await
+    }
+
+    /// El `FETCH` de encabezados y lo que se hace con lo que vuelve.
+    ///
+    /// Está aparte porque lo usan dos: la lista de una casilla, que pide un
+    /// rango de secuencia, y la búsqueda, que pide UID puntuales. Lo único que
+    /// cambia es el comando; qué se pide y cómo se lee lo que vuelve es idéntico
+    /// — y dos copias de eso son dos que se separan.
+    async fn fetch_de_resumenes(
+        &mut self,
+        comando: &str,
+    ) -> Result<Vec<crate::mensaje::Resumen>, ImapError> {
         let etiqueta = self.siguiente_etiqueta();
         // `CONTENT-TYPE` viene para saber si hay algo pegado. Es una pista y no
         // una certeza —un `multipart/mixed` puede ser texto con una imagen
         // incrustada—, pero cuesta cero y acierta casi siempre; saberlo de verdad
         // pide traer la estructura completa del mensaje.
         self.escribir(&format!(
-            "{etiqueta} FETCH {rango} (UID FLAGS \
+            "{etiqueta} {comando} (UID FLAGS \
              BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE CONTENT-TYPE)])"
         ))
         .await?;
@@ -988,6 +1132,8 @@ mod tests {
             let (lectura, mut escritura) = tokio::io::split(servidor);
             let mut lineas = BufReader::new(lectura).lines();
             let mut recibidos = Vec::new();
+            let mut etiqueta = String::from("a1");
+            let mut esperando_literal = false;
 
             escritura.write_all(saludo.as_bytes()).await.unwrap();
             escritura.write_all(b"\r\n").await.unwrap();
@@ -1005,7 +1151,19 @@ mod tests {
                 // La etiqueta que mandó el cliente, para poder contestarle con
                 // la suya: usar una fija haría pasar una prueba que en la vida
                 // real se colgaría esperando.
-                let etiqueta = linea.split_whitespace().next().unwrap_or("a1").to_string();
+                //
+                // **Salvo después de un `+`.** Lo que sigue a una continuación
+                // son los bytes de un literal, no un comando: no empiezan con
+                // etiqueta, y tomarles la primera palabra por una haría
+                // contestar con una etiqueta inventada. Es lo que hace un
+                // servidor de verdad, y sin esto la prueba del término con
+                // acentos se colgaba esperando una respuesta que nunca
+                // emparejaba.
+                if !esperando_literal {
+                    etiqueta = linea.split_whitespace().next().unwrap_or("a1").to_string();
+                }
+                esperando_literal = respuesta.iter().any(|l| l.starts_with('+'));
+
                 for l in respuesta {
                     let l = l.replace("{etiqueta}", &etiqueta);
                     escritura.write_all(l.as_bytes()).await.unwrap();
@@ -1024,6 +1182,134 @@ mod tests {
             uidvalidity: None,
         };
         (sesion, tarea)
+    }
+
+    #[tokio::test]
+    async fn buscar_manda_uid_search_con_el_juego_declarado() {
+        let (mut sesion, tarea) = con_servidor(
+            "* OK listo",
+            vec![(
+                "UID SEARCH CHARSET UTF-8 FROM \"ana\"",
+                vec!["* SEARCH 3 7 11", "{etiqueta} OK SEARCH completado"],
+            )],
+        );
+
+        let uids = sesion
+            .buscar(&[crate::consulta::Termino::De("ana".into())])
+            .await
+            .unwrap();
+        tarea.await.unwrap();
+        assert_eq!(uids, vec![3, 7, 11]);
+    }
+
+    /// Hay servidores viejos que rechazan el juego declarado. El estándar
+    /// permite mandarlo sin declarar, y es lo que hacen todos los clientes.
+    #[tokio::test]
+    async fn si_rechazan_el_juego_se_reintenta_sin_el() {
+        let (mut sesion, tarea) = con_servidor(
+            "* OK listo",
+            vec![
+                (
+                    "CHARSET UTF-8",
+                    vec!["{etiqueta} NO [BADCHARSET] UTF-8 no soportado"],
+                ),
+                (
+                    "UID SEARCH FROM \"ana\"",
+                    vec!["* SEARCH 5", "{etiqueta} OK completado"],
+                ),
+            ],
+        );
+
+        let uids = sesion
+            .buscar(&[crate::consulta::Termino::De("ana".into())])
+            .await
+            .unwrap();
+        let recibidos = tarea.await.unwrap();
+
+        assert_eq!(uids, vec![5]);
+        assert_eq!(recibidos.len(), 2, "tenía que reintentar una vez");
+        assert!(!recibidos[1].contains("CHARSET"));
+    }
+
+    /// Un `NO` que no es por el juego de caracteres no se reintenta: mandar dos
+    /// veces un comando que ya se sabe que falla no arregla nada.
+    #[tokio::test]
+    async fn otro_rechazo_no_se_reintenta() {
+        let (mut sesion, tarea) = con_servidor(
+            "* OK listo",
+            vec![("UID SEARCH", vec!["{etiqueta} NO no se puede"])],
+        );
+
+        assert!(sesion
+            .buscar(&[crate::consulta::Termino::De("ana".into())])
+            .await
+            .is_err());
+        assert_eq!(tarea.await.unwrap().len(), 1);
+    }
+
+    /// Un término que no es ASCII va como literal: se anuncia el largo **en
+    /// bytes**, el servidor contesta `+` y recién ahí van los bytes.
+    #[tokio::test]
+    async fn un_termino_con_acentos_va_como_literal() {
+        let (mut sesion, tarea) = con_servidor(
+            "* OK listo",
+            vec![
+                // «reunión» son 8 bytes en UTF-8, no 7 caracteres. Mandar 7
+                // dejaría la sesión desincronizada.
+                ("SUBJECT {8}", vec!["+ dale"]),
+                ("reunión", vec!["* SEARCH 9", "{etiqueta} OK completado"]),
+            ],
+        );
+
+        let uids = sesion
+            .buscar(&[crate::consulta::Termino::Asunto("reunión".into())])
+            .await
+            .unwrap();
+        tarea.await.unwrap();
+        assert_eq!(uids, vec![9]);
+    }
+
+    /// Sin criterio, `SEARCH` devolvería la casilla entera. Eso no es una
+    /// búsqueda vacía: es todo, y contestar nada es más honesto.
+    #[tokio::test]
+    async fn sin_criterio_no_se_manda_nada() {
+        let (mut sesion, tarea) = con_servidor("* OK listo", vec![]);
+        assert!(sesion.buscar(&[]).await.unwrap().is_empty());
+        assert!(tarea.await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn una_busqueda_sin_resultados_no_es_un_error() {
+        let (mut sesion, tarea) = con_servidor(
+            "* OK listo",
+            vec![("UID SEARCH", vec!["* SEARCH", "{etiqueta} OK completado"])],
+        );
+
+        let uids = sesion
+            .buscar(&[crate::consulta::Termino::De("nadie".into())])
+            .await
+            .unwrap();
+        tarea.await.unwrap();
+        assert!(uids.is_empty());
+    }
+
+    /// Una búsqueda amplia puede traer diez mil UID. Pedir los encabezados de
+    /// todos llena la memoria de la ventana con algo que nadie va a leer.
+    #[tokio::test]
+    async fn los_resumenes_de_una_busqueda_se_acotan_a_los_mas_nuevos() {
+        let (mut sesion, tarea) = con_servidor(
+            "* OK listo",
+            vec![("UID FETCH", vec!["{etiqueta} OK completado"])],
+        );
+
+        let muchos: Vec<u32> = (1..=500).collect();
+        sesion.resumenes_de(&muchos).await.unwrap();
+        let recibidos = tarea.await.unwrap();
+
+        let pedidos = recibidos[0].split(',').count();
+        assert_eq!(pedidos, CUANTOS as usize);
+        // Y son los más nuevos: el primero de la lista es el UID más alto.
+        assert!(recibidos[0].contains("UID FETCH 500,499,"));
     }
 
     #[tokio::test]
