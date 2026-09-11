@@ -225,15 +225,53 @@ impl Lector {
             .await
     }
 
+    /// Los últimos mensajes de una casilla que no es la de entrada.
+    ///
+    /// Se traen del servidor en el momento y no se guardan, al revés que los de
+    /// `INBOX`. La razón es la misma por la que el IDLE se queda en `INBOX`:
+    /// es la única que necesita aviso inmediato, y una conexión en espera por
+    /// carpeta multiplicaría las conexiones contra el servidor de alguien.
+    ///
+    /// `EXAMINE` y no `SELECT`: abrir para mirar no tiene que marcar nada como
+    /// leído.
+    async fn resumenes_de(
+        &mut self,
+        broker: &Broker,
+        cuenta: &broker::Account,
+        casilla: &str,
+    ) -> Result<Vec<mensaje::Resumen>, String> {
+        let casilla = casilla.to_string();
+        self.con_reintento(broker, cuenta, move |sesion| {
+            let casilla = casilla.clone();
+            Box::pin(async move {
+                let cuantos = sesion.examinar(&casilla).await?;
+                sesion.resumenes(cuantos).await
+            })
+        })
+        .await
+    }
+
     /// Lo que hace falta para mostrar un mensaje abierto.
+    ///
+    /// `casilla` importa y no es un adorno: **los UID son por casilla**. El 412
+    /// de la de entrada y el 412 de «Enviados» son mensajes distintos, así que
+    /// pedir uno sin decir de dónde es pedir cualquiera.
     async fn cuerpo(
         &mut self,
         broker: &Broker,
         cuenta: &broker::Account,
+        casilla: &str,
         uid: u32,
     ) -> Result<Abierto, String> {
+        let casilla = casilla.to_string();
         let (crudo, recortado) = self
-            .con_reintento(broker, cuenta, |sesion| Box::pin(sesion.cuerpo(uid)))
+            .con_reintento(broker, cuenta, move |sesion| {
+                let casilla = casilla.clone();
+                Box::pin(async move {
+                    sesion.seleccionar(&casilla).await?;
+                    sesion.cuerpo(uid).await
+                })
+            })
             .await?;
 
         // Los bytes se le pasan **crudos** al parser. Convertirlos a texto acá
@@ -259,10 +297,21 @@ impl Lector {
         &mut self,
         broker: &Broker,
         cuenta: &broker::Account,
+        casilla: &str,
         uid: u32,
     ) -> Result<(), String> {
-        self.con_reintento(broker, cuenta, |sesion| Box::pin(sesion.marcar_leido(uid)))
-            .await
+        let casilla = casilla.to_string();
+        self.con_reintento(broker, cuenta, move |sesion| {
+            let casilla = casilla.clone();
+            Box::pin(async move {
+                // La casilla correcta antes de tocar nada: los UID son por
+                // casilla, y marcar el 412 con «Enviados» abierta marcaría otro
+                // mensaje.
+                sesion.seleccionar(&casilla).await?;
+                sesion.marcar_leido(uid).await
+            })
+        })
+        .await
     }
 
     /// Hace algo sobre la sesión, abriéndola si hace falta.
@@ -381,9 +430,29 @@ impl Servicio {
     /// IMAP. Es la aplicación más expuesta del escritorio —lo que muestra lo
     /// escribió cualquiera que sepa la dirección de la persona— y es la que menos
     /// tiene para perder.
-    async fn list_messages(&self, account_id: String) -> zbus::fdo::Result<String> {
-        let estado = self.estado.lock().await;
-        let mensajes = estado.mensajes.get(&account_id).cloned().unwrap_or_default();
+    ///
+    /// `mailbox` vacío o `INBOX` contesta con lo que ya está en memoria, que es
+    /// lo que mantiene al día la sesión con IDLE. Cualquier otra casilla se
+    /// abre en el momento: no hay caché de las demás, y no lo hay a propósito
+    /// —una conexión en espera por carpeta multiplicaría las conexiones contra
+    /// el servidor de alguien—.
+    ///
+    /// O sea que abrir «Enviados» tarda lo que tarda el servidor, y la de
+    /// entrada es instantánea. Es la diferencia que se ve, y es la correcta:
+    /// la que se mira todo el tiempo es la que está lista.
+    async fn list_messages(&self, account_id: String, mailbox: String) -> zbus::fdo::Result<String> {
+        let mensajes = if mailbox.is_empty() || mailbox.eq_ignore_ascii_case("INBOX") {
+            let estado = self.estado.lock().await;
+            estado.mensajes.get(&account_id).cloned().unwrap_or_default()
+        } else {
+            let (broker, cuenta) = self.cuenta(&account_id).await?;
+            let lector = self.lector(&account_id).await;
+            let mut lector = lector.lock().await;
+            lector
+                .resumenes_de(&broker, &cuenta, &mailbox)
+                .await
+                .map_err(zbus::fdo::Error::Failed)?
+        };
 
         serde_json::to_string(&mensajes)
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
@@ -428,13 +497,18 @@ impl Servicio {
     /// poder decir**: un texto cortado sin explicación parece un mensaje raro, y
     /// un adjunto que no se nombra es un archivo que la persona no sabe que
     /// recibió.
-    async fn get_message(&self, account_id: String, uid: u32) -> zbus::fdo::Result<String> {
+    async fn get_message(
+        &self,
+        account_id: String,
+        mailbox: String,
+        uid: u32,
+    ) -> zbus::fdo::Result<String> {
         let (broker, cuenta) = self.cuenta(&account_id).await?;
         let lector = self.lector(&account_id).await;
         let mut lector = lector.lock().await;
 
         let abierto = lector
-            .cuerpo(&broker, &cuenta, uid)
+            .cuerpo(&broker, &cuenta, &casilla_o_entrada(&mailbox), uid)
             .await
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo traer el mensaje: {e}")))?;
 
@@ -452,19 +526,30 @@ impl Servicio {
         &self,
         #[zbus(signal_context)] emisor: SignalContext<'_>,
         account_id: String,
+        mailbox: String,
         uid: u32,
     ) -> zbus::fdo::Result<()> {
+        let casilla = casilla_o_entrada(&mailbox);
         let (broker, cuenta) = self.cuenta(&account_id).await?;
         let lector = self.lector(&account_id).await;
         let mut lector = lector.lock().await;
 
         lector
-            .marcar_leido(&broker, &cuenta, uid)
+            .marcar_leido(&broker, &cuenta, &casilla, uid)
             .await
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo marcar: {e}")))?;
 
         // Y acá también, para que la lista no muestre en negrita algo que el
         // servidor ya sabe que se leyó. La próxima vuelta del bucle lo confirma.
+        //
+        // Sólo para la de entrada: es la única que está en memoria, y buscar un
+        // UID de otra casilla en esa lista encontraría el de un mensaje
+        // distinto —los UID son por casilla— y lo marcaría leído sin que nadie
+        // lo haya leído.
+        if !casilla.eq_ignore_ascii_case("INBOX") {
+            return Ok(());
+        }
+
         let mut estado = self.estado.lock().await;
         let cambio = estado
             .mensajes
@@ -938,6 +1023,19 @@ enum Salida {
     Cortada(String),
 }
 
+/// La casilla que pidieron, o la de entrada si no dijeron ninguna.
+///
+/// Las ventanas viejas no mandan el campo. Caer a `INBOX` es lo que hacían
+/// antes, así que una que no se actualizó sigue funcionando igual en vez de
+/// fallar con un nombre vacío.
+fn casilla_o_entrada(mailbox: &str) -> String {
+    if mailbox.is_empty() {
+        "INBOX".to_string()
+    } else {
+        mailbox.to_string()
+    }
+}
+
 /// Una sesión, de principio a fin. Nunca vuelve bien: o se corta o la rechazan.
 async fn sesion_de_cuenta(
     broker: &Broker,
@@ -1319,5 +1417,18 @@ mod tests {
             "el estándar pide renovar antes de los 29 minutos"
         );
         assert!(REINTENTO_CUENTA < INTERVALO);
+    }
+
+    /// Las ventanas viejas no mandan el campo. Caer a la de entrada es lo que
+    /// hacían antes, así que una que no se actualizó sigue funcionando en vez
+    /// de fallar con un nombre vacío.
+    #[test]
+    fn sin_casilla_se_usa_la_de_entrada() {
+        assert_eq!(casilla_o_entrada(""), "INBOX");
+        assert_eq!(casilla_o_entrada("INBOX"), "INBOX");
+        assert_eq!(casilla_o_entrada("Sent"), "Sent");
+        // No se normaliza: el servidor distingue mayúsculas en todo lo que no
+        // sea `INBOX`, y «sent» puede ser otra carpeta distinta de «Sent».
+        assert_eq!(casilla_o_entrada("[Gmail]/Sent Mail"), "[Gmail]/Sent Mail");
     }
 }
