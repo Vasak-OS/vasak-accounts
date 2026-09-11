@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 /// y con versión en texto y en HTML tiene dos niveles—. Ocho es de sobra para
 /// cualquier correo real y corta un mensaje armado para anidar mil veces, que
 /// sin tope reventaría la pila.
-const MAX_PROFUNDIDAD: usize = 8;
+pub const MAX_PROFUNDIDAD: usize = 8;
 
 /// Cuántas partes se miran en un mismo nivel.
 ///
@@ -578,40 +578,11 @@ fn buscar_texto(cabeceras: &Cabeceras, cuerpo: &str, profundidad: usize) -> Opti
 }
 
 /// Si una parte viene marcada como adjunto.
-fn es_adjunto(cabeceras: &Cabeceras) -> bool {
+pub fn es_adjunto(cabeceras: &Cabeceras) -> bool {
     cabeceras
         .valor("content-disposition")
         .map(|d| d.trim().to_ascii_lowercase().starts_with("attachment"))
         .unwrap_or(false)
-}
-
-/// Si el mensaje trae algo pegado.
-pub fn tiene_adjuntos(crudo: &[u8]) -> bool {
-    let vista = como_latin1(crudo);
-    let (cabeceras, cuerpo) = partir(&vista);
-    buscar_adjunto(&cabeceras, cuerpo, 0)
-}
-
-fn buscar_adjunto(cabeceras: &Cabeceras, cuerpo: &str, profundidad: usize) -> bool {
-    if profundidad > MAX_PROFUNDIDAD {
-        return false;
-    }
-    if profundidad > 0 && es_adjunto(cabeceras) {
-        return true;
-    }
-
-    let tipo = cabeceras
-        .valor("content-type")
-        .map(tipo_de)
-        .unwrap_or_default();
-    let Some(frontera) = &tipo.frontera else {
-        return false;
-    };
-
-    partes_de(cuerpo, frontera).into_iter().any(|parte| {
-        let (suyas, su_cuerpo) = partir(parte);
-        buscar_adjunto(&suyas, su_cuerpo, profundidad + 1)
-    })
 }
 
 /// Saca las etiquetas de un HTML y deja el texto.
@@ -1165,12 +1136,6 @@ mod tests {
         let texto = texto_de(con_adjunto.as_bytes());
         assert!(texto.contains("El cuerpo de verdad"), "{texto:?}");
         assert!(!texto.contains("a,b,c"), "{texto:?}");
-        assert!(tiene_adjuntos(con_adjunto.as_bytes()));
-    }
-
-    #[test]
-    fn un_mensaje_simple_no_tiene_adjuntos() {
-        assert!(!tiene_adjuntos(b"Content-Type: text/plain\r\n\r\nHola"));
     }
 
     /// Un mensaje armado para anidar mil veces reventaría la pila. El tope corta
@@ -1187,7 +1152,6 @@ mod tests {
 
         // Lo único que importa es que vuelva.
         let _ = texto_de(crudo.as_bytes());
-        let _ = tiene_adjuntos(crudo.as_bytes());
     }
 
     /// Un mensaje sin la línea de cierre está mal formado, pero perder el cuerpo

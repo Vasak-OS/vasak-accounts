@@ -49,6 +49,7 @@
 //! Todavía **no envía**. Mandar correo pasa por SMTP y por una cola que sobreviva
 //! a que se apague el equipo con algo sin mandar, y eso es su propio trabajo.
 
+mod adjuntos;
 mod broker;
 mod casillas;
 mod cola;
@@ -175,13 +176,19 @@ struct Abierto {
     /// que poder decirlo en vez de dejar el texto terminado a la mitad sin
     /// explicación.
     recortado: bool,
-    /// Si trae algo pegado.
+    /// Los archivos pegados: cuáles hay, cómo se llaman y qué número de parte
+    /// tienen.
     ///
-    /// Se dice aunque **todavía no se pueda abrir**: alguien que lee un mensaje
-    /// y no se entera de que traía un archivo pierde el archivo. Que la ventana
-    /// diga «tiene un adjunto y esta versión no los muestra» es peor que
-    /// mostrarlo y muchísimo mejor que callarlo.
-    adjuntos: bool,
+    /// Era un booleano —«trae algo»— y ahora es la lista. Sale del mismo mensaje
+    /// que ya se trajo, así que no cuesta ni una vuelta más al servidor, y el
+    /// número de parte es lo que después hace falta para pedirle al servidor
+    /// esa parte sola.
+    ///
+    /// **Si `recortado` es cierto, esta lista puede estar corta.** Se arma
+    /// mirando lo que se trajo, y lo que se trae tiene tope; un adjunto que
+    /// quedó más allá del corte no aparece. La ventana ya tiene que decir que el
+    /// mensaje está recortado, y eso cubre también esto.
+    adjuntos: Vec<adjuntos::Adjunto>,
     /// Lo que hace falta para responderlo: a quién, y con qué cabeceras para que
     /// la respuesta quede enganchada a la conversación.
     ///
@@ -283,7 +290,7 @@ impl Lector {
         Ok(Abierto {
             texto: mensaje::texto_de(&crudo),
             recortado,
-            adjuntos: mensaje::tiene_adjuntos(&crudo),
+            adjuntos: adjuntos::listar(&crudo),
             responder: mensaje::para_responder(&crudo),
         })
     }
