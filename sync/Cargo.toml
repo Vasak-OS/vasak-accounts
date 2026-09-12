@@ -25,8 +25,15 @@ rustls-native-certs.workspace = true
 # Para el usuario y la contraseña de las cuentas con contraseña de aplicación,
 # y para el XOAUTH2 de las que usan token.
 base64 = "0.22"
-# Para el flujo de señales de D-Bus.
+# Para el flujo de señales de D-Bus, y para leer una imagen a medida que llega
+# sin pasarse del tope.
 futures-util = "0.3"
+# Para traer las imágenes de un correo cuando la persona las pide. El mismo
+# cliente que ya usa el servicio de cuentas del mismo espacio de trabajo, con
+# rustls: es Rust puro y no suma bibliotecas compartidas al paquete.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+# Para mirar la dirección de una imagen antes de pedirla. Ver `imagenes.rs`.
+url.workspace = true
 # Los juegos de caracteres del correo. Medio correo viejo viene en latin-1, y sin
 # convertirlo un mensaje en español de hace quince años se ve con un rombo en
 # cada acento. Es Rust puro —el mismo motor de codificaciones de Firefox—, así
