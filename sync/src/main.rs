@@ -56,6 +56,7 @@ mod casillas;
 mod cola;
 mod consulta;
 mod html;
+mod imagenes;
 mod imap;
 mod mensaje;
 mod redactar;
@@ -662,6 +663,27 @@ impl Servicio {
             "recortado": recortado,
         }))
         .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
+    }
+
+    /// Trae una imagen de un mensaje, cuando la persona la pidió.
+    ///
+    /// **La trae el servicio y no la ventana**, y ésa es la función entera: una
+    /// petición hecha desde el motor que dibuja la aplicación lleva el idioma de
+    /// la sesión, el tamaño de la ventana y las galletas que tenga guardadas, y
+    /// la dirección la eligió quien mandó el correo.
+    ///
+    /// Que la pida este proceso trae un riesgo nuevo —la máquina pidiéndose
+    /// cosas a sí misma— y por eso la dirección se revisa y se resuelve antes.
+    /// Ver `imagenes.rs`, que es donde está la decisión y sus pruebas.
+    ///
+    /// No se pide sola nunca: este método existe porque alguien apretó un botón.
+    async fn fetch_image(&self, url: String) -> zbus::fdo::Result<String> {
+        let imagen = imagenes::traer(&url)
+            .await
+            .map_err(zbus::fdo::Error::Failed)?;
+
+        serde_json::to_string(&imagen)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
     }
 
     /// El texto de un mensaje.
