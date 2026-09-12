@@ -28,6 +28,7 @@
 use std::collections::HashMap;
 
 use crate::mensaje::Resumen;
+use crate::preferencias::Detalle;
 
 /// El identificador del botón, con el que vuelve la señal.
 ///
@@ -54,36 +55,130 @@ const PROGRAMA_DE_CORREO: &str = "vasak-mail";
 const SERVICIO: &str = "org.freedesktop.Notifications";
 const RUTA: &str = "/org/freedesktop/Notifications";
 
-/// Cuántos mensajes hay en `ahora` que no estaban en `antes`.
+/// Cuáles de los mensajes de `ahora` no estaban en `antes`.
 ///
 /// `antes` en `None` es la primera lista de la cuenta: no hay con qué comparar,
 /// así que no hay novedad. Es lo que evita el aluvión de carteles al arrancar.
 ///
 /// Se comparan por UID y no por posición: un mensaje borrado desde el teléfono
 /// corre la lista entera, y por posición todo parecería nuevo.
-pub fn cuantos_nuevos(antes: Option<&[Resumen]>, ahora: &[Resumen]) -> usize {
+pub fn los_nuevos<'a>(antes: Option<&[Resumen]>, ahora: &'a [Resumen]) -> Vec<&'a Resumen> {
     let Some(antes) = antes else {
-        return 0;
+        return Vec::new();
     };
 
     let conocidos: std::collections::HashSet<u32> = antes.iter().map(|m| m.uid).collect();
-    ahora.iter().filter(|m| !conocidos.contains(&m.uid)).count()
+    ahora
+        .iter()
+        .filter(|m| !conocidos.contains(&m.uid))
+        .collect()
 }
 
 /// Lo que dice el cartel.
 ///
-/// **Sólo el número.** Ni remitente ni asunto: la pantalla puede estar
-/// bloqueada, compartida o proyectada, y quién te escribe es un dato tan
-/// personal como lo que te escribió. El issue pide que esto se pueda
-/// configurar; mientras no haya dónde guardar esa preferencia, el valor por
-/// omisión es el que no muestra nada de nadie.
-pub fn texto(cuantos: usize, cuenta: &str) -> (String, String) {
-    let titulo = if cuantos == 1 {
+/// Cuánto muestra lo elige la persona; lo de omisión es lo que menos dice. Ver
+/// `preferencias.rs`, y el comentario de [`Detalle::Cantidad`] sobre por qué ese
+/// es el valor por omisión.
+///
+/// # Lo que llega acá lo escribió un desconocido
+///
+/// El nombre de quien manda y el asunto salen del mensaje. Dos cosas que hay que
+/// hacerles antes de que terminen en un cartel del escritorio:
+///
+/// - **Escapar.** El cuerpo de una notificación admite un subconjunto de marcado
+///   —así lo define la especificación, y el servidor puede anunciar la capacidad
+///   `body-markup`—, así que un remitente que se llame `<b>Banco</b>` sale en
+///   negrita, y uno más creativo puede meter un enlace.
+/// - **Acortar.** Un asunto de cinco mil caracteres no lo corta nadie por
+///   nosotros: el cartel se estira hasta tapar la pantalla.
+pub fn texto(nuevos: &[&Resumen], cuenta: &str, detalle: Detalle) -> (String, String) {
+    let titulo = if nuevos.len() == 1 {
         "Llegó 1 mensaje".to_string()
     } else {
-        format!("Llegaron {cuantos} mensajes")
+        format!("Llegaron {} mensajes", nuevos.len())
     };
-    (titulo, cuenta.to_string())
+
+    let cuerpo = match detalle {
+        Detalle::Cantidad => escapar(cuenta),
+        Detalle::Remitente => con_la_cuenta(&lista(nuevos, quien), cuenta),
+        Detalle::Asunto => con_la_cuenta(
+            &lista(nuevos, |m| {
+                let asunto = recortar(m.asunto.trim());
+                if asunto.is_empty() {
+                    quien(m)
+                } else {
+                    format!("{}: {}", quien(m), asunto)
+                }
+            }),
+            cuenta,
+        ),
+    };
+
+    (titulo, cuerpo)
+}
+
+/// Quién manda, con la dirección de respaldo si no se firmó con un nombre.
+fn quien(mensaje: &Resumen) -> String {
+    let nombre = mensaje.de.trim();
+    recortar(if nombre.is_empty() {
+        mensaje.direccion.trim()
+    } else {
+        nombre
+    })
+}
+
+/// Los primeros, y cuántos quedaron afuera.
+///
+/// Tres y no todos: un cartel con veinte renglones tapa la pantalla, y a partir
+/// del cuarto lo único que importa es que hay más.
+fn lista(nuevos: &[&Resumen], como: impl Fn(&Resumen) -> String) -> String {
+    const CUANTOS: usize = 3;
+
+    let mut renglones: Vec<String> = nuevos.iter().take(CUANTOS).map(|m| como(m)).collect();
+    if nuevos.len() > CUANTOS {
+        renglones.push(format!("y {} más", nuevos.len() - CUANTOS));
+    }
+    renglones.join("\n")
+}
+
+/// Junta lo que se muestra con a qué cuenta llegó.
+///
+/// La cuenta va siempre: con varias conectadas, saber que llegó correo sin saber
+/// a cuál obliga a abrirlas todas.
+fn con_la_cuenta(detalle: &str, cuenta: &str) -> String {
+    let cuenta = escapar(cuenta);
+    if detalle.is_empty() {
+        return cuenta;
+    }
+    format!("{detalle}\n{cuenta}")
+}
+
+/// Tope de lo que se muestra de un nombre o de un asunto.
+const MAX_TEXTO: usize = 80;
+
+/// Acorta y escapa, en ese orden.
+///
+/// Primero se acorta sobre el texto original y después se escapa: al revés, un
+/// `&amp;` podía quedar cortado por la mitad y el cartel mostraría `&am`.
+fn recortar(texto: &str) -> String {
+    let mut corte = MAX_TEXTO.min(texto.len());
+    while corte > 0 && !texto.is_char_boundary(corte) {
+        corte -= 1;
+    }
+
+    if corte < texto.len() {
+        format!("{}…", escapar(&texto[..corte]))
+    } else {
+        escapar(texto)
+    }
+}
+
+/// Lo que el cuerpo de una notificación interpreta como marcado.
+fn escapar(texto: &str) -> String {
+    texto
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Los identificadores de los carteles que ya se mostraron, por cuenta.
@@ -239,14 +334,14 @@ mod tests {
     #[test]
     fn la_primera_lista_no_avisa_nada() {
         let ahora = vec![resumen(1), resumen(2), resumen(3)];
-        assert_eq!(cuantos_nuevos(None, &ahora), 0);
+        assert_eq!(los_nuevos(None, &ahora).len(), 0);
     }
 
     #[test]
     fn lo_que_no_estaba_antes_es_nuevo() {
         let antes = vec![resumen(1), resumen(2)];
         let ahora = vec![resumen(3), resumen(1), resumen(2)];
-        assert_eq!(cuantos_nuevos(Some(&antes), &ahora), 1);
+        assert_eq!(los_nuevos(Some(&antes), &ahora).len(), 1);
     }
 
     /// Se compara por UID y no por posición. Un mensaje borrado desde el
@@ -255,31 +350,137 @@ mod tests {
     fn borrar_uno_no_hace_parecer_nuevos_a_los_demas() {
         let antes = vec![resumen(1), resumen(2), resumen(3)];
         let ahora = vec![resumen(2), resumen(3)];
-        assert_eq!(cuantos_nuevos(Some(&antes), &ahora), 0);
+        assert_eq!(los_nuevos(Some(&antes), &ahora).len(), 0);
     }
 
     #[test]
     fn sin_cambios_no_hay_novedad() {
         let lista = vec![resumen(1), resumen(2)];
-        assert_eq!(cuantos_nuevos(Some(&lista), &lista), 0);
-        assert_eq!(cuantos_nuevos(Some(&[]), &[]), 0);
+        assert_eq!(los_nuevos(Some(&lista), &lista).len(), 0);
+        assert_eq!(los_nuevos(Some(&[]), &[]).len(), 0);
     }
 
     #[test]
     fn varios_juntos_se_cuentan_juntos() {
         let antes = vec![resumen(1)];
         let ahora: Vec<Resumen> = (1..=21).map(resumen).collect();
-        assert_eq!(cuantos_nuevos(Some(&antes), &ahora), 20);
+        assert_eq!(los_nuevos(Some(&antes), &ahora).len(), 20);
     }
 
+    fn de(uid: u32, quien: &str, asunto: &str) -> Resumen {
+        Resumen {
+            uid,
+            de: quien.to_string(),
+            asunto: asunto.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// **Lo de omisión no nombra a nadie**, que es lo que pasaba antes de que
+    /// esto se pudiera configurar.
     #[test]
-    fn el_texto_no_nombra_a_nadie() {
-        let (titulo, cuerpo) = texto(3, "ana@ejemplo.com");
-        assert!(titulo.contains('3'));
+    fn por_omision_el_texto_no_nombra_a_nadie() {
+        let nuevos = [de(1, "Ana", "Factura"), de(2, "Juan", "Hola")];
+        let lista: Vec<&Resumen> = nuevos.iter().collect();
+
+        let (titulo, cuerpo) = texto(&lista, "ana@ejemplo.com", Detalle::Cantidad);
+        assert!(titulo.contains('2'));
         // La cuenta sí, porque es la de quien está mirando: dice a cuál de sus
         // casillas llegó. Quién escribió y qué escribió, no.
         assert_eq!(cuerpo, "ana@ejemplo.com");
-        assert_eq!(texto(1, "x").0, "Llegó 1 mensaje");
+        assert!(!cuerpo.contains("Ana"));
+        assert!(!cuerpo.contains("Factura"));
+
+        let uno = [de(1, "Ana", "x")];
+        let uno: Vec<&Resumen> = uno.iter().collect();
+        assert_eq!(texto(&uno, "x", Detalle::Cantidad).0, "Llegó 1 mensaje");
+    }
+
+    #[test]
+    fn con_remitente_dice_de_quien_y_no_de_que() {
+        let nuevos = [de(1, "Ana", "Factura secreta")];
+        let lista: Vec<&Resumen> = nuevos.iter().collect();
+
+        let (_, cuerpo) = texto(&lista, "ana@ejemplo.com", Detalle::Remitente);
+        assert!(cuerpo.contains("Ana"), "{cuerpo}");
+        assert!(!cuerpo.contains("Factura"), "{cuerpo}");
+        // La cuenta va siempre: con varias conectadas, saber que llegó correo
+        // sin saber a cuál obliga a abrirlas todas.
+        assert!(cuerpo.contains("ana@ejemplo.com"), "{cuerpo}");
+    }
+
+    #[test]
+    fn con_asunto_dice_las_dos_cosas() {
+        let nuevos = [de(1, "Ana", "Factura")];
+        let lista: Vec<&Resumen> = nuevos.iter().collect();
+
+        let (_, cuerpo) = texto(&lista, "x", Detalle::Asunto);
+        assert!(cuerpo.contains("Ana"), "{cuerpo}");
+        assert!(cuerpo.contains("Factura"), "{cuerpo}");
+    }
+
+    /// Tres y el resto contado: un cartel con veinte renglones tapa la pantalla.
+    #[test]
+    fn con_muchos_se_nombran_los_primeros_y_se_cuenta_el_resto() {
+        let nuevos: Vec<Resumen> = (1..=10).map(|i| de(i, &format!("P{i}"), "x")).collect();
+        let lista: Vec<&Resumen> = nuevos.iter().collect();
+
+        let (_, cuerpo) = texto(&lista, "x", Detalle::Remitente);
+        assert!(cuerpo.contains("P1") && cuerpo.contains("P3"), "{cuerpo}");
+        assert!(!cuerpo.contains("P4"), "{cuerpo}");
+        assert!(cuerpo.contains("y 7 más"), "{cuerpo}");
+    }
+
+    /// **El nombre y el asunto los escribió un desconocido.** El cuerpo de una
+    /// notificación admite un subconjunto de marcado, así que un remitente que
+    /// se llame `<b>Banco</b>` sale en negrita si no se escapa.
+    #[test]
+    fn lo_que_escribio_un_desconocido_no_se_interpreta() {
+        let nuevos = [de(1, "<b>Banco</b>", "<a href='x'>clic</a> & más")];
+        let lista: Vec<&Resumen> = nuevos.iter().collect();
+
+        let (_, cuerpo) = texto(&lista, "x", Detalle::Asunto);
+        assert!(!cuerpo.contains("<b>"), "{cuerpo}");
+        assert!(!cuerpo.contains("<a "), "{cuerpo}");
+        assert!(cuerpo.contains("&lt;b&gt;"), "{cuerpo}");
+        assert!(cuerpo.contains("&amp;"), "{cuerpo}");
+    }
+
+    /// Y la cuenta también se escapa: sale del servidor de cuentas, pero el
+    /// nombre para mostrar lo puso alguien.
+    #[test]
+    fn la_cuenta_tambien_se_escapa() {
+        let nuevos = [de(1, "Ana", "x")];
+        let lista: Vec<&Resumen> = nuevos.iter().collect();
+
+        let (_, cuerpo) = texto(&lista, "<i>casa</i>", Detalle::Cantidad);
+        assert!(!cuerpo.contains("<i>"), "{cuerpo}");
+    }
+
+    /// Un asunto de cinco mil caracteres estira el cartel hasta tapar la
+    /// pantalla: nadie lo corta por nosotros.
+    #[test]
+    fn un_asunto_enorme_se_corta() {
+        let largo = "a".repeat(5000);
+        let nuevos = [de(1, "Ana", &largo)];
+        let lista: Vec<&Resumen> = nuevos.iter().collect();
+
+        let (_, cuerpo) = texto(&lista, "x", Detalle::Asunto);
+        assert!(cuerpo.len() < 200, "quedó de {}", cuerpo.len());
+        assert!(cuerpo.contains('…'), "{cuerpo}");
+    }
+
+    /// Quien no se firmó con un nombre se muestra por su dirección: «llegó un
+    /// mensaje de nadie» no le sirve a nadie.
+    #[test]
+    fn sin_nombre_se_muestra_la_direccion() {
+        let mut sin_nombre = de(1, "", "x");
+        sin_nombre.direccion = "quien@ejemplo.com".to_string();
+        let nuevos = [sin_nombre];
+        let lista: Vec<&Resumen> = nuevos.iter().collect();
+
+        let (_, cuerpo) = texto(&lista, "x", Detalle::Remitente);
+        assert!(cuerpo.contains("quien@ejemplo.com"), "{cuerpo}");
     }
 
     /// El botón vuelve por el bus con el número del cartel, y hay que saber si

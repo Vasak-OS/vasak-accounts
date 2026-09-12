@@ -59,6 +59,7 @@ mod html;
 mod imagenes;
 mod imap;
 mod mensaje;
+mod preferencias;
 mod redactar;
 mod smtp;
 mod tls;
@@ -1199,7 +1200,15 @@ async fn publicar_mensajes(
     // única forma: después ya no hay con qué comparar. Y sale `0` la primera
     // vez, porque no había lista anterior — que es justo lo que evita veinte
     // carteles de correo de la semana pasada al conectarse.
-    let nuevos = avisos::cuantos_nuevos(anterior.map(|v| v.as_slice()), &mensajes);
+    //
+    // Y cuáles son, no sólo cuántos: desde que el cartel puede decir de quién y
+    // de qué, hay que quedarse con los mensajes. Se clonan porque la lista se
+    // mueve al estado en la línea de abajo y el candado se suelta antes de
+    // mostrar nada.
+    let nuevos: Vec<mensaje::Resumen> = avisos::los_nuevos(anterior.map(|v| v.as_slice()), &mensajes)
+        .into_iter()
+        .cloned()
+        .collect();
     if cambio {
         estado.mensajes.insert(account_id.to_string(), mensajes);
     }
@@ -1210,13 +1219,20 @@ async fn publicar_mensajes(
     }
     let _ = Servicio::messages_changed(emisor).await;
 
-    if nuevos == 0 {
+    if nuevos.is_empty() {
         return;
     }
 
     // El cartel, por el bus de sesión. La ventana puede estar cerrada —que es lo
     // normal— y ésta es la única forma de que alguien se entere.
-    let (titulo, cuerpo) = avisos::texto(nuevos, account_id);
+    // Cuánto dice el cartel lo elige la persona, y se lee en cada tanda: así
+    // cambiar la preferencia se nota en el aviso siguiente y no al reiniciar la
+    // sesión. Ver `preferencias.rs`.
+    let (titulo, cuerpo) = avisos::texto(
+        &nuevos.iter().collect::<Vec<_>>(),
+        account_id,
+        preferencias::leer().detalle,
+    );
     let mut carteles = servicio.carteles.lock().await;
     if let Some(id) = avisos::mostrar(
         emisor.connection(),
