@@ -101,17 +101,23 @@ pub fn texto(nuevos: &[Resumen], cuenta: &str, detalle: Detalle) -> (String, Str
     let uno = (cuantos == 1).then(|| nuevos.first()).flatten();
 
     let cuerpo = match (detalle, uno) {
-        (Detalle::Remitente, Some(m)) => con_cuenta(&quien(m), cuenta),
+        (Detalle::Remitente, Some(m)) => con_cuenta(&para_el_cartel(&quien(m)), cuenta),
         (Detalle::RemitenteYAsunto, Some(m)) => {
             let asunto = m.asunto.trim();
             if asunto.is_empty() {
-                con_cuenta(&quien(m), cuenta)
+                con_cuenta(&para_el_cartel(&quien(m)), cuenta)
             } else {
-                con_cuenta(&format!("{}: {asunto}", quien(m)), cuenta)
+                // Cada uno por su lado y no el texto ya junto: así el tope de
+                // largo vale para cada cosa, y un asunto enorme no se come el
+                // nombre de quien lo mandó.
+                con_cuenta(
+                    &format!("{}: {}", para_el_cartel(&quien(m)), para_el_cartel(asunto)),
+                    cuenta,
+                )
             }
         }
         // Lo callado: cuántos y a qué casilla llegaron, nada de quién ni de qué.
-        _ => cuenta.to_string(),
+        _ => escapar(cuenta),
     };
 
     (titulo, cuerpo)
@@ -132,9 +138,55 @@ fn quien(mensaje: &Resumen) -> String {
     }
 }
 
+/// Tope de lo que se muestra de un nombre o de un asunto.
+///
+/// Ochenta caracteres entran en dos renglones de cartel. Un asunto de cinco mil
+/// —que no es raro en una lista de correo, y que en uno hostil es deliberado—
+/// estira el cartel hasta tapar la pantalla: nadie lo corta por nosotros.
+const MAX_TEXTO: usize = 80;
+
+/// Deja un texto del mensaje en condiciones de ir a un cartel.
+///
+/// # Lo que llega acá lo escribió un desconocido
+///
+/// El nombre con el que alguien se firma y el asunto que le puso salen del
+/// mensaje, y el mensaje lo manda cualquiera que sepa la dirección de la
+/// persona.
+///
+/// **Se escapa** porque el cuerpo de una notificación admite un subconjunto de
+/// marcado: la especificación lo define y el servidor lo anuncia como
+/// `body-markup`. Sin esto, un remitente que se llame `<b>Banco</b>` sale en
+/// negrita —y uno más creativo mete un enlace— en un cartel que el escritorio
+/// presenta como propio.
+///
+/// **Se acorta primero y se escapa después.** Al revés, el corte puede caer en
+/// medio de un `&amp;` y el cartel muestra `&am`.
+fn para_el_cartel(texto: &str) -> String {
+    let mut corte = MAX_TEXTO.min(texto.len());
+    while corte > 0 && !texto.is_char_boundary(corte) {
+        corte -= 1;
+    }
+
+    if corte < texto.len() {
+        format!("{}…", escapar(&texto[..corte]))
+    } else {
+        escapar(texto)
+    }
+}
+
+/// Lo que el cuerpo de una notificación interpreta como marcado.
+fn escapar(texto: &str) -> String {
+    texto
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 /// La cuenta va siempre, porque dice a cuál de las casillas de alguien llegó.
 fn con_cuenta(que: &str, cuenta: &str) -> String {
-    format!("{que} — {cuenta}")
+    // La cuenta también se escapa: la da el servicio de cuentas, pero el nombre
+    // para mostrar lo puso alguien al conectarla.
+    format!("{que} — {}", escapar(cuenta))
 }
 
 /// Los identificadores de los carteles que ya se mostraron, por cuenta.
@@ -466,5 +518,86 @@ mod tests {
         // llenaría el mapa de entradas que no sirven.
         carteles.recordar("dos", 0);
         assert_eq!(carteles.anterior("dos"), 0);
+    }
+
+    /// **Lo que llega al cartel lo escribió un desconocido.**
+    ///
+    /// El cuerpo de una notificación admite un subconjunto de marcado —la
+    /// especificación lo define y el servidor lo anuncia como `body-markup`—, así
+    /// que un remitente que se llame `<b>Banco</b>` sale en negrita en un cartel
+    /// que el escritorio presenta como propio.
+    #[test]
+    fn el_marcado_de_un_desconocido_no_se_interpreta() {
+        let m = Resumen {
+            de: "<b>Banco</b>".to_string(),
+            asunto: "<a href='x'>clic</a> & más".to_string(),
+            ..Default::default()
+        };
+
+        let (_, cuerpo) = texto(&[m], "casa", Detalle::RemitenteYAsunto);
+        assert!(!cuerpo.contains("<b>"), "{cuerpo}");
+        assert!(!cuerpo.contains("<a "), "{cuerpo}");
+        assert!(cuerpo.contains("&lt;b&gt;"), "{cuerpo}");
+        assert!(cuerpo.contains("&amp;"), "{cuerpo}");
+    }
+
+    /// La cuenta también: la da el servicio de cuentas, pero el nombre para
+    /// mostrar lo puso alguien al conectarla.
+    #[test]
+    fn la_cuenta_tambien_se_escapa() {
+        let m = Resumen::default();
+        let (_, cuerpo) = texto(&[m], "<i>casa</i>", Detalle::Cuenta);
+        assert!(!cuerpo.contains("<i>"), "{cuerpo}");
+        assert!(cuerpo.contains("&lt;i&gt;"), "{cuerpo}");
+    }
+
+    /// Un asunto enorme estira el cartel hasta tapar la pantalla: nadie lo corta
+    /// por nosotros.
+    #[test]
+    fn un_asunto_enorme_se_corta() {
+        let m = Resumen {
+            de: "Ana".to_string(),
+            asunto: "a".repeat(5000),
+            ..Default::default()
+        };
+
+        let (_, cuerpo) = texto(&[m], "casa", Detalle::RemitenteYAsunto);
+        assert!(cuerpo.len() < 200, "quedó de {}", cuerpo.len());
+        assert!(cuerpo.contains('…'), "{cuerpo}");
+        // Y el nombre sigue estando: cada cosa se acorta por su lado, así que un
+        // asunto enorme no se come a quien lo mandó.
+        assert!(cuerpo.contains("Ana"), "{cuerpo}");
+    }
+
+    /// Cortar no puede partir un carácter por la mitad.
+    #[test]
+    fn el_corte_respeta_los_acentos() {
+        // Dos bytes por carácter: el corte cae justo en el medio de uno.
+        let m = Resumen {
+            de: "Ana".to_string(),
+            asunto: "ñ".repeat(200),
+            ..Default::default()
+        };
+
+        let (_, cuerpo) = texto(&[m], "casa", Detalle::RemitenteYAsunto);
+        assert!(cuerpo.contains('ñ'), "{cuerpo}");
+    }
+
+    /// Y lo normal no se toca: si esto escapara de más, un asunto con un «&»
+    /// aparecería como «&amp;» en pantalla.
+    #[test]
+    fn un_asunto_normal_sale_tal_cual() {
+        let m = Resumen {
+            de: "Ana Pérez".to_string(),
+            asunto: "Factura de septiembre".to_string(),
+            ..Default::default()
+        };
+
+        let (_, cuerpo) = texto(&[m], "casa", Detalle::RemitenteYAsunto);
+        assert!(
+            cuerpo.contains("Ana Pérez: Factura de septiembre"),
+            "{cuerpo}"
+        );
+        assert!(!cuerpo.contains("&amp;"), "{cuerpo}");
     }
 }
