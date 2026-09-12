@@ -97,6 +97,30 @@ pub struct Borrador {
     /// La cadena de mensajes anteriores, del más viejo al más nuevo.
     #[serde(default)]
     pub referencias: Vec<String>,
+    /// Los archivos que van pegados.
+    ///
+    /// Llegan **con su contenido** y no con una ruta. Es a propósito: este
+    /// servicio corre como la persona y podría leer cualquier archivo suyo, así
+    /// que aceptar una ruta de la ventana sería dejar que la ventana elija qué
+    /// lee el servicio. Quien eligió el archivo es quien lo abre.
+    #[serde(default)]
+    pub adjuntos: Vec<Adjunto>,
+}
+
+/// Un archivo para pegar a un mensaje.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Adjunto {
+    /// Cómo se va a llamar del otro lado.
+    pub nombre: String,
+    /// El tipo declarado. Vacío para que lo decida `tipo_por_nombre`.
+    #[serde(default)]
+    pub tipo: String,
+    /// El contenido, en base64.
+    ///
+    /// Ya codificado porque así viaja por D-Bus sin que nadie tenga que
+    /// inventar cómo mandar bytes crudos en una cadena, y porque es la forma en
+    /// la que va a salir en el mensaje de todos modos.
+    pub contenido: String,
 }
 
 impl Borrador {
@@ -410,14 +434,163 @@ pub fn armar(borrador: &Borrador, identificador: &str, fecha: &str) -> Result<St
     }
 
     cabeceras.push("MIME-Version: 1.0".into());
-    cabeceras.push("Content-Type: text/plain; charset=utf-8".into());
-    cabeceras.push("Content-Transfer-Encoding: quoted-printable".into());
 
-    Ok(format!(
-        "{}\r\n\r\n{}",
-        cabeceras.join("\r\n"),
-        quoted_printable(&borrador.cuerpo)
-    ))
+    let texto = quoted_printable(&borrador.cuerpo);
+
+    if borrador.adjuntos.is_empty() {
+        // Sin adjuntos, un mensaje de una sola parte. Envolverlo en un
+        // `multipart` igual sería hacerle leer un árbol a quien recibe un
+        // mensaje que es dos renglones de texto.
+        cabeceras.push("Content-Type: text/plain; charset=utf-8".into());
+        cabeceras.push("Content-Transfer-Encoding: quoted-printable".into());
+        return Ok(format!("{}\r\n\r\n{}", cabeceras.join("\r\n"), texto));
+    }
+
+    // La frontera se calcula sobre **todo** lo que va adentro, incluido cada
+    // adjunto: si apareciera dentro de una parte, quien lo lea cortaría ahí y el
+    // mensaje llegaría partido en pedazos que no son los que se mandaron.
+    let mut contenidos: Vec<&str> = vec![texto.as_str()];
+    contenidos.extend(borrador.adjuntos.iter().map(|a| a.contenido.as_str()));
+    let frontera = frontera(&contenidos);
+
+    cabeceras.push(format!(
+        "Content-Type: multipart/mixed; boundary=\"{frontera}\""
+    ));
+
+    let mut cuerpo = String::new();
+    // El texto primero. Es lo que muestran los clientes que no bajan el árbol
+    // entero, y lo que alguien espera ver al abrir el mensaje.
+    cuerpo.push_str(&format!("--{frontera}\r\n"));
+    cuerpo.push_str("Content-Type: text/plain; charset=utf-8\r\n");
+    cuerpo.push_str("Content-Transfer-Encoding: quoted-printable\r\n\r\n");
+    cuerpo.push_str(&texto);
+    cuerpo.push_str("\r\n");
+
+    for adjunto in &borrador.adjuntos {
+        let tipo = if adjunto.tipo.trim().is_empty() {
+            tipo_por_nombre(&adjunto.nombre)
+        } else {
+            adjunto.tipo.trim()
+        };
+        cuerpo.push_str(&format!("--{frontera}\r\n"));
+        // El nombre va en los dos lados: en el `Content-Type` para los clientes
+        // viejos, y en el `Content-Disposition`, que es donde lo dice el
+        // estándar. Es lo mismo que `adjuntos.rs` busca al leer.
+        cuerpo.push_str(&format!(
+            "Content-Type: {tipo}; {}\r\n",
+            nombre_de_archivo(&adjunto.nombre).replace("filename", "name")
+        ));
+        cuerpo.push_str(&format!(
+            "Content-Disposition: attachment; {}\r\n",
+            nombre_de_archivo(&adjunto.nombre)
+        ));
+        cuerpo.push_str("Content-Transfer-Encoding: base64\r\n\r\n");
+        cuerpo.push_str(&en_renglones(&adjunto.contenido));
+        cuerpo.push_str("\r\n");
+    }
+
+    cuerpo.push_str(&format!("--{frontera}--\r\n"));
+
+    Ok(format!("{}\r\n\r\n{}", cabeceras.join("\r\n"), cuerpo))
+}
+
+/// El tipo de un archivo, adivinado por su extensión.
+///
+/// **Conservador a propósito.** Ante la duda, `application/octet-stream`: un
+/// tipo equivocado hace que el cliente de quien lo recibe intente abrirlo con lo
+/// que no corresponde, y declarar `text/html` algo que no lo es es peor todavía.
+/// La lista es corta y son los que de verdad aparecen pegados a un correo.
+pub fn tipo_por_nombre(nombre: &str) -> &'static str {
+    let extension = nombre
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    match extension.as_str() {
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "txt" | "log" | "md" => "text/plain",
+        "csv" => "text/csv",
+        "zip" => "application/zip",
+        "odt" => "application/vnd.oasis.opendocument.text",
+        "ods" => "application/vnd.oasis.opendocument.spreadsheet",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Una frontera que **no aparece** en ninguna de las partes.
+///
+/// Es la condición que hace que un `multipart` se pueda volver a partir. Si la
+/// frontera aparece dentro de un cuerpo, quien lo lea corta ahí: el mensaje
+/// llega partido en pedazos que no son los que se mandaron, y el adjunto se
+/// pierde o sale truncado.
+///
+/// Se arma con un número derivado del contenido y se alarga hasta que no
+/// aparezca. El bucle termina siempre: cada vuelta agrega un carácter, y un
+/// texto finito no puede contener cadenas arbitrariamente largas.
+pub fn frontera(partes: &[&str]) -> String {
+    // FNV-1a. No hace falta que sea impredecible —no es un secreto— sino que
+    // dependa del contenido, para que dos mensajes no usen la misma.
+    let mut huella: u64 = 0xcbf2_9ce4_8422_2325;
+    for parte in partes {
+        for byte in parte.as_bytes() {
+            huella ^= u64::from(*byte);
+            huella = huella.wrapping_mul(0x1000_0000_01b3);
+        }
+    }
+
+    let mut candidata = format!("=_vasak_{huella:016x}");
+    while partes.iter().any(|p| p.contains(&candidata)) {
+        candidata.push('x');
+    }
+    candidata
+}
+
+/// El nombre de archivo para el `Content-Disposition`.
+///
+/// ASCII entre comillas cuando se puede; RFC 2231 cuando no, que es la forma
+/// que el estándar pide para lo que no es ASCII y la que `mensaje.rs` ya sabe
+/// leer del otro lado.
+///
+/// Las comillas y las barras del nombre se escapan, y los saltos de línea se
+/// sacan: un salto acá partiría la cabecera y lo que siguiera sería otra cosa.
+pub fn nombre_de_archivo(nombre: &str) -> String {
+    let limpio: String = nombre.chars().filter(|c| !c.is_control()).collect();
+
+    if limpio.is_ascii() {
+        let escapado = limpio.replace('\\', "\\\\").replace('"', "\\\"");
+        return format!("filename=\"{escapado}\"");
+    }
+
+    let mut codificado = String::new();
+    for byte in limpio.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_') {
+            codificado.push(*byte as char);
+        } else {
+            codificado.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    format!("filename*=utf-8''{codificado}")
+}
+
+/// Parte el base64 en renglones de 76, que es lo que pide el estándar.
+///
+/// Una línea de un megabyte no la acepta ningún servidor: el límite del formato
+/// es 998 octetos, y muchos cortan antes.
+pub fn en_renglones(base64: &str) -> String {
+    base64
+        .as_bytes()
+        .chunks(76)
+        .map(|t| String::from_utf8_lossy(t).into_owned())
+        .collect::<Vec<_>>()
+        .join("\r\n")
 }
 
 /// Escribe una cabecera de varios valores, partida en renglones.
@@ -900,4 +1073,194 @@ mod tests {
         // compartirían identificador y algún cliente escondería uno.
         assert_ne!(id, identificador("ana@ejemplo.com", momento, 43));
     }
+
+    fn con_adjunto(nombre: &str, contenido: &str) -> Borrador {
+        Borrador {
+            de: "ana@ejemplo.com".into(),
+            para: vec!["juan@otro.com".into()],
+            asunto: "Con algo pegado".into(),
+            cuerpo: "Va el archivo.".into(),
+            adjuntos: vec![Adjunto {
+                nombre: nombre.into(),
+                tipo: String::new(),
+                contenido: contenido.into(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sin_adjuntos_sigue_siendo_de_una_sola_parte() {
+        // Envolver en un `multipart` un mensaje que son dos renglones de texto
+        // es hacerle leer un árbol a quien no lo necesita.
+        let borrador = Borrador {
+            de: "a@b.c".into(),
+            para: vec!["d@e.f".into()],
+            cuerpo: "Hola".into(),
+            ..Default::default()
+        };
+        let armado = armar(&borrador, "<x@b.c>", "Thu, 10 Sep 2026 12:00:00 +0000").unwrap();
+        assert!(armado.contains("Content-Type: text/plain; charset=utf-8"));
+        assert!(!armado.contains("multipart"));
+    }
+
+    /// La vuelta completa: se arma el mensaje y se lo lee con el analizador del
+    /// propio proyecto. Comprobar el texto a ojo diría que las cadenas están;
+    /// esto dice que el mensaje **se puede volver a partir**.
+    #[test]
+    fn lo_armado_se_vuelve_a_leer_como_adjunto() {
+        let armado = armar(
+            &con_adjunto("informe.pdf", "SGVsbG8gd29ybGQ="),
+            "<x@b.c>",
+            "Thu, 10 Sep 2026 12:00:00 +0000",
+        )
+        .unwrap();
+
+        let leidos = crate::adjuntos::listar(armado.as_bytes());
+        assert_eq!(leidos.len(), 1);
+        assert_eq!(leidos[0].nombre, "informe.pdf");
+        assert_eq!(leidos[0].tipo, "application/pdf");
+        // La parte 1 es el texto, la 2 el adjunto.
+        assert_eq!(leidos[0].parte, "2");
+
+        // Y el texto sigue siendo legible.
+        assert!(crate::mensaje::texto_de(armado.as_bytes()).contains("Va el archivo"));
+    }
+
+    /// Es la condición que hace que un `multipart` se pueda volver a partir. Si
+    /// la frontera aparece dentro de una parte, quien lo lea corta ahí.
+    #[test]
+    fn la_frontera_nunca_aparece_en_las_partes() {
+        let normal = frontera(&["hola", "chau"]);
+        assert!(!normal.contains("hola"));
+
+        // Un contenido que trae adentro la frontera que se le iba a poner.
+        let calculada = frontera(&["nada"]);
+        let malicioso = format!("texto --{calculada} texto");
+        let otra = frontera(&[malicioso.as_str()]);
+        assert!(!malicioso.contains(&otra));
+    }
+
+    /// El bucle que alarga la frontera es una red por si acaso: para que haga
+    /// falta, una parte tendría que contener la frontera derivada **de sí
+    /// misma**, que es un punto fijo de la huella y no se construye a mano. Lo
+    /// que sí se puede comprobar —y es lo que importa— es la invariante: salga
+    /// lo que salga, no aparece en ninguna parte.
+    #[test]
+    fn la_invariante_vale_tambien_con_contenido_hostil() {
+        let vista = frontera(&[""]);
+        let intentos = [
+            format!("{vista} y {vista}x"),
+            format!("--{vista}--"),
+            "=_vasak_0000000000000000".to_string(),
+            "=_vasak_".repeat(50),
+        ];
+        for parte in &intentos {
+            let elegida = frontera(&[parte.as_str()]);
+            assert!(!parte.contains(&elegida), "{parte}");
+        }
+    }
+
+    #[test]
+    fn el_tipo_se_adivina_por_la_extension_y_ante_la_duda_es_octet_stream() {
+        assert_eq!(tipo_por_nombre("informe.pdf"), "application/pdf");
+        assert_eq!(tipo_por_nombre("FOTO.JPG"), "image/jpeg");
+        assert_eq!(tipo_por_nombre("datos.csv"), "text/csv");
+        // Ante la duda, el genérico: un tipo equivocado hace que el cliente de
+        // quien lo recibe intente abrirlo con lo que no corresponde.
+        assert_eq!(tipo_por_nombre("cosa.xyz"), "application/octet-stream");
+        assert_eq!(tipo_por_nombre("sinextension"), "application/octet-stream");
+        assert_eq!(tipo_por_nombre(""), "application/octet-stream");
+    }
+
+    #[test]
+    fn un_tipo_declarado_le_gana_al_adivinado() {
+        let mut borrador = con_adjunto("cosa.bin", "AAAA");
+        borrador.adjuntos[0].tipo = "image/png".into();
+        let armado = armar(&borrador, "<x@b.c>", "Thu, 10 Sep 2026 12:00:00 +0000").unwrap();
+        assert!(armado.contains("Content-Type: image/png;"));
+    }
+
+    #[test]
+    fn un_nombre_con_acentos_va_en_rfc_2231() {
+        let armado = armar(
+            &con_adjunto("árbol.pdf", "AAAA"),
+            "<x@b.c>",
+            "Thu, 10 Sep 2026 12:00:00 +0000",
+        )
+        .unwrap();
+        assert!(armado.contains("filename*=utf-8''%C3%A1rbol.pdf"), "{armado}");
+
+        // Y del otro lado se vuelve a leer entero.
+        assert_eq!(
+            crate::adjuntos::listar(armado.as_bytes())[0].nombre,
+            "árbol.pdf"
+        );
+    }
+
+    /// Un salto de línea en el nombre partiría la cabecera, y lo que siguiera
+    /// sería una cabecera que nadie escribió.
+    ///
+    /// Lo que se comprueba no es que el texto no esté —queda adentro del nombre,
+    /// entre comillas, que es inofensivo— sino que **no empiece un renglón**,
+    /// que es lo que lo convertiría en una cabecera.
+    #[test]
+    fn un_nombre_con_saltos_no_parte_la_cabecera() {
+        let armado = armar(
+            &con_adjunto("uno\r\nContent-Type: text/html", "AAAA"),
+            "<x@b.c>",
+            "Thu, 10 Sep 2026 12:00:00 +0000",
+        )
+        .unwrap();
+
+        for renglon in armado.split("\r\n") {
+            assert!(
+                !renglon.starts_with("Content-Type: text/html"),
+                "el nombre se convirtió en cabecera: {armado}"
+            );
+        }
+
+        // Y el adjunto se sigue leyendo, con el nombre ya sin los saltos.
+        let leidos = crate::adjuntos::listar(armado.as_bytes());
+        assert_eq!(leidos.len(), 1);
+        assert!(!leidos[0].nombre.contains('\n'));
+    }
+
+    #[test]
+    fn las_comillas_del_nombre_se_escapan() {
+        assert_eq!(
+            nombre_de_archivo(r#"el "bueno".pdf"#),
+            r#"filename="el \"bueno\".pdf""#
+        );
+    }
+
+    /// Una línea de un megabyte no la acepta ningún servidor: el límite del
+    /// formato son 998 octetos.
+    #[test]
+    fn el_base64_sale_en_renglones_cortos() {
+        let largo = "A".repeat(500);
+        for linea in en_renglones(&largo).split("\r\n") {
+            assert!(linea.len() <= 76, "renglón de {}", linea.len());
+        }
+        // Y no se pierde nada.
+        assert_eq!(en_renglones(&largo).replace("\r\n", ""), largo);
+    }
+
+    #[test]
+    fn varios_adjuntos_van_cada_uno_en_su_parte() {
+        let mut borrador = con_adjunto("uno.pdf", "AAAA");
+        borrador.adjuntos.push(Adjunto {
+            nombre: "dos.png".into(),
+            tipo: String::new(),
+            contenido: "BBBB".into(),
+        });
+        let armado = armar(&borrador, "<x@b.c>", "Thu, 10 Sep 2026 12:00:00 +0000").unwrap();
+
+        let leidos = crate::adjuntos::listar(armado.as_bytes());
+        assert_eq!(leidos.len(), 2);
+        assert_eq!(leidos[0].parte, "2");
+        assert_eq!(leidos[1].parte, "3");
+        assert_eq!(leidos[1].tipo, "image/png");
+    }
+
 }
