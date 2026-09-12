@@ -28,6 +28,7 @@
 use std::collections::HashMap;
 
 use crate::mensaje::Resumen;
+use crate::preferencias::Detalle;
 
 /// El identificador del botón, con el que vuelve la señal.
 ///
@@ -61,13 +62,23 @@ const RUTA: &str = "/org/freedesktop/Notifications";
 ///
 /// Se comparan por UID y no por posición: un mensaje borrado desde el teléfono
 /// corre la lista entera, y por posición todo parecería nuevo.
-pub fn cuantos_nuevos(antes: Option<&[Resumen]>, ahora: &[Resumen]) -> usize {
+pub fn recien_llegados(antes: Option<&[Resumen]>, ahora: &[Resumen]) -> Vec<Resumen> {
     let Some(antes) = antes else {
-        return 0;
+        return Vec::new();
     };
 
     let conocidos: std::collections::HashSet<u32> = antes.iter().map(|m| m.uid).collect();
-    ahora.iter().filter(|m| !conocidos.contains(&m.uid)).count()
+    ahora
+        .iter()
+        .filter(|m| !conocidos.contains(&m.uid))
+        .cloned()
+        .collect()
+}
+
+/// Cuántos son nuevos. Lo mismo de arriba cuando sólo hace falta el número.
+#[cfg(test)]
+pub fn cuantos_nuevos(antes: Option<&[Resumen]>, ahora: &[Resumen]) -> usize {
+    recien_llegados(antes, ahora).len()
 }
 
 /// Lo que dice el cartel.
@@ -77,13 +88,53 @@ pub fn cuantos_nuevos(antes: Option<&[Resumen]>, ahora: &[Resumen]) -> usize {
 /// personal como lo que te escribió. El issue pide que esto se pueda
 /// configurar; mientras no haya dónde guardar esa preferencia, el valor por
 /// omisión es el que no muestra nada de nadie.
-pub fn texto(cuantos: usize, cuenta: &str) -> (String, String) {
+pub fn texto(nuevos: &[Resumen], cuenta: &str, detalle: Detalle) -> (String, String) {
+    let cuantos = nuevos.len();
     let titulo = if cuantos == 1 {
         "Llegó 1 mensaje".to_string()
     } else {
         format!("Llegaron {cuantos} mensajes")
     };
-    (titulo, cuenta.to_string())
+
+    // Con uno solo se puede decir de quién y de qué. Con varios no: el cartel
+    // diría el de uno y callaría los otros, que es peor que no decir ninguno.
+    let uno = (cuantos == 1).then(|| nuevos.first()).flatten();
+
+    let cuerpo = match (detalle, uno) {
+        (Detalle::Remitente, Some(m)) => con_cuenta(&quien(m), cuenta),
+        (Detalle::RemitenteYAsunto, Some(m)) => {
+            let asunto = m.asunto.trim();
+            if asunto.is_empty() {
+                con_cuenta(&quien(m), cuenta)
+            } else {
+                con_cuenta(&format!("{}: {asunto}", quien(m)), cuenta)
+            }
+        }
+        // Lo callado: cuántos y a qué casilla llegaron, nada de quién ni de qué.
+        _ => cuenta.to_string(),
+    };
+
+    (titulo, cuerpo)
+}
+
+/// Cómo se nombra a quien lo mandó.
+///
+/// El nombre con el que se firma si lo hay, y la dirección si no. **No los dos**:
+/// en la lista van juntos porque ahí el engaño de firmarse «soporte@banco.com»
+/// desde otra dirección se ve, y en un cartel de dos renglones no entra el
+/// contraste que lo hace visible.
+fn quien(mensaje: &Resumen) -> String {
+    let nombre = mensaje.de.trim();
+    if nombre.is_empty() {
+        mensaje.direccion.trim().to_string()
+    } else {
+        nombre.to_string()
+    }
+}
+
+/// La cuenta va siempre, porque dice a cuál de las casillas de alguien llegó.
+fn con_cuenta(que: &str, cuenta: &str) -> String {
+    format!("{que} — {cuenta}")
 }
 
 /// Los identificadores de los carteles que ya se mostraron, por cuenta.
@@ -272,14 +323,84 @@ mod tests {
         assert_eq!(cuantos_nuevos(Some(&antes), &ahora), 20);
     }
 
+    fn de(quien: &str, direccion: &str, asunto: &str) -> Resumen {
+        Resumen {
+            uid: 1,
+            de: quien.into(),
+            direccion: direccion.into(),
+            asunto: asunto.into(),
+            ..Default::default()
+        }
+    }
+
+    /// El valor por omisión. La pantalla puede estar bloqueada, compartida o
+    /// proyectada, y quién te escribe es tan personal como lo que te escribió.
     #[test]
-    fn el_texto_no_nombra_a_nadie() {
-        let (titulo, cuerpo) = texto(3, "ana@ejemplo.com");
+    fn por_omision_el_texto_no_nombra_a_nadie() {
+        let tres = vec![de("Ana", "ana@x.com", "Hola"); 3];
+        let (titulo, cuerpo) = texto(&tres, "mia@ejemplo.com", Detalle::Cuenta);
+
         assert!(titulo.contains('3'));
-        // La cuenta sí, porque es la de quien está mirando: dice a cuál de sus
-        // casillas llegó. Quién escribió y qué escribió, no.
-        assert_eq!(cuerpo, "ana@ejemplo.com");
-        assert_eq!(texto(1, "x").0, "Llegó 1 mensaje");
+        assert_eq!(cuerpo, "mia@ejemplo.com");
+        assert!(!cuerpo.contains("Ana"));
+        assert!(!cuerpo.contains("Hola"));
+    }
+
+    #[test]
+    fn con_uno_solo_se_puede_decir_de_quien() {
+        let uno = vec![de("Ana", "ana@x.com", "La factura")];
+        let (_, cuerpo) = texto(&uno, "mia@ejemplo.com", Detalle::Remitente);
+        assert!(cuerpo.contains("Ana"));
+        // El asunto no, que es el escalón siguiente.
+        assert!(!cuerpo.contains("factura"));
+
+        let (_, cuerpo) = texto(&uno, "mia@ejemplo.com", Detalle::RemitenteYAsunto);
+        assert!(cuerpo.contains("Ana") && cuerpo.contains("La factura"));
+    }
+
+    /// Con varios, el cartel diría el de uno y callaría los otros, que es peor
+    /// que no decir ninguno.
+    #[test]
+    fn con_varios_no_se_nombra_a_ninguno() {
+        let dos = vec![
+            de("Ana", "ana@x.com", "Uno"),
+            de("Juan", "juan@y.com", "Dos"),
+        ];
+        for detalle in [Detalle::Remitente, Detalle::RemitenteYAsunto] {
+            let (_, cuerpo) = texto(&dos, "mia@ejemplo.com", detalle);
+            assert!(!cuerpo.contains("Ana"), "{cuerpo}");
+            assert!(!cuerpo.contains("Juan"), "{cuerpo}");
+        }
+    }
+
+    #[test]
+    fn sin_nombre_se_usa_la_direccion() {
+        let uno = vec![de("", "ana@x.com", "Hola")];
+        let (_, cuerpo) = texto(&uno, "mia@ejemplo.com", Detalle::Remitente);
+        assert!(cuerpo.contains("ana@x.com"));
+    }
+
+    /// Un asunto vacío no deja un cartel que termina en dos puntos y nada.
+    #[test]
+    fn sin_asunto_se_dice_sólo_quien() {
+        let uno = vec![de("Ana", "ana@x.com", "   ")];
+        let (_, cuerpo) = texto(&uno, "mia@ejemplo.com", Detalle::RemitenteYAsunto);
+        assert!(cuerpo.contains("Ana"));
+        assert!(!cuerpo.contains(':'), "{cuerpo}");
+    }
+
+    /// La cuenta va siempre: dice a cuál de las casillas de alguien llegó.
+    #[test]
+    fn la_cuenta_va_en_los_tres_escalones() {
+        let uno = vec![de("Ana", "ana@x.com", "Hola")];
+        for detalle in [
+            Detalle::Cuenta,
+            Detalle::Remitente,
+            Detalle::RemitenteYAsunto,
+        ] {
+            let (_, cuerpo) = texto(&uno, "mia@ejemplo.com", detalle);
+            assert!(cuerpo.contains("mia@ejemplo.com"), "{cuerpo}");
+        }
     }
 
     /// El botón vuelve por el bus con el número del cartel, y hay que saber si

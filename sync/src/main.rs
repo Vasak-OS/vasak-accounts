@@ -59,6 +59,7 @@ mod html;
 mod imagenes;
 mod imap;
 mod mensaje;
+mod preferencias;
 mod redactar;
 mod smtp;
 mod tls;
@@ -1199,7 +1200,8 @@ async fn publicar_mensajes(
     // única forma: después ya no hay con qué comparar. Y sale `0` la primera
     // vez, porque no había lista anterior — que es justo lo que evita veinte
     // carteles de correo de la semana pasada al conectarse.
-    let nuevos = avisos::cuantos_nuevos(anterior.map(|v| v.as_slice()), &mensajes);
+    let recien_llegados = avisos::recien_llegados(anterior.map(|v| v.as_slice()), &mensajes);
+    let nuevos = recien_llegados.len();
     if cambio {
         estado.mensajes.insert(account_id.to_string(), mensajes);
     }
@@ -1216,7 +1218,10 @@ async fn publicar_mensajes(
 
     // El cartel, por el bus de sesión. La ventana puede estar cerrada —que es lo
     // normal— y ésta es la única forma de que alguien se entere.
-    let (titulo, cuerpo) = avisos::texto(nuevos, account_id);
+    // Se releen acá y no al arrancar: un cambio vale en el próximo cartel y no
+    // en la próxima sesión. Es una vez por aviso, o sea unas pocas por día.
+    let detalle = preferencias::leer().detalle_del_aviso;
+    let (titulo, cuerpo) = avisos::texto(&recien_llegados, account_id, detalle);
     let mut carteles = servicio.carteles.lock().await;
     if let Some(id) = avisos::mostrar(
         emisor.connection(),
