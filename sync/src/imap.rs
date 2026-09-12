@@ -992,12 +992,18 @@ impl<F: AsyncRead + AsyncWrite + Unpin + Send> Sesion<F> {
     /// El tope es el mismo que el del mensaje entero por ahora, y va explícito
     /// en el comando: un servidor puede anunciar el tamaño que quiera, y pedir
     /// «desde el byte cero, tantos» es lo que garantiza que no llegue más.
+    /// Devuelve las cabeceras, el contenido, y **si se cortó**.
+    ///
+    /// Lo tercero no es un detalle. El tope va en el comando, así que un adjunto
+    /// más grande llega recortado y con la misma pinta que uno entero: se
+    /// guardaría un archivo que no abre ningún programa, sin nada que explique
+    /// por qué. Es el mismo motivo por el que `cuerpo` devuelve `recortado`.
     pub async fn parte(
         &mut self,
         uid: u32,
         parte: &str,
         tope: usize,
-    ) -> Result<(Vec<u8>, Vec<u8>), ImapError> {
+    ) -> Result<(Vec<u8>, Vec<u8>, bool), ImapError> {
         if !parte_valida(parte) {
             return Err(ImapError::Fallo(format!(
                 "«{parte}» no es un número de parte"
@@ -1027,7 +1033,12 @@ impl<F: AsyncRead + AsyncWrite + Unpin + Send> Sesion<F> {
                         }
                         let contenido = recibidos.pop().unwrap_or_default();
                         let cabeceras = recibidos.pop().unwrap_or_default();
-                        return Ok((cabeceras, contenido));
+                        // Llegó justo el tope: o cabía exacto, o hay más. No se
+                        // puede distinguir desde acá, y decir «puede estar
+                        // cortado» de un archivo que estaba entero es mucho
+                        // menos malo que callar uno que sí se cortó.
+                        let recortado = contenido.len() >= tope;
+                        return Ok((cabeceras, contenido, recortado));
                     }
                     Some(Respuesta::No(d)) | Some(Respuesta::Bad(d)) => {
                         return Err(ImapError::Fallo(format!("no se pudo traer la parte: {d}")))
@@ -1452,11 +1463,40 @@ mod tests {
             )],
         );
 
-        let (cabeceras, contenido) = sesion.parte(5, "2", 1024).await.unwrap();
+        let (cabeceras, contenido, recortado) = sesion.parte(5, "2", 1024).await.unwrap();
         tarea.await.unwrap();
 
         assert!(String::from_utf8_lossy(&cabeceras).contains("base64"));
         assert_eq!(contenido, b"SGkgdGhl");
+        assert!(!recortado);
+    }
+
+    /// El tope va en el comando, así que un adjunto más grande llega recortado
+    /// y con la misma pinta que uno entero: se guardaría un archivo que no abre
+    /// ningún programa, sin nada que explique por qué.
+    #[tokio::test]
+    async fn una_parte_que_llega_al_tope_se_dice_recortada() {
+        let (mut sesion, tarea) = con_servidor(
+            "* OK listo",
+            vec![(
+                "BODY.PEEK",
+                vec![
+                    "* 1 FETCH (UID 5 BODY[2.MIME] {2}",
+                    "x\r\n",
+                    " BODY[2]<0> {8}",
+                    "AAAABBBB",
+                    ")",
+                    "{etiqueta} OK completado",
+                ],
+            )],
+        );
+
+        // Se pide un tope de 8 y llegan 8: o cabía exacto, o hay más. No se
+        // puede distinguir, y decir «puede estar cortado» de algo que estaba
+        // entero es mucho menos malo que callar lo que sí se cortó.
+        let (_, _, recortado) = sesion.parte(5, "2", 8).await.unwrap();
+        tarea.await.unwrap();
+        assert!(recortado);
     }
 
     /// Si viniera un solo literal no se puede adivinar cuál es: devolver el

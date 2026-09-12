@@ -289,10 +289,10 @@ impl Lector {
         casilla: &str,
         uid: u32,
         parte: &str,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<(Vec<u8>, bool), String> {
         let casilla = casilla.to_string();
         let parte = parte.to_string();
-        let (cabeceras, contenido) = self
+        let (cabeceras, contenido, recortado) = self
             .con_reintento(broker, cuenta, move |sesion| {
                 let casilla = casilla.clone();
                 let parte = parte.clone();
@@ -305,7 +305,10 @@ impl Lector {
             })
             .await?;
 
-        Ok(adjuntos::destransportar_parte(&cabeceras, &contenido))
+        Ok((
+            adjuntos::destransportar_parte(&cabeceras, &contenido),
+            recortado,
+        ))
     }
 
     /// Los últimos mensajes de una casilla que no es la de entrada.
@@ -646,12 +649,19 @@ impl Servicio {
         let lector = self.lector(&account_id).await;
         let mut lector = lector.lock().await;
 
-        let bytes = lector
+        let (bytes, recortado) = lector
             .adjunto(&broker, &cuenta, &casilla_o_entrada(&mailbox), uid, &part)
             .await
             .map_err(zbus::fdo::Error::Failed)?;
 
-        Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
+        // Con el aviso adentro y no como un segundo método: quien guarda el
+        // archivo tiene que enterarse en el mismo momento en que lo recibe, o
+        // guarda uno cortado creyendo que está entero.
+        serde_json::to_string(&serde_json::json!({
+            "contenido": base64::engine::general_purpose::STANDARD.encode(&bytes),
+            "recortado": recortado,
+        }))
+        .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
     }
 
     /// El texto de un mensaje.
