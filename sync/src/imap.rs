@@ -221,6 +221,19 @@ pub fn resultados_de_search(linea: &str) -> Option<u32> {
     )
 }
 
+/// Si un número de parte tiene la forma que IMAP espera: `2`, `1.3.2`.
+///
+/// Se comprueba porque **va crudo en el comando**. El número sale de recorrer el
+/// árbol de un mensaje que mandó cualquiera, y aunque hoy lo genera este mismo
+/// programa, un día va a venir de la ventana: una parte con un espacio y una
+/// palabra clave adentro sería un comando distinto del que se quiso mandar.
+pub fn parte_valida(parte: &str) -> bool {
+    !parte.is_empty()
+        && parte
+            .split('.')
+            .all(|t| !t.is_empty() && t.len() <= 4 && t.chars().all(|c| c.is_ascii_digit()))
+}
+
 /// Saca una línea del búfer, si ya hay una entera.
 ///
 /// Aparte de la sesión para poder probarla: el búfer es lo que hace que esperar
@@ -965,6 +978,67 @@ impl<F: AsyncRead + AsyncWrite + Unpin + Send> Sesion<F> {
         .await
     }
 
+    /// Una parte suelta de un mensaje, con sus cabeceras.
+    ///
+    /// `parte` es el número del árbol MIME —`2`, `1.3`—, el mismo que devuelve
+    /// `adjuntos::listar`. Traer la parte sola y no el mensaje entero es lo que
+    /// hace que se pueda bajar un adjunto de veinte megas sin traer los otros
+    /// tres que venían con él.
+    ///
+    /// Vienen las cabeceras **y** el contenido, en dos pedidos: las cabeceras
+    /// dicen cómo está codificado el contenido, y sin eso lo que se baja es un
+    /// bloque de base64 que nadie sabe deshacer.
+    ///
+    /// El tope es el mismo que el del mensaje entero por ahora, y va explícito
+    /// en el comando: un servidor puede anunciar el tamaño que quiera, y pedir
+    /// «desde el byte cero, tantos» es lo que garantiza que no llegue más.
+    pub async fn parte(
+        &mut self,
+        uid: u32,
+        parte: &str,
+        tope: usize,
+    ) -> Result<(Vec<u8>, Vec<u8>), ImapError> {
+        if !parte_valida(parte) {
+            return Err(ImapError::Fallo(format!(
+                "«{parte}» no es un número de parte"
+            )));
+        }
+
+        let etiqueta = self.siguiente_etiqueta();
+        self.escribir(&format!(
+            "{etiqueta} UID FETCH {uid} (BODY.PEEK[{parte}.MIME] BODY.PEEK[{parte}]<0.{tope}>)"
+        ))
+        .await?;
+
+        Self::con_tope("traer la parte", async {
+            let mut recibidos: Vec<Vec<u8>> = Vec::new();
+            loop {
+                let (linea, literales) = self.leer_respuesta().await?;
+                recibidos.extend(literales);
+                match respuesta_de(&linea, &etiqueta) {
+                    Some(Respuesta::Ok) => {
+                        // En el orden en que se pidieron: primero las cabeceras
+                        // de la parte, después su contenido. Si viniera uno
+                        // solo, no se adivina cuál es.
+                        if recibidos.len() < 2 {
+                            return Err(ImapError::Fallo(
+                                "el servidor no mandó la parte completa".into(),
+                            ));
+                        }
+                        let contenido = recibidos.pop().unwrap_or_default();
+                        let cabeceras = recibidos.pop().unwrap_or_default();
+                        return Ok((cabeceras, contenido));
+                    }
+                    Some(Respuesta::No(d)) | Some(Respuesta::Bad(d)) => {
+                        return Err(ImapError::Fallo(format!("no se pudo traer la parte: {d}")))
+                    }
+                    None => continue,
+                }
+            }
+        })
+        .await
+    }
+
     /// Marca un mensaje como leído en el servidor.
     ///
     /// En el servidor y no sólo acá: la persona lee en el teléfono y en el
@@ -1331,6 +1405,88 @@ mod tests {
         assert_eq!(pedidos, CUANTOS as usize);
         // Y son los más nuevos: el primero de la lista es el UID más alto.
         assert!(recibidos[0].contains("UID FETCH 500,499,"));
+    }
+
+    #[test]
+    fn un_numero_de_parte_tiene_forma_de_numero_de_parte() {
+        for buena in ["1", "2", "1.3", "1.2.3.4", "12"] {
+            assert!(parte_valida(buena), "{buena}");
+        }
+    }
+
+    /// Va crudo en el comando. El número sale de recorrer el árbol de un mensaje
+    /// que mandó cualquiera, así que una parte con un espacio y una palabra
+    /// clave adentro sería un comando distinto del que se quiso mandar.
+    #[test]
+    fn lo_que_no_es_un_numero_de_parte_se_rechaza() {
+        for mala in [
+            "",
+            "1 BODY[]",
+            "1.",
+            ".1",
+            "1..2",
+            "uno",
+            "1;2",
+            "*",
+            "99999",
+            "1\r\na1 LOGOUT",
+        ] {
+            assert!(!parte_valida(mala), "pasó: {mala:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn traer_una_parte_pide_sus_cabeceras_y_su_contenido() {
+        let (mut sesion, tarea) = con_servidor(
+            "* OK listo",
+            vec![(
+                "BODY.PEEK[2.MIME] BODY.PEEK[2]",
+                vec![
+                    "* 1 FETCH (UID 5 BODY[2.MIME] {47}",
+                    "Content-Transfer-Encoding: base64\r\n\r\n",
+                    " BODY[2]<0> {8}",
+                    "SGkgdGhl",
+                    ")",
+                    "{etiqueta} OK FETCH completado",
+                ],
+            )],
+        );
+
+        let (cabeceras, contenido) = sesion.parte(5, "2", 1024).await.unwrap();
+        tarea.await.unwrap();
+
+        assert!(String::from_utf8_lossy(&cabeceras).contains("base64"));
+        assert_eq!(contenido, b"SGkgdGhl");
+    }
+
+    /// Si viniera un solo literal no se puede adivinar cuál es: devolver el
+    /// contenido tomándolo por cabeceras dejaría un archivo vacío, y al revés
+    /// un archivo con el encabezado adentro.
+    #[tokio::test]
+    async fn una_parte_a_medias_es_un_error() {
+        let (mut sesion, tarea) = con_servidor(
+            "* OK listo",
+            vec![(
+                "BODY.PEEK",
+                vec![
+                    "* 1 FETCH (UID 5 BODY[2] {4}",
+                    "AAAA",
+                    ")",
+                    "{etiqueta} OK completado",
+                ],
+            )],
+        );
+
+        assert!(sesion.parte(5, "2", 1024).await.is_err());
+        tarea.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn una_parte_invalida_no_llega_al_servidor() {
+        let (mut sesion, tarea) = con_servidor("* OK listo", vec![]);
+        assert!(sesion.parte(5, "1 BODY[]", 1024).await.is_err());
+        // Y no se mandó nada: el comando ni se arma.
+        assert!(tarea.await.unwrap().is_empty());
     }
 
     #[tokio::test]
