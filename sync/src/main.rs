@@ -1067,11 +1067,68 @@ async fn publicar_mensajes(
         carteles.anterior(account_id),
         &titulo,
         &cuerpo,
+        // Preguntado cada vez y no una: el servidor de notificaciones se puede
+        // reiniciar —o cambiar por otro— sin que este servicio se entere, y la
+        // respuesta viene de un método que ya está conectado.
+        avisos::soporta_botones(emisor.connection()).await,
     )
     .await
     {
         carteles.recordar(account_id, id);
     }
+}
+
+/// Atiende el botón «Abrir» de los carteles de correo nuevo.
+///
+/// Vive toda la sesión, como el despachador: el cartel puede seguir en el centro
+/// de notificaciones mucho después de haberse mostrado, y alguien lo puede
+/// apretar en cualquier momento.
+fn atender_los_carteles(servicio: Servicio, conexion: zbus::Connection) {
+    tokio::spawn(async move {
+        // En bucle, igual que el resto de lo que escucha el bus: si la conexión
+        // se corta, el botón dejaría de contestar hasta reiniciar la sesión.
+        loop {
+            if let Err(e) = seguir_los_carteles(&servicio, &conexion).await {
+                eprintln!("[avisos] no se puede atender el botón del cartel: {e}");
+            }
+            tokio::time::sleep(REINTENTO).await;
+        }
+    });
+}
+
+async fn seguir_los_carteles(
+    servicio: &Servicio,
+    conexion: &zbus::Connection,
+) -> Result<(), String> {
+    use futures_util::StreamExt;
+
+    let regla = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface("org.freedesktop.Notifications")
+        .and_then(|r| r.member("ActionInvoked"))
+        .map_err(|e| format!("no se pudo armar el filtro: {e}"))?
+        .build();
+
+    let mut avisos_del_bus = zbus::MessageStream::for_match_rule(regla, conexion, None)
+        .await
+        .map_err(|e| format!("no se pudo escuchar «ActionInvoked»: {e}"))?;
+
+    while let Some(Ok(mensaje)) = avisos_del_bus.next().await {
+        let Ok((id, accion)) = mensaje.body().deserialize::<(u32, String)>() else {
+            continue;
+        };
+
+        // **El número del cartel importa.** La señal llega por cada botón que
+        // alguien apriete en cualquier cartel del escritorio, no sólo en los
+        // propios: sin esto, un botón llamado «abrir» en el aviso de otro
+        // programa abriría el correo.
+        if accion != "abrir" || !servicio.carteles.lock().await.es_nuestro(id) {
+            continue;
+        }
+        avisos::abrir_el_correo();
+    }
+
+    Err("el bus de sesión cerró la conexión".into())
 }
 
 /// La tarea de una cuenta: se conecta y se queda.
@@ -1367,6 +1424,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // cuentas. Arranca antes que nada porque lo primero que hace es intentar
     // mandar lo que haya quedado de la sesión anterior.
     tokio::spawn(despachar(servicio.clone(), emisor.clone()));
+
+    // Y quien atiende el botón «Abrir» de los carteles de correo nuevo. También
+    // una sola tarea: la señal es del servidor de notificaciones y no de una
+    // cuenta.
+    atender_los_carteles(servicio.clone(), emisor.connection().clone());
 
     // El hilo principal ya no mira casillas: sólo se asegura de que haya una
     // tarea por cuenta. Cada tarea se queda conectada y avisa por su cuenta.
