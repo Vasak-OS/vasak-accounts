@@ -147,7 +147,9 @@ impl Cabeceras {
 
     /// El valor de una cabecera, ya legible.
     pub fn texto(&self, nombre: &str) -> String {
-        self.valor(nombre).map(decodificar_palabras).unwrap_or_default()
+        self.valor(nombre)
+            .map(decodificar_palabras)
+            .unwrap_or_default()
     }
 }
 
@@ -227,7 +229,9 @@ fn base64_de(texto: &str) -> Option<Vec<u8>> {
     let limpio: String = texto.chars().filter(|c| !c.is_whitespace()).collect();
     base64::engine::general_purpose::STANDARD
         .decode(&limpio)
-        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(limpio.trim_end_matches('=')))
+        .or_else(|_| {
+            base64::engine::general_purpose::STANDARD_NO_PAD.decode(limpio.trim_end_matches('='))
+        })
         .ok()
 }
 
@@ -279,7 +283,11 @@ pub fn imprimible_de(bytes: &[u8], en_cabecera: bool) -> Vec<u8> {
             b'=' if !en_cabecera && bytes.get(i + 1) == Some(&b'\r') => {
                 // Un `=` al final de la línea es un corte blando: la línea sigue
                 // y ni el `=` ni el salto van al texto.
-                i += if bytes.get(i + 2) == Some(&b'\n') { 3 } else { 2 };
+                i += if bytes.get(i + 2) == Some(&b'\n') {
+                    3
+                } else {
+                    2
+                };
             }
             b'=' if !en_cabecera && bytes.get(i + 1) == Some(&b'\n') => i += 2,
             b'=' => match hex_de(bytes.get(i + 1).copied(), bytes.get(i + 2).copied()) {
@@ -343,7 +351,11 @@ pub fn a_texto(bytes: &[u8], juego: &str) -> String {
 }
 
 fn si_no_hay_etiqueta(bytes: &[u8], es_utf8: bool) -> String {
-    let codificacion = if es_utf8 { encoding_rs::UTF_8 } else { encoding_rs::WINDOWS_1252 };
+    let codificacion = if es_utf8 {
+        encoding_rs::UTF_8
+    } else {
+        encoding_rs::WINDOWS_1252
+    };
     codificacion.decode(bytes).0.into_owned()
 }
 
@@ -384,7 +396,11 @@ pub fn tipo_de(valor: &str) -> Tipo {
         .to_ascii_lowercase();
 
     let mut tipo = Tipo {
-        medio: if medio.is_empty() { "text/plain".into() } else { medio },
+        medio: if medio.is_empty() {
+            "text/plain".into()
+        } else {
+            medio
+        },
         juego: "us-ascii".into(),
         frontera: None,
     };
@@ -520,6 +536,55 @@ fn recorte_valido(texto: &str, tope: usize) -> usize {
         corte -= 1;
     }
     corte
+}
+
+/// El HTML del mensaje, decodificado y **sin sanear**.
+///
+/// Aparte de [`texto_de`] y no como una variante suya, porque lo que se busca es
+/// lo contrario: aquella prefiere el texto plano y cae al HTML sin etiquetas;
+/// ésta quiere el HTML y **no** cae a nada. Si el mensaje no trae una parte
+/// `text/html`, no hay formato que mostrar y la ventana se queda con el texto.
+///
+/// Lo que sale de acá lo escribió un desconocido y no se puede dibujar así:
+/// pasa por `html::sanear` antes de salir del servicio.
+pub fn html_de(crudo: &[u8]) -> Option<String> {
+    let vista = como_latin1(crudo);
+    let (cabeceras, cuerpo) = partir(&vista);
+    buscar_html(&cabeceras, cuerpo, 0)
+}
+
+fn buscar_html(cabeceras: &Cabeceras, cuerpo: &str, profundidad: usize) -> Option<String> {
+    if profundidad > MAX_PROFUNDIDAD {
+        return None;
+    }
+
+    let tipo = cabeceras
+        .valor("content-type")
+        .map(tipo_de)
+        .unwrap_or_default();
+
+    if let Some(frontera) = &tipo.frontera {
+        // El primero que aparezca. En un `multipart/alternative` el HTML va
+        // después del texto plano —de peor a mejor, dice el estándar— así que
+        // recorrer en orden y quedarse con el primero que sea HTML da el que
+        // corresponde sin tener que saber qué clase de `multipart` es.
+        return partes_de(cuerpo, frontera).into_iter().find_map(|parte| {
+            let (suyas, su_cuerpo) = partir(parte);
+            buscar_html(&suyas, su_cuerpo, profundidad + 1)
+        });
+    }
+
+    // Un adjunto no es el cuerpo, aunque sea una página web: un `.html` pegado
+    // no es lo que escribió la persona.
+    if es_adjunto(cabeceras) || tipo.medio != "text/html" {
+        return None;
+    }
+
+    let codificacion = cabeceras
+        .valor("content-transfer-encoding")
+        .unwrap_or("7bit");
+    let bytes = destransportar(&de_latin1(cuerpo), codificacion);
+    Some(a_texto(&bytes, &tipo.juego))
 }
 
 fn buscar_texto(cabeceras: &Cabeceras, cuerpo: &str, profundidad: usize) -> Option<String> {
@@ -749,7 +814,11 @@ pub fn remitente_de(valor: &str) -> (String, String) {
             // codificada es lo normal y no un truco.
             let nombre = decodificar_palabras(&valor[..abre]);
             let nombre = nombre.trim().trim_matches('"').trim().to_string();
-            let nombre = if nombre.is_empty() { direccion.clone() } else { nombre };
+            let nombre = if nombre.is_empty() {
+                direccion.clone()
+            } else {
+                nombre
+            };
             return (nombre, direccion);
         }
     }
@@ -803,7 +872,11 @@ pub fn para_responder(crudo: &[u8]) -> ParaResponder {
     let vista = como_latin1(crudo);
     let (cabeceras, _) = partir(&vista);
 
-    let message_id = cabeceras.valor("message-id").unwrap_or_default().trim().to_string();
+    let message_id = cabeceras
+        .valor("message-id")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
 
     // `References` es la cadena entera; si no está, la arma el `In-Reply-To`.
     // Y el original va al final: es el que sigue en la conversación.
@@ -835,7 +908,12 @@ pub fn para_responder(crudo: &[u8]) -> ParaResponder {
         .unwrap_or_default();
     let (nombre, responder_a) = remitente_de(de);
 
-    ParaResponder { message_id, referencias, responder_a, nombre }
+    ParaResponder {
+        message_id,
+        referencias,
+        responder_a,
+        nombre,
+    }
 }
 
 /// Arma el resumen de un mensaje a partir de sus cabeceras.
@@ -1185,7 +1263,10 @@ mod tests {
     fn el_script_y_el_estilo_se_descartan_enteros() {
         let html = "<p>Hola</p><script>alert('x')</script><style>p{color:red}</style><p>Chau</p>";
         let texto = sin_etiquetas(html);
-        assert!(texto.contains("Hola") && texto.contains("Chau"), "{texto:?}");
+        assert!(
+            texto.contains("Hola") && texto.contains("Chau"),
+            "{texto:?}"
+        );
         assert!(!texto.contains("alert"), "{texto:?}");
         assert!(!texto.contains("color"), "{texto:?}");
     }
@@ -1229,7 +1310,14 @@ mod tests {
     /// igual: si no, un mensaje con un `&#` suelto cuelga el proceso.
     #[test]
     fn una_entidad_numerica_rota_no_cuelga_ni_se_come_el_texto() {
-        for basura in ["&#", "&#;", "&#xZZ;", "&#99999999999;", "a &# b", "&#123456789012345;"] {
+        for basura in [
+            "&#",
+            "&#;",
+            "&#xZZ;",
+            "&#99999999999;",
+            "a &# b",
+            "&#123456789012345;",
+        ] {
             let salida = entidades(basura);
             assert!(!salida.is_empty(), "{basura:?}");
         }
@@ -1445,5 +1533,58 @@ mod tests {
         // Que sea un `String` válido ya lo garantiza el tipo; esto comprueba que
         // no se cortó en el medio de la ñ dejando un carácter de reemplazo.
         assert!(!texto.contains('\u{FFFD}'));
+    }
+
+    /// Un mensaje que sólo trae HTML: hay formato que mostrar.
+    #[test]
+    fn el_html_de_un_mensaje_se_encuentra() {
+        let crudo = b"Content-Type: text/html; charset=utf-8\r\n\r\n<p>Hola</p>";
+        assert_eq!(html_de(crudo).as_deref(), Some("<p>Hola</p>"));
+    }
+
+    /// Uno que trae las dos versiones: se devuelve la de formato, al revés que
+    /// `texto_de`, que prefiere la plana.
+    #[test]
+    fn de_las_dos_versiones_se_devuelve_la_de_formato() {
+        let crudo = b"Content-Type: multipart/alternative; boundary=lim\r\n\r\n\
+            --lim\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nHola\r\n\
+            --lim\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>Hola</p>\r\n\
+            --lim--\r\n";
+        // Con `trim`: el cuerpo de una parte se queda con el salto de línea que
+        // va antes de la frontera, y eso es del formato, no del mensaje. Para
+        // HTML da igual, y el saneador lo normaliza después.
+        assert_eq!(
+            html_de(crudo).as_deref().map(str::trim),
+            Some("<p>Hola</p>")
+        );
+        // Y el texto plano sigue saliendo por su camino de siempre.
+        assert!(texto_de(crudo).contains("Hola"));
+    }
+
+    /// Uno que sólo trae texto: no hay formato, y eso no es un error.
+    #[test]
+    fn un_mensaje_sin_html_no_devuelve_nada() {
+        let crudo = b"Content-Type: text/plain; charset=utf-8\r\n\r\nHola";
+        assert_eq!(html_de(crudo), None);
+    }
+
+    /// Un `.html` pegado no es el cuerpo del mensaje.
+    #[test]
+    fn un_html_adjunto_no_es_el_cuerpo() {
+        let crudo = b"Content-Type: multipart/mixed; boundary=lim\r\n\r\n\
+            --lim\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nMira esto\r\n\
+            --lim\r\nContent-Type: text/html; charset=utf-8\r\n\
+            Content-Disposition: attachment; filename=\"pagina.html\"\r\n\r\n<p>otra cosa</p>\r\n\
+            --lim--\r\n";
+        assert_eq!(html_de(crudo), None);
+    }
+
+    /// El juego de caracteres se respeta, igual que en el texto plano.
+    #[test]
+    fn el_html_se_decodifica_con_su_juego_de_caracteres() {
+        let mut crudo = b"Content-Type: text/html; charset=iso-8859-1\r\n\r\n".to_vec();
+        // «<p>Pérez</p>» en latin-1: la «é» es un solo byte, 0xE9.
+        crudo.extend_from_slice(b"<p>P\xE9rez</p>");
+        assert_eq!(html_de(&crudo).as_deref(), Some("<p>Pérez</p>"));
     }
 }

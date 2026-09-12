@@ -164,7 +164,12 @@ fn entrecomillar(valor: &str) -> String {
 /// peor que uno que falta.
 pub fn uids_de_search(linea: &str) -> Option<Vec<u32>> {
     let resto = tras_search(linea)?;
-    Some(resto.split_whitespace().filter_map(|t| t.parse().ok()).collect())
+    Some(
+        resto
+            .split_whitespace()
+            .filter_map(|t| t.parse().ok())
+            .collect(),
+    )
 }
 
 /// Lo que sigue a `* SEARCH` en una línea, si la línea es ésa.
@@ -210,10 +215,7 @@ mod tests {
     #[test]
     fn las_comillas_y_las_barras_se_escapan() {
         let trozos = armar(&[Termino::De(r#"el "jefe" \ raro"#.into())]);
-        assert_eq!(
-            trozos[1],
-            Trozo::Literal(r#""el \"jefe\" \\ raro""#.into())
-        );
+        assert_eq!(trozos[1], Trozo::Literal(r#""el \"jefe\" \\ raro""#.into()));
     }
 
     /// Un salto de línea partiría el comando en dos, y la segunda mitad sería
@@ -320,7 +322,12 @@ mod tests {
 
     #[test]
     fn lo_que_no_es_una_respuesta_de_search_se_descarta() {
-        for otra in ["* 12 EXISTS", "a1 OK SEARCH completado", "", "* SEARCHING 1"] {
+        for otra in [
+            "* 12 EXISTS",
+            "a1 OK SEARCH completado",
+            "",
+            "* SEARCHING 1",
+        ] {
             assert!(uids_de_search(otra).is_none(), "{otra:?}");
         }
     }

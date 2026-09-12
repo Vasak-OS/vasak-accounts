@@ -339,7 +339,10 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        std::env::temp_dir().join(format!("vasak-cola-{unico}-{:?}", std::thread::current().id()))
+        std::env::temp_dir().join(format!(
+            "vasak-cola-{unico}-{:?}",
+            std::thread::current().id()
+        ))
     }
 
     fn salida(id: &str) -> Salida {
@@ -403,9 +406,16 @@ mod tests {
         cola.encolar(&salida("0001")).unwrap();
 
         let del_directorio = std::fs::metadata(&raiz).unwrap().permissions().mode() & 0o777;
-        assert_eq!(del_directorio, 0o700, "el directorio quedó en {del_directorio:o}");
+        assert_eq!(
+            del_directorio, 0o700,
+            "el directorio quedó en {del_directorio:o}"
+        );
 
-        let del_archivo = std::fs::metadata(cola.ruta("0001")).unwrap().permissions().mode() & 0o777;
+        let del_archivo = std::fs::metadata(cola.ruta("0001"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(del_archivo, 0o600, "el archivo quedó en {del_archivo:o}");
 
         let _ = std::fs::remove_dir_all(&raiz);
@@ -541,7 +551,10 @@ mod tests {
         let mut s = salida("0001");
         s.fallo("el servidor no contestó".into(), diez_minutos_despues);
 
-        assert!(!s.le_toca(diez_minutos_despues), "no tendría que tocarle ya");
+        assert!(
+            !s.le_toca(diez_minutos_despues),
+            "no tendría que tocarle ya"
+        );
     }
 
     /// Una fecha que no se entiende —un archivo tocado a mano, una versión
@@ -659,5 +672,4 @@ mod tests {
         assert!(leido.programado_para.is_empty());
         assert!(leido.le_toca(chrono::Utc::now()));
     }
-
 }

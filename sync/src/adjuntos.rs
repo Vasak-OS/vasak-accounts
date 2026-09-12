@@ -69,7 +69,11 @@ pub fn nombre_seguro(sugerido: &str) -> Option<String> {
         "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
         "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
     ];
-    let base = limpio.split('.').next().unwrap_or(limpio).to_ascii_lowercase();
+    let base = limpio
+        .split('.')
+        .next()
+        .unwrap_or(limpio)
+        .to_ascii_lowercase();
     if RESERVADOS.contains(&base.as_str()) {
         return None;
     }
@@ -195,7 +199,11 @@ pub fn parametro(valor: &str, nombre: &str) -> Option<String> {
                 if let (Some(j), Some(_), Some(texto)) =
                     (trozos.next(), trozos.next(), trozos.next())
                 {
-                    juego = if j.is_empty() { "utf-8".into() } else { j.to_string() };
+                    juego = if j.is_empty() {
+                        "utf-8".into()
+                    } else {
+                        j.to_string()
+                    };
                     juntado.push_str(&de_porcentajes(texto, &juego));
                     continue;
                 }
@@ -314,7 +322,10 @@ mod tests {
         assert_eq!(nombre_seguro("/etc/shadow").unwrap(), "shadow");
         // Las tres formas de separar, porque el nombre lo pudo escribir
         // cualquier sistema.
-        assert_eq!(nombre_seguro(r"C:\Windows\system32\x.dll").unwrap(), "x.dll");
+        assert_eq!(
+            nombre_seguro(r"C:\Windows\system32\x.dll").unwrap(),
+            "x.dll"
+        );
         assert_eq!(nombre_seguro("carpeta/informe.pdf").unwrap(), "informe.pdf");
     }
 

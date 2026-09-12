@@ -7,6 +7,12 @@ license.workspace = true
 description = "Mantiene al día el correo de las cuentas en línea, como servicio del usuario"
 
 [dependencies]
+# Sanear el HTML de un mensaje, que lo escribió un desconocido. Parsea con el
+# mismo motor que un navegador y reescribe desde el árbol, que es lo que cierra
+# la familia de ataques que un recortador por texto deja pasar. Ver `html.rs`.
+ammonia = "4"
+# Para copiar el `src` de las imágenes antes de sanear. Ver `html.rs`.
+regex = "1"
 zbus.workspace = true
 tokio.workspace = true
 tracing.workspace = true

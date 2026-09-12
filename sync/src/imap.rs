@@ -214,7 +214,11 @@ pub fn resultados_de_search(linea: &str) -> Option<u32> {
     // `* SEARCHING 1` pasaba por una respuesta de `SEARCH` con un resultado —
     // la misma clase de error que el de las etiquetas, que ya tiene su prueba
     // más abajo.
-    Some(crate::consulta::tras_search(linea)?.split_whitespace().count() as u32)
+    Some(
+        crate::consulta::tras_search(linea)?
+            .split_whitespace()
+            .count() as u32,
+    )
 }
 
 /// Saca una línea del búfer, si ya hay una entera.
@@ -303,8 +307,13 @@ pub fn esta_visto(respuesta: &str) -> bool {
         return false;
     };
     let desde = inicio + "FLAGS (".len();
-    let hasta = mayusculas[desde..].find(')').map(|f| desde + f).unwrap_or(mayusculas.len());
-    mayusculas[desde..hasta].split_whitespace().any(|b| b == "\\SEEN")
+    let hasta = mayusculas[desde..]
+        .find(')')
+        .map(|f| desde + f)
+        .unwrap_or(mayusculas.len());
+    mayusculas[desde..hasta]
+        .split_whitespace()
+        .any(|b| b == "\\SEEN")
 }
 
 /// El rango de secuencia de los últimos `cuantos` mensajes de una casilla.
@@ -389,9 +398,13 @@ impl Sesion<Flujo> {
             })?;
 
         let nombre = ServerName::try_from(destino.host.clone()).map_err(|e| {
-            ImapError::Fallo(format!("«{}» no es un nombre de servidor: {e}", destino.host))
+            ImapError::Fallo(format!(
+                "«{}» no es un nombre de servidor: {e}",
+                destino.host
+            ))
         })?;
-        let cifrado = crate::tls::conector().map_err(ImapError::Fallo)?
+        let cifrado = crate::tls::conector()
+            .map_err(ImapError::Fallo)?
             .connect(nombre, tcp)
             .await
             .map_err(|e| ImapError::Fallo(format!("no se pudo cifrar la conexión: {e}")))?;
@@ -406,7 +419,9 @@ impl Sesion<Flujo> {
 
         let saludo = sesion.leer_linea().await?;
         if saludo.starts_with("* BYE") {
-            return Err(ImapError::Fallo(format!("el servidor cerró la conexión: {saludo}")));
+            return Err(ImapError::Fallo(format!(
+                "el servidor cerró la conexión: {saludo}"
+            )));
         }
         // Muchos servidores las pegan al saludo; si vienen, una vuelta menos.
         sesion.capacidades = capacidades_de(&saludo);
@@ -531,7 +546,8 @@ impl<F: AsyncRead + AsyncWrite + Unpin + Send> Sesion<F> {
     /// líneas, y todavía no apareció ningún servidor que los mande para esto.
     pub async fn listar_casillas(&mut self) -> Result<Vec<Casilla>, ImapError> {
         let etiqueta = self.siguiente_etiqueta();
-        self.escribir(&format!("{etiqueta} LIST \"\" \"*\"")).await?;
+        self.escribir(&format!("{etiqueta} LIST \"\" \"*\""))
+            .await?;
 
         Self::con_tope("listar las casillas", async {
             let mut casillas = Vec::new();
@@ -564,7 +580,8 @@ impl<F: AsyncRead + AsyncWrite + Unpin + Send> Sesion<F> {
             .ok_or_else(|| ImapError::Fallo("el nombre de la casilla no es válido".into()))?;
 
         let etiqueta = self.siguiente_etiqueta();
-        self.escribir(&format!("{etiqueta} {comando} {nombre}")).await?;
+        self.escribir(&format!("{etiqueta} {comando} {nombre}"))
+            .await?;
 
         Self::con_tope("abrir la casilla", async {
             let mut mensajes = 0;
@@ -834,7 +851,10 @@ impl<F: AsyncRead + AsyncWrite + Unpin + Send> Sesion<F> {
     /// leer sin que hayas leído nada es de los errores más molestos que puede
     /// tener un cliente de correo, y se comete escribiendo cuatro letras de
     /// menos.
-    pub async fn resumenes(&mut self, mensajes: u32) -> Result<Vec<crate::mensaje::Resumen>, ImapError> {
+    pub async fn resumenes(
+        &mut self,
+        mensajes: u32,
+    ) -> Result<Vec<crate::mensaje::Resumen>, ImapError> {
         let Some(rango) = ultimos(mensajes, CUANTOS) else {
             return Ok(Vec::new());
         };
@@ -956,7 +976,8 @@ impl<F: AsyncRead + AsyncWrite + Unpin + Send> Sesion<F> {
     /// lectura, y eso es correcto: cambiar banderas es una decisión de la
     /// persona, no un efecto de estar sincronizando.
     pub async fn marcar_leido(&mut self, uid: u32) -> Result<(), ImapError> {
-        self.mandar(&format!("UID STORE {uid} +FLAGS (\\Seen)")).await
+        self.mandar(&format!("UID STORE {uid} +FLAGS (\\Seen)"))
+            .await
     }
 
     /// Abre una casilla **para escribir** y devuelve cuántos mensajes tiene.
@@ -1518,8 +1539,14 @@ mod tests {
 
         // Y no se confunde con las otras dos, que son las que dejan la sesión
         // utilizable o mandan a dejar de reintentar.
-        assert!(!matches!(ImapError::Fallo("x".into()), ImapError::Desincronizada(_)));
-        assert!(!matches!(ImapError::Rechazado("x".into()), ImapError::Desincronizada(_)));
+        assert!(!matches!(
+            ImapError::Fallo("x".into()),
+            ImapError::Desincronizada(_)
+        ));
+        assert!(!matches!(
+            ImapError::Rechazado("x".into()),
+            ImapError::Desincronizada(_)
+        ));
     }
 
     /// Pedir `1:0` es un error de sintaxis, y hay servidores que ante uno cortan
@@ -1546,9 +1573,14 @@ mod tests {
     #[test]
     fn el_xoauth2_usa_el_separador_que_fija_el_proveedor() {
         let carga = carga_xoauth2("ana@ejemplo.com", "el-token");
-        let crudo = base64::engine::general_purpose::STANDARD.decode(&carga).unwrap();
+        let crudo = base64::engine::general_purpose::STANDARD
+            .decode(&carga)
+            .unwrap();
 
-        assert_eq!(crudo, b"user=ana@ejemplo.com\x01auth=Bearer el-token\x01\x01");
+        assert_eq!(
+            crudo,
+            b"user=ana@ejemplo.com\x01auth=Bearer el-token\x01\x01"
+        );
         // Y termina en dos separadores, no en uno: los servidores rechazan la
         // carga si falta el último.
         assert!(crudo.ends_with(b"\x01\x01"));
@@ -1588,10 +1620,6 @@ mod tests {
         assert_eq!(respuesta_de("* OK sin etiqueta", "a1"), None);
         assert_eq!(respuesta_de("+ continuá", "a1"), None);
     }
-
-
-
-
 
     /// Las capacidades llegan de dos formas y hay servidores que sólo usan una:
     /// pegadas al saludo entre corchetes, o en su propia línea. Leer sólo una
@@ -1655,7 +1683,12 @@ mod tests {
     /// sin motivo.
     #[test]
     fn se_reconoce_lo_que_cambia_de_lo_que_no() {
-        for cambio in ["* 5 EXISTS", "* 3 EXPUNGE", "* 2 FETCH (FLAGS (\\Seen))", "* 12 exists"] {
+        for cambio in [
+            "* 5 EXISTS",
+            "* 3 EXPUNGE",
+            "* 2 FETCH (FLAGS (\\Seen))",
+            "* 12 exists",
+        ] {
             assert!(anuncia_cambio(cambio), "{cambio:?} tenía que despertar");
         }
         for quieto in [
@@ -1677,8 +1710,14 @@ mod tests {
     fn las_lineas_salen_del_buffer_de_a_una() {
         let mut pendiente = b"* OK uno\r\n* OK dos\r\n* OK incom".to_vec();
 
-        assert_eq!(linea_del_buffer(&mut pendiente).as_deref(), Some("* OK uno"));
-        assert_eq!(linea_del_buffer(&mut pendiente).as_deref(), Some("* OK dos"));
+        assert_eq!(
+            linea_del_buffer(&mut pendiente).as_deref(),
+            Some("* OK uno")
+        );
+        assert_eq!(
+            linea_del_buffer(&mut pendiente).as_deref(),
+            Some("* OK dos")
+        );
         // La tercera está a medias: no se entrega hasta que llegue su fin de
         // línea, y lo leído sigue en el búfer esperándola.
         assert_eq!(linea_del_buffer(&mut pendiente), None);
@@ -1701,7 +1740,10 @@ mod tests {
 
         // Llega el resto: la línea sale entera.
         pendiente.extend_from_slice(b"ISTS\r\n");
-        assert_eq!(linea_del_buffer(&mut pendiente).as_deref(), Some("* 5 EXISTS"));
+        assert_eq!(
+            linea_del_buffer(&mut pendiente).as_deref(),
+            Some("* 5 EXISTS")
+        );
         assert!(pendiente.is_empty());
     }
 }

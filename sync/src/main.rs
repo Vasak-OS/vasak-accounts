@@ -53,8 +53,9 @@ mod adjuntos;
 mod avisos;
 mod broker;
 mod casillas;
-mod consulta;
 mod cola;
+mod consulta;
+mod html;
 mod imap;
 mod mensaje;
 mod redactar;
@@ -66,8 +67,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Mutex;
-use zbus::object_server::SignalContext;
 use zbus::interface;
+use zbus::object_server::SignalContext;
 
 use broker::{Broker, BrokerError};
 
@@ -196,6 +197,16 @@ struct Abierto {
     /// quedó más allá del corte no aparece. La ventana ya tiene que decir que el
     /// mensaje está recortado, y eso cubre también esto.
     adjuntos: Vec<adjuntos::Adjunto>,
+    /// El mismo mensaje con su formato, ya saneado, o nada si no traía HTML.
+    ///
+    /// Va **además** del texto y no en su lugar: el texto plano se queda como la
+    /// vista segura de siempre, y la ventana elige cuál muestra. Un mensaje que
+    /// sólo trae HTML seguía teniendo su versión sin etiquetas en `texto`, así
+    /// que quitarle el formato a la vista es siempre posible.
+    ///
+    /// Lo que hay acá ya pasó por `html::sanear`: sin `<script>`, sin `on*`, sin
+    /// `<iframe>` y sin ninguna imagen cargándose sola. Ver `html.rs`.
+    con_formato: Option<html::Saneado>,
     /// Lo que hace falta para responderlo: a quién, y con qué cabeceras para que
     /// la respuesta quede enganchada a la conversación.
     ///
@@ -325,6 +336,11 @@ impl Lector {
             texto: mensaje::texto_de(&crudo),
             recortado,
             adjuntos: adjuntos::listar(&crudo),
+            // El saneado pasa **acá**, en el servicio, y no en la ventana: es lo
+            // que hace que la ventana no vea nunca el HTML crudo de un
+            // desconocido, del mismo modo que no ve una contraseña ni abre una
+            // conexión propia.
+            con_formato: mensaje::html_de(&crudo).map(|bruto| html::sanear(&bruto)),
             responder: mensaje::para_responder(&crudo),
         })
     }
@@ -396,7 +412,10 @@ impl Lector {
                 // fallo aparece recién al usarla. Una recién abierta que falló
                 // no se reintenta — si el servidor rechazó la credencial,
                 // insistir es cómo se bloquea una cuenta.
-                tracing::debug!("'{}': la conexión de lectura estaba muerta: {primero}", cuenta.id);
+                tracing::debug!(
+                    "'{}': la conexión de lectura estaba muerta: {primero}",
+                    cuenta.id
+                );
                 self.intentar(broker, cuenta, &mut trabajo).await
             }
         }
@@ -481,10 +500,18 @@ impl Servicio {
     /// O sea que abrir «Enviados» tarda lo que tarda el servidor, y la de
     /// entrada es instantánea. Es la diferencia que se ve, y es la correcta:
     /// la que se mira todo el tiempo es la que está lista.
-    async fn list_messages(&self, account_id: String, mailbox: String) -> zbus::fdo::Result<String> {
+    async fn list_messages(
+        &self,
+        account_id: String,
+        mailbox: String,
+    ) -> zbus::fdo::Result<String> {
         let mensajes = if mailbox.is_empty() || mailbox.eq_ignore_ascii_case("INBOX") {
             let estado = self.estado.lock().await;
-            estado.mensajes.get(&account_id).cloned().unwrap_or_default()
+            estado
+                .mensajes
+                .get(&account_id)
+                .cloned()
+                .unwrap_or_default()
         } else {
             let (broker, cuenta) = self.cuenta(&account_id).await?;
             let lector = self.lector(&account_id).await;
@@ -673,15 +700,14 @@ impl Servicio {
         borrador: String,
         no_antes_de: String,
     ) -> zbus::fdo::Result<String> {
-        if !no_antes_de.is_empty()
-            && chrono::DateTime::parse_from_rfc3339(&no_antes_de).is_err()
-        {
+        if !no_antes_de.is_empty() && chrono::DateTime::parse_from_rfc3339(&no_antes_de).is_err() {
             return Err(zbus::fdo::Error::InvalidArgs(format!(
                 "«{no_antes_de}» no es una hora válida"
             )));
         }
-        let mut borrador: redactar::Borrador = serde_json::from_str(&borrador)
-            .map_err(|e| zbus::fdo::Error::InvalidArgs(format!("el borrador no se entiende: {e}")))?;
+        let mut borrador: redactar::Borrador = serde_json::from_str(&borrador).map_err(|e| {
+            zbus::fdo::Error::InvalidArgs(format!("el borrador no se entiende: {e}"))
+        })?;
 
         let (broker, cuenta) = self.cuenta(&account_id).await?;
         let config = broker
@@ -841,10 +867,9 @@ impl Servicio {
             zbus::fdo::Error::Failed(format!("no se pudo hablar con el servicio de cuentas: {e}"))
         })?;
 
-        let cuentas = broker
-            .accounts()
-            .await
-            .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudieron leer las cuentas: {e}")))?;
+        let cuentas = broker.accounts().await.map_err(|e| {
+            zbus::fdo::Error::Failed(format!("no se pudieron leer las cuentas: {e}"))
+        })?;
 
         cuentas
             .into_iter()
@@ -980,8 +1005,8 @@ async fn mandar_uno(servicio: &Servicio, salida: &cola::Salida) -> Result<(), sm
     let config = config.get("config").cloned().unwrap_or(config);
 
     // Una cuenta sin servidor de salida no se arregla esperando.
-    let destino = broker::destino_smtp_de(&config, Some(token))
-        .map_err(smtp::SmtpError::Permanente)?;
+    let destino =
+        broker::destino_smtp_de(&config, Some(token)).map_err(smtp::SmtpError::Permanente)?;
 
     let mensaje = redactar::armar(&salida.borrador, &salida.identificador, &salida.fecha)
         .map_err(smtp::SmtpError::Permanente)?;
@@ -1014,7 +1039,9 @@ async fn abrir(broker: &Broker, cuenta: &broker::Account) -> Result<imap::Sesion
     let config = config.get("config").cloned().unwrap_or(config);
 
     let destino = broker::destino_de(&config, Some(token))?;
-    imap::Sesion::abrir(&destino).await.map_err(|e| e.to_string())
+    imap::Sesion::abrir(&destino)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Cuenta lo que hay en la casilla abierta.
@@ -1169,11 +1196,7 @@ async fn seguir_los_carteles(
 /// queda esperando y el correo nuevo aparece en el momento; cuando no, vuelve a
 /// mirar cada cinco minutos sobre la misma conexión, que igual es mejor que
 /// reconectarse cada vez.
-async fn atender(
-    cuenta: broker::Account,
-    servicio: Servicio,
-    emisor: SignalContext<'static>,
-) {
+async fn atender(cuenta: broker::Account, servicio: Servicio, emisor: SignalContext<'static>) {
     loop {
         let broker = match Broker::connect().await {
             Ok(b) => b,
@@ -1193,7 +1216,12 @@ async fn atender(
                 tracing::warn!("'{}' deja de mirarse: {detalle}", cuenta.id);
                 // Antes de publicar: quien revisa las tareas tiene que ver la
                 // marca aunque llegue justo ahora, o la vuelve a arrancar.
-                servicio.estado.lock().await.rechazadas.insert(cuenta.id.clone());
+                servicio
+                    .estado
+                    .lock()
+                    .await
+                    .rechazadas
+                    .insert(cuenta.id.clone());
                 publicar(&servicio, &emisor, &cuenta, Err(detalle)).await;
                 return;
             }
@@ -1378,14 +1406,20 @@ async fn ajustar_tareas(
     });
 
     let mut estado = servicio.estado.lock().await;
-    estado.por_cuenta.retain(|id, _| vigentes.contains(&id.as_str()));
+    estado
+        .por_cuenta
+        .retain(|id, _| vigentes.contains(&id.as_str()));
     // Los mensajes de una cuenta que ya no está **se van con ella**. Sin esto,
     // borrar una cuenta desde Configuración dejaba en memoria el remitente y el
     // asunto de sus últimos doscientos mensajes, y `ListMessages` los seguía
     // entregando a quien preguntara por ese identificador. Alguien que quita una
     // cuenta espera que se vaya el correo también.
-    estado.mensajes.retain(|id, _| vigentes.contains(&id.as_str()));
-    estado.rechazadas.retain(|id| vigentes.contains(&id.as_str()));
+    estado
+        .mensajes
+        .retain(|id, _| vigentes.contains(&id.as_str()));
+    estado
+        .rechazadas
+        .retain(|id| vigentes.contains(&id.as_str()));
     let rechazadas = estado.rechazadas.clone();
     drop(estado);
 
@@ -1409,11 +1443,7 @@ async fn ajustar_tareas(
             continue;
         }
         tracing::info!("'{}' pasa a atenderse", cuenta.id);
-        let tarea = tokio::spawn(atender(
-            cuenta.clone(),
-            servicio.clone(),
-            emisor.clone(),
-        ));
+        let tarea = tokio::spawn(atender(cuenta.clone(), servicio.clone(), emisor.clone()));
         tareas.insert(cuenta.id.clone(), tarea);
     }
 
