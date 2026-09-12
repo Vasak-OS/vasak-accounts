@@ -106,7 +106,8 @@ impl Broker {
         account_id: &str,
         capability: &str,
     ) -> Result<String, BrokerError> {
-        self.llamar("GetAccessToken", &(account_id, capability)).await
+        self.llamar("GetAccessToken", &(account_id, capability))
+            .await
     }
 
     /// La configuración de una capacidad: el servidor, el usuario, los puertos.
@@ -115,7 +116,9 @@ impl Broker {
         account_id: &str,
         capability: &str,
     ) -> Result<serde_json::Value, BrokerError> {
-        let json = self.llamar("GetAccountData", &(account_id, capability)).await?;
+        let json = self
+            .llamar("GetAccountData", &(account_id, capability))
+            .await?;
         serde_json::from_str(&json)
             .map_err(|e| BrokerError::Failed(format!("no se pudo leer la configuración: {e}")))
     }
@@ -206,12 +209,19 @@ pub fn destino_de(config: &serde_json::Value, secreto: Option<String>) -> Result
     };
 
     let credencial = if campo("client_id").is_some() {
-        Credencial::Token { usuario, token: secreto }
+        Credencial::Token {
+            usuario,
+            token: secreto,
+        }
     } else {
         Credencial::Contrasena { usuario, secreto }
     };
 
-    Ok(Destino { host, puerto, credencial })
+    Ok(Destino {
+        host,
+        puerto,
+        credencial,
+    })
 }
 
 /// Lo mismo, pero para el servidor por el que se manda.
@@ -259,12 +269,19 @@ pub fn destino_smtp_de(
     // tienen las cuentas que pasaron por un flujo OAuth2. Confundirlas manda una
     // contraseña donde va un token.
     let credencial = if campo("client_id").is_some() {
-        Credencial::Token { usuario, token: secreto }
+        Credencial::Token {
+            usuario,
+            token: secreto,
+        }
     } else {
         Credencial::Contrasena { usuario, secreto }
     };
 
-    Ok(Destino { host, puerto, credencial })
+    Ok(Destino {
+        host,
+        puerto,
+        credencial,
+    })
 }
 
 #[cfg(test)]
@@ -318,7 +335,10 @@ mod tests {
         let config = serde_json::json!({
             "username": "ana", "smtp_server": "smtp.x.com", "smtp_port": 465,
         });
-        assert_eq!(destino_smtp_de(&config, Some("c".into())).unwrap().puerto, 465);
+        assert_eq!(
+            destino_smtp_de(&config, Some("c".into())).unwrap().puerto,
+            465
+        );
     }
 
     /// La misma regla que para leer: el `client_id` es lo que distingue una
@@ -331,13 +351,17 @@ mod tests {
             "username": "ana", "smtp_server": "smtp.x.com", "client_id": "abc",
         });
         assert!(matches!(
-            destino_smtp_de(&con_token, Some("t".into())).unwrap().credencial,
+            destino_smtp_de(&con_token, Some("t".into()))
+                .unwrap()
+                .credencial,
             Credencial::Token { .. }
         ));
 
         let con_clave = serde_json::json!({ "username": "ana", "smtp_server": "smtp.x.com" });
         assert!(matches!(
-            destino_smtp_de(&con_clave, Some("c".into())).unwrap().credencial,
+            destino_smtp_de(&con_clave, Some("c".into()))
+                .unwrap()
+                .credencial,
             Credencial::Contrasena { .. }
         ));
     }
@@ -396,7 +420,10 @@ mod tests {
 
         assert_eq!(cuentas.len(), 2);
         assert!(cuentas[0].hay_correo_que_sincronizar());
-        assert!(!cuentas[1].needs_reauth, "sin la marca es una cuenta que anda");
+        assert!(
+            !cuentas[1].needs_reauth,
+            "sin la marca es una cuenta que anda"
+        );
     }
 
     #[test]
@@ -428,7 +455,9 @@ mod tests {
             "imap_port": 993,
         });
         assert_eq!(
-            destino_de(&con_contrasena, Some("la-contrasena".into())).unwrap().credencial,
+            destino_de(&con_contrasena, Some("la-contrasena".into()))
+                .unwrap()
+                .credencial,
             Credencial::Contrasena {
                 usuario: "ana@gmail.com".into(),
                 secreto: "la-contrasena".into(),
@@ -442,8 +471,13 @@ mod tests {
             "token_url": "https://oauth2.googleapis.com/token",
         });
         assert_eq!(
-            destino_de(&con_oauth, Some("el-token".into())).unwrap().credencial,
-            Credencial::Token { usuario: "ana@gmail.com".into(), token: "el-token".into() }
+            destino_de(&con_oauth, Some("el-token".into()))
+                .unwrap()
+                .credencial,
+            Credencial::Token {
+                usuario: "ana@gmail.com".into(),
+                token: "el-token".into()
+            }
         );
     }
 

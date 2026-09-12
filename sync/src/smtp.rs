@@ -155,7 +155,9 @@ pub fn puntos_protegidos(mensaje: &str) -> String {
 pub fn cabe_en_un_comando(direccion: &str) -> bool {
     !direccion.is_empty()
         && direccion.len() <= 320
-        && !direccion.chars().any(|c| c.is_control() || c.is_whitespace())
+        && !direccion
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace())
         && !direccion.contains(['<', '>'])
 }
 
@@ -359,7 +361,8 @@ impl Sesion {
             }
         }
 
-        self.mandar(&format!("MAIL FROM:<{remitente}>"), &["250"]).await?;
+        self.mandar(&format!("MAIL FROM:<{remitente}>"), &["250"])
+            .await?;
 
         for destinatario in destinatarios {
             // 251 es «no está acá pero lo reenvío», que es una entrega buena.
@@ -428,9 +431,7 @@ impl Sesion {
         // la cola entera.
         let cifrado = tokio::time::timeout(TIMEOUT, conector.connect(nombre, tcp))
             .await
-            .map_err(|_| {
-                SmtpError::Temporal(format!("{host} no completó el cifrado a tiempo"))
-            })?
+            .map_err(|_| SmtpError::Temporal(format!("{host} no completó el cifrado a tiempo")))?
             .map_err(|e| SmtpError::Temporal(format!("no se pudo cifrar con {host}: {e}")))?;
         self.flujo = Flujo::Cifrado(Box::new(cifrado));
         Ok(())
@@ -447,7 +448,8 @@ impl Sesion {
         match (como, credencial) {
             ("XOAUTH2", Credencial::Token { usuario, token }) => {
                 let carga = carga_xoauth2(usuario, token);
-                self.mandar(&format!("AUTH XOAUTH2 {carga}"), &["235"]).await
+                self.mandar(&format!("AUTH XOAUTH2 {carga}"), &["235"])
+                    .await
             }
             ("PLAIN", Credencial::Contrasena { usuario, secreto }) => {
                 let carga = carga_plain(usuario, secreto);
@@ -471,7 +473,9 @@ impl Sesion {
 
     /// Manda una línea y espera una respuesta con uno de los códigos esperados.
     async fn mandar(&mut self, comando: &str, esperados: &[&str]) -> Result<(), SmtpError> {
-        self.flujo.escribir(format!("{comando}\r\n").as_bytes()).await?;
+        self.flujo
+            .escribir(format!("{comando}\r\n").as_bytes())
+            .await?;
         self.esperar(esperados).await?;
         Ok(())
     }
@@ -526,9 +530,7 @@ impl Sesion {
             let leidos = self.flujo.leer(&mut destino).await;
             self.pendiente = destino;
             if leidos? == 0 {
-                return Err(SmtpError::Temporal(
-                    "el servidor cortó la conexión".into(),
-                ));
+                return Err(SmtpError::Temporal("el servidor cortó la conexión".into()));
             }
         }
     }
@@ -574,7 +576,10 @@ mod tests {
         assert!(!clasificar(550, "x".into()).se_reintenta());
         assert!(!clasificar(552, "x".into()).se_reintenta());
         // Y el de credenciales es su propio caso, porque lo arregla la persona.
-        assert!(matches!(clasificar(535, "x".into()), SmtpError::Rechazado(_)));
+        assert!(matches!(
+            clasificar(535, "x".into()),
+            SmtpError::Rechazado(_)
+        ));
         assert!(!clasificar(535, "x".into()).se_reintenta());
     }
 
@@ -620,14 +625,21 @@ mod tests {
     #[test]
     fn el_xoauth2_usa_el_separador_que_fija_el_proveedor() {
         let carga = carga_xoauth2("ana@ejemplo.com", "el-token");
-        let crudo = base64::engine::general_purpose::STANDARD.decode(&carga).unwrap();
-        assert_eq!(crudo, b"user=ana@ejemplo.com\x01auth=Bearer el-token\x01\x01");
+        let crudo = base64::engine::general_purpose::STANDARD
+            .decode(&carga)
+            .unwrap();
+        assert_eq!(
+            crudo,
+            b"user=ana@ejemplo.com\x01auth=Bearer el-token\x01\x01"
+        );
     }
 
     #[test]
     fn el_plain_lleva_los_nulos_que_lo_separan() {
         let carga = carga_plain("ana", "clave");
-        let crudo = base64::engine::general_purpose::STANDARD.decode(&carga).unwrap();
+        let crudo = base64::engine::general_purpose::STANDARD
+            .decode(&carga)
+            .unwrap();
         assert_eq!(crudo, b"\0ana\0clave");
     }
 

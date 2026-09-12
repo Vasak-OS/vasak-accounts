@@ -200,8 +200,15 @@ pub fn revisar(borrador: &Borrador) -> Result<(), String> {
             borrador.referencias.len()
         ));
     }
-    if let Some(larga) = borrador.referencias.iter().find(|r| r.len() > MAX_IDENTIFICADOR) {
-        return Err(format!("una referencia es demasiado larga ({})", larga.len()));
+    if let Some(larga) = borrador
+        .referencias
+        .iter()
+        .find(|r| r.len() > MAX_IDENTIFICADOR)
+    {
+        return Err(format!(
+            "una referencia es demasiado larga ({})",
+            larga.len()
+        ));
     }
 
     Ok(())
@@ -405,7 +412,11 @@ pub fn armar(borrador: &Borrador, identificador: &str, fecha: &str) -> Result<St
     if !borrador.referencias.is_empty() {
         // Sin separador: las referencias van una atrás de otra, separadas por el
         // espacio que ya pone el plegado.
-        let cadena: Vec<String> = borrador.referencias.iter().map(|r| cabecera_segura(r)).collect();
+        let cadena: Vec<String> = borrador
+            .referencias
+            .iter()
+            .map(|r| cabecera_segura(r))
+            .collect();
         cabeceras.push(plegada("References", &cadena, ""));
     }
 
@@ -508,7 +519,10 @@ mod tests {
         // El texto no se pierde: se pega en el mismo renglón, que es donde no
         // hace nada. Y con un espacio y no con dos, que es lo que dejaría el
         // `\r\n` convertido carácter por carácter.
-        assert!(mensaje.contains("Subject: Hola Bcc: espia@ajeno.com"), "{mensaje}");
+        assert!(
+            mensaje.contains("Subject: Hola Bcc: espia@ajeno.com"),
+            "{mensaje}"
+        );
     }
 
     /// Con dos saltos seguidos se corta el bloque de cabeceras y lo que sigue es
@@ -530,7 +544,10 @@ mod tests {
             let limpio = cabecera_segura(veneno);
             assert!(!limpio.contains('\n'), "{veneno:?} -> {limpio:?}");
             assert!(!limpio.contains('\r'), "{veneno:?} -> {limpio:?}");
-            assert!(!limpio.chars().any(char::is_control), "{veneno:?} -> {limpio:?}");
+            assert!(
+                !limpio.chars().any(char::is_control),
+                "{veneno:?} -> {limpio:?}"
+            );
         }
     }
 
@@ -588,7 +605,17 @@ mod tests {
 
     #[test]
     fn una_direccion_mal_formada_se_rechaza() {
-        for mala in ["", "  ", "juan", "@otro.com", "juan@", "juan@otro", "juan@@otro.com", "juan@.com", "juan@otro."] {
+        for mala in [
+            "",
+            "  ",
+            "juan",
+            "@otro.com",
+            "juan@",
+            "juan@otro",
+            "juan@@otro.com",
+            "juan@.com",
+            "juan@otro.",
+        ] {
             assert!(!direccion_valida(mala), "{mala:?} tendría que rechazarse");
         }
     }
@@ -627,7 +654,9 @@ mod tests {
     #[test]
     fn hay_un_tope_de_destinatarios() {
         let mut b = borrador();
-        b.para = (0..MAX_DESTINATARIOS + 1).map(|i| format!("x{i}@otro.com")).collect();
+        b.para = (0..MAX_DESTINATARIOS + 1)
+            .map(|i| format!("x{i}@otro.com"))
+            .collect();
         let error = armar(&b, "<x@y>", "Thu, 10 Sep 2026 12:00:00 +0000").unwrap_err();
         assert!(error.contains("tope"), "{error}");
     }
@@ -653,7 +682,9 @@ mod tests {
     #[test]
     fn una_lista_larga_de_destinatarios_se_parte_en_renglones() {
         let mut b = borrador();
-        b.para = (0..60).map(|i| format!("destinatario.numero{i}@ejemplo.com")).collect();
+        b.para = (0..60)
+            .map(|i| format!("destinatario.numero{i}@ejemplo.com"))
+            .collect();
 
         let mensaje = armar(&b, "<x@y>", "Thu, 10 Sep 2026 12:00:00 +0000").unwrap();
         for linea in mensaje.split("\r\n") {
@@ -672,14 +703,19 @@ mod tests {
     #[test]
     fn una_cadena_larga_de_referencias_se_parte() {
         let mut b = borrador();
-        b.referencias = (0..20).map(|i| format!("<mensaje.numero{i}@ejemplo.com>")).collect();
+        b.referencias = (0..20)
+            .map(|i| format!("<mensaje.numero{i}@ejemplo.com>"))
+            .collect();
 
         let mensaje = armar(&b, "<x@y>", "Thu, 10 Sep 2026 12:00:00 +0000").unwrap();
         for linea in mensaje.split("\r\n") {
             assert!(linea.len() <= 998, "línea de {} octetos", linea.len());
         }
         let cabeceras = crate::mensaje::Cabeceras::leer(&mensaje);
-        assert_eq!(cabeceras.valor("references").unwrap().matches('<').count(), 20);
+        assert_eq!(
+            cabeceras.valor("references").unwrap().matches('<').count(),
+            20
+        );
     }
 
     /// Una dirección que sola no entra en el renglón recomendado va en el suyo:
@@ -717,7 +753,9 @@ mod tests {
     #[test]
     fn una_cadena_de_referencias_desmedida_se_rechaza() {
         let mut b = borrador();
-        b.referencias = (0..MAX_REFERENCIAS + 1).map(|i| format!("<{i}@x>")).collect();
+        b.referencias = (0..MAX_REFERENCIAS + 1)
+            .map(|i| format!("<{i}@x>"))
+            .collect();
         let error = armar(&b, "<x@y>", "Thu, 10 Sep 2026 12:00:00 +0000").unwrap_err();
         assert!(error.contains("referencias"), "{error}");
     }
@@ -742,7 +780,10 @@ mod tests {
 
         let mensaje = armar(&b, "<x@y>", "Thu, 10 Sep 2026 12:00:00 +0000").unwrap();
         assert!(mensaje.contains("Subject: =?UTF-8?B?"), "{mensaje}");
-        assert!(mensaje.is_ascii(), "quedó algo que no es ASCII en el mensaje");
+        assert!(
+            mensaje.is_ascii(),
+            "quedó algo que no es ASCII en el mensaje"
+        );
     }
 
     /// Y se puede volver a leer: lo que se codifica acá lo decodifica el módulo
@@ -773,7 +814,11 @@ mod tests {
         let largo = "á".repeat(200);
         let codificado = cabecera_segura(&largo);
         for linea in codificado.split("\r\n") {
-            assert!(linea.len() <= 76, "línea de {} octetos: {linea}", linea.len());
+            assert!(
+                linea.len() <= 76,
+                "línea de {} octetos: {linea}",
+                linea.len()
+            );
         }
     }
 
@@ -849,13 +894,23 @@ mod tests {
     /// lo único que los separa.
     #[test]
     fn el_mensaje_tiene_la_forma_que_espera_un_servidor() {
-        let mensaje = armar(&borrador(), "<abc@ejemplo.com>", "Thu, 10 Sep 2026 12:00:00 +0000")
-            .unwrap();
+        let mensaje = armar(
+            &borrador(),
+            "<abc@ejemplo.com>",
+            "Thu, 10 Sep 2026 12:00:00 +0000",
+        )
+        .unwrap();
 
         let (cabeceras, cuerpo) = mensaje.split_once("\r\n\r\n").unwrap();
-        assert!(cabeceras.starts_with("Date: Thu, 10 Sep 2026"), "{cabeceras}");
+        assert!(
+            cabeceras.starts_with("Date: Thu, 10 Sep 2026"),
+            "{cabeceras}"
+        );
         assert!(cabeceras.contains("\r\nTo: juan@otro.com"), "{cabeceras}");
-        assert!(cabeceras.contains("\r\nMessage-ID: <abc@ejemplo.com>"), "{cabeceras}");
+        assert!(
+            cabeceras.contains("\r\nMessage-ID: <abc@ejemplo.com>"),
+            "{cabeceras}"
+        );
         assert!(cabeceras.contains("\r\nMIME-Version: 1.0"), "{cabeceras}");
         assert_eq!(cuerpo, "Buenas.");
     }
@@ -870,7 +925,10 @@ mod tests {
         b.referencias = vec!["<primero@otro.com>".into(), "<original@otro.com>".into()];
 
         let mensaje = armar(&b, "<x@y>", "Thu, 10 Sep 2026 12:00:00 +0000").unwrap();
-        assert!(mensaje.contains("In-Reply-To: <original@otro.com>"), "{mensaje}");
+        assert!(
+            mensaje.contains("In-Reply-To: <original@otro.com>"),
+            "{mensaje}"
+        );
         assert!(
             mensaje.contains("References: <primero@otro.com> <original@otro.com>"),
             "{mensaje}"
