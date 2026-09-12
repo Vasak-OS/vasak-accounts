@@ -277,6 +277,37 @@ impl Lector {
         .await
     }
 
+    /// Un adjunto, ya decodificado y listo para guardar.
+    ///
+    /// Se pide la parte sola y no el mensaje entero: es lo que hace que se pueda
+    /// bajar un adjunto de veinte megas sin traer los otros tres que venían con
+    /// él, y lo que el número de parte existe para permitir.
+    async fn adjunto(
+        &mut self,
+        broker: &Broker,
+        cuenta: &broker::Account,
+        casilla: &str,
+        uid: u32,
+        parte: &str,
+    ) -> Result<Vec<u8>, String> {
+        let casilla = casilla.to_string();
+        let parte = parte.to_string();
+        let (cabeceras, contenido) = self
+            .con_reintento(broker, cuenta, move |sesion| {
+                let casilla = casilla.clone();
+                let parte = parte.clone();
+                Box::pin(async move {
+                    // `EXAMINE`: bajar un archivo no tiene por qué marcar el
+                    // mensaje como leído.
+                    sesion.examinar(&casilla).await?;
+                    sesion.parte(uid, &parte, MAXIMO_ADJUNTO).await
+                })
+            })
+            .await?;
+
+        Ok(adjuntos::destransportar_parte(&cabeceras, &contenido))
+    }
+
     /// Los últimos mensajes de una casilla que no es la de entrada.
     ///
     /// Se traen del servidor en el momento y no se guardan, al revés que los de
@@ -587,6 +618,40 @@ impl Servicio {
 
         serde_json::to_string(&encontrados)
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
+    }
+
+    /// Trae un adjunto y lo devuelve en base64.
+    ///
+    /// # Por qué lo devuelve y no lo escribe
+    ///
+    /// Este servicio corre como la persona y podría escribir en cualquier
+    /// archivo suyo. Recibir una ruta de la ventana sería dejar que la ventana
+    /// elija dónde escribe el servicio — que es el mismo motivo por el que, para
+    /// mandar, es la ventana la que lee el archivo. El proceso que toca el disco
+    /// es aquel cuyo dueño eligió la ruta.
+    ///
+    /// En base64 porque es texto y viaja por D-Bus sin que nadie tenga que
+    /// inventar cómo mandar bytes crudos en una cadena. Un adjunto de veinte
+    /// megas son veintisiete así, muy por debajo del tope del bus.
+    async fn get_attachment(
+        &self,
+        account_id: String,
+        mailbox: String,
+        uid: u32,
+        part: String,
+    ) -> zbus::fdo::Result<String> {
+        use base64::Engine;
+
+        let (broker, cuenta) = self.cuenta(&account_id).await?;
+        let lector = self.lector(&account_id).await;
+        let mut lector = lector.lock().await;
+
+        let bytes = lector
+            .adjunto(&broker, &cuenta, &casilla_o_entrada(&mailbox), uid, &part)
+            .await
+            .map_err(zbus::fdo::Error::Failed)?;
+
+        Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
     }
 
     /// El texto de un mensaje.
@@ -1241,6 +1306,14 @@ enum Salida {
     /// Se cortó, se cayó la red, el servidor se reinició. Se reconecta.
     Cortada(String),
 }
+
+/// Lo más grande que se baja de un adjunto.
+///
+/// Veinte megas, el mismo número que la ventana usa como tope para mandar. Va
+/// explícito en el comando de IMAP: un servidor puede anunciar el tamaño que
+/// quiera, y pedir «desde el byte cero, tantos» es lo que garantiza que no
+/// llegue más de lo que se está dispuesto a tener en memoria.
+const MAXIMO_ADJUNTO: usize = 20 * 1024 * 1024;
 
 /// La casilla que pidieron, o la de entrada si no dijeron ninguna.
 ///

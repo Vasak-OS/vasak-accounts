@@ -225,6 +225,24 @@ pub fn parametro(valor: &str, nombre: &str) -> Option<String> {
     busca(nombre).map(|v| decodificar_palabras(&v))
 }
 
+/// Deshace la codificación de una parte, según lo que digan sus cabeceras.
+///
+/// Sin esto, lo que se baja es un bloque de base64: el archivo guardado pesaría
+/// un tercio más y no lo abriría ningún programa.
+///
+/// Lo que no se reconoce se devuelve tal cual, que es lo correcto para `7bit`,
+/// `8bit` y `binary` —los tres quieren decir «no hay nada que deshacer»— y lo
+/// menos malo para una codificación que no existe: guardar los bytes crudos deja
+/// algo que se puede mirar, y devolver un error deja a la persona sin el
+/// archivo.
+pub fn destransportar_parte(cabeceras_crudas: &[u8], contenido: &[u8]) -> Vec<u8> {
+    let vista = como_latin1(cabeceras_crudas);
+    let (cabeceras, _) = partir(&vista);
+    let codificacion = cabeceras.texto("content-transfer-encoding");
+
+    crate::mensaje::destransportar(contenido, codificacion.trim())
+}
+
 /// Los adjuntos de un mensaje, con su número de parte.
 pub fn listar(crudo: &[u8]) -> Vec<Adjunto> {
     let vista = como_latin1(crudo);
@@ -537,5 +555,39 @@ Content-Disposition: attachment\r\n\r\n\
 datos\r\n\
 --z--\r\n";
         assert_eq!(listar(crudo.as_bytes())[0].nombre, "viejo.pdf");
+    }
+
+    #[test]
+    fn una_parte_en_base64_se_deshace() {
+        let cabeceras = b"Content-Type: application/pdf\r\nContent-Transfer-Encoding: base64\r\n";
+        assert_eq!(
+            destransportar_parte(cabeceras, b"SGkgdGhlcmU="),
+            b"Hi there"
+        );
+    }
+
+    #[test]
+    fn una_parte_en_quoted_printable_se_deshace() {
+        let cabeceras = b"Content-Transfer-Encoding: quoted-printable\r\n";
+        assert_eq!(
+            destransportar_parte(cabeceras, b"reuni=C3=B3n"),
+            "reunión".as_bytes()
+        );
+    }
+
+    /// `7bit`, `8bit` y `binary` quieren decir «no hay nada que deshacer», y una
+    /// codificación que no existe es mejor guardarla cruda que dejar a la
+    /// persona sin el archivo.
+    #[test]
+    fn lo_que_no_hay_que_deshacer_se_deja_igual() {
+        for cabeceras in [
+            &b"Content-Transfer-Encoding: 7bit\r\n"[..],
+            &b"Content-Transfer-Encoding: binary\r\n"[..],
+            &b"Content-Transfer-Encoding: lo-que-sea\r\n"[..],
+            &b"Content-Type: application/pdf\r\n"[..],
+            &b""[..],
+        ] {
+            assert_eq!(destransportar_parte(cabeceras, b"crudo"), b"crudo");
+        }
     }
 }
