@@ -221,6 +221,21 @@ pub fn resultados_de_search(linea: &str) -> Option<u32> {
     )
 }
 
+/// Cómo terminó un movimiento.
+///
+/// No es un booleano porque hay un tercer final, y es el que importa: el mensaje
+/// se copió y se marcó para borrar, pero **la copia vieja sigue ahí** porque
+/// borrarla de verdad habría borrado también lo de otro. Quien llame tiene que
+/// poder decirlo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Movido {
+    /// Está en el destino y ya no está en el origen.
+    Entero,
+    /// Está en el destino y en el origen sigue, marcado para borrar.
+    SinBorrarElViejo,
+}
+
 /// Si un número de parte tiene la forma que IMAP espera: `2`, `1.3.2`.
 ///
 /// Se comprueba porque **va crudo en el comando**. El número sale de recorrer el
@@ -1065,6 +1080,45 @@ impl<F: AsyncRead + AsyncWrite + Unpin + Send> Sesion<F> {
             .await
     }
 
+    /// Mueve un mensaje a otra casilla.
+    ///
+    /// # Los tres caminos, y por qué el tercero no borra
+    ///
+    /// Con `MOVE` (RFC 6851) es un solo comando y el servidor se encarga.
+    ///
+    /// Sin `MOVE` pero con `UIDPLUS` (RFC 4315): `UID COPY`, marcar `\Deleted`,
+    /// y `UID EXPUNGE` **de ese UID**, que borra ese y nada más.
+    ///
+    /// Sin ninguno de los dos se copia y se marca, y **no se expurga**. Un
+    /// `EXPUNGE` a secas borra de la casilla *todos* los mensajes marcados
+    /// `\Deleted`, no el nuestro: si la persona tiene mensajes marcados desde
+    /// otro cliente —hay clientes que marcan y no expurgan— mover uno le
+    /// borraría los otros para siempre. Dejar una copia de más es un problema
+    /// que se ve y se arregla; borrar correo ajeno a la operación no se deshace.
+    pub async fn mover(&mut self, uid: u32, destino: &str) -> Result<Movido, ImapError> {
+        let nombre = comillas(destino)
+            .ok_or_else(|| ImapError::Fallo("el nombre de la casilla no es válido".into()))?;
+
+        if self.capacidades.iter().any(|c| c == "MOVE") {
+            self.mandar(&format!("UID MOVE {uid} {nombre}")).await?;
+            return Ok(Movido::Entero);
+        }
+
+        // La copia primero. Si falla, no se marcó nada y el mensaje sigue donde
+        // estaba: el orden es lo que hace que un fallo a mitad de camino no
+        // pierda nada.
+        self.mandar(&format!("UID COPY {uid} {nombre}")).await?;
+        self.mandar(&format!("UID STORE {uid} +FLAGS (\\Deleted)"))
+            .await?;
+
+        if self.capacidades.iter().any(|c| c == "UIDPLUS") {
+            self.mandar(&format!("UID EXPUNGE {uid}")).await?;
+            return Ok(Movido::Entero);
+        }
+
+        Ok(Movido::SinBorrarElViejo)
+    }
+
     /// Abre una casilla **para escribir** y devuelve cuántos mensajes tiene.
     ///
     /// Se usa sólo cuando hay que cambiar una bandera. El resto del tiempo la
@@ -1526,6 +1580,115 @@ mod tests {
         let (mut sesion, tarea) = con_servidor("* OK listo", vec![]);
         assert!(sesion.parte(5, "1 BODY[]", 1024).await.is_err());
         // Y no se mandó nada: el comando ni se arma.
+        assert!(tarea.await.unwrap().is_empty());
+    }
+
+    /// Con `MOVE` es un solo comando y el servidor se encarga.
+    #[tokio::test]
+    async fn con_move_se_manda_uno_solo() {
+        let (mut sesion, tarea) = con_servidor(
+            "* OK listo",
+            vec![(
+                "UID MOVE 7 \"Papelera\"",
+                vec!["{etiqueta} OK MOVE completado"],
+            )],
+        );
+        sesion.capacidades = vec!["MOVE".into(), "UIDPLUS".into()];
+
+        assert_eq!(sesion.mover(7, "Papelera").await.unwrap(), Movido::Entero);
+        assert_eq!(tarea.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sin_move_pero_con_uidplus_se_copia_marca_y_expurga_ese() {
+        let (mut sesion, tarea) = con_servidor(
+            "* OK listo",
+            vec![
+                ("UID COPY 7 \"Papelera\"", vec!["{etiqueta} OK completado"]),
+                (
+                    "UID STORE 7 +FLAGS (\\Deleted)",
+                    vec!["{etiqueta} OK completado"],
+                ),
+                ("UID EXPUNGE 7", vec!["{etiqueta} OK completado"]),
+            ],
+        );
+        sesion.capacidades = vec!["UIDPLUS".into()];
+
+        assert_eq!(sesion.mover(7, "Papelera").await.unwrap(), Movido::Entero);
+        let recibidos = tarea.await.unwrap();
+        assert_eq!(recibidos.len(), 3);
+        // El UID **en** el expurgo: `EXPUNGE` a secas borraría todo lo marcado.
+        assert!(recibidos[2].contains("UID EXPUNGE 7"));
+    }
+
+    /// El caso que importa. `EXPUNGE` a secas borra de la casilla **todos** los
+    /// mensajes marcados `\Deleted`, no el nuestro. Si la persona tiene
+    /// mensajes marcados desde otro cliente, mover uno le borraría los otros
+    /// para siempre.
+    #[tokio::test]
+    async fn sin_uidplus_no_se_expurga_nada() {
+        let (mut sesion, tarea) = con_servidor(
+            "* OK listo",
+            vec![
+                ("UID COPY 7", vec!["{etiqueta} OK completado"]),
+                ("UID STORE 7 +FLAGS", vec!["{etiqueta} OK completado"]),
+            ],
+        );
+        sesion.capacidades = vec![];
+
+        assert_eq!(
+            sesion.mover(7, "Papelera").await.unwrap(),
+            Movido::SinBorrarElViejo
+        );
+        let recibidos = tarea.await.unwrap();
+        assert_eq!(recibidos.len(), 2, "no tenía que mandar un tercer comando");
+        for comando in &recibidos {
+            assert!(
+                !comando.to_ascii_uppercase().contains("EXPUNGE"),
+                "mandó un expurgo: {comando}"
+            );
+        }
+    }
+
+    /// El orden es lo que hace que un fallo a mitad de camino no pierda nada: si
+    /// la copia falla, el mensaje sigue entero donde estaba y sin marcar.
+    #[tokio::test]
+    async fn si_la_copia_falla_no_se_marca_nada() {
+        let (mut sesion, tarea) = con_servidor(
+            "* OK listo",
+            vec![(
+                "UID COPY",
+                vec!["{etiqueta} NO [TRYCREATE] la casilla no existe"],
+            )],
+        );
+        sesion.capacidades = vec!["UIDPLUS".into()];
+
+        assert!(sesion.mover(7, "NoExiste").await.is_err());
+        assert_eq!(tarea.await.unwrap().len(), 1, "no tenía que marcar nada");
+    }
+
+    /// Una casilla con espacios sin comillas son dos argumentos, y el servidor
+    /// contesta un error — o peor, mueve a otro lado.
+    #[tokio::test]
+    async fn la_casilla_de_destino_va_entre_comillas() {
+        let (mut sesion, tarea) = con_servidor(
+            "* OK listo",
+            vec![(
+                "UID MOVE 7 \"[Gmail]/Trash\"",
+                vec!["{etiqueta} OK completado"],
+            )],
+        );
+        sesion.capacidades = vec!["MOVE".into()];
+
+        sesion.mover(7, "[Gmail]/Trash").await.unwrap();
+        tarea.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn un_destino_invalido_no_llega_al_servidor() {
+        let (mut sesion, tarea) = con_servidor("* OK listo", vec![]);
+        sesion.capacidades = vec!["MOVE".into()];
+        assert!(sesion.mover(7, "con\r\nsalto").await.is_err());
         assert!(tarea.await.unwrap().is_empty());
     }
 
