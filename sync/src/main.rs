@@ -313,6 +313,46 @@ impl Lector {
         ))
     }
 
+    /// Mueve un mensaje a otra casilla.
+    async fn mover(
+        &mut self,
+        broker: &Broker,
+        cuenta: &broker::Account,
+        casilla: &str,
+        uid: u32,
+        destino: &str,
+    ) -> Result<imap::Movido, String> {
+        let casilla = casilla.to_string();
+        let destino = destino.to_string();
+        self.con_reintento(broker, cuenta, move |sesion| {
+            let casilla = casilla.clone();
+            let destino = destino.clone();
+            Box::pin(async move {
+                // `SELECT` y no `EXAMINE`: mover escribe.
+                sesion.seleccionar(&casilla).await?;
+                sesion.mover(uid, &destino).await
+            })
+        })
+        .await
+    }
+
+    /// Cuál es la papelera de esta cuenta, si tiene una.
+    ///
+    /// Se pregunta al servidor en vez de guardarla: la persona puede crearla,
+    /// borrarla o renombrarla desde otro cliente, y una papelera guardada que ya
+    /// no existe hace que borrar falle sin decir por qué.
+    async fn papelera(
+        &mut self,
+        broker: &Broker,
+        cuenta: &broker::Account,
+    ) -> Result<Option<String>, String> {
+        let casillas = self.casillas(broker, cuenta).await?;
+        Ok(casillas
+            .into_iter()
+            .find(|c| c.uso == casillas::Uso::Papelera && c.seleccionable)
+            .map(|c| c.ruta))
+    }
+
     /// Los últimos mensajes de una casilla que no es la de entrada.
     ///
     /// Se traen del servidor en el momento y no se guardan, al revés que los de
@@ -685,6 +725,93 @@ impl Servicio {
 
         serde_json::to_string(&imagen)
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
+    }
+
+    /// Mueve un mensaje a otra casilla.
+    ///
+    /// Devuelve `entero` o `sin_borrar_el_viejo`. Lo segundo no es un fallo: el
+    /// mensaje **está** en el destino, y la copia vieja quedó marcada para
+    /// borrar porque el servidor no sabe borrar una sola. Ver `imap::mover`.
+    async fn move_message(
+        &self,
+        #[zbus(signal_context)] emisor: SignalContext<'_>,
+        account_id: String,
+        mailbox: String,
+        uid: u32,
+        destino: String,
+    ) -> zbus::fdo::Result<String> {
+        let origen = casilla_o_entrada(&mailbox);
+        if destino.trim().is_empty() {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "no se dijo a qué casilla".into(),
+            ));
+        }
+        if destino == origen {
+            // Mover algo a donde ya está no es un error, pero tampoco es nada
+            // que haya que pedirle al servidor.
+            return Ok("entero".into());
+        }
+
+        let (broker, cuenta) = self.cuenta(&account_id).await?;
+        let lector = self.lector(&account_id).await;
+        let mut lector = lector.lock().await;
+
+        let como = lector
+            .mover(&broker, &cuenta, &origen, uid, &destino)
+            .await
+            .map_err(zbus::fdo::Error::Failed)?;
+        drop(lector);
+
+        // La lista en memoria es la de la de entrada. Si de ahí salió algo, se
+        // saca ya en vez de esperar la próxima vuelta: la ventana lo acaba de
+        // mover y verlo seguir ahí parece que no funcionó.
+        if origen.eq_ignore_ascii_case("INBOX") && matches!(como, imap::Movido::Entero) {
+            let mut estado = self.estado.lock().await;
+            if let Some(lista) = estado.mensajes.get_mut(&account_id) {
+                lista.retain(|m| m.uid != uid);
+            }
+            drop(estado);
+            let _ = Servicio::messages_changed(&emisor).await;
+        }
+
+        serde_json::to_string(&como)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
+    }
+
+    /// Manda un mensaje a la papelera.
+    ///
+    /// **Borrar quiere decir mover a la papelera del servidor**, no marcar
+    /// `\Deleted`: es lo que hace cualquier otro cliente y lo que la persona
+    /// espera poder deshacer desde el teléfono.
+    ///
+    /// Si la cuenta no tiene papelera se **falla** en vez de marcar y expurgar.
+    /// Un borrado que no se puede deshacer no es lo que alguien pidió al apretar
+    /// un botón que dice «borrar», y decirlo permite ofrecer otra cosa.
+    async fn delete_message(
+        &self,
+        #[zbus(signal_context)] emisor: SignalContext<'_>,
+        account_id: String,
+        mailbox: String,
+        uid: u32,
+    ) -> zbus::fdo::Result<String> {
+        let (broker, cuenta) = self.cuenta(&account_id).await?;
+        let lector = self.lector(&account_id).await;
+        let papelera = {
+            let mut lector = lector.lock().await;
+            lector
+                .papelera(&broker, &cuenta)
+                .await
+                .map_err(zbus::fdo::Error::Failed)?
+        };
+
+        let Some(papelera) = papelera else {
+            return Err(zbus::fdo::Error::Failed(
+                "esta cuenta no tiene papelera en el servidor".into(),
+            ));
+        };
+
+        self.move_message(emisor, account_id, mailbox, uid, papelera)
+            .await
     }
 
     /// El texto de un mensaje.
