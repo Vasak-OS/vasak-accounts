@@ -79,6 +79,23 @@ pub struct Salida {
     /// Qué pasó la última vez. Vacío si todavía no se intentó.
     #[serde(default)]
     pub ultimo_error: String,
+    /// A partir de cuándo **la persona** pidió que salga, en RFC 3339.
+    ///
+    /// Vacío quiere decir «cuando se pueda», que es lo de siempre. Lo usan dos
+    /// cosas que son la misma por dentro: el envío programado, con la hora que
+    /// alguien eligió, y la ventana para deshacer, que es `ahora` más unos
+    /// segundos.
+    ///
+    /// Aparte de `proximo_intento` a propósito, aunque los dos sean momentos:
+    /// uno lo pone la persona y el otro lo pone un fallo. Con un solo campo, un
+    /// mensaje programado para las nueve que falla a las nueve se reintentaría
+    /// a las nueve y treinta — y ya no saldría a la hora que se pidió.
+    ///
+    /// `#[serde(default)]` no es adorno: la cola vive en disco, y sin eso un
+    /// mensaje encolado por una versión anterior no se podría leer. Un mensaje
+    /// que alguien escribió y no se puede leer es un mensaje perdido.
+    #[serde(default)]
+    pub programado_para: String,
     /// A partir de cuándo se puede volver a intentar, en ISO 8601.
     ///
     /// Se guarda el **momento** y no se calcula desde la fecha del mensaje: así
@@ -88,6 +105,21 @@ pub struct Salida {
     /// rehacer la cuenta.
     #[serde(default)]
     pub proximo_intento: String,
+}
+
+/// Si un momento guardado ya pasó.
+///
+/// Vacío quiere decir «no hay nada que esperar». Una fecha que no se entiende
+/// **también**: un campo ilegible no puede dejar encerrado para siempre un
+/// mensaje que alguien escribió.
+fn ya_paso(momento: &str, ahora: chrono::DateTime<chrono::Utc>) -> bool {
+    if momento.is_empty() {
+        return true;
+    }
+    match chrono::DateTime::parse_from_rfc3339(momento) {
+        Ok(cuando) => ahora >= cuando.with_timezone(&chrono::Utc),
+        Err(_) => true,
+    }
 }
 
 impl Salida {
@@ -110,15 +142,20 @@ impl Salida {
     /// versión anterior— le toca ya: es preferible un intento de más a un
     /// mensaje que no sale nunca.
     pub fn le_toca(&self, ahora: chrono::DateTime<chrono::Utc>) -> bool {
-        if self.proximo_intento.is_empty() {
-            return true;
-        }
-        match chrono::DateTime::parse_from_rfc3339(&self.proximo_intento) {
-            Ok(cuando) => ahora >= cuando.with_timezone(&chrono::Utc),
-            // Una fecha que no se entiende no puede dejar un mensaje encerrado
-            // para siempre.
-            Err(_) => true,
-        }
+        // **Las dos condiciones**, y por separado. `proximo_intento` quiere
+        // decir «esperá antes de reintentar» y `programado_para` quiere decir
+        // «no lo mandes antes de esta hora»: son cosas distintas y sumarlas en
+        // un solo campo hace que un programado que falla una vez se corra de
+        // hora — la espera exponencial se apilaría encima de la hora elegida.
+        ya_paso(&self.programado_para, ahora) && ya_paso(&self.proximo_intento, ahora)
+    }
+
+    /// Si un mensaje está esperando una hora que todavía no llegó.
+    ///
+    /// Es lo que la ventana necesita para mostrarlo como programado y no como
+    /// «saliendo»: son dos cosas distintas y se ven igual si no se pregunta.
+    pub fn esta_programado(&self, ahora: chrono::DateTime<chrono::Utc>) -> bool {
+        !ya_paso(&self.programado_para, ahora)
     }
 
     /// Anota que falló y cuándo se vuelve a probar.
@@ -321,6 +358,7 @@ mod tests {
             intentos: 0,
             estado: Estado::Pendiente,
             ultimo_error: String::new(),
+            programado_para: String::new(),
             proximo_intento: String::new(),
         }
     }
@@ -548,4 +586,78 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&raiz);
     }
+
+    /// Las dos condiciones, por separado. Con un solo campo, un programado que
+    /// falla una vez se corre de hora: la espera exponencial del reintento se
+    /// apila encima de la hora que alguien eligió.
+    #[test]
+    fn un_programado_que_falla_no_se_corre_de_hora() {
+        let nueve = chrono::DateTime::parse_from_rfc3339("2026-09-12T09:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let mut s = salida("uno");
+        s.programado_para = "2026-09-12T09:00:00Z".into();
+
+        // Antes de la hora, no le toca.
+        assert!(!s.le_toca(nueve - chrono::Duration::minutes(1)));
+        // A la hora, sí.
+        assert!(s.le_toca(nueve));
+
+        // Falla: el reintento lo corre media hora.
+        s.fallo("el servidor no contestó".into(), nueve);
+        assert!(!s.le_toca(nueve));
+        // Pero la hora que pidió la persona sigue siendo las nueve: pasado el
+        // reintento sale, y no una hora más tarde por haberse sumado las dos.
+        assert!(s.le_toca(nueve + chrono::Duration::hours(2)));
+    }
+
+    #[test]
+    fn sin_hora_pedida_sale_cuando_se_pueda() {
+        let ahora = chrono::Utc::now();
+        let s = salida("uno");
+        assert!(s.le_toca(ahora));
+        assert!(!s.esta_programado(ahora));
+    }
+
+    /// Un campo ilegible no puede dejar encerrado para siempre un mensaje que
+    /// alguien escribió.
+    #[test]
+    fn una_hora_que_no_se_entiende_no_encierra_el_mensaje() {
+        let ahora = chrono::Utc::now();
+        let mut s = salida("uno");
+        s.programado_para = "el jueves".into();
+        assert!(s.le_toca(ahora));
+        assert!(!s.esta_programado(ahora));
+    }
+
+    /// Esperar una hora y estar saliendo son dos cosas distintas, y se ven
+    /// igual si no se pregunta.
+    #[test]
+    fn se_puede_saber_si_esta_esperando_su_hora() {
+        let ahora = chrono::Utc::now();
+        let mut s = salida("uno");
+        s.programado_para = (ahora + chrono::Duration::hours(3)).to_rfc3339();
+        assert!(s.esta_programado(ahora));
+        assert!(!s.le_toca(ahora));
+    }
+
+    /// La cola vive en disco. Un mensaje encolado por una versión anterior no
+    /// tiene el campo nuevo, y no poder leerlo es perder un mensaje que alguien
+    /// escribió.
+    #[test]
+    fn un_mensaje_de_una_version_anterior_se_sigue_leyendo() {
+        let viejo = r#"{
+            "id": "uno",
+            "account_id": "cuenta",
+            "borrador": {"de": "a@b.c", "para": ["d@e.f"], "asunto": "x", "cuerpo": "y"},
+            "identificador": "<x@b.c>",
+            "fecha": "Thu, 10 Sep 2026 12:00:00 +0000"
+        }"#;
+        let leido: Salida = serde_json::from_str(viejo).expect("tiene que poder leerse");
+        assert_eq!(leido.id, "uno");
+        assert!(leido.programado_para.is_empty());
+        assert!(leido.le_toca(chrono::Utc::now()));
+    }
+
 }

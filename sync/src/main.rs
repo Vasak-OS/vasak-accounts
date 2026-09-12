@@ -660,12 +660,26 @@ impl Servicio {
     /// El `de` no lo elige la ventana: se toma de la cuenta. Mandar desde una
     /// dirección que no es la que autentica hace que el servidor rechace, o peor,
     /// que el mensaje llegue y lo marquen como falsificado.
+    /// `no_antes_de` es una hora en RFC 3339, o vacío para «cuando se pueda».
+    /// Sirve para las dos cosas que por dentro son la misma: programar un envío
+    /// para una hora, y dar unos segundos para arrepentirse.
+    ///
+    /// Si la hora no se entiende **se rechaza** en vez de mandarlo ya. Un
+    /// mensaje que sale ahora cuando se pidió para mañana no se puede deshacer.
     async fn send_message(
         &self,
         #[zbus(signal_context)] emisor: SignalContext<'_>,
         account_id: String,
         borrador: String,
+        no_antes_de: String,
     ) -> zbus::fdo::Result<String> {
+        if !no_antes_de.is_empty()
+            && chrono::DateTime::parse_from_rfc3339(&no_antes_de).is_err()
+        {
+            return Err(zbus::fdo::Error::InvalidArgs(format!(
+                "«{no_antes_de}» no es una hora válida"
+            )));
+        }
         let mut borrador: redactar::Borrador = serde_json::from_str(&borrador)
             .map_err(|e| zbus::fdo::Error::InvalidArgs(format!("el borrador no se entiende: {e}")))?;
 
@@ -703,6 +717,7 @@ impl Servicio {
             estado: cola::Estado::Pendiente,
             ultimo_error: String::new(),
             proximo_intento: String::new(),
+            programado_para: no_antes_de,
         };
 
         cola::Cola::nueva(cola::directorio())
@@ -722,7 +737,24 @@ impl Servicio {
             .and_then(|c| c.todos())
             .map_err(zbus::fdo::Error::Failed)?;
 
-        serde_json::to_string(&salidas)
+        // Se agrega si está esperando su hora, que no es un campo del archivo
+        // sino una pregunta sobre el reloj. Calcularlo acá y no en la ventana
+        // deja la regla —vacío, ilegible, o ya pasó— en un solo lugar; hacerlo
+        // en los dos es tener dos reglas que se pueden separar.
+        let ahora = chrono::Utc::now();
+        let vista: Vec<_> = salidas
+            .into_iter()
+            .map(|salida| {
+                let esperando = salida.esta_programado(ahora);
+                let mut json = serde_json::to_value(salida).unwrap_or_default();
+                if let Some(objeto) = json.as_object_mut() {
+                    objeto.insert("esperando_su_hora".into(), esperando.into());
+                }
+                json
+            })
+            .collect();
+
+        serde_json::to_string(&vista)
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
     }
 
