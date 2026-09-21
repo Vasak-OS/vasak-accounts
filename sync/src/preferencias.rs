@@ -61,9 +61,16 @@ pub struct Preferencias {
 /// `XDG_CONFIG_HOME` y, si no está, `~/.config`, que es lo que dice el estándar
 /// y lo que ya hace `cola.rs` con `XDG_DATA_HOME`.
 pub fn archivo() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    // Por `dirs`, igual que `cola.rs`. Acá no se escribe, pero una base relativa
+    // igual duele: se leería un archivo de preferencias de donde no está —o de
+    // donde haya uno que no es—, y quien llama no lo distingue de «no hay
+    // preferencias guardadas», así que se cae a las de por omisión sin decirlo.
+    archivo_bajo(dirs::config_dir())
+}
+
+/// La misma decisión sin leer el entorno, para poder probarla.
+fn archivo_bajo(base: Option<PathBuf>) -> Option<PathBuf> {
+    let base = base.filter(|base| base.is_absolute())?;
     Some(base.join("vasak-mail").join("preferencias.json"))
 }
 
@@ -140,8 +147,43 @@ mod tests {
     }
 
     #[test]
-    fn el_archivo_cuelga_de_la_configuracion_del_usuario() {
-        let ruta = archivo().expect("hay HOME o XDG_CONFIG_HOME en cualquier sesión");
-        assert!(ruta.ends_with("vasak-mail/preferencias.json"), "{ruta:?}");
+    fn archivo_usa_el_directorio_de_configuracion_del_sistema() {
+        // Antes esto hacía `archivo().expect(...)` dando por sentado que hay
+        // `HOME` o `XDG_CONFIG_HOME`. No lo hay siempre —`dirs::config_dir()`
+        // puede no resolver nada—, y ahí `None` es la respuesta correcta y no
+        // un fallo de la prueba.
+        //
+        // Lo que se comprueba entonces es el **cableado**: que `archivo()` sea
+        // exactamente `archivo_bajo` sobre el directorio del sistema. Vale igual
+        // en una máquina sin `HOME`, donde las dos dan `None`, y falla si
+        // alguien cambia de dónde sale la base. Envolverlo en un `if let` habría
+        // sido peor: una prueba que puede pasar sin comprobar nada.
+        assert_eq!(archivo(), archivo_bajo(dirs::config_dir()));
+    }
+
+    #[test]
+    fn el_archivo_cuelga_del_directorio_de_configuracion() {
+        assert_eq!(
+            archivo_bajo(Some(PathBuf::from("/home/pato/.config"))),
+            Some(PathBuf::from(
+                "/home/pato/.config/vasak-mail/preferencias.json"
+            ))
+        );
+    }
+
+    #[test]
+    fn una_base_relativa_no_da_archivo() {
+        // Acá no se escribe, pero una base relativa igual duele: se leería de
+        // donde no está —o de donde haya un archivo que no es— y quien llama no
+        // lo distingue de «no hay preferencias guardadas», así que se cae a las
+        // de por omisión sin decirlo.
+        for relativa in ["", "config", "./config", "../config"] {
+            assert_eq!(
+                archivo_bajo(Some(PathBuf::from(relativa))),
+                None,
+                "una base de {relativa:?} no tiene que dar archivo"
+            );
+        }
+        assert_eq!(archivo_bajo(None), None);
     }
 }

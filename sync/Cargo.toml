@@ -7,6 +7,9 @@ license.workspace = true
 description = "Mantiene al día el correo de las cuentas en línea, como servicio del usuario"
 
 [dependencies]
+# Los directorios base del estándar, para que la regla de que una variable
+# relativa o vacía se ignora viva en un solo lugar y no en una copia por módulo.
+dirs = "6"
 # Sanear el HTML de un mensaje, que lo escribió un desconocido. Parsea con el
 # mismo motor que un navegador y reescribe desde el árbol, que es lo que cierra
 # la familia de ataques que un recortador por texto deja pasar. Ver `html.rs`.
