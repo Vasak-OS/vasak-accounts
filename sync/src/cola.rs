@@ -173,10 +173,26 @@ impl Salida {
 /// En los datos del usuario, no en la caché: una caché se puede borrar entera
 /// sin avisar, y con ella se iría un correo sin mandar.
 pub fn directorio() -> PathBuf {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+    // Por `dirs` y no leyendo el entorno acá: la regla —absoluta o nada, que el
+    // estándar pide y que de paso cubre la variable vacía, porque la cadena
+    // vacía tampoco es absoluta— vive en un solo lugar en vez de en una copia
+    // por programa.
+    //
+    // Antes esto filtraba `XDG_DATA_HOME` por absoluta y **no** `HOME`, así que
+    // la mitad del agujero seguía abierta: con un `HOME` relativo la cola de
+    // salida se escribía bajo el directorio de trabajo del daemon. El filtro de
+    // acá cierra esa otra mitad, que es la que `dirs` no mira.
+    directorio_bajo(dirs::data_dir())
+}
+
+/// La misma decisión sin leer el entorno.
+///
+/// Aparte para poder probarla: el entorno es global al proceso y las pruebas
+/// corren en paralelo, así que una que escriba una variable decide al azar el
+/// resultado de otra.
+fn directorio_bajo(base: Option<PathBuf>) -> PathBuf {
+    let base = base
+        .filter(|base| base.is_absolute())
         .unwrap_or_else(|| PathBuf::from("/tmp"));
 
     base.join("vasak-accounts-sync/salientes")
@@ -671,5 +687,31 @@ mod tests {
         assert_eq!(leido.id, "uno");
         assert!(leido.programado_para.is_empty());
         assert!(leido.le_toca(chrono::Utc::now()));
+    }
+
+    #[test]
+    fn la_cola_cuelga_del_directorio_de_datos() {
+        assert_eq!(
+            directorio_bajo(Some(PathBuf::from("/home/pato/.local/share"))),
+            PathBuf::from("/home/pato/.local/share/vasak-accounts-sync/salientes")
+        );
+    }
+
+    #[test]
+    fn una_base_relativa_no_se_usa() {
+        // Antes esto filtraba `XDG_DATA_HOME` por absoluta y no `HOME`, así que
+        // con un `HOME` relativo la cola de salida se escribía bajo el
+        // directorio de trabajo del daemon — que en una unidad de systemd no es
+        // el home de nadie, y los correos sin mandar quedaban ahí.
+        //
+        // Las cuatro formas de no ser absoluta: la del nombre suelto es la que
+        // se escapa cuando uno se acuerda sólo de la vacía.
+        for relativa in ["", "datos", "./datos", "../datos"] {
+            assert_eq!(
+                directorio_bajo(Some(PathBuf::from(relativa))),
+                PathBuf::from("/tmp/vasak-accounts-sync/salientes"),
+                "una base de {relativa:?} no tiene que usarse"
+            );
+        }
     }
 }
