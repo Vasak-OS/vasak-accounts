@@ -147,9 +147,18 @@ mod tests {
     }
 
     #[test]
-    fn el_archivo_cuelga_de_la_configuracion_del_usuario() {
-        let ruta = archivo().expect("hay HOME o XDG_CONFIG_HOME en cualquier sesión");
-        assert!(ruta.ends_with("vasak-mail/preferencias.json"), "{ruta:?}");
+    fn archivo_usa_el_directorio_de_configuracion_del_sistema() {
+        // Antes esto hacía `archivo().expect(...)` dando por sentado que hay
+        // `HOME` o `XDG_CONFIG_HOME`. No lo hay siempre —`dirs::config_dir()`
+        // puede no resolver nada—, y ahí `None` es la respuesta correcta y no
+        // un fallo de la prueba.
+        //
+        // Lo que se comprueba entonces es el **cableado**: que `archivo()` sea
+        // exactamente `archivo_bajo` sobre el directorio del sistema. Vale igual
+        // en una máquina sin `HOME`, donde las dos dan `None`, y falla si
+        // alguien cambia de dónde sale la base. Envolverlo en un `if let` habría
+        // sido peor: una prueba que puede pasar sin comprobar nada.
+        assert_eq!(archivo(), archivo_bajo(dirs::config_dir()));
     }
 
     #[test]
