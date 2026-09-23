@@ -2,11 +2,11 @@ use crate::providers::Provider;
 use crate::storage::{Account, AccountDatabase, CapabilityType, SecretStore};
 use chrono::{DateTime, Utc};
 use oauth2::basic::{BasicClient, BasicErrorResponseType};
+use oauth2::TokenResponse;
 use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge,
     PkceCodeVerifier, RedirectUrl, RefreshToken, RequestTokenError, Scope, TokenUrl,
 };
-use oauth2::TokenResponse;
 
 /// Cuánta vida le tiene que quedar a un token para darlo sin refrescarlo.
 ///
@@ -65,7 +65,16 @@ fn http_client() -> Result<reqwest::Client, TokenError> {
 fn oauth_client(
     provider: &Provider,
     redirect_uri: Option<&str>,
-) -> Result<BasicClient<oauth2::EndpointSet, oauth2::EndpointNotSet, oauth2::EndpointNotSet, oauth2::EndpointNotSet, oauth2::EndpointSet>, TokenError> {
+) -> Result<
+    BasicClient<
+        oauth2::EndpointSet,
+        oauth2::EndpointNotSet,
+        oauth2::EndpointNotSet,
+        oauth2::EndpointNotSet,
+        oauth2::EndpointSet,
+    >,
+    TokenError,
+> {
     let client_id = provider
         .client_id
         .clone()
@@ -83,8 +92,13 @@ fn oauth_client(
                 .map_err(|e| TokenError::Failed(format!("auth_url inválida: {e}")))?,
         )
         .set_token_uri(
-            TokenUrl::new(provider.token_url.clone().ok_or_else(|| falta("token_url"))?)
-                .map_err(|e| TokenError::Failed(format!("token_url inválida: {e}")))?,
+            TokenUrl::new(
+                provider
+                    .token_url
+                    .clone()
+                    .ok_or_else(|| falta("token_url"))?,
+            )
+            .map_err(|e| TokenError::Failed(format!("token_url inválida: {e}")))?,
         );
 
     if let Some(secreto) = provider.client_secret.clone().filter(|s| !s.is_empty()) {
@@ -126,11 +140,18 @@ pub fn authorization_url(
     // Sin repetir. Google devuelve error si el mismo alcance viene dos veces, y
     // dos capacidades del mismo proveedor comparten alcances a menudo.
     let mut vistos = std::collections::BTreeSet::new();
-    for capacidad in capabilities {
-        for alcance in provider.scopes.get(capacidad).into_iter().flatten() {
-            if vistos.insert(alcance.clone()) {
-                pedido = pedido.add_scope(Scope::new(alcance.clone()));
-            }
+    // Los de identidad primero y siempre: son los que hacen que al terminar se
+    // sepa **de quién** es la cuenta. Sin eso no hay forma de armar la dirección
+    // de CardDAV —que lleva el correo adentro— ni de autenticarse contra IMAP,
+    // donde el usuario viaja en la misma línea que el token.
+    let alcances = provider.identity_scopes.iter().chain(
+        capabilities
+            .iter()
+            .flat_map(|c| provider.scopes.get(c).into_iter().flatten()),
+    );
+    for alcance in alcances {
+        if vistos.insert(alcance.clone()) {
+            pedido = pedido.add_scope(Scope::new(alcance.clone()));
         }
     }
 
@@ -342,6 +363,14 @@ pub fn provider_desde_config(
         scopes: Default::default(),
         extra_auth_params: Default::default(),
         capabilities: Default::default(),
+        // Este proveedor se arma **para refrescar un token**, no para conectar
+        // una cuenta: la identidad ya se resolvió al conectarla y las
+        // direcciones ya están guardadas. Rellenarlas acá desde el catálogo
+        // sería peor que dejarlas vacías —el archivo de /etc puede haber
+        // cambiado, y lo que vale para esta cuenta es lo que se guardó con ella—.
+        identity_scopes: Default::default(),
+        userinfo_url: Default::default(),
+        endpoints: Default::default(),
     })
 }
 
@@ -366,13 +395,19 @@ pub fn persistir(
     }
 
     let Some(expira) = frescos.expires_at else {
-        tracing::warn!("el proveedor no dijo cuándo expira el token de '{}'", cuenta.id);
+        tracing::warn!(
+            "el proveedor no dijo cuándo expira el token de '{}'",
+            cuenta.id
+        );
         return Ok(());
     };
 
     let mut nueva_config = config.clone();
     if let Some(objeto) = nueva_config.as_object_mut() {
-        objeto.insert("expires_at".into(), serde_json::Value::String(expira.to_rfc3339()));
+        objeto.insert(
+            "expires_at".into(),
+            serde_json::Value::String(expira.to_rfc3339()),
+        );
     }
 
     let mut db = AccountDatabase::for_user(uid)
@@ -404,13 +439,12 @@ pub fn persistir(
 /// El estándar pide que el servidor conteste 200 aunque el token ya no valga, así
 /// que un token vencido no es un fallo: es el resultado que se buscaba.
 pub async fn revoke(provider: &Provider, refresh_token: &str) -> Result<(), TokenError> {
-    let url = provider
-        .revocation_url
-        .as_deref()
-        .ok_or_else(|| TokenError::Failed(format!(
+    let url = provider.revocation_url.as_deref().ok_or_else(|| {
+        TokenError::Failed(format!(
             "'{}' no tiene dónde avisar que la autorización terminó",
             provider.id
-        )))?;
+        ))
+    })?;
 
     let client_id = provider
         .client_id
@@ -451,18 +485,70 @@ pub async fn revoke(provider: &Provider, refresh_token: &str) -> Result<(), Toke
     )))
 }
 
+/// Quién es el dueño del token, preguntándoselo al proveedor.
+///
+/// Devuelve el correo. Es lo que las aplicaciones guardan como `username` y lo
+/// que completa las direcciones que lo llevan adentro.
+///
+/// **No es un error que falle.** Un proveedor sin `userinfo_url`, una respuesta
+/// rara o un corte de red dejan la cuenta sin identidad, y eso es peor que
+/// tenerla pero mucho mejor que perder la autorización recién concedida: lo que
+/// falte se ve como «la cuenta no guardó el usuario», que dice qué hacer. Por eso
+/// devuelve `Option` y no `Result`.
+pub async fn resolve_identity(provider: &Provider, access_token: &str) -> Option<String> {
+    let url = provider.userinfo_url.as_deref()?;
+
+    let respuesta = http_client()
+        .ok()?
+        .get(url)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .map_err(|e| tracing::warn!("no se pudo preguntar la identidad a {url}: {e}"))
+        .ok()?;
+
+    if !respuesta.status().is_success() {
+        tracing::warn!(
+            "{url} contestó {} al preguntar la identidad",
+            respuesta.status()
+        );
+        return None;
+    }
+
+    let datos: serde_json::Value = respuesta
+        .json()
+        .await
+        .map_err(|e| tracing::warn!("{url} devolvió algo que no es JSON: {e}"))
+        .ok()?;
+
+    // `email` es lo que dice OpenID Connect. `preferred_username` y `upn` son de
+    // Microsoft, que no siempre manda el primero.
+    ["email", "preferred_username", "upn"]
+        .iter()
+        .find_map(|campo| datos.get(campo).and_then(|v| v.as_str()))
+        .map(|s| s.to_string())
+}
+
 /// La configuración que se guarda en la capacidad al conectar una cuenta.
 ///
-/// Es lo que hace que el refresco pueda funcionar más adelante: sin `client_id`,
-/// `token_url` y `expires_at` guardados, el motor de refresco no tiene con qué
-/// hablarle al proveedor ni cómo saber que hace falta. Antes se guardaba sólo el
-/// access_token, y la cuenta se moría en una hora sin decir por qué.
+/// Dos cosas distintas conviven acá:
+///
+/// 1. **Cómo seguir hablando con el proveedor**: sin `client_id`, `token_url` y
+///    `expires_at` guardados, el motor de refresco no tiene con qué hablarle ni
+///    cómo saber que hace falta. Antes se guardaba sólo el access_token, y la
+///    cuenta se moría en una hora sin decir por qué.
+/// 2. **Dónde está el servicio y de quién es**: `url`, los servidores del correo
+///    y `username`. Esto es lo que leen las aplicaciones, y faltaba: una cuenta
+///    de Google se conectaba bien y después el calendario decía «la cuenta no
+///    guardó la dirección de sus calendarios» sin que reconectarla arreglara
+///    nada, porque no era algo que se hubiera perdido — nunca se había escrito.
 pub fn capability_config(
     provider: &Provider,
     capability: &CapabilityType,
     frescos: &FreshTokens,
+    identidad: Option<&str>,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut config = serde_json::json!({
         "client_id": provider.client_id,
         "auth_url": provider.auth_url,
         "token_url": provider.token_url,
@@ -472,12 +558,43 @@ pub fn capability_config(
         "revocation_url": provider.revocation_url,
         "scopes": provider.scopes.get(capability).cloned().unwrap_or_default(),
         "expires_at": frescos.expires_at.map(|e| e.to_rfc3339()),
-    })
+    });
+
+    let Some(objeto) = config.as_object_mut() else {
+        return config;
+    };
+
+    if let Some(quien) = identidad {
+        objeto.insert(
+            "username".into(),
+            serde_json::Value::String(quien.to_string()),
+        );
+    }
+
+    // Las direcciones del proveedor, con la identidad puesta donde la plantilla
+    // la pide. Una que la necesite y no la tenga **no se guarda a medias**: una
+    // URL con `{email}` adentro no es una dirección, es una que falla al usarse
+    // diciendo cualquier otra cosa.
+    for (clave, valor) in provider.endpoints.get(capability).into_iter().flatten() {
+        match valor.resolve(identidad) {
+            Some(resuelto) => {
+                objeto.insert(clave.clone(), resuelto);
+            }
+            None => tracing::warn!(
+                "el proveedor '{}' necesita la identidad para '{clave}' de {} y no se pudo resolver",
+                provider.id,
+                capability.as_id(),
+            ),
+        }
+    }
+
+    config
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::EndpointValue;
     use std::collections::HashMap;
 
     fn proveedor() -> Provider {
@@ -499,6 +616,36 @@ mod tests {
         let mut extra = HashMap::new();
         extra.insert("access_type".to_string(), "offline".to_string());
 
+        // Las direcciones, como las declara el archivo del paquete: una fija y
+        // una con la identidad adentro, que son los dos casos que hay.
+        let mut endpoints = HashMap::new();
+        endpoints.insert(
+            CapabilityType::Calendar,
+            HashMap::from([(
+                "url".to_string(),
+                EndpointValue::Text("https://apidata.googleusercontent.com/caldav/v2/".into()),
+            )]),
+        );
+        endpoints.insert(
+            CapabilityType::Contacts,
+            HashMap::from([(
+                "url".to_string(),
+                EndpointValue::Text(
+                    "https://www.googleapis.com/carddav/v1/principals/{email}/".into(),
+                ),
+            )]),
+        );
+        endpoints.insert(
+            CapabilityType::Email,
+            HashMap::from([
+                (
+                    "imap_server".to_string(),
+                    EndpointValue::Text("imap.gmail.com".into()),
+                ),
+                ("imap_port".to_string(), EndpointValue::Number(993)),
+            ]),
+        );
+
         Provider {
             id: "google".into(),
             display_name: "Google".into(),
@@ -511,6 +658,9 @@ mod tests {
             scopes,
             extra_auth_params: extra,
             capabilities: Vec::new(),
+            identity_scopes: vec!["openid".into()],
+            userinfo_url: Some("https://openidconnect.googleapis.com/v1/userinfo".into()),
+            endpoints,
         }
     }
 
@@ -566,9 +716,18 @@ mod tests {
             .map(|(_, v)| v.to_string())
             .expect("la URL tiene que llevar scope");
 
-        let veces = scope.split(' ').filter(|s| s.ends_with("/calendar")).count();
-        assert_eq!(veces, 1, "el alcance de calendario se mandó {veces} veces: {scope}");
-        assert!(scope.contains("/contacts"), "falta el de contactos: {scope}");
+        let veces = scope
+            .split(' ')
+            .filter(|s| s.ends_with("/calendar"))
+            .count();
+        assert_eq!(
+            veces, 1,
+            "el alcance de calendario se mandó {veces} veces: {scope}"
+        );
+        assert!(
+            scope.contains("/contacts"),
+            "falta el de contactos: {scope}"
+        );
     }
 
     /// Sin `access_type=offline` Google no devuelve refresh_token, y la cuenta
@@ -602,6 +761,110 @@ mod tests {
         .is_err());
     }
 
+    fn frescos() -> FreshTokens {
+        FreshTokens {
+            access: "el-access".into(),
+            refresh: Some("el-refresh".into()),
+            expires_at: None,
+        }
+    }
+
+    /// Lo que las aplicaciones leen: **dónde está el servicio y de quién es**.
+    ///
+    /// Faltaba, y no fallaba nada acá: la cuenta se conectaba bien y recién al
+    /// abrir el calendario aparecía «la cuenta no guardó la dirección de sus
+    /// calendarios». Reconectarla no arreglaba nada, porque no era algo que se
+    /// hubiera perdido — nunca se había escrito.
+    #[test]
+    fn la_configuracion_guardada_dice_donde_esta_el_servicio() {
+        let config = capability_config(
+            &proveedor(),
+            &CapabilityType::Calendar,
+            &frescos(),
+            Some("pepe@gmail.com"),
+        );
+
+        assert_eq!(
+            config["url"],
+            "https://apidata.googleusercontent.com/caldav/v2/"
+        );
+        assert_eq!(config["username"], "pepe@gmail.com");
+    }
+
+    #[test]
+    fn la_direccion_que_lleva_el_correo_adentro_se_completa() {
+        let config = capability_config(
+            &proveedor(),
+            &CapabilityType::Contacts,
+            &frescos(),
+            Some("pepe@gmail.com"),
+        );
+
+        assert_eq!(
+            config["url"],
+            "https://www.googleapis.com/carddav/v1/principals/pepe@gmail.com/"
+        );
+    }
+
+    #[test]
+    fn sin_identidad_esa_direccion_no_se_guarda_a_medias() {
+        // Una URL con `{email}` adentro no es una dirección incompleta: es una
+        // que falla al usarse diciendo cualquier otra cosa. Que falte se ve como
+        // «la cuenta no guardó la dirección», que al menos dice qué hacer.
+        let config = capability_config(&proveedor(), &CapabilityType::Contacts, &frescos(), None);
+
+        assert!(config.get("url").is_none(), "{config}");
+        assert!(config.get("username").is_none(), "{config}");
+    }
+
+    #[test]
+    fn la_direccion_fija_se_guarda_aunque_no_haya_identidad() {
+        // La del calendario no lleva el correo adentro, así que no depende de él:
+        // negarla también sería perder lo que sí se puede dar.
+        let config = capability_config(&proveedor(), &CapabilityType::Calendar, &frescos(), None);
+
+        assert_eq!(
+            config["url"],
+            "https://apidata.googleusercontent.com/caldav/v2/"
+        );
+    }
+
+    #[test]
+    fn el_correo_guarda_sus_servidores_con_el_puerto_como_numero() {
+        // El sincronizador lee `imap_port` como número. Guardado como texto, la
+        // cuenta cae al puerto por omisión sin decir nada.
+        let config = capability_config(
+            &proveedor(),
+            &CapabilityType::Email,
+            &frescos(),
+            Some("pepe@gmail.com"),
+        );
+
+        assert_eq!(config["imap_server"], "imap.gmail.com");
+        assert_eq!(config["imap_port"], 993);
+        assert!(config["imap_port"].is_number(), "{config}");
+        // Y el usuario, que en XOAUTH2 viaja en la misma línea que el token.
+        assert_eq!(config["username"], "pepe@gmail.com");
+    }
+
+    #[test]
+    fn los_alcances_de_identidad_se_piden_siempre() {
+        // Sin ellos el proveedor no contesta quién es la persona, y sin eso no
+        // hay `username` ni dirección de CardDAV.
+        let (url, _, _) = authorization_url(
+            &proveedor(),
+            &[CapabilityType::Calendar],
+            "http://127.0.0.1:45321/callback",
+        )
+        .expect("tiene client_id");
+
+        let scope = url
+            .split('&')
+            .find_map(|p| p.strip_prefix("scope="))
+            .expect("la URL lleva alcances");
+        assert!(scope.contains("openid"), "{url}");
+    }
+
     /// La configuración que se guarda en la cuenta es lo que hace posible el
     /// refresco más adelante. Antes se guardaba sólo el access_token, y sin
     /// `client_id`/`token_url`/`expires_at` el motor no tenía con qué hablarle
@@ -615,11 +878,14 @@ mod tests {
             expires_at: Some(vence),
         };
 
-        let config = capability_config(&proveedor(), &CapabilityType::Calendar, &frescos);
+        let config = capability_config(&proveedor(), &CapabilityType::Calendar, &frescos, None);
 
         assert_eq!(config["client_id"], "el-client-id");
         assert_eq!(config["token_url"], "https://oauth2.googleapis.com/token");
-        assert_eq!(config["auth_url"], "https://accounts.google.com/o/oauth2/v2/auth");
+        assert_eq!(
+            config["auth_url"],
+            "https://accounts.google.com/o/oauth2/v2/auth"
+        );
         assert_eq!(config["expires_at"], vence.to_rfc3339());
         assert_eq!(
             config["scopes"][0],
@@ -628,7 +894,10 @@ mod tests {
 
         // Y ningún token adentro: accounts.json no es donde viven los secretos.
         let texto = config.to_string();
-        assert!(!texto.contains("el-access") && !texto.contains("el-refresh"), "{texto}");
+        assert!(
+            !texto.contains("el-access") && !texto.contains("el-refresh"),
+            "{texto}"
+        );
     }
 
     /// La dirección para avisar se guarda **con la cuenta**.
@@ -644,9 +913,12 @@ mod tests {
             refresh: Some("el-refresh".into()),
             expires_at: None,
         };
-        let config = capability_config(&proveedor(), &CapabilityType::Calendar, &frescos);
+        let config = capability_config(&proveedor(), &CapabilityType::Calendar, &frescos, None);
 
-        assert_eq!(config["revocation_url"], "https://oauth2.googleapis.com/revoke");
+        assert_eq!(
+            config["revocation_url"],
+            "https://oauth2.googleapis.com/revoke"
+        );
     }
 
     /// Un proveedor sin dónde avisar deja el campo nulo, y eso hay que poder
@@ -663,7 +935,7 @@ mod tests {
             refresh: None,
             expires_at: None,
         };
-        let config = capability_config(&sin_revocacion, &CapabilityType::Calendar, &frescos);
+        let config = capability_config(&sin_revocacion, &CapabilityType::Calendar, &frescos, None);
         assert!(config["revocation_url"].is_null());
     }
 
@@ -692,7 +964,7 @@ mod tests {
             refresh: None,
             expires_at: None,
         };
-        let config = capability_config(&proveedor(), &CapabilityType::Calendar, &frescos);
+        let config = capability_config(&proveedor(), &CapabilityType::Calendar, &frescos, None);
         assert!(config["expires_at"].is_null());
     }
 
