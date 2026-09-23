@@ -485,6 +485,21 @@ pub async fn revoke(provider: &Provider, refresh_token: &str) -> Result<(), Toke
     )))
 }
 
+/// Cuánto se espera a que el proveedor diga quién es la persona.
+///
+/// **Tiene que haber un plazo, y tiene que ser corto.** Esto corre después de
+/// que el pendiente se consumió y el código de autorización se canjeó: un
+/// servidor que acepta la conexión y no contesta nunca deja la tarea esperando
+/// para siempre, y entonces la cuenta no se guarda y los tokens se pierden. Del
+/// otro lado, quien llamó por D-Bus se lleva un tiempo agotado y la persona tiene
+/// que rehacer el flujo entero — que es exactamente lo que el comentario de abajo
+/// promete que no pasa.
+///
+/// Diez segundos: bastante menos que el plazo de D-Bus, que es de veinticinco, y
+/// de sobra para una petición que en condiciones normales tarda milésimas. Lo
+/// marcó CodeRabbit.
+const PLAZO_IDENTIDAD: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Quién es el dueño del token, preguntándoselo al proveedor.
 ///
 /// Devuelve el correo. Es lo que las aplicaciones guardan como `username` y lo
@@ -502,6 +517,7 @@ pub async fn resolve_identity(provider: &Provider, access_token: &str) -> Option
         .ok()?
         .get(url)
         .bearer_auth(access_token)
+        .timeout(PLAZO_IDENTIDAD)
         .send()
         .await
         .map_err(|e| tracing::warn!("no se pudo preguntar la identidad a {url}: {e}"))
@@ -863,6 +879,51 @@ mod tests {
             .find_map(|p| p.strip_prefix("scope="))
             .expect("la URL lleva alcances");
         assert!(scope.contains("openid"), "{url}");
+    }
+
+    /// Un `userinfo` que acepta la conexión y no contesta **no puede colgar el
+    /// flujo**.
+    ///
+    /// Es el caso feo: esto corre después de consumir el pendiente y de canjear
+    /// el código, así que quedarse esperando ahí no significa «sin identidad»,
+    /// significa que la cuenta no se guarda y hay que autorizar de nuevo desde
+    /// cero.
+    ///
+    /// El servidor de mentira acepta y se queda callado, que es lo que hace un
+    /// balanceador con el backend caído — y lo que **no** se puede reproducir
+    /// apagando el puerto, porque ahí la conexión se rechaza en el acto y el
+    /// código toma otro camino.
+    #[tokio::test]
+    async fn un_userinfo_que_no_contesta_no_deja_la_cuenta_colgada() {
+        let escucha = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let puerto = escucha.local_addr().unwrap().port();
+        // Acepta y no responde. Las conexiones se guardan para que no se cierren
+        // al soltarlas, que le diría al cliente que no hay nadie.
+        tokio::spawn(async move {
+            let mut abiertas = Vec::new();
+            while let Ok((flujo, _)) = escucha.accept().await {
+                abiertas.push(flujo);
+            }
+        });
+
+        let mut proveedor = proveedor();
+        proveedor.userinfo_url = Some(format!("http://127.0.0.1:{puerto}/userinfo"));
+
+        // Con un margen sobre el plazo: lo que se comprueba es que **vuelve**, y
+        // que vuelve por su propio plazo y no por el de esta prueba.
+        let empezo = std::time::Instant::now();
+        let quien = tokio::time::timeout(
+            PLAZO_IDENTIDAD + std::time::Duration::from_secs(5),
+            resolve_identity(&proveedor, "el-access"),
+        )
+        .await
+        .expect("se colgó: sin plazo, la cuenta se pierde y hay que rehacer el flujo");
+
+        assert_eq!(quien, None);
+        assert!(
+            empezo.elapsed() >= PLAZO_IDENTIDAD,
+            "volvió antes del plazo, así que no fue el plazo lo que la cortó"
+        );
     }
 
     /// La configuración que se guarda en la cuenta es lo que hace posible el
