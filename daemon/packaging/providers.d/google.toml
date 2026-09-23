@@ -27,9 +27,14 @@
 #
 # Un proyecto propio sin verificar queda en modo «prueba», y ahí Google caduca
 # los permisos a los pocos días: vas a tener que reconectar la cuenta seguido.
-# Para el **correo** de Gmail conviene no usar esto: agregá la casilla como
+#
+# Eso pega más fuerte en el **correo**, que es el alcance que Google llama
+# «restringido»: para tenerlo sin caducidad hace falta la evaluación de seguridad
+# de un tercero, que se paga todos los años. El alcance está declarado más abajo
+# y funciona, pero si el correo se te desconecta cada pocos días no es un error:
+# es el modo prueba. La alternativa que no caduca es agregar la casilla como
 # servidor personalizado por IMAP con una contraseña de aplicación, que no
-# caduca y no depende de ningún registro.
+# depende de ningún registro.
 
 id = "google"
 display_name = "Google"
@@ -42,9 +47,23 @@ revocation_url = "https://oauth2.googleapis.com/revoke"
 # client_id = "xxxxx.apps.googleusercontent.com"
 # client_secret = "xxxxx"
 
+# Lo que se pide siempre, además de lo de cada capacidad: sin esto el servicio
+# no se entera de **qué cuenta** se acaba de conectar, y sin el correo no puede
+# armar la dirección de CardDAV —que lo lleva adentro— ni autenticarse contra
+# IMAP, donde el usuario va en la misma línea que el token.
+identity_scopes = ["openid", "https://www.googleapis.com/auth/userinfo.email"]
+# Y dónde preguntarlo.
+userinfo_url = "https://openidconnect.googleapis.com/v1/userinfo"
+
 [scopes]
 calendar = ["https://www.googleapis.com/auth/calendar"]
 contacts = ["https://www.googleapis.com/auth/contacts"]
+# El correo. Google lo considera un alcance **restringido**: con un proyecto sin
+# verificar anda igual, pero en modo prueba el permiso caduca a los pocos días.
+# Está declarado igual porque la alternativa era que la capacidad no existiera —y
+# entonces conectar una cuenta de Google dejaba el correo afuera sin decir por
+# qué—. El sincronizador ya sabe hablar XOAUTH2: lo decide por el `client_id`.
+email = ["https://mail.google.com/"]
 # `drive.file` y no `drive`: da acceso sólo a los archivos que se abren o crean
 # desde acá, no a todo el Drive. Es el alcance que Google **no** considera
 # sensible, así que es el único que funciona sin pasar por su verificación.
@@ -57,3 +76,32 @@ access_type = "offline"
 # Y sin esto sólo lo devuelve la primera vez que la persona autoriza: si
 # reconecta la cuenta, se queda sin refresh_token y vuelve el mismo problema.
 prompt = "consent"
+
+# ── Dónde vive cada servicio ────────────────────────────────────────────────
+#
+# Lo que las aplicaciones leen para saber a qué servidor hablarle. Va acá y no en
+# el código por el mismo motivo que las URLs de OAuth: agregar un proveedor tiene
+# que ser dejar un archivo.
+#
+# `{email}` se reemplaza por la cuenta que se conectó, que sale de `userinfo_url`.
+
+[endpoints.calendar]
+# El CalDAV de Google. La raíz alcanza: el calendario descubre desde ahí cuáles
+# hay, con el mismo `PROPFIND` que usa contra cualquier otro servidor.
+url = "https://apidata.googleusercontent.com/caldav/v2/"
+
+[endpoints.contacts]
+# El CardDAV lleva la cuenta en la ruta, y por eso hace falta la identidad.
+url = "https://www.googleapis.com/carddav/v1/principals/{email}/"
+
+[endpoints.email]
+imap_server = "imap.gmail.com"
+imap_port = 993
+# 587 con STARTTLS, que es lo que Google recomienda para enviar.
+smtp_server = "smtp.gmail.com"
+smtp_port = 587
+
+# Drive **no** tiene dirección acá, y no es un olvido: Google Drive no habla
+# WebDAV, que es por donde el gestor de archivos monta. La capacidad se ofrece
+# igual —el alcance es real y queda concedido— pero montarla todavía no se puede.
+# Ver Vasak-OS/vasak-file-manager#95.

@@ -15,10 +15,10 @@ use storage::{AccountDatabase, CapabilityType};
 
 use zbus::fdo::DBusProxy;
 use zbus::fdo::Error as FdoError;
+use zbus::interface;
 use zbus::message::Header;
 use zbus::names::BusName;
 use zbus::object_server::SignalContext;
-use zbus::interface;
 
 /// Decides whether `caller` may use `capability` on `account_id`.
 ///
@@ -114,9 +114,7 @@ async fn caller_pid_and_uid(
     let pid = dbus_proxy
         .get_connection_unix_process_id(name.clone())
         .await
-        .map_err(|e| {
-            FdoError::Failed(format!("Error al obtener PID para '{}': {}", sender, e))
-        })?;
+        .map_err(|e| FdoError::Failed(format!("Error al obtener PID para '{}': {}", sender, e)))?;
 
     // The daemon serves every session on the machine, so the caller's user is
     // what keeps one person's accounts out of another person's requests.
@@ -188,7 +186,10 @@ impl AccountManager {
             .ok_or_else(|| FdoError::Failed(format!("Cuenta '{}' no encontrada", account_id)))?;
 
         let data = account.capabilities.get(&cap).ok_or_else(|| {
-            FdoError::Failed(format!("Capability '{}' no configurada en la cuenta", capability))
+            FdoError::Failed(format!(
+                "Capability '{}' no configurada en la cuenta",
+                capability
+            ))
         })?;
 
         let response = serde_json::json!({
@@ -511,13 +512,30 @@ impl AccountManager {
             display_name
         };
 
+        // De quién es la cuenta. Va acá, con el token recién emitido en la mano:
+        // es lo que completa `username` y las direcciones que lo llevan adentro.
+        // Que no se resuelva no corta el flujo — ver `resolve_identity`.
+        let identidad = protocols::oauth2::resolve_identity(&proveedor, &frescos.access).await;
+        if identidad.is_none() {
+            tracing::warn!(
+                "cuenta de '{}' conectada sin identidad: las aplicaciones van a \
+                 pedir que se reconecte",
+                proveedor.id,
+            );
+        }
+
         let capabilities: HashMap<CapabilityType, serde_json::Value> = pendiente
             .capabilities
             .iter()
             .map(|capacidad| {
                 (
                     *capacidad,
-                    protocols::oauth2::capability_config(&proveedor, capacidad, &frescos),
+                    protocols::oauth2::capability_config(
+                        &proveedor,
+                        capacidad,
+                        &frescos,
+                        identidad.as_deref(),
+                    ),
                 )
             })
             .collect();
@@ -533,7 +551,10 @@ impl AccountManager {
         // huérfanos que nada limpia.
         guardar_secretos_de_oauth(uid, &account_id, &proveedor, &frescos)?;
 
-        tracing::info!("cuenta '{account_id}' conectada a '{}' (uid {uid})", proveedor.id);
+        tracing::info!(
+            "cuenta '{account_id}' conectada a '{}' (uid {uid})",
+            proveedor.id
+        );
         Self::accounts_changed(&emisor, uid).await?;
         Ok(account_id)
     }
@@ -642,7 +663,10 @@ impl AccountManager {
         // dejado sin nada que buscar al intento siguiente.
         self.pendientes.lock().await.cancel(&request_id, uid);
 
-        tracing::info!("cuenta '{account_id}' conectada a {} (uid {uid})", flujo.server);
+        tracing::info!(
+            "cuenta '{account_id}' conectada a {} (uid {uid})",
+            flujo.server
+        );
         Self::accounts_changed(&emisor, uid).await?;
 
         Ok(serde_json::json!({ "status": "done", "account_id": account_id }).to_string())
@@ -785,7 +809,9 @@ impl AccountManager {
             Revocacion::Hecha => (true, String::new()),
             Revocacion::NoHaceFalta => (true, String::new()),
             Revocacion::Fallo(detalle) => {
-                tracing::warn!("'{account_id}' se borró sin poder avisarle al proveedor: {detalle}");
+                tracing::warn!(
+                    "'{account_id}' se borró sin poder avisarle al proveedor: {detalle}"
+                );
                 (false, detalle)
             }
         };
@@ -1019,7 +1045,11 @@ async fn revocar_sin_tope(uid: u32, cuenta: &storage::Account) -> Revocacion {
         Err(_) => return Revocacion::NoHaceFalta,
     };
 
-    tracing::debug!("avisando a '{}' que '{}' termina", cuenta.provider_type, capacidad.as_id());
+    tracing::debug!(
+        "avisando a '{}' que '{}' termina",
+        cuenta.provider_type,
+        capacidad.as_id()
+    );
     match protocols::oauth2::revoke(&provider, &refresh).await {
         Ok(()) => Revocacion::Hecha,
         Err(e) => Revocacion::Fallo(e.to_string()),
@@ -1107,7 +1137,6 @@ fn marcar_reauth(uid: u32, account_id: &str, necesita: bool) -> zbus::fdo::Resul
         .map_err(|e| FdoError::Failed(format!("Error al marcar la cuenta: {e}")))
 }
 
-
 /// The system bus, always, in a released build.
 ///
 /// Debug builds can be pointed at a session bus to exercise the whole chain
@@ -1137,8 +1166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //   RUST_LOG=trace  → todos los mensajes (más verboso)
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -1196,7 +1224,10 @@ mod tests {
     fn un_nombre_desconocido_frena_todo() {
         let error = parse_capabilities(r#"["email","calendario"]"#).unwrap_err();
         assert!(error.to_string().contains("calendario"), "{error}");
-        assert!(error.to_string().contains("calendar"), "tiene que decir los válidos: {error}");
+        assert!(
+            error.to_string().contains("calendar"),
+            "tiene que decir los válidos: {error}"
+        );
     }
 
     /// Pedir dos veces lo mismo duplicaría los alcances en la URL, y hay
@@ -1211,7 +1242,15 @@ mod tests {
 
     #[test]
     fn lo_que_no_es_una_lista_de_nombres_se_rechaza() {
-        for malo in ["", "email", "{}", r#"{"email":true}"#, "[1,2]", "[null]", "[[\"email\"]]"] {
+        for malo in [
+            "",
+            "email",
+            "{}",
+            r#"{"email":true}"#,
+            "[1,2]",
+            "[null]",
+            "[[\"email\"]]",
+        ] {
             assert!(
                 parse_capabilities(malo).is_err(),
                 "{malo:?} tenía que rechazarse"

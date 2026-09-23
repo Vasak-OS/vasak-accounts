@@ -106,6 +106,70 @@ pub struct Provider {
     /// todo lo que la cuenta tenga, así que no hay nada que pedir por separado.
     #[serde(default)]
     pub capabilities: Vec<CapabilityType>,
+
+    /// Los alcances que se piden **siempre**, además de los de las capacidades
+    /// elegidas.
+    ///
+    /// Son los de identidad: sin ellos el servicio nunca se entera de qué cuenta
+    /// acaba de conectar, y sin eso no puede ni armar la dirección de CardDAV
+    /// —que lleva el correo adentro— ni autenticarse contra IMAP, donde el
+    /// usuario va en la misma línea que el token.
+    #[serde(default)]
+    pub identity_scopes: Vec<String>,
+
+    /// Dónde preguntar quién es el dueño del token recién emitido.
+    ///
+    /// La respuesta es el JSON de OpenID Connect; de ahí sale `email`. Opcional
+    /// porque no todos lo tienen ni hace falta siempre: Nextcloud sabe el usuario
+    /// desde el principio, porque lo escribió la persona.
+    #[serde(default)]
+    pub userinfo_url: Option<String>,
+
+    /// Las direcciones de servicio de cada capacidad.
+    ///
+    /// Van acá y no en el código por el mismo motivo que las URLs de OAuth:
+    /// agregar un proveedor tiene que ser dejar un archivo. Cada capacidad lleva
+    /// lo que su aplicación necesita —`url` para las que hablan DAV, los
+    /// servidores y puertos para el correo— y se copia tal cual a la
+    /// configuración de la cuenta.
+    ///
+    /// En los textos, `{email}` se reemplaza por la identidad resuelta: la
+    /// dirección de CardDAV de Google la lleva adentro.
+    #[serde(default)]
+    pub endpoints: HashMap<CapabilityType, HashMap<String, EndpointValue>>,
+}
+
+/// Lo que puede valer un campo de una dirección de servicio.
+///
+/// Tres tipos y no `toml::Value` entero: lo que se guarda en la configuración de
+/// una cuenta es una dirección, un puerto o un interruptor, y nada más. Aceptar
+/// cualquier cosa obligaba a decidir en tiempo de ejecución qué hacer con una
+/// tabla o una fecha, y la respuesta siempre iba a ser descartarla — mejor que el
+/// archivo no se lea si trae algo que no tiene sentido.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum EndpointValue {
+    Text(String),
+    Number(i64),
+    Flag(bool),
+}
+
+impl EndpointValue {
+    /// El valor como JSON, con `{email}` reemplazado por la identidad.
+    ///
+    /// `None` cuando el texto pide la identidad y no hay ninguna: una dirección
+    /// con `{email}` adentro no es una dirección a medias, es una que falla al
+    /// usarse diciendo cualquier otra cosa.
+    pub fn resolve(&self, identity: Option<&str>) -> Option<serde_json::Value> {
+        Some(match self {
+            EndpointValue::Text(texto) if texto.contains("{email}") => {
+                serde_json::Value::String(texto.replace("{email}", identity?))
+            }
+            EndpointValue::Text(texto) => serde_json::Value::String(texto.clone()),
+            EndpointValue::Number(n) => serde_json::Value::from(*n),
+            EndpointValue::Flag(b) => serde_json::Value::Bool(*b),
+        })
+    }
 }
 
 impl Provider {
@@ -153,9 +217,15 @@ pub enum CatalogError {
     NoClientId(String),
     /// Se lo pidió por un camino que no es el suyo — un flujo OAuth2 sobre un
     /// proveedor de Nextcloud, o al revés.
-    WrongKind { provider: String, esperado: &'static str },
+    WrongKind {
+        provider: String,
+        esperado: &'static str,
+    },
     /// El proveedor no ofrece alguna de las capacidades pedidas.
-    UnsupportedCapability { provider: String, capability: &'static str },
+    UnsupportedCapability {
+        provider: String,
+        capability: &'static str,
+    },
     Io(String),
 }
 
@@ -173,10 +243,10 @@ impl std::fmt::Display for CatalogError {
                  distribuye uno propio: registrá una aplicación en la consola del \
                  proveedor y dejá el client_id en {LOCAL}/{id}.toml",
             ),
-            CatalogError::UnsupportedCapability { provider, capability } => write!(
-                f,
-                "el proveedor '{provider}' no ofrece '{capability}'",
-            ),
+            CatalogError::UnsupportedCapability {
+                provider,
+                capability,
+            } => write!(f, "el proveedor '{provider}' no ofrece '{capability}'",),
             CatalogError::WrongKind { provider, esperado } => write!(
                 f,
                 "el proveedor '{provider}' no se conecta así; su flujo es '{esperado}'",
@@ -279,7 +349,11 @@ impl UserCredentials {
         provider_id: &str,
         credenciales: Option<UserCredentials>,
     ) -> Result<(), CatalogError> {
-        Self::store_in(&crate::storage::AccountDatabase::directory_for(uid), provider_id, credenciales)
+        Self::store_in(
+            &crate::storage::AccountDatabase::directory_for(uid),
+            provider_id,
+            credenciales,
+        )
     }
 
     /// La versión que nombra el directorio; los tests la usan directamente en
@@ -541,8 +615,14 @@ mod tests {
         .unwrap();
 
         let guardadas = UserCredentials::load_from(&dir.join("providers.json")).unwrap();
-        assert_eq!(guardadas["google"].client_id, "el-mio.apps.googleusercontent.com");
-        assert_eq!(guardadas["google"].client_secret.as_deref(), Some("el-secreto"));
+        assert_eq!(
+            guardadas["google"].client_id,
+            "el-mio.apps.googleusercontent.com"
+        );
+        assert_eq!(
+            guardadas["google"].client_secret.as_deref(),
+            Some("el-secreto")
+        );
 
         std::fs::remove_dir_all(dir).unwrap_or_default();
     }
@@ -565,7 +645,10 @@ mod tests {
         UserCredentials::store_in(
             &dir,
             "google",
-            Some(UserCredentials { client_id: "el-mio".into(), client_secret: None }),
+            Some(UserCredentials {
+                client_id: "el-mio".into(),
+                client_secret: None,
+            }),
         )
         .unwrap();
 
@@ -584,7 +667,9 @@ mod tests {
     #[test]
     fn sin_archivo_no_hay_credenciales_y_no_es_un_error() {
         let dir = temp_dir();
-        assert!(UserCredentials::load_from(&dir.join("providers.json")).unwrap().is_empty());
+        assert!(UserCredentials::load_from(&dir.join("providers.json"))
+            .unwrap()
+            .is_empty());
         std::fs::remove_dir_all(dir).unwrap_or_default();
     }
 
@@ -595,7 +680,10 @@ mod tests {
             UserCredentials::store_in(
                 &dir,
                 id,
-                Some(UserCredentials { client_id: format!("{id}-id"), client_secret: None }),
+                Some(UserCredentials {
+                    client_id: format!("{id}-id"),
+                    client_secret: None,
+                }),
             )
             .unwrap();
         }
@@ -619,7 +707,10 @@ mod tests {
         UserCredentials::store_in(
             &dir,
             "google",
-            Some(UserCredentials { client_id: "x".into(), client_secret: None }),
+            Some(UserCredentials {
+                client_id: "x".into(),
+                client_secret: None,
+            }),
         )
         .unwrap();
 
@@ -733,7 +824,10 @@ mod tests {
         assert_eq!(nube.kind, ProviderKind::Nextcloud);
         assert_eq!(nube.client_id, None);
         assert!(nube.is_configured());
-        assert_eq!(nube.capabilities(), vec![CapabilityType::Calendar, CapabilityType::Drive]);
+        assert_eq!(
+            nube.capabilities(),
+            vec![CapabilityType::Calendar, CapabilityType::Drive]
+        );
 
         std::fs::remove_dir_all(dir).unwrap_or_default();
     }
@@ -747,7 +841,11 @@ mod tests {
         std::fs::write(dir.join("google.toml"), GOOGLE).unwrap();
 
         let google = &cargar(&dir)["google"];
-        assert_eq!(google.kind, ProviderKind::Oauth2, "oauth2 es el tipo por omisión");
+        assert_eq!(
+            google.kind,
+            ProviderKind::Oauth2,
+            "oauth2 es el tipo por omisión"
+        );
         assert!(!google.is_configured());
 
         std::fs::remove_dir_all(dir).unwrap_or_default();
@@ -774,7 +872,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(cargar(&dir)["mixto"].capabilities(), vec![CapabilityType::Email]);
+        assert_eq!(
+            cargar(&dir)["mixto"].capabilities(),
+            vec![CapabilityType::Email]
+        );
 
         std::fs::remove_dir_all(dir).unwrap_or_default();
     }
@@ -801,7 +902,10 @@ mod tests {
     #[test]
     fn el_error_de_client_id_dice_donde_ponerlo() {
         let mensaje = CatalogError::NoClientId("google".into()).to_string();
-        assert!(mensaje.contains("/etc/vasak-accounts/providers.d/google.toml"), "{mensaje}");
+        assert!(
+            mensaje.contains("/etc/vasak-accounts/providers.d/google.toml"),
+            "{mensaje}"
+        );
     }
 
     /// Los archivos que el paquete instala tienen que parsear.
@@ -811,14 +915,21 @@ mod tests {
     /// servicio responde «no se pudo leer el catálogo».
     #[test]
     fn los_proveedores_que_trae_el_paquete_parsean() {
-        let directorio = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/providers.d");
+        let directorio =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/providers.d");
         let catalogo = cargar(&directorio);
 
         assert!(!catalogo.is_empty(), "el paquete no trae ningún proveedor");
 
         for (id, proveedor) in &catalogo {
-            assert_eq!(id, &proveedor.id, "el nombre del archivo no coincide con el id");
-            assert!(!proveedor.display_name.is_empty(), "{id} no tiene nombre visible");
+            assert_eq!(
+                id, &proveedor.id,
+                "el nombre del archivo no coincide con el id"
+            );
+            assert!(
+                !proveedor.display_name.is_empty(),
+                "{id} no tiene nombre visible"
+            );
             assert!(
                 !proveedor.capabilities().is_empty(),
                 "{id} no ofrece ninguna capacidad; nadie lo podría conectar"
@@ -837,13 +948,17 @@ mod tests {
                 ProviderKind::Oauth2 => {
                     // Un proveedor OAuth2 sin URLs no se puede conectar nunca, y
                     // por http entregaría el código de autorización en claro.
-                    for (nombre, url) in
-                        [("auth_url", &proveedor.auth_url), ("token_url", &proveedor.token_url)]
-                    {
+                    for (nombre, url) in [
+                        ("auth_url", &proveedor.auth_url),
+                        ("token_url", &proveedor.token_url),
+                    ] {
                         let url = url
                             .as_deref()
                             .unwrap_or_else(|| panic!("{id} no tiene {nombre}"));
-                        assert!(url.starts_with("https://"), "{id}: {nombre}={url} no es https");
+                        assert!(
+                            url.starts_with("https://"),
+                            "{id}: {nombre}={url} no es https"
+                        );
                     }
                 }
                 // Nextcloud no las tiene: la dirección la escribe la persona y
@@ -868,12 +983,17 @@ mod tests {
     /// nada — ninguna aplicación le podría pedir permiso a algo que no declara.
     #[test]
     fn el_archivo_de_nextcloud_declara_sus_capacidades() {
-        let directorio = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/providers.d");
+        let directorio =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/providers.d");
         let nube = &cargar(&directorio)["nextcloud"];
 
         assert_eq!(nube.kind, ProviderKind::Nextcloud);
         assert!(nube.is_configured(), "no tiene que necesitar configuración");
-        for esperada in [CapabilityType::Drive, CapabilityType::Calendar, CapabilityType::Contacts] {
+        for esperada in [
+            CapabilityType::Drive,
+            CapabilityType::Calendar,
+            CapabilityType::Contacts,
+        ] {
             assert!(
                 nube.capabilities().contains(&esperada),
                 "falta '{}': una cuenta sin ella no la puede ofrecer a ninguna app",
@@ -882,20 +1002,157 @@ mod tests {
         }
     }
 
+    /// Cada capacidad que un proveedor OAuth2 ofrece tiene que decir **dónde
+    /// vive**, o la cuenta se conecta bien y después ninguna aplicación sabe a
+    /// qué servidor hablarle: es exactamente el fallo que se arregló acá, y no
+    /// da ningún error hasta que alguien abre el calendario.
+    ///
+    /// La excepción está nombrada una por una y no por proveedor: que Drive de
+    /// Google no tenga dirección es una decisión —no habla WebDAV, ver
+    /// `Vasak-OS/vasak-file-manager#95`— y tiene que seguir doliendo lo justo
+    /// para que no se olvide. Que aparezca una segunda excepción sin discutirla
+    /// hace fallar esto.
     #[test]
-    fn el_archivo_de_google_pide_acceso_sin_conexion() {
-        let directorio = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/providers.d");
+    fn cada_capacidad_dice_donde_vive() {
+        const SIN_DIRECCION: [(&str, CapabilityType); 5] = [
+            // Google Drive no habla WebDAV, que es por donde monta el gestor de
+            // archivos. Ver Vasak-OS/vasak-file-manager#95.
+            ("google", CapabilityType::Drive),
+            // Microsoft no expone CalDAV ni CardDAV: todo pasa por Graph, que es
+            // otra integración y todavía no existe.
+            ("microsoft", CapabilityType::Calendar),
+            ("microsoft", CapabilityType::Contacts),
+            ("microsoft", CapabilityType::Drive),
+            // Y su correo está declarado con alcances de Graph —`Mail.ReadWrite`,
+            // `Mail.Send`— mientras el sincronizador habla IMAP con XOAUTH2. Para
+            // IMAP hacen falta otros (`IMAP.AccessAsUser.All`, `SMTP.Send`), así
+            // que poner acá los servidores de Outlook no alcanzaría: hay que
+            // elegir uno de los dos caminos y eso no se decide de paso.
+            ("microsoft", CapabilityType::Email),
+        ];
+
+        let directorio =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/providers.d");
+
+        for (id, proveedor) in cargar(&directorio) {
+            if proveedor.kind != ProviderKind::Oauth2 {
+                continue;
+            }
+            for capacidad in proveedor.capabilities() {
+                if SIN_DIRECCION.contains(&(id.as_str(), capacidad)) {
+                    assert!(
+                        !proveedor.endpoints.contains_key(&capacidad),
+                        "{id} declara dirección para '{}' pero está en la lista de las que no la tienen",
+                        capacidad.as_id(),
+                    );
+                    continue;
+                }
+                assert!(
+                    proveedor.endpoints.contains_key(&capacidad),
+                    "{id} ofrece '{}' y no dice dónde vive: la cuenta se conecta y \
+                     después ninguna aplicación sabe a qué servidor hablarle",
+                    capacidad.as_id(),
+                );
+            }
+        }
+    }
+
+    /// Un proveedor con direcciones que llevan el correo adentro tiene que poder
+    /// averiguarlo. Sin `userinfo_url`, esa dirección no se arma nunca y la
+    /// capacidad queda sin `url` sin que nada lo explique.
+    #[test]
+    fn quien_necesita_la_identidad_sabe_donde_preguntarla() {
+        let directorio =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/providers.d");
+
+        for (id, proveedor) in cargar(&directorio) {
+            let la_necesita = proveedor
+                .endpoints
+                .values()
+                .flat_map(|campos| campos.values())
+                .any(|valor| matches!(valor, EndpointValue::Text(t) if t.contains("{email}")));
+            if !la_necesita {
+                continue;
+            }
+            assert!(
+                proveedor.userinfo_url.is_some(),
+                "{id} usa {{email}} en sus direcciones y no dice dónde preguntar quién es"
+            );
+            assert!(
+                !proveedor.identity_scopes.is_empty(),
+                "{id} pregunta la identidad pero no pide ningún alcance para tenerla"
+            );
+        }
+    }
+
+    /// Las direcciones son a dónde van las credenciales de la persona.
+    #[test]
+    fn las_direcciones_de_servicio_van_cifradas() {
+        let directorio =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/providers.d");
+
+        for (id, proveedor) in cargar(&directorio) {
+            for (capacidad, campos) in &proveedor.endpoints {
+                if let Some(EndpointValue::Text(url)) = campos.get("url") {
+                    assert!(
+                        url.starts_with("https://"),
+                        "{id}/{}: {url} no está cifrado",
+                        capacidad.as_id(),
+                    );
+                }
+            }
+            if let Some(url) = &proveedor.userinfo_url {
+                assert!(url.starts_with("https://"), "{id}: {url} no está cifrado");
+            }
+        }
+    }
+
+    #[test]
+    fn el_correo_de_google_tiene_donde_conectarse() {
+        // El alcance solo no alcanza: sin los servidores guardados, el
+        // sincronizador dice «la cuenta no tiene servidor IMAP guardado».
+        let directorio =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/providers.d");
         let google = &cargar(&directorio)["google"];
 
-        assert_eq!(google.extra_auth_params.get("access_type").map(String::as_str), Some("offline"));
-        assert_eq!(google.extra_auth_params.get("prompt").map(String::as_str), Some("consent"));
+        assert!(
+            google.capabilities().contains(&CapabilityType::Email),
+            "una cuenta de Google tiene que poder traer el correo"
+        );
+        let correo = &google.endpoints[&CapabilityType::Email];
+        assert_eq!(
+            correo.get("imap_server"),
+            Some(&EndpointValue::Text("imap.gmail.com".into()))
+        );
+        assert_eq!(correo.get("imap_port"), Some(&EndpointValue::Number(993)));
+        assert!(correo.contains_key("smtp_server") && correo.contains_key("smtp_port"));
+    }
+
+    #[test]
+    fn el_archivo_de_google_pide_acceso_sin_conexion() {
+        let directorio =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/providers.d");
+        let google = &cargar(&directorio)["google"];
+
+        assert_eq!(
+            google
+                .extra_auth_params
+                .get("access_type")
+                .map(String::as_str),
+            Some("offline")
+        );
+        assert_eq!(
+            google.extra_auth_params.get("prompt").map(String::as_str),
+            Some("consent")
+        );
     }
 
     /// `offline_access` cumple para Microsoft el mismo papel que
     /// `access_type=offline` para Google, y se pide como un alcance más.
     #[test]
     fn el_archivo_de_microsoft_pide_acceso_sin_conexion() {
-        let directorio = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/providers.d");
+        let directorio =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/providers.d");
         let microsoft = &cargar(&directorio)["microsoft"];
 
         for (capacidad, alcances) in &microsoft.scopes {
@@ -910,6 +1167,9 @@ mod tests {
     #[test]
     fn el_error_de_proveedor_desconocido_dice_donde_se_buscan() {
         let mensaje = CatalogError::Unknown("inventado".into()).to_string();
-        assert!(mensaje.contains(SHIPPED) && mensaje.contains(LOCAL), "{mensaje}");
+        assert!(
+            mensaje.contains(SHIPPED) && mensaje.contains(LOCAL),
+            "{mensaje}"
+        );
     }
 }
