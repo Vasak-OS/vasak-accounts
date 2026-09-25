@@ -358,6 +358,9 @@ mod tests {
 
     /// 0700 la carpeta y 0600 los tres archivos, y otra vez en cada apertura si
     /// alguien los abrió.
+    /// En el orden de [`StorePaths::files`].
+    const STORE_FILE_NAMES: [&str; 3] = ["store.db", "store.db-wal", "store.db-shm"];
+
     #[test]
     fn los_permisos_se_ponen_y_se_reaplican() {
         let temp = TempDir::new("permisos");
@@ -366,9 +369,12 @@ mod tests {
 
         // Con la base abierta en WAL están los tres.
         assert_eq!(mode(&paths.dir), 0o700);
-        for file in paths.files() {
-            assert!(file.exists(), "{} tendría que existir", file.display());
-            assert_eq!(mode(file), 0o600, "{}", file.display());
+        // Los mensajes nombran el archivo por su posición y no por su ruta: la
+        // ruta lleva el identificador de la cuenta, y CodeQL marca cualquier
+        // camino de ese dato a una salida aunque sea el texto de una prueba.
+        for (file, name) in paths.files().into_iter().zip(STORE_FILE_NAMES) {
+            assert!(file.exists(), "{name} tendría que existir");
+            assert_eq!(mode(file), 0o600, "{name}");
         }
 
         for file in paths.files() {
@@ -378,8 +384,8 @@ mod tests {
 
         let again = Store::open(&paths, &key_of(b'f')).unwrap();
         assert_eq!(mode(&paths.dir), 0o700);
-        for file in paths.files() {
-            assert_eq!(mode(file), 0o600, "{}", file.display());
+        for (file, name) in paths.files().into_iter().zip(STORE_FILE_NAMES) {
+            assert_eq!(mode(file), 0o600, "{name}");
         }
         drop(again);
         drop(store);
