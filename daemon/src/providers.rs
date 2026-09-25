@@ -192,6 +192,69 @@ impl Provider {
         lista
     }
 
+    /// Las capacidades que este proveedor ofrece pero **todavía no puede dar**.
+    ///
+    /// Es la única fuente de verdad de «no disponible», y se deriva de los
+    /// `[endpoints]` del archivo y no de una lista escrita a mano: una
+    /// capacidad OAuth2 sin dirección de servicio se conecta bien y después
+    /// ninguna aplicación sabe a qué servidor hablarle. Google Drive no habla
+    /// WebDAV y Microsoft no expone CalDAV ni CardDAV —ver
+    /// `Vasak-OS/vasak-file-manager#95` y la decisión en
+    /// `Vasak-OS/vasak-accounts#24`—, así que esas capacidades se muestran
+    /// **apagadas**, nunca rotas, hasta que el archivo reciba su dirección. El
+    /// día que `google.toml` traiga `[endpoints.drive]`, Drive se enciende solo.
+    ///
+    /// Para Nextcloud siempre es vacío: sus direcciones no están en el archivo
+    /// porque se arman al conectar, a partir del servidor que escribió la
+    /// persona (`protocols::nextcloud::dav_urls`).
+    ///
+    /// Ordenada igual que [`capabilities`](Self::capabilities), y por eso
+    /// determinista: es un subconjunto suyo, en el mismo orden.
+    pub fn unavailable_capabilities(&self) -> Vec<CapabilityType> {
+        match self.kind {
+            ProviderKind::Oauth2 => self
+                .capabilities()
+                .into_iter()
+                .filter(|c| !self.endpoints.contains_key(c))
+                .collect(),
+            ProviderKind::Nextcloud => Vec::new(),
+        }
+    }
+
+    /// Separa un pedido de capacidades en las que hoy se pueden dar y las que no.
+    ///
+    /// Es lo que `BeginAuth` aplica antes de abrir el navegador: las que no
+    /// tienen dirección se descartan —no se le pide al proveedor un alcance que
+    /// después no se va a poder usar, y la cuenta queda sin la capacidad rota en
+    /// vez de con una que dice «volvé a conectarla» sin que reconectar arregle
+    /// nada—. Quien llama registra las descartadas; acá sólo se decide.
+    ///
+    /// Conserva el orden del pedido. Si no queda ninguna, es un error con
+    /// nombre: la persona pidió exactamente lo que todavía no existe, y hay que
+    /// decírselo en vez de conectar una cuenta que no sirve para nada.
+    pub fn filter_available(
+        &self,
+        requested: &[CapabilityType],
+    ) -> Result<FilteredCapabilities, CatalogError> {
+        let unavailable = self.unavailable_capabilities();
+        let (discarded, available): (Vec<CapabilityType>, Vec<CapabilityType>) = requested
+            .iter()
+            .copied()
+            .partition(|c| unavailable.contains(c));
+
+        if available.is_empty() {
+            return Err(CatalogError::NoneAvailable {
+                provider: self.id.clone(),
+                capabilities: discarded.iter().map(|c| c.as_id()).collect(),
+            });
+        }
+
+        Ok(FilteredCapabilities {
+            available,
+            discarded,
+        })
+    }
+
     /// Si se puede empezar un flujo con este proveedor tal como está.
     ///
     /// Para OAuth2 hace falta que alguien haya dejado el `client_id`; para
@@ -209,10 +272,29 @@ impl Provider {
     }
 }
 
+/// Un pedido de capacidades ya pasado por [`Provider::filter_available`].
+///
+/// Las dos listas y no sólo la buena: quien llama tiene que poder decir en el
+/// registro **qué** se descartó y por qué, o la persona pide Drive, ve que la
+/// cuenta se conecta sin Drive y nadie le explica nada.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilteredCapabilities {
+    /// Las que siguen adelante, en el orden en que se pidieron.
+    pub available: Vec<CapabilityType>,
+    /// Las que el proveedor ofrece pero todavía no tienen dirección.
+    pub discarded: Vec<CapabilityType>,
+}
+
 #[derive(Debug)]
 pub enum CatalogError {
     /// El proveedor no está en ningún archivo.
     Unknown(String),
+    /// Todas las capacidades pedidas están declaradas, pero ninguna tiene
+    /// todavía dirección de servicio: no hay nada que conectar.
+    NoneAvailable {
+        provider: String,
+        capabilities: Vec<&'static str>,
+    },
     /// Está, pero le falta el `client_id`: no hay con qué empezar el flujo.
     NoClientId(String),
     /// Se lo pidió por un camino que no es el suyo — un flujo OAuth2 sobre un
@@ -247,6 +329,15 @@ impl std::fmt::Display for CatalogError {
                 provider,
                 capability,
             } => write!(f, "el proveedor '{provider}' no ofrece '{capability}'",),
+            CatalogError::NoneAvailable {
+                provider,
+                capabilities,
+            } => write!(
+                f,
+                "ninguna de las capacidades pedidas está disponible todavía en \
+                 '{provider}': {}",
+                capabilities.join(", "),
+            ),
             CatalogError::WrongKind { provider, esperado } => write!(
                 f,
                 "el proveedor '{provider}' no se conecta así; su flujo es '{esperado}'",
@@ -1012,6 +1103,11 @@ mod tests {
     /// `Vasak-OS/vasak-file-manager#95`— y tiene que seguir doliendo lo justo
     /// para que no se olvide. Que aparezca una segunda excepción sin discutirla
     /// hace fallar esto.
+    ///
+    /// Y compara **en los dos sentidos** contra lo que el servicio anuncia como
+    /// no disponible: una excepción nueva sin discutir falla, y una que dejó de
+    /// serlo —porque el archivo recibió su dirección— también falla, para que
+    /// se saque de la tabla en vez de quedar como recuerdo de algo que ya anda.
     #[test]
     fn cada_capacidad_dice_donde_vive() {
         const SIN_DIRECCION: [(&str, CapabilityType); 5] = [
@@ -1033,28 +1129,212 @@ mod tests {
 
         let directorio =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/providers.d");
+        let catalogo = cargar(&directorio);
 
-        for (id, proveedor) in cargar(&directorio) {
-            if proveedor.kind != ProviderKind::Oauth2 {
-                continue;
-            }
-            for capacidad in proveedor.capabilities() {
-                if SIN_DIRECCION.contains(&(id.as_str(), capacidad)) {
-                    assert!(
-                        !proveedor.endpoints.contains_key(&capacidad),
-                        "{id} declara dirección para '{}' pero está en la lista de las que no la tienen",
-                        capacidad.as_id(),
-                    );
-                    continue;
-                }
-                assert!(
-                    proveedor.endpoints.contains_key(&capacidad),
-                    "{id} ofrece '{}' y no dice dónde vive: la cuenta se conecta y \
-                     después ninguna aplicación sabe a qué servidor hablarle",
-                    capacidad.as_id(),
-                );
-            }
+        // Lo que el paquete anuncia hoy como no disponible, por la misma función
+        // que usan `ListProviders`, `ListAccounts` y `BeginAuth`: si la tabla y
+        // el servicio dijeran cosas distintas, esta prueba no probaría nada.
+        let mut anunciadas: Vec<(&str, CapabilityType)> = catalogo
+            .iter()
+            .flat_map(|(id, proveedor)| {
+                proveedor
+                    .unavailable_capabilities()
+                    .into_iter()
+                    .map(move |capacidad| (id.as_str(), capacidad))
+            })
+            .collect();
+        anunciadas.sort_by_key(|(id, capacidad)| (*id, capacidad.as_id()));
+
+        let mut esperadas = SIN_DIRECCION.to_vec();
+        esperadas.sort_by_key(|(id, capacidad)| (*id, capacidad.as_id()));
+
+        for (id, capacidad) in &anunciadas {
+            assert!(
+                esperadas.contains(&(*id, *capacidad)),
+                "{id} ofrece '{}' y no dice dónde vive: la cuenta se conecta y \
+                 después ninguna aplicación sabe a qué servidor hablarle. Si es \
+                 una decisión, va en la tabla con su porqué",
+                capacidad.as_id(),
+            );
         }
+        for (id, capacidad) in &esperadas {
+            assert!(
+                anunciadas.contains(&(*id, *capacidad)),
+                "{id} ya declara dirección para '{}': sacarla de la tabla de las \
+                 que no la tienen",
+                capacidad.as_id(),
+            );
+        }
+        assert_eq!(anunciadas, esperadas);
+    }
+
+    /// Un proveedor OAuth2 con direcciones para algunas capacidades y no para
+    /// otras: lo que hay en el paquete hoy, en chico.
+    const A_MEDIAS: &str = r#"
+        id = "amedias"
+        display_name = "A medias"
+        auth_url = "https://ejemplo.com/auth"
+        token_url = "https://ejemplo.com/token"
+
+        [scopes]
+        calendar = ["cal"]
+        contacts = ["con"]
+        drive = ["drv"]
+
+        [endpoints.calendar]
+        url = "https://ejemplo.com/caldav/"
+
+        [endpoints.contacts]
+        url = "https://ejemplo.com/carddav/"
+    "#;
+
+    /// La fuente de verdad de «no disponible» son los `[endpoints]` del
+    /// archivo: lo que se ofrece y no dice dónde vive, y nada más.
+    #[test]
+    fn lo_no_disponible_sale_de_las_direcciones_que_faltan() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("amedias.toml"), A_MEDIAS).unwrap();
+
+        let proveedor = &cargar(&dir)["amedias"];
+        assert_eq!(
+            proveedor.unavailable_capabilities(),
+            vec![CapabilityType::Drive]
+        );
+        // Y es un subconjunto de lo que ofrece, en el mismo orden.
+        let ofrece = proveedor.capabilities();
+        for capacidad in proveedor.unavailable_capabilities() {
+            assert!(ofrece.contains(&capacidad));
+        }
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// El día que el archivo reciba la dirección, la capacidad se enciende
+    /// sola: no hay lista aparte que actualizar.
+    #[test]
+    fn una_direccion_nueva_enciende_la_capacidad_sin_tocar_nada_mas() {
+        let dir = temp_dir();
+        std::fs::write(
+            dir.join("amedias.toml"),
+            format!("{A_MEDIAS}\n[endpoints.drive]\nurl = \"https://ejemplo.com/dav/\"\n"),
+        )
+        .unwrap();
+
+        assert!(cargar(&dir)["amedias"]
+            .unavailable_capabilities()
+            .is_empty());
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// Nextcloud no tiene direcciones en el archivo porque se arman al conectar
+    /// desde el servidor que escribió la persona. Mirarle los `[endpoints]`
+    /// diría que nada está disponible, y es justo el proveedor que funciona
+    /// entero.
+    #[test]
+    fn nextcloud_no_tiene_nada_no_disponible() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("nextcloud.toml"), NEXTCLOUD).unwrap();
+
+        let nube = &cargar(&dir)["nextcloud"];
+        assert!(
+            nube.endpoints.is_empty(),
+            "la prueba supone un archivo sin direcciones"
+        );
+        assert!(nube.unavailable_capabilities().is_empty());
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// Lo que `BeginAuth` hace con un pedido: se descarta lo que no tiene
+    /// dirección, se conserva lo demás en el orden pedido, y se dice qué se
+    /// descartó para poder registrarlo.
+    #[test]
+    fn se_descarta_lo_no_disponible_y_se_conserva_lo_demas() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("amedias.toml"), A_MEDIAS).unwrap();
+
+        let filtrado = cargar(&dir)["amedias"]
+            .filter_available(&[
+                CapabilityType::Drive,
+                CapabilityType::Contacts,
+                CapabilityType::Calendar,
+            ])
+            .unwrap();
+
+        assert_eq!(
+            filtrado.available,
+            vec![CapabilityType::Contacts, CapabilityType::Calendar]
+        );
+        assert_eq!(filtrado.discarded, vec![CapabilityType::Drive]);
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// Un pedido sin nada que descartar pasa entero y sin ruido.
+    #[test]
+    fn un_pedido_con_todo_disponible_pasa_entero() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("amedias.toml"), A_MEDIAS).unwrap();
+
+        let filtrado = cargar(&dir)["amedias"]
+            .filter_available(&[CapabilityType::Calendar])
+            .unwrap();
+
+        assert_eq!(filtrado.available, vec![CapabilityType::Calendar]);
+        assert!(filtrado.discarded.is_empty());
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// Pedir sólo lo que todavía no existe es un error con nombre, y el
+    /// mensaje llega al D-Bus que ve la persona: tiene que decir el proveedor y
+    /// qué fue lo que no se pudo dar.
+    #[test]
+    fn pedir_solo_lo_no_disponible_es_un_error_que_lo_nombra() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("amedias.toml"), A_MEDIAS).unwrap();
+
+        let error = cargar(&dir)["amedias"]
+            .filter_available(&[CapabilityType::Drive])
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, CatalogError::NoneAvailable { provider, capabilities }
+                if provider == "amedias" && capabilities == &["drive"]),
+            "{error:?}"
+        );
+        let mensaje = error.to_string();
+        assert!(mensaje.contains("'amedias'"), "{mensaje}");
+        assert!(mensaje.contains("drive"), "{mensaje}");
+        assert!(mensaje.contains("todavía"), "{mensaje}");
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// Con las del paquete: pedirle Drive a Google tiene que dar el mensaje
+    /// exacto que la ventana va a mostrar.
+    #[test]
+    fn drive_de_google_todavia_no_se_puede_pedir_solo() {
+        let directorio =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/providers.d");
+        let google = &cargar(&directorio)["google"];
+
+        let error = google
+            .filter_available(&[CapabilityType::Drive])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "ninguna de las capacidades pedidas está disponible todavía en 'google': drive"
+        );
+
+        // Y pedirlo junto con el calendario sigue adelante sin Drive.
+        let filtrado = google
+            .filter_available(&[CapabilityType::Calendar, CapabilityType::Drive])
+            .unwrap();
+        assert_eq!(filtrado.available, vec![CapabilityType::Calendar]);
+        assert_eq!(filtrado.discarded, vec![CapabilityType::Drive]);
     }
 
     /// Un proveedor con direcciones que llevan el correo adentro tiene que poder

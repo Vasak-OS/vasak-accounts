@@ -127,8 +127,8 @@ correo le permite todas tus casillas.
 |---|---|---|---|---|
 | `Ping` | — | `s` | — | Identifica al llamante (PID + binario). Diagnóstico. |
 | `ListAccounts` | — | `s` (JSON) | — | Resumen de las cuentas del usuario que llama. Nunca un token. |
-| `ListProviders` | — | `s` (JSON) | — | Qué proveedores hay y cuáles están configurados. |
-| `BeginAuth` | `s` proveedor, `s` capacidades JSON, `s` redirect_uri | `s` (JSON) | — | Empieza a conectar una cuenta OAuth2. Devuelve `auth_url`, `request_id` y `state`. |
+| `ListProviders` | — | `s` (JSON) | — | Qué proveedores hay, cuáles están configurados y qué capacidades todavía no pueden dar. |
+| `BeginAuth` | `s` proveedor, `s` capacidades JSON, `s` redirect_uri | `s` (JSON) | — | Empieza a conectar una cuenta OAuth2. Devuelve `auth_url`, `request_id` y `state`. Descarta las capacidades que el proveedor todavía no puede dar; si no queda ninguna, `InvalidArgs`. |
 | `CompleteAuth` | `s` request_id, `s` code, `s` state, `s` nombre | `s` id | — | Canjea el código y crea la cuenta. |
 | `CancelAuth` | `s` request_id | `b` | — | Descarta un flujo abandonado. |
 | `SetProviderCredentials` | `s` proveedor, `s` client_id, `s` client_secret | — | — | Guarda **tus** credenciales para un proveedor OAuth2. |
@@ -169,9 +169,52 @@ cuentas, o que la app de calendario dibuje una lista, no puede costar un diálog
 por cuenta.
 
 Lo que se paga es que la lista la ve cualquier programa del usuario. Por eso sale
-un **resumen** —id, nombre, proveedor, qué capacidades tiene y si hay que
-reconectarla— y no la cuenta entera. La configuración completa, con el servidor
-y el `client_id`, sigue detrás de `GetAccountData`, que sí pregunta.
+un **resumen** —id, nombre, proveedor, qué capacidades tiene, cuáles de ésas
+todavía no se pueden usar y si hay que reconectarla— y no la cuenta entera. La
+configuración completa, con el servidor y el `client_id`, sigue detrás de
+`GetAccountData`, que sí pregunta.
+
+```json
+[{"id": "…", "display_name": "Alguien", "provider_type": "google",
+  "capabilities": ["calendar", "contacts", "drive"],
+  "unavailable_capabilities": ["drive"],
+  "needs_reauth": false}]
+```
+
+### Lo que todavía no está disponible
+
+Un proveedor OAuth2 puede ofrecer una capacidad —el alcance existe y se
+concede— y **no tener todavía dónde usarla**: Google Drive no habla WebDAV, que
+es por donde monta el gestor de archivos, y Microsoft no expone CalDAV ni CardDAV
+(ver `Vasak-OS/vasak-file-manager#95` y la decisión en `vasak-accounts#24`). La
+regla es que lo no implementado se ve **«todavía no disponible»**, nunca roto.
+
+La fuente de verdad es el archivo del proveedor: una capacidad sin `[endpoints]`
+es una capacidad sin dirección. No hay lista aparte; el día que `google.toml`
+reciba `[endpoints.drive]`, Drive se enciende solo. Y sale por tres lados:
+
+- `ListProviders` trae `unavailable_capabilities`, subconjunto de
+  `capabilities`, para que la pantalla de conexión muestre la casilla apagada
+  y no la esconda.
+- `ListAccounts` trae `unavailable_capabilities` en cada resumen: las que la
+  cuenta **tiene** y su proveedor todavía no puede dar. Es lo que necesita una
+  barra lateral que no llama a `GetAccountData` hasta montar. Si el proveedor
+  ya no está en el catálogo, va vacía: no se inventa nada.
+- `BeginAuth` **descarta** las capacidades pedidas que no tienen dirección —lo
+  registra, y sigue con las demás—, así no se le pide al proveedor un alcance
+  que no se va a poder usar y la cuenta queda sin la capacidad en vez de con una
+  rota. Si no queda ninguna, devuelve `InvalidArgs`: «ninguna de las capacidades
+  pedidas está disponible todavía en 'google': drive».
+
+Los dos campos nuevos se suman a lo que ya había; un cliente que no los conoce
+los ignora.
+
+```json
+[{"id": "google", "display_name": "Google", "kind": "oauth2",
+  "capabilities": ["calendar", "contacts", "drive", "email"],
+  "unavailable_capabilities": ["drive"],
+  "configured": false}]
+```
 
 🔑 quiere decir que pasa por polkit: la persona se autentica en un diálogo sobre
 el que el programa que llamó no tiene ningún control. Agregar una cuenta no lo
