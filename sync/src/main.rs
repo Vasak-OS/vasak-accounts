@@ -29,6 +29,11 @@
 //! nada de lo que escribió un desconocido. Ese parser llegó con la aplicación de
 //! correo y vive en `mensaje.rs`, con su propia discusión escrita arriba.
 //!
+//! Prepara además una base **cifrada y vacía** por cuenta —el almacén local de
+//! `store/`, con su estado en `ar.net.vasak.os.AccountsStore`—. Todavía no
+//! guarda nada de nadie: lo que dicen los dos párrafos que siguen sigue siendo
+//! cierto hasta que el correo pase al almacén.
+//!
 //! **La lista vive en memoria, no en un archivo.** Un caché en disco guardaría el
 //! remitente y el asunto de todo el correo de la persona en texto plano, para
 //! siempre, en un archivo que nadie recuerda que existe. A cambio ahorraría los
@@ -46,8 +51,9 @@
 //! lo escribió cualquiera que sepa la dirección de la persona— y es la que menos
 //! tiene para perder.
 //!
-//! Todavía **no envía**. Mandar correo pasa por SMTP y por una cola que sobreviva
-//! a que se apague el equipo con algo sin mandar, y eso es su propio trabajo.
+//! Y **envía**: `SendMessage` deja el mensaje en una cola en el disco
+//! (`cola.rs`) que sobrevive a que se apague el equipo, y un despachador lo
+//! manda por SMTP (`smtp.rs`) en cuanto el servidor lo acepta.
 
 mod adjuntos;
 mod avisos;
@@ -62,6 +68,8 @@ mod mensaje;
 mod preferencias;
 mod redactar;
 mod smtp;
+mod store;
+mod store_api;
 mod tls;
 
 use std::collections::HashMap;
@@ -1620,71 +1628,72 @@ fn clasificar_salida(detalle: String) -> Salida {
 }
 
 /// Arranca y para las tareas para que coincidan con las cuentas que hay.
-async fn ajustar_tareas(
+///
+/// Devuelve lo que contestó `ListAccounts`: el almacén local lo necesita para
+/// saber qué bases ya no son de nadie, y **sólo** cuando respondió bien.
+async fn reconcile_tasks(
     broker: &Broker,
-    servicio: &Servicio,
-    emisor: &SignalContext<'static>,
-    tareas: &mut HashMap<String, tokio::task::JoinHandle<()>>,
-) -> Result<(), BrokerError> {
-    let cuentas = broker.accounts().await?;
-    let con_correo: Vec<&broker::Account> = cuentas
+    service: &Servicio,
+    emitter: &SignalContext<'static>,
+    tasks: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+) -> Result<Vec<broker::Account>, BrokerError> {
+    let accounts = broker.accounts().await?;
+    let with_mail: Vec<&broker::Account> = accounts
         .iter()
-        .filter(|c| c.hay_correo_que_sincronizar())
+        .filter(|a| a.hay_correo_que_sincronizar())
         .collect();
-    let vigentes: Vec<&str> = con_correo.iter().map(|c| c.id.as_str()).collect();
+    let current: Vec<&str> = with_mail.iter().map(|a| a.id.as_str()).collect();
 
     // Las que ya no están, o que pasaron a necesitar reautenticación.
-    tareas.retain(|id, tarea| {
-        if vigentes.contains(&id.as_str()) && !tarea.is_finished() {
+    tasks.retain(|id, task| {
+        if current.contains(&id.as_str()) && !task.is_finished() {
             return true;
         }
-        tarea.abort();
+        task.abort();
         false
     });
 
-    let mut estado = servicio.estado.lock().await;
-    estado
+    let mut state = service.estado.lock().await;
+    state
         .por_cuenta
-        .retain(|id, _| vigentes.contains(&id.as_str()));
+        .retain(|id, _| current.contains(&id.as_str()));
     // Los mensajes de una cuenta que ya no está **se van con ella**. Sin esto,
     // borrar una cuenta desde Configuración dejaba en memoria el remitente y el
     // asunto de sus últimos doscientos mensajes, y `ListMessages` los seguía
     // entregando a quien preguntara por ese identificador. Alguien que quita una
     // cuenta espera que se vaya el correo también.
-    estado
+    state
         .mensajes
-        .retain(|id, _| vigentes.contains(&id.as_str()));
-    estado
-        .rechazadas
-        .retain(|id| vigentes.contains(&id.as_str()));
-    let rechazadas = estado.rechazadas.clone();
-    drop(estado);
+        .retain(|id, _| current.contains(&id.as_str()));
+    state.rechazadas.retain(|id| current.contains(&id.as_str()));
+    let rejected = state.rechazadas.clone();
+    drop(state);
 
     // Y su conexión de lectura, que está autenticada contra el servidor. Una
     // cuenta borrada no puede dejar una sesión IMAP viva: al soltar el `Lector`
     // se cierra el socket.
-    servicio
+    service
         .lectores
         .lock()
         .await
-        .retain(|id, _| vigentes.contains(&id.as_str()));
+        .retain(|id, _| current.contains(&id.as_str()));
 
-    for cuenta in con_correo {
-        if tareas.contains_key(&cuenta.id) {
+    for account in with_mail {
+        if tasks.contains_key(&account.id) {
             continue;
         }
         // Una cuenta rechazada no se vuelve a arrancar. Su tarea terminó, así
         // que sin esto la revisión siguiente la levantaría de nuevo y el
         // servidor recibiría un intento cada cinco minutos.
-        if rechazadas.contains(&cuenta.id) {
+        if rejected.contains(&account.id) {
             continue;
         }
-        tracing::info!("'{}' pasa a atenderse", cuenta.id);
-        let tarea = tokio::spawn(atender(cuenta.clone(), servicio.clone(), emisor.clone()));
-        tareas.insert(cuenta.id.clone(), tarea);
+        tracing::info!("'{}' pasa a atenderse", account.id);
+        let task = tokio::spawn(atender(account.clone(), service.clone(), emitter.clone()));
+        tasks.insert(account.id.clone(), task);
     }
 
-    Ok(())
+    Ok(accounts)
 }
 
 #[tokio::main]
@@ -1697,21 +1706,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Iniciando vasak-accounts-sync…");
 
-    let servicio = Servicio::default();
+    let service = Servicio::default();
 
     // El bus de **sesión**: es un servicio del usuario y lo que publica es suyo.
-    let conexion = zbus::connection::Builder::session()?
-        .name("ar.net.vasak.os.AccountsSync")?
-        .serve_at("/ar/net/vasak/os/AccountsSync", servicio.clone())?
+    //
+    // El nombre se pide recién cuando están publicados los dos objetos: con la
+    // activación por D-Bus, el primer mensaje llega apenas el nombre tiene
+    // dueño, y un objeto que todavía no está contesta `UnknownObject`.
+    let connection = zbus::connection::Builder::session()?
+        .serve_at("/ar/net/vasak/os/AccountsSync", service.clone())?
         .build()
         .await?;
 
-    let emisor = SignalContext::new(&conexion, "/ar/net/vasak/os/AccountsSync")?.to_owned();
+    // El almacén local cifrado. No frena nada si falta el llavero: cada cuenta
+    // se ve «no disponible» en su estado y el correo sigue en memoria.
+    let store = store_api::StoreService::start(&connection).await?;
 
-    let (despertar, mut despertador) = tokio::sync::mpsc::channel::<()>(1);
+    connection
+        .request_name("ar.net.vasak.os.AccountsSync")
+        .await?;
+
+    let emitter = SignalContext::new(&connection, "/ar/net/vasak/os/AccountsSync")?.to_owned();
+
+    let (wake, mut wakeup) = tokio::sync::mpsc::channel::<()>(1);
     tokio::spawn(async move {
         loop {
-            match escuchar_al_servicio(&despertar).await {
+            match escuchar_al_servicio(&wake).await {
                 Ok(()) => tracing::warn!("se cortó la escucha del servicio de cuentas"),
                 Err(e) => tracing::warn!("no se pudo escuchar al servicio de cuentas: {e}"),
             }
@@ -1722,25 +1742,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // El despachador de la cola de salida: una sola tarea para todas las
     // cuentas. Arranca antes que nada porque lo primero que hace es intentar
     // mandar lo que haya quedado de la sesión anterior.
-    tokio::spawn(despachar(servicio.clone(), emisor.clone()));
+    tokio::spawn(despachar(service.clone(), emitter.clone()));
 
     // Y quien atiende el botón «Abrir» de los carteles de correo nuevo. También
     // una sola tarea: la señal es del servidor de notificaciones y no de una
     // cuenta.
-    atender_los_carteles(servicio.clone(), emisor.connection().clone());
+    atender_los_carteles(service.clone(), emitter.connection().clone());
 
     // El hilo principal ya no mira casillas: sólo se asegura de que haya una
     // tarea por cuenta. Cada tarea se queda conectada y avisa por su cuenta.
-    let mut tareas: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut tasks: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
     loop {
         match Broker::connect().await {
             Ok(broker) => {
-                if let Err(e) = ajustar_tareas(&broker, &servicio, &emisor, &mut tareas).await {
+                let listed = reconcile_tasks(&broker, &service, &emitter, &mut tasks).await;
+                // Con lo que haya contestado, bien o mal: un fallo le dice al
+                // almacén que **no** borre nada, que no es lo mismo que no
+                // avisarle.
+                store.accounts_listed(store_api::listing_from(&listed));
+                if let Err(e) = listed {
                     match e {
                         BrokerError::Unavailable(d) => {
                             tracing::info!("el servicio de cuentas no está todavía: {d}")
                         }
-                        otro => tracing::warn!("no se pudieron leer las cuentas: {otro}"),
+                        other => tracing::warn!("no se pudieron leer las cuentas: {other}"),
                     }
                 }
             }
@@ -1749,16 +1774,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Se revisa cuando el servicio avisa que cambió algo, y cada tanto por
         // las dudas: una tarea que terminó por rechazo tiene que poder volver si
-        // la persona reconectó la cuenta.
+        // la persona reconectó la cuenta. La misma vuelta pasa la tabla del
+        // almacén, que es lo que nota un llavero que se bloqueó sin avisar.
         tokio::select! {
             _ = tokio::time::sleep(INTERVALO) => {}
-            _ = despertador.recv() => {
+            _ = wakeup.recv() => {
                 tracing::debug!("algo cambió en las cuentas");
                 // Y sólo acá se olvidan los rechazos: la persona pudo haber
                 // corregido una contraseña o reconectado una cuenta. En la
                 // revisión por reloj no, o el olvido devolvería los 288
                 // intentos diarios que la marca evita.
-                servicio.estado.lock().await.rechazadas.clear();
+                service.estado.lock().await.rechazadas.clear();
             }
         }
     }

@@ -42,3 +42,20 @@ url.workspace = true
 # cada acento. Es Rust puro —el mismo motor de codificaciones de Firefox—, así
 # que no suma ninguna biblioteca compartida al paquete.
 encoding_rs = "0.8"
+# El almacén local cifrado, una base por cuenta. SQLCipher compilado junto con el
+# programa —la versión la fija el `Cargo.lock`— y enlazado contra el OpenSSL del
+# sistema, que sigue recibiendo los parches de la distribución. Es la única
+# dependencia del sync que suma una biblioteca compartida al paquete:
+# `libcrypto.so.3`. Ver `store/mod.rs`.
+rusqlite = { version = "0.40", features = ["bundled-sqlcipher"] }
+# Las migraciones del esquema, sobre `user_version` y no sobre una tabla propia.
+rusqlite_migration = "2.6"
+# La clave de cada base, puesta en cero al soltarla.
+zeroize = "1"
+# Los 32 bytes al azar de cada clave, del generador del sistema operativo.
+getrandom = "0.4"
+
+[dev-dependencies]
+# Las conexiones punto a punto de zbus, para probar el cliente del llavero y la
+# interfaz del almacén contra un servidor falso, sin `dbus-daemon`.
+zbus = { workspace = true, features = ["p2p"] }

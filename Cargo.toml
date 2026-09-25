@@ -19,7 +19,7 @@ resolver = "2"
 members = ["daemon", "sync"]
 
 [workspace.package]
-version = "0.13.1"
+version = "0.14.0"
 edition = "2021"
 authors = ["Vasak Group", "Joaquin (Pato) Decima"]
 license = "GPL-3.0-only"
@@ -33,8 +33,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 url = "2"
-# rustls y no native-tls: es Rust puro, así que no suma bibliotecas compartidas
-# al paquete.
+# rustls y no native-tls: es Rust puro, así que el TLS no suma bibliotecas
+# compartidas. El paquete sí enlaza una desde el almacén local del sync:
+# SQLCipher cifra con la `libcrypto.so.3` del sistema (paquete `openssl`), y
+# `readelf -d target/release/vasak-accounts-sync` la muestra en NEEDED. El
+# demonio sigue sin ninguna fuera de la libc.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rustls-native-certs = "0.8"
 
