@@ -14,14 +14,14 @@ tracing-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid = { version = "1", features = ["v4"] }
-dirs = "5"
+dirs = "7"
 oauth2 = { version = "5", features = ["reqwest"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 chrono.workspace = true
 libc = "0.2"
 # El catálogo de proveedores son archivos TOML en /usr/share y /etc, para poder
 # agregar uno —o poner un client_id propio— sin recompilar el servicio.
-toml = "0.8"
+toml = "1"
 # Para comprobar que un redirect_uri apunta al propio equipo antes de mandarle
 # un código de autorización. Parsear URLs a mano acá sería el lugar donde un
 # «http://127.0.0.1.ejemplo.com» pasa por local.
