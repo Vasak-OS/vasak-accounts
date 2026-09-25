@@ -214,8 +214,14 @@ impl AccountManager {
     ///
     /// Lo que se paga por eso es que la lista la ve cualquier programa del
     /// usuario. Por eso sale un resumen —nombre, proveedor, qué capacidades
-    /// tiene y si hay que reconectarla— y no la configuración completa, que
-    /// sigue detrás de `GetAccountData`. Un token nunca sale por acá.
+    /// tiene, cuáles de ésas todavía no se pueden usar, y si hay que
+    /// reconectarla— y no la configuración completa, que sigue detrás de
+    /// `GetAccountData`. Un token nunca sale por acá.
+    ///
+    /// Las que «todavía no se pueden usar» (`unavailable_capabilities`) salen
+    /// del catálogo de proveedores: es el gestor de archivos, que sólo llama a
+    /// esto para dibujar la barra lateral, el que necesita poder decir «todavía
+    /// no disponible» en vez de «volvé a conectarla».
     async fn list_accounts(
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
@@ -224,8 +230,16 @@ impl AccountManager {
         let (_caller, uid) = caller_identity(connection, &header).await?;
         let db = open_db(uid)?;
 
-        let resumenes: Vec<storage::AccountSummary> =
-            db.all().iter().map(storage::Account::summary).collect();
+        // Sin las credenciales de la persona: las direcciones de servicio salen
+        // sólo de los archivos de root, así que el catálogo plano alcanza. Y un
+        // catálogo que no se puede leer no deja sin lista a la pantalla —eso ya
+        // lo reporta `ListProviders`—: acá se avisa y no se marca nada.
+        let catalogo = providers::load().unwrap_or_else(|e| {
+            tracing::warn!("ListAccounts sin catálogo de proveedores: {e}");
+            HashMap::new()
+        });
+
+        let resumenes = summarize_accounts(db.all(), &catalogo);
 
         serde_json::to_string(&resumenes)
             .map_err(|e| FdoError::Failed(format!("Error de serialización: {e}")))
@@ -258,9 +272,14 @@ impl AccountManager {
                         .iter()
                         .map(|c| c.as_id())
                         .collect::<Vec<_>>(),
-                    // Sin el client_id no se puede empezar ningún flujo, y eso
-                    // es lo único que la pantalla necesita saber para decidir si
-                    // el botón va encendido.
+                    // Las que ofrece y todavía no puede dar, para que la pantalla
+                    // las muestre apagadas y no rotas. Subconjunto de
+                    // `capabilities`, que sigue entera: una capacidad que
+                    // desaparece de la lista parece una que no existe.
+                    "unavailable_capabilities": proveedor.unavailable_capabilities()
+                        .iter()
+                        .map(|c| c.as_id())
+                        .collect::<Vec<_>>(),
                     // Sin lo que le falte no se puede empezar ningún flujo, y
                     // eso es lo único que la pantalla necesita saber para
                     // decidir si el botón va encendido.
@@ -424,6 +443,23 @@ impl AccountManager {
             &capacidades,
         )
         .map_err(|e| FdoError::Failed(e.to_string()))?;
+
+        // Lo que el proveedor ofrece pero todavía no puede dar se descarta acá,
+        // antes de abrir el navegador: así no se le pide a Google un alcance que
+        // no se va a poder usar, y la cuenta queda **sin** la capacidad en vez
+        // de con una que dice «volvé a conectarla» sin que reconectar arregle
+        // nada. `CompleteAuth` hereda la lista recortada por el pendiente.
+        let filtrado = proveedor
+            .filter_available(&capacidades)
+            .map_err(|e| FdoError::InvalidArgs(e.to_string()))?;
+        for descartada in &filtrado.discarded {
+            tracing::warn!(
+                "'{}' todavía no tiene dirección de servicio para '{}': se conecta sin ella",
+                proveedor.id,
+                descartada.as_id(),
+            );
+        }
+        let capacidades = filtrado.available;
 
         let (auth_url, verifier, state) =
             protocols::oauth2::authorization_url(&proveedor, &capacidades, &redirect_uri)
@@ -1104,6 +1140,29 @@ fn parse_capabilities(json: &str) -> zbus::fdo::Result<Vec<CapabilityType>> {
     Ok(capacidades)
 }
 
+/// Los resúmenes que `ListAccounts` entrega, con lo que cada cuenta tiene y
+/// todavía no puede usar según su proveedor.
+///
+/// Aparte y sin D-Bus para poder probarlo. El proveedor se busca en el catálogo
+/// por `provider_type`; si ya no está —se quitó el archivo, o la cuenta se
+/// registró a mano con un nombre que no es un proveedor— no se marca nada: no
+/// se inventa lo que no se sabe.
+fn summarize_accounts(
+    accounts: &[storage::Account],
+    catalog: &HashMap<String, providers::Provider>,
+) -> Vec<storage::AccountSummary> {
+    accounts
+        .iter()
+        .map(|cuenta| {
+            let sin_direccion = catalog
+                .get(&cuenta.provider_type)
+                .map(providers::Provider::unavailable_capabilities)
+                .unwrap_or_default();
+            cuenta.summary(&sin_direccion)
+        })
+        .collect()
+}
+
 /// Guarda los tokens de una cuenta recién conectada.
 ///
 /// El `client_secret` se guarda con la cuenta y no se lee del catálogo cada vez:
@@ -1276,5 +1335,71 @@ mod tests {
         // `access` no está: una contraseña de aplicación de IMAP se guarda ahí y
         // sí se registra por RegisterAccount.
         assert!(!SECRETOS_DE_OAUTH.contains(&"access"));
+    }
+
+    /// Un proveedor OAuth2 de prueba con dirección para el calendario y no
+    /// para Drive: lo que le pasa a Google hoy, en chico.
+    fn catalogo_de_prueba() -> HashMap<String, providers::Provider> {
+        let proveedor: providers::Provider = toml::from_str(
+            r#"
+                id = "amedias"
+                display_name = "A medias"
+                auth_url = "https://ejemplo.com/auth"
+                token_url = "https://ejemplo.com/token"
+
+                [scopes]
+                calendar = ["cal"]
+                drive = ["drv"]
+
+                [endpoints.calendar]
+                url = "https://ejemplo.com/caldav/"
+            "#,
+        )
+        .unwrap();
+        HashMap::from([(proveedor.id.clone(), proveedor)])
+    }
+
+    fn cuenta_con(provider_type: &str, capacidades: &[CapabilityType]) -> storage::Account {
+        let capabilities = capacidades
+            .iter()
+            .map(|c| (*c, serde_json::json!({})))
+            .collect();
+        storage::Account::new("Alguien", provider_type, capabilities)
+    }
+
+    /// Lo que la barra lateral del gestor de archivos lee: de cada cuenta, lo
+    /// que su proveedor todavía no puede dar, y sólo lo que la cuenta tiene.
+    #[test]
+    fn el_resumen_de_cada_cuenta_lleva_lo_que_su_proveedor_no_puede_dar() {
+        let catalogo = catalogo_de_prueba();
+        let cuentas = [
+            cuenta_con(
+                "amedias",
+                &[CapabilityType::Calendar, CapabilityType::Drive],
+            ),
+            cuenta_con("amedias", &[CapabilityType::Calendar]),
+        ];
+
+        let resumenes = summarize_accounts(&cuentas, &catalogo);
+
+        assert_eq!(resumenes.len(), 2);
+        assert_eq!(resumenes[0].unavailable_capabilities, vec!["drive"]);
+        assert_eq!(resumenes[0].capabilities, vec!["calendar", "drive"]);
+        // La segunda no tiene Drive, así que no hay nada que marcar.
+        assert!(resumenes[1].unavailable_capabilities.is_empty());
+    }
+
+    /// Un proveedor que ya no está en el catálogo no marca nada: no se inventa
+    /// lo que no se sabe, y la cuenta sigue apareciendo en la lista.
+    #[test]
+    fn una_cuenta_de_un_proveedor_que_ya_no_esta_no_marca_nada() {
+        let catalogo = catalogo_de_prueba();
+        let cuentas = [cuenta_con("desaparecido", &[CapabilityType::Drive])];
+
+        let resumenes = summarize_accounts(&cuentas, &catalogo);
+
+        assert_eq!(resumenes.len(), 1);
+        assert_eq!(resumenes[0].capabilities, vec!["drive"]);
+        assert!(resumenes[0].unavailable_capabilities.is_empty());
     }
 }

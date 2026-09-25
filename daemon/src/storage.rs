@@ -1,8 +1,8 @@
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 // ---------------------------------------------------------------------------
 // CapabilityType — enum polimórfico snake_case
@@ -129,7 +129,14 @@ impl Account {
     }
 
     /// Lo que se le cuenta a cualquiera que pregunte qué cuentas hay.
-    pub fn summary(&self) -> AccountSummary {
+    ///
+    /// `provider_unavailable` es lo que el proveedor de esta cuenta anuncia hoy
+    /// como sin dirección de servicio (`Provider::unavailable_capabilities`).
+    /// Llega de afuera y no se busca acá: así el resumen sigue siendo puro y se
+    /// prueba sin catálogo ni D-Bus. Lo que se marca es la intersección con lo
+    /// que la cuenta **tiene**: una capacidad que el proveedor no ofrece, o que
+    /// la persona no conectó, no se inventa.
+    pub fn summary(&self, provider_unavailable: &[CapabilityType]) -> AccountSummary {
         let mut capabilities: Vec<&'static str> = CapabilityType::ALL
             .into_iter()
             .filter(|c| self.capabilities.contains_key(c))
@@ -137,11 +144,19 @@ impl Account {
             .collect();
         capabilities.sort();
 
+        let mut unavailable_capabilities: Vec<&'static str> = CapabilityType::ALL
+            .into_iter()
+            .filter(|c| self.capabilities.contains_key(c) && provider_unavailable.contains(c))
+            .map(|c| c.as_id())
+            .collect();
+        unavailable_capabilities.sort();
+
         AccountSummary {
             id: self.id.clone(),
             display_name: self.display_name.clone(),
             provider_type: self.provider_type.clone(),
             capabilities,
+            unavailable_capabilities,
             needs_reauth: self.needs_reauth,
         }
     }
@@ -164,6 +179,15 @@ pub struct AccountSummary {
     pub display_name: String,
     pub provider_type: String,
     pub capabilities: Vec<&'static str>,
+    /// Las de `capabilities` que la cuenta tiene y **todavía no se pueden
+    /// usar**, porque su proveedor no tiene dirección de servicio para ellas.
+    ///
+    /// Es un subconjunto de `capabilities` y no una resta: la capacidad sigue
+    /// en la lista, apagada. Existe para que el gestor de archivos —que sólo
+    /// llama `ListAccounts` para dibujar la barra lateral— pueda decir
+    /// «todavía no disponible» en vez de «volvé a conectarla», que es falso.
+    /// Un cliente viejo que no lo conoce lo ignora.
+    pub unavailable_capabilities: Vec<&'static str>,
     pub needs_reauth: bool,
 }
 
@@ -196,11 +220,15 @@ impl std::error::Error for StorageError {
 }
 
 impl From<std::io::Error> for StorageError {
-    fn from(e: std::io::Error) -> Self { StorageError::Io(e) }
+    fn from(e: std::io::Error) -> Self {
+        StorageError::Io(e)
+    }
 }
 
 impl From<serde_json::Error> for StorageError {
-    fn from(e: serde_json::Error) -> Self { StorageError::Json(e) }
+    fn from(e: serde_json::Error) -> Self {
+        StorageError::Json(e)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -292,7 +320,6 @@ impl AccountDatabase {
         self.accounts.iter().find(|a| a.id == id)
     }
 
-
     /// Sólo para los tests: la aplicación nunca pregunta cuántas cuentas hay.
     ///
     /// Con `#[cfg(test)]` en lugar de un `allow(dead_code)`: así no viaja en el
@@ -352,8 +379,6 @@ impl AccountDatabase {
             Ok(false)
         }
     }
-
-
 }
 
 // ---------------------------------------------------------------------------
@@ -378,7 +403,9 @@ impl SecretStore {
     const FILE_NAME: &'static str = "secrets.json";
 
     /// account id → (secret name → value).
-    fn load(directory: &std::path::Path) -> Result<HashMap<String, HashMap<String, String>>, StorageError> {
+    fn load(
+        directory: &std::path::Path,
+    ) -> Result<HashMap<String, HashMap<String, String>>, StorageError> {
         let path = directory.join(Self::FILE_NAME);
         if !path.exists() {
             return Ok(HashMap::new());
@@ -405,7 +432,12 @@ impl SecretStore {
         key: &str,
         secret: &str,
     ) -> Result<(), StorageError> {
-        Self::store_secret_in(&AccountDatabase::directory_for(uid), account_id, key, secret)
+        Self::store_secret_in(
+            &AccountDatabase::directory_for(uid),
+            account_id,
+            key,
+            secret,
+        )
     }
 
     /// The per-user calls resolve to these; tests use them directly rather than
@@ -543,7 +575,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn test_update_account() {
         let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
@@ -560,11 +591,6 @@ mod tests {
 
         std::fs::remove_dir_all(dir).unwrap_or_default();
     }
-
-
-
-
-
 
     /// Las dos mitades de la misma verdad: `as_id()` es lo que se le manda al
     /// servicio de permisos y `Serialize` es lo que se escribe en
@@ -622,7 +648,10 @@ mod tests {
     #[test]
     fn el_error_nombra_las_capacidades_validas() {
         let mensaje = "emial".parse::<CapabilityType>().unwrap_err().to_string();
-        assert!(mensaje.contains("emial"), "falta lo que se escribió: {mensaje}");
+        assert!(
+            mensaje.contains("emial"),
+            "falta lo que se escribió: {mensaje}"
+        );
         for capacidad in CapabilityType::ALL {
             assert!(
                 mensaje.contains(capacidad.as_id()),
@@ -658,7 +687,10 @@ mod tests {
         let mut db2 = AccountDatabase::in_directory(dir.clone()).unwrap();
         db2.load().unwrap();
         assert_eq!(db2.len(), 1);
-        assert_eq!(db2.get(&db.accounts[0].id).unwrap().display_name, "Alice Google");
+        assert_eq!(
+            db2.get(&db.accounts[0].id).unwrap().display_name,
+            "Alice Google"
+        );
 
         std::fs::remove_dir_all(dir).unwrap_or_default();
     }
@@ -744,11 +776,12 @@ mod tests {
     #[test]
     fn el_resumen_no_lleva_la_configuracion_de_la_cuenta() {
         let cuenta = sample_account();
-        let resumen = cuenta.summary();
+        let resumen = cuenta.summary(&[]);
 
         assert_eq!(resumen.display_name, "Alice Google");
         assert_eq!(resumen.provider_type, "google");
         assert_eq!(resumen.capabilities, vec!["drive", "email"]);
+        assert!(resumen.unavailable_capabilities.is_empty());
         assert!(!resumen.needs_reauth);
 
         // El servidor de correo, el client_id y los alcances quedan detrás de
@@ -771,12 +804,68 @@ mod tests {
         for capacidad in CapabilityType::ALL {
             caps.insert(capacidad, json!({}));
         }
-        let resumen = Account::new("Todas", "prueba", caps).summary();
+        let resumen = Account::new("Todas", "prueba", caps).summary(&[]);
 
         let mut esperado = resumen.capabilities.clone();
         esperado.sort();
         assert_eq!(resumen.capabilities, esperado);
         assert_eq!(resumen.capabilities.len(), 6);
+    }
+
+    /// Lo que el gestor de archivos necesita para decir «todavía no
+    /// disponible» en vez de «volvé a conectarla»: de lo que el proveedor
+    /// anuncia sin dirección, sólo lo que la cuenta **tiene**.
+    #[test]
+    fn el_resumen_marca_lo_que_la_cuenta_tiene_y_no_se_puede_usar() {
+        // La cuenta tiene email y drive. El proveedor dice que drive y
+        // calendar no tienen dirección: calendar no cuenta, porque la cuenta
+        // no lo tiene, y no se inventa.
+        let resumen = sample_account().summary(&[CapabilityType::Drive, CapabilityType::Calendar]);
+
+        assert_eq!(resumen.unavailable_capabilities, vec!["drive"]);
+        // Y sigue en la lista: es un subconjunto, no una resta. La pantalla la
+        // muestra apagada, no la esconde.
+        assert_eq!(resumen.capabilities, vec!["drive", "email"]);
+    }
+
+    /// Sin nada anunciado —o con un proveedor que ya no está en el catálogo,
+    /// que llega igual, como lista vacía— no se marca nada.
+    #[test]
+    fn el_resumen_sin_proveedor_no_marca_nada() {
+        let resumen = sample_account().summary(&[]);
+        assert!(resumen.unavailable_capabilities.is_empty());
+    }
+
+    /// Ordenadas y sin depender del recorrido de un HashMap, por el mismo
+    /// motivo que `capabilities`: la barra lateral no se puede reordenar sola.
+    #[test]
+    fn las_no_disponibles_del_resumen_van_ordenadas() {
+        let mut caps = HashMap::new();
+        for capacidad in CapabilityType::ALL {
+            caps.insert(capacidad, json!({}));
+        }
+        let resumen = Account::new("Todas", "prueba", caps).summary(&[
+            CapabilityType::Tasks,
+            CapabilityType::Calendar,
+            CapabilityType::Drive,
+        ]);
+
+        assert_eq!(
+            resumen.unavailable_capabilities,
+            vec!["calendar", "drive", "tasks"]
+        );
+    }
+
+    /// El campo viaja por D-Bus con ese nombre exacto: es lo que los clientes
+    /// van a leer, y cambiarlo los deja mudos sin error.
+    #[test]
+    fn el_resumen_serializa_las_no_disponibles_con_su_nombre() {
+        let resumen = sample_account().summary(&[CapabilityType::Drive]);
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&resumen).unwrap()).unwrap();
+
+        assert_eq!(json["unavailable_capabilities"], json!(["drive"]));
+        assert_eq!(json["capabilities"], json!(["drive", "email"]));
     }
 
     #[test]
@@ -786,13 +875,19 @@ mod tests {
         db.load().unwrap();
         let id = db.add(sample_account()).unwrap();
 
-        assert!(db.set_needs_reauth(&id, true).unwrap(), "el primer cambio avisa");
+        assert!(
+            db.set_needs_reauth(&id, true).unwrap(),
+            "el primer cambio avisa"
+        );
         // Y el segundo no: si no, cada refresco fallido de una cuenta ya marcada
         // emitiría una señal y despertaría a todas las aplicaciones.
         assert!(!db.set_needs_reauth(&id, true).unwrap());
         assert!(db.get(&id).unwrap().needs_reauth);
 
-        assert!(db.set_needs_reauth(&id, false).unwrap(), "volver a andar avisa");
+        assert!(
+            db.set_needs_reauth(&id, false).unwrap(),
+            "volver a andar avisa"
+        );
         assert!(!db.get(&id).unwrap().needs_reauth);
 
         // Y una cuenta que no existe no es un error: puede haberse borrado
@@ -887,8 +982,14 @@ mod tests {
         SecretStore::store_secret_in(&dir, "acct-1", "access", "one").unwrap();
         SecretStore::store_secret_in(&dir, "acct-2", "access", "two").unwrap();
 
-        assert_eq!(SecretStore::get_secret_in(&dir, "acct-1", "access").unwrap(), "one");
-        assert_eq!(SecretStore::get_secret_in(&dir, "acct-2", "access").unwrap(), "two");
+        assert_eq!(
+            SecretStore::get_secret_in(&dir, "acct-1", "access").unwrap(),
+            "one"
+        );
+        assert_eq!(
+            SecretStore::get_secret_in(&dir, "acct-2", "access").unwrap(),
+            "two"
+        );
 
         std::fs::remove_dir_all(dir).unwrap_or_default();
     }

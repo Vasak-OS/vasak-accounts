@@ -9,7 +9,7 @@ description = "Mantiene al día el correo de las cuentas en línea, como servici
 [dependencies]
 # Los directorios base del estándar, para que la regla de que una variable
 # relativa o vacía se ignora viva en un solo lugar y no en una copia por módulo.
-dirs = "6"
+dirs = "7"
 # Sanear el HTML de un mensaje, que lo escribió un desconocido. Parsea con el
 # mismo motor que un navegador y reescribe desde el árbol, que es lo que cierra
 # la familia de ataques que un recortador por texto deja pasar. Ver `html.rs`.
@@ -27,7 +27,7 @@ tokio-rustls.workspace = true
 rustls-native-certs.workspace = true
 # Para el usuario y la contraseña de las cuentas con contraseña de aplicación,
 # y para el XOAUTH2 de las que usan token.
-base64 = "0.22"
+base64 = "0.23"
 # Para el flujo de señales de D-Bus, y para leer una imagen a medida que llega
 # sin pasarse del tope.
 futures-util = "0.3"
