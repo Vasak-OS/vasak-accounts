@@ -57,7 +57,10 @@ impl std::fmt::Display for NextcloudError {
         match self {
             NextcloudError::BadServer(motivo) => write!(f, "{motivo}"),
             NextcloudError::Pending => {
-                write!(f, "todavía no se completó el inicio de sesión en el servidor")
+                write!(
+                    f,
+                    "todavía no se completó el inicio de sesión en el servidor"
+                )
             }
             NextcloudError::Failed(detalle) => write!(f, "{detalle}"),
         }
@@ -126,8 +129,9 @@ pub fn normalize_server(entrada: &str) -> Result<String, NextcloudError> {
         format!("https://{texto}")
     };
 
-    let mut url = url::Url::parse(&con_esquema)
-        .map_err(|e| NextcloudError::BadServer(format!("«{texto}» no es una dirección válida: {e}")))?;
+    let mut url = url::Url::parse(&con_esquema).map_err(|e| {
+        NextcloudError::BadServer(format!("«{texto}» no es una dirección válida: {e}"))
+    })?;
 
     if url.scheme() != "https" {
         return Err(NextcloudError::BadServer(format!(
@@ -326,8 +330,9 @@ pub async fn revoke_app_password(
 pub fn dav_urls(server: &str, login_name: &str) -> DavUrls {
     // El nombre de usuario va a una ruta, así que hay que codificarlo: un
     // usuario con espacio, `#` o `/` armaría una URL distinta de la que quiere.
-    let usuario: String =
-        url::form_urlencoded::byte_serialize(login_name.as_bytes()).collect::<String>().replace('+', "%20");
+    let usuario: String = url::form_urlencoded::byte_serialize(login_name.as_bytes())
+        .collect::<String>()
+        .replace('+', "%20");
 
     DavUrls {
         files: format!("{server}/remote.php/dav/files/{usuario}/"),
@@ -379,8 +384,17 @@ mod tests {
 
     #[test]
     fn no_se_aceptan_otros_esquemas_ni_basura() {
-        for malo in ["ftp://nube.ejemplo.com", "file:///etc/passwd", "", "   ", "https://"] {
-            assert!(normalize_server(malo).is_err(), "{malo:?} tenía que rechazarse");
+        for malo in [
+            "ftp://nube.ejemplo.com",
+            "file:///etc/passwd",
+            "",
+            "   ",
+            "https://",
+        ] {
+            assert!(
+                normalize_server(malo).is_err(),
+                "{malo:?} tenía que rechazarse"
+            );
         }
     }
 
@@ -393,7 +407,10 @@ mod tests {
             "https://alguien@nube.ejemplo.com",
             "https://alguien:secreto@nube.ejemplo.com",
         ] {
-            assert!(normalize_server(malo).is_err(), "{malo} tenía que rechazarse");
+            assert!(
+                normalize_server(malo).is_err(),
+                "{malo} tenía que rechazarse"
+            );
         }
     }
 
@@ -411,8 +428,14 @@ mod tests {
     #[test]
     fn un_endpoint_de_otro_servidor_no_es_del_mismo() {
         let servidor = "https://nube.ejemplo.com";
-        assert!(misma_procedencia(servidor, "https://nube.ejemplo.com/index.php/login/v2/poll"));
-        assert!(misma_procedencia(servidor, "https://nube.ejemplo.com:443/otra/ruta"));
+        assert!(misma_procedencia(
+            servidor,
+            "https://nube.ejemplo.com/index.php/login/v2/poll"
+        ));
+        assert!(misma_procedencia(
+            servidor,
+            "https://nube.ejemplo.com:443/otra/ruta"
+        ));
 
         for ajeno in [
             "https://atacante.com/poll",
@@ -432,7 +455,10 @@ mod tests {
     #[test]
     fn las_rutas_dav_se_arman_con_el_usuario() {
         let urls = dav_urls("https://nube.ejemplo.com", "ana");
-        assert_eq!(urls.files, "https://nube.ejemplo.com/remote.php/dav/files/ana/");
+        assert_eq!(
+            urls.files,
+            "https://nube.ejemplo.com/remote.php/dav/files/ana/"
+        );
         assert_eq!(
             urls.calendars,
             "https://nube.ejemplo.com/remote.php/dav/calendars/ana/"
@@ -449,13 +475,25 @@ mod tests {
     #[test]
     fn un_usuario_con_caracteres_raros_se_codifica() {
         let urls = dav_urls("https://nube.ejemplo.com", "ana maría");
-        assert!(urls.files.ends_with("/files/ana%20mar%C3%ADa/"), "{}", urls.files);
+        assert!(
+            urls.files.ends_with("/files/ana%20mar%C3%ADa/"),
+            "{}",
+            urls.files
+        );
 
         let urls = dav_urls("https://nube.ejemplo.com", "../otro");
-        assert!(!urls.files.contains("../"), "no puede quedar un salto de ruta: {}", urls.files);
+        assert!(
+            !urls.files.contains("../"),
+            "no puede quedar un salto de ruta: {}",
+            urls.files
+        );
 
         let urls = dav_urls("https://nube.ejemplo.com", "a#b?c");
-        assert!(!urls.files.contains('#') && !urls.files.contains('?'), "{}", urls.files);
+        assert!(
+            !urls.files.contains('#') && !urls.files.contains('?'),
+            "{}",
+            urls.files
+        );
     }
 
     #[test]
