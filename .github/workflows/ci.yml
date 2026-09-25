@@ -24,3 +24,13 @@ jobs:
     # instala dependencias de terceros.
     secrets:
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    with:
+      # Los dos son del servicio y ninguno depende de Tauri, así que sus
+      # pruebas compilan en un runner pelado y no necesitan ni webkit2gtk ni
+      # una tanda de apt.
+      #
+      # Y son las que más importan: el demonio corre como root y decide quién
+      # llega a los tokens, y el sincronizador parsea lo que manda un servidor
+      # de correo cualquiera. Estaban escritas —405 pruebas— y no las corría
+      # nadie: hoy una de ellas puede romperse y mergearse sin que nadie lo note.
+      pruebas_rust: -p vasak-accounts -p vasak-accounts-sync
