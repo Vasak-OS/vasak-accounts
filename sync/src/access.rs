@@ -70,9 +70,8 @@
 //!
 //! Los comandos que cambian algo (`ClearStore`, `SetStoreEnabled`,
 //! `RequestSync`) no leen nada, pero cuestan: vaciar son dos escrituras del
-//! llavero y un `fsync`, con el almacén tomado. [`CallerLimits`] pone dos
-//! topes, y el pedido que pasa cualquiera de los dos contesta
-//! `LimitsExceeded`:
+//! llavero y un `fsync`, con el almacén tomado. [`CallerLimits`] pone tres
+//! topes, y el pedido que pasa cualquiera contesta `LimitsExceeded`:
 //!
 //! - [`CONTROL_BURST`] por cuenta y por nombre único cada [`CONTROL_WINDOW`],
 //!   para los tres. Frena a una aplicación con un bucle por error, **no a un
@@ -83,8 +82,17 @@
 //!   `SetStoreEnabled(true)` y un `SetStoreEnabled(false)` por cuenta cada
 //!   [`ACCOUNT_FLOOR`], cada uno por su lado. Vaciar dos veces en diez
 //!   segundos nunca hace falta, y con esto el costo queda acotado aunque cada
-//!   pedido llegue de una conexión distinta. `RequestSync` no lo tiene: no
-//!   borra nada, y dos aplicaciones que se abren a la vez lo piden las dos.
+//!   pedido llegue de una conexión distinta. `RequestSync`, uno cada
+//!   [`SYNC_FLOOR`]: la vuelta ya espera 30 s entre una y otra de la misma
+//!   cuenta, así que el piso sólo ahorra lo que cuesta cada llamada. Dos
+//!   aplicaciones que se abren a la vez lo piden las dos, y la segunda recibe
+//!   `LimitsExceeded`; la vuelta que pidió la primera sirve para las dos.
+//! - [`MAX_TRACKED_CALLS`] anotados a la vez, de todos. Sin tope, la tabla
+//!   crecía con cada nombre nuevo de la ventana, y recorrerla en cada llamada
+//!   la volvía O(n): 20 000 `RequestSync` desde nombres nuevos tardaban
+//!   15,3 s en debug. Llena, el que sigue no entra; quien la llene desde
+//!   conexiones nuevas deja sin comandos de control a los demás por un
+//!   minuto, que es lo mismo que ya puede hacer ocupando los pisos.
 
 use std::collections::{HashMap, VecDeque};
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -110,10 +118,25 @@ pub const CONTROL_BURST: usize = 3;
 /// La ventana de [`CONTROL_BURST`].
 pub const CONTROL_WINDOW: Duration = Duration::from_secs(60);
 
-/// El piso por cuenta de lo que borra o rehace una base: uno de cada
-/// [`ControlAction`] con piso, por cuenta, en este tiempo, de cualquier
-/// llamante.
+/// El piso por cuenta de lo que borra o rehace una base: un `ClearStore`, un
+/// `SetStoreEnabled(true)` y un `SetStoreEnabled(false)` por cuenta, cada uno
+/// por su lado, en este tiempo, de cualquier llamante.
 pub const ACCOUNT_FLOOR: Duration = Duration::from_secs(10);
+
+/// El piso por cuenta de `RequestSync`, de cualquier llamante. Corto: la
+/// vuelta misma ya espera 30 s entre una y otra de la misma cuenta, así que
+/// esto sólo ahorra lo que cuesta cada llamada —la tabla del ciclo de vida,
+/// con la cerradura del almacén tomada—.
+pub const SYNC_FLOOR: Duration = Duration::from_secs(5);
+
+/// El piso más largo: lo que espera cada anotación de un piso para vencerse.
+const LONGEST_FLOOR: Duration = ACCOUNT_FLOOR;
+const _: () = assert!(SYNC_FLOOR.as_nanos() <= LONGEST_FLOOR.as_nanos());
+
+/// Cuántos comandos de control anota [`CallerLimits`] a la vez, de todos los
+/// llamantes, en la ventana. Lleno —lo vencido ya salió—, el siguiente no
+/// entra: la tabla no crece con los nombres nuevos que se abran.
+pub const MAX_TRACKED_CALLS: usize = 4096;
 
 /// Qué comando de control es: el piso por cuenta va por cada uno.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -124,13 +147,17 @@ pub enum ControlAction {
     Enable,
     /// `SetStoreEnabled(false)`.
     Disable,
-    /// `RequestSync`: sin piso por cuenta.
+    /// `RequestSync`.
     Sync,
 }
 
 impl ControlAction {
-    fn has_floor(self) -> bool {
-        !matches!(self, ControlAction::Sync)
+    /// El piso por cuenta de este comando.
+    pub fn floor(self) -> Duration {
+        match self {
+            ControlAction::Sync => SYNC_FLOOR,
+            ControlAction::Clear | ControlAction::Enable | ControlAction::Disable => ACCOUNT_FLOOR,
+        }
     }
 }
 
@@ -139,8 +166,11 @@ impl ControlAction {
 pub enum Refusal {
     /// Quien llama pasó su cupo sobre la cuenta, o no dice quién es.
     Caller,
-    /// La cuenta recibió ese mismo comando hace menos de [`ACCOUNT_FLOOR`].
+    /// La cuenta recibió ese mismo comando hace menos de su piso
+    /// ([`ControlAction::floor`]).
     Account,
+    /// La tabla está llena: [`MAX_TRACKED_CALLS`] comandos en la ventana.
+    Full,
 }
 
 /// El reloj de la caché y del límite, para poder probarlos sin esperar.
@@ -411,14 +441,22 @@ async fn ask(
 }
 
 /// El límite de los comandos de control: [`CONTROL_BURST`] por cuenta y
-/// nombre único cada [`CONTROL_WINDOW`], y el piso por cuenta
-/// ([`ACCOUNT_FLOOR`]) de lo que borra.
+/// nombre único cada [`CONTROL_WINDOW`], el piso por cuenta de cada comando
+/// ([`ControlAction::floor`]) y un tope de lo que se anota
+/// ([`MAX_TRACKED_CALLS`]).
 ///
 /// El cupo va por nombre único porque es lo que el bus garantiza sin
 /// preguntarle a nadie. **No alcanza contra quien lo quiera esquivar**: abrir
 /// una conexión nueva es un nombre nuevo, y el bus no limita cuántas se abren
 /// por segundo. Por eso el piso: no mira quién llama, y un nombre que se va del
 /// bus —o un aviso falso de que se fue— no lo reinicia.
+///
+/// **Nada es O(n) por llamada.** Cada comando anotado entra al final de una
+/// fila, y se vence por el frente: como el reloj no va para atrás, lo vencido
+/// está siempre adelante, y cada llamada saca sólo lo que venció desde la
+/// anterior. Antes, cada llamada recorría la tabla entera: 20 000
+/// `RequestSync` desde nombres nuevos tardaban 15,3 s en debug, con la
+/// cerradura tomada.
 pub struct CallerLimits {
     clock: Arc<dyn Clock>,
     state: Mutex<LimitsState>,
@@ -426,10 +464,79 @@ pub struct CallerLimits {
 
 #[derive(Default)]
 struct LimitsState {
-    /// Por nombre único y cuenta, cuándo llegó cada comando de la ventana.
-    calls: HashMap<(String, String), VecDeque<Instant>>,
-    /// Por cuenta y comando, cuándo entró el último con piso.
+    /// Por nombre único, y dentro por cuenta, cuántos comandos lleva en la
+    /// ventana. Olvidar un nombre es sacarlo de acá, sin recorrer nada.
+    calls: HashMap<String, HashMap<String, Tally>>,
+    /// Cada comando que entró, en orden de llegada: la ventana, para vencer
+    /// por el frente. Es lo que tiene el tope de [`MAX_TRACKED_CALLS`], y
+    /// acota también a `calls`, que no tiene una entrada sin su anotación acá.
+    log: VecDeque<Logged>,
+    /// Por cuenta y comando, cuándo entró el último. Son de cuentas conocidas
+    /// —se valida antes— y por cada una hay cuatro como mucho.
     floors: HashMap<(String, ControlAction), Instant>,
+    /// Lo mismo en orden de llegada, para vencer los pisos por el frente sin
+    /// recorrer `floors`. Cada una sale pasado el piso más largo; la de un
+    /// piso más corto puede quedar un rato de más, y no importa: el piso se
+    /// mira contra la hora al consultarlo.
+    floor_log: VecDeque<(Instant, (String, ControlAction))>,
+    /// La próxima alta de `calls`: una anotación vieja de un nombre que se
+    /// olvidó no le descuenta nada a la entrada nueva del mismo nombre.
+    next_generation: u64,
+}
+
+struct Tally {
+    count: usize,
+    generation: u64,
+}
+
+struct Logged {
+    at: Instant,
+    name: String,
+    account: String,
+    generation: u64,
+}
+
+impl LimitsState {
+    /// Saca lo que venció, por el frente de la fila.
+    fn expire(&mut self, now: Instant) {
+        while self
+            .log
+            .front()
+            .is_some_and(|l| now.saturating_duration_since(l.at) >= CONTROL_WINDOW)
+        {
+            let Some(logged) = self.log.pop_front() else {
+                break;
+            };
+            let Some(accounts) = self.calls.get_mut(&logged.name) else {
+                continue;
+            };
+            if let Some(tally) = accounts
+                .get_mut(&logged.account)
+                .filter(|t| t.generation == logged.generation)
+            {
+                tally.count = tally.count.saturating_sub(1);
+                if tally.count == 0 {
+                    accounts.remove(&logged.account);
+                }
+            }
+            if accounts.is_empty() {
+                self.calls.remove(&logged.name);
+            }
+        }
+        while self
+            .floor_log
+            .front()
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= LONGEST_FLOOR)
+        {
+            let Some((at, floor)) = self.floor_log.pop_front() else {
+                break;
+            };
+            // Sólo si nadie lo volvió a poner después.
+            if self.floors.get(&floor) == Some(&at) {
+                self.floors.remove(&floor);
+            }
+        }
+    }
 }
 
 impl CallerLimits {
@@ -445,8 +552,7 @@ impl CallerLimits {
     }
 
     /// Anota un comando de `caller` sobre `account_id` y dice si entra. Uno
-    /// que no entra no se anota en ninguno de los dos topes: no alarga la
-    /// espera.
+    /// que no entra no se anota en ninguno de los topes: no alarga la espera.
     ///
     /// Sin remitente no hay a quién contarle, y no entra.
     pub fn admit(
@@ -458,48 +564,70 @@ impl CallerLimits {
         let Some(name) = caller else {
             return Err(Refusal::Caller);
         };
-        let now = self.clock.now();
         let mut state = self.state();
-        // Lo vencido se va, de todos: así las tablas no crecen con los nombres
-        // que ya no llaman ni con las cuentas que nadie toca.
-        state.calls.retain(|_, times| {
-            while times
-                .front()
-                .is_some_and(|t| now.saturating_duration_since(*t) >= CONTROL_WINDOW)
-            {
-                times.pop_front();
-            }
-            !times.is_empty()
-        });
-        state
-            .floors
-            .retain(|_, at| now.saturating_duration_since(*at) < ACCOUNT_FLOOR);
+        // El reloj se lee con la cerradura tomada: así la fila queda en orden
+        // de llegada, que es lo que deja vencer por el frente.
+        let now = self.clock.now();
+        state.expire(now);
 
-        let key = (name.to_string(), account_id.to_string());
         if state
             .calls
-            .get(&key)
-            .is_some_and(|t| t.len() >= CONTROL_BURST)
+            .get(name)
+            .and_then(|accounts| accounts.get(account_id))
+            .is_some_and(|t| t.count >= CONTROL_BURST)
         {
             return Err(Refusal::Caller);
         }
         let floor = (account_id.to_string(), action);
-        if action.has_floor() && state.floors.contains_key(&floor) {
+        if state
+            .floors
+            .get(&floor)
+            .is_some_and(|at| now.saturating_duration_since(*at) < action.floor())
+        {
             return Err(Refusal::Account);
         }
-        state.calls.entry(key).or_default().push_back(now);
-        if action.has_floor() {
-            state.floors.insert(floor, now);
+        // Lo vencido ya salió: si igual no hay lugar, no se anota nada.
+        if state.log.len() >= MAX_TRACKED_CALLS {
+            return Err(Refusal::Full);
         }
+
+        let fresh = state.next_generation;
+        let accounts = state.calls.entry(name.to_string()).or_default();
+        let tally = accounts.entry(account_id.to_string()).or_insert(Tally {
+            count: 0,
+            generation: fresh,
+        });
+        tally.count += 1;
+        let generation = tally.generation;
+        if generation == fresh {
+            state.next_generation += 1;
+        }
+        state.log.push_back(Logged {
+            at: now,
+            name: name.to_string(),
+            account: account_id.to_string(),
+            generation,
+        });
+        state.floors.insert(floor.clone(), now);
+        state.floor_log.push_back((now, floor));
         Ok(())
     }
 
     /// Lo de un nombre único que se fue: su cupo. El piso por cuenta no es de
-    /// nadie y no se toca.
+    /// nadie y no se toca; sus anotaciones en la fila se vencen solas, y hasta
+    /// entonces siguen contando para el tope.
     fn forget(&self, unique_name: &str) {
-        self.state()
-            .calls
-            .retain(|(name, _), _| name != unique_name);
+        self.state().calls.remove(unique_name);
+    }
+
+    /// Cuántos comandos hay anotados, y de cuántos pares de nombre y cuenta.
+    #[cfg(test)]
+    fn tracked(&self) -> (usize, usize) {
+        let state = self.state();
+        (
+            state.log.len(),
+            state.calls.values().map(HashMap::len).sum(),
+        )
     }
 }
 
@@ -1103,8 +1231,10 @@ pub(crate) mod tests {
         use ControlAction::Sync;
         let clock = FakeClock::new();
         let limits = CallerLimits::new(Arc::clone(&clock) as Arc<dyn Clock>);
+        // Separadas por el piso de la cuenta, para que corte el cupo.
         for _ in 0..CONTROL_BURST {
             assert_eq!(limits.admit(Some(":1.7"), "cuenta", Sync), Ok(()));
+            clock.advance(SYNC_FLOOR);
         }
         assert_eq!(
             limits.admit(Some(":1.7"), "cuenta", Sync),
@@ -1128,11 +1258,96 @@ pub(crate) mod tests {
 
         // Y un nombre que se va se olvida.
         for _ in 0..CONTROL_BURST {
-            let _ = limits.admit(Some(":1.9"), "cuenta", Sync);
+            assert_eq!(limits.admit(Some(":1.9"), "tercera", Sync), Ok(()));
+            clock.advance(SYNC_FLOOR);
         }
-        assert!(limits.admit(Some(":1.9"), "cuenta", Sync).is_err());
+        assert_eq!(
+            limits.admit(Some(":1.9"), "tercera", Sync),
+            Err(Refusal::Caller)
+        );
         limits.forget(":1.9");
-        assert_eq!(limits.admit(Some(":1.9"), "cuenta", Sync), Ok(()));
+        assert_eq!(limits.admit(Some(":1.9"), "tercera", Sync), Ok(()));
+    }
+
+    /// Olvidar un nombre no deja anotaciones sueltas que le descuenten a lo
+    /// que ese mismo nombre haga después: las de antes se vencen sin tocar la
+    /// cuenta nueva.
+    #[test]
+    fn olvidar_un_nombre_no_le_descuenta_las_llamadas_nuevas() {
+        use ControlAction::Sync;
+        let clock = FakeClock::new();
+        let limits = CallerLimits::new(Arc::clone(&clock) as Arc<dyn Clock>);
+        for _ in 0..CONTROL_BURST {
+            assert_eq!(limits.admit(Some(":1.9"), "cuenta", Sync), Ok(()));
+            clock.advance(SYNC_FLOOR);
+        }
+        limits.forget(":1.9");
+        clock.advance(Duration::from_secs(30));
+        for _ in 0..CONTROL_BURST {
+            assert_eq!(limits.admit(Some(":1.9"), "cuenta", Sync), Ok(()));
+            clock.advance(SYNC_FLOOR);
+        }
+        // Las de antes del olvido ya vencieron; las de después, no.
+        clock.advance(CONTROL_WINDOW - Duration::from_secs(30));
+        assert_eq!(
+            limits.admit(Some(":1.9"), "cuenta", Sync),
+            Err(Refusal::Caller),
+            "las anotaciones olvidadas le descontaron a las nuevas"
+        );
+    }
+
+    /// Miles de nombres nuevos —una conexión nueva por pedido— no hacen crecer
+    /// la tabla más allá de su tope, y anotarlos no recorre la tabla: antes,
+    /// 20 000 tardaban 15,3 s en debug. Pasada la ventana, se vacía sola.
+    #[test]
+    fn miles_de_nombres_nuevos_no_pasan_el_tope_y_terminan_rapido() {
+        use ControlAction::Sync;
+        let clock = FakeClock::new();
+        let limits = CallerLimits::new(Arc::clone(&clock) as Arc<dyn Clock>);
+        let started = Instant::now();
+        let mut admitted = 0;
+        for n in 0..20_000 {
+            // Cada una sobre una cuenta propia, para que no las corte el piso.
+            match limits.admit(Some(&format!(":1.{n}")), &format!("c{n}"), Sync) {
+                Ok(()) => admitted += 1,
+                Err(refusal) => assert_eq!(refusal, Refusal::Full),
+            }
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(admitted, MAX_TRACKED_CALLS);
+        assert_eq!(limits.tracked(), (MAX_TRACKED_CALLS, MAX_TRACKED_CALLS));
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "20 000 pedidos tardaron {elapsed:?}"
+        );
+
+        clock.advance(CONTROL_WINDOW);
+        assert_eq!(limits.admit(Some(":1.99999"), "cuenta", Sync), Ok(()));
+        assert_eq!(limits.tracked(), (1, 1), "lo vencido no salió");
+    }
+
+    /// `RequestSync` también tiene su piso por cuenta, más corto: mil nombres
+    /// nuevos a la vez son una vuelta.
+    #[test]
+    fn pedir_vueltas_desde_nombres_nuevos_no_pasa_el_piso_de_la_cuenta() {
+        use ControlAction::Sync;
+        let clock = FakeClock::new();
+        let limits = CallerLimits::new(Arc::clone(&clock) as Arc<dyn Clock>);
+        let admitted = (0..1000)
+            .filter(|n| {
+                limits
+                    .admit(Some(&format!(":1.{n}")), "cuenta", Sync)
+                    .is_ok()
+            })
+            .count();
+        assert_eq!(admitted, 1);
+        assert_eq!(
+            limits.admit(Some(":1.5000"), "cuenta", Sync),
+            Err(Refusal::Account)
+        );
+        assert_eq!(limits.tracked().0, 1, "un rechazo no se anota");
+        clock.advance(SYNC_FLOOR);
+        assert_eq!(limits.admit(Some(":1.5000"), "cuenta", Sync), Ok(()));
     }
 
     /// El cupo por nombre se esquiva abriendo conexiones nuevas: cada una es un
@@ -1164,10 +1379,13 @@ pub(crate) mod tests {
             limits.admit(Some(":1.9"), "cuenta", Disable),
             Err(Refusal::Account)
         );
-        // Otra cuenta tiene el suyo, y pedir una vuelta no tiene piso.
+        // Otra cuenta tiene el suyo, y pedir una vuelta tiene el propio.
         assert_eq!(limits.admit(Some(":1.8"), "otra", Clear), Ok(()));
         assert_eq!(limits.admit(Some(":1.9"), "cuenta", Sync), Ok(()));
-        assert_eq!(limits.admit(Some(":1.10"), "cuenta", Sync), Ok(()));
+        assert_eq!(
+            limits.admit(Some(":1.10"), "cuenta", Sync),
+            Err(Refusal::Account)
+        );
 
         clock.advance(ACCOUNT_FLOOR);
         assert_eq!(limits.admit(Some(":1.11"), "cuenta", Clear), Ok(()));

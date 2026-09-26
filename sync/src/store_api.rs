@@ -164,7 +164,8 @@ impl<K: KeySource> StoreApi<K> {
     /// leer. Sin permiso, `AccessDenied` y no se enciende nada.
     ///
     /// No espera a que la vuelta termine: el resultado se ve en `GetStatus`,
-    /// con `StatusChanged`. Con el límite por llamante.
+    /// con `StatusChanged`. Con el límite por llamante, y uno por cuenta cada
+    /// [`access::SYNC_FLOOR`] de cualquier llamante.
     async fn request_sync(
         &self,
         #[zbus(header)] header: Header<'_>,
@@ -362,7 +363,11 @@ impl<K: KeySource> StoreApi<K> {
             ))),
             Err(Refusal::Account) => Err(zbus::fdo::Error::LimitsExceeded(format!(
                 "esta cuenta recibió el mismo pedido hace menos de {} s",
-                access::ACCOUNT_FLOOR.as_secs()
+                action.floor().as_secs()
+            ))),
+            Err(Refusal::Full) => Err(zbus::fdo::Error::LimitsExceeded(format!(
+                "demasiados pedidos de control en el último minuto: como mucho {}",
+                access::MAX_TRACKED_CALLS
             ))),
         }
     }
@@ -1009,7 +1014,9 @@ mod tests {
             "off"
         );
 
+        // Un rechazo también ocupa el piso de `RequestSync` de la cuenta.
         api.access.permissions.set(Answer::Allow);
+        api.access.clock.advance(access::SYNC_FLOOR);
         let (allowed, _s2) = api.client(":1.8").await;
         call_unit(&allowed, "RequestSync", &("cuenta",))
             .await
@@ -1030,6 +1037,7 @@ mod tests {
             .lock()
             .unwrap()
             .insert(":1.9".into(), std::process::id());
+        api.access.clock.advance(access::SYNC_FLOOR);
         call_unit(&other, "RequestSync", &("cuenta",))
             .await
             .unwrap();
@@ -1334,10 +1342,12 @@ mod tests {
     async fn el_limite_por_llamante_corta_la_llamada_siguiente() {
         let mut api = Api::new("api-limite", vec![account("cuenta", false)], Answer::Allow).await;
         let (client, _s1) = api.client(":1.7").await;
+        // Separadas por el piso de la cuenta, para que corte el cupo.
         for _ in 0..access::CONTROL_BURST {
             call_unit(&client, "RequestSync", &("cuenta",))
                 .await
                 .unwrap();
+            api.access.clock.advance(access::SYNC_FLOOR);
         }
         assert_eq!(
             error_name(&call_unit(&client, "RequestSync", &("cuenta",)).await),
@@ -1365,6 +1375,32 @@ mod tests {
         );
         api.access.clock.advance(access::ACCOUNT_FLOOR);
         call_unit(&second, "ClearStore", &("cuenta",))
+            .await
+            .unwrap();
+    }
+
+    /// El piso de `RequestSync`, por el bus: otra conexión que pide una vuelta
+    /// de la misma cuenta dentro de los 5 s contesta `LimitsExceeded`, y
+    /// pasado el piso entra.
+    #[tokio::test]
+    async fn pedir_una_vuelta_desde_otra_conexion_respeta_el_piso_de_la_cuenta() {
+        let mut api = Api::new(
+            "api-piso-vuelta",
+            vec![account("cuenta", false)],
+            Answer::Allow,
+        )
+        .await;
+        let (first, _s1) = api.client(":1.7").await;
+        let (second, _s2) = api.client(":1.8").await;
+        call_unit(&first, "RequestSync", &("cuenta",))
+            .await
+            .unwrap();
+        assert_eq!(
+            error_name(&call_unit(&second, "RequestSync", &("cuenta",)).await),
+            LIMITS_EXCEEDED
+        );
+        api.access.clock.advance(access::SYNC_FLOOR);
+        call_unit(&second, "RequestSync", &("cuenta",))
             .await
             .unwrap();
     }

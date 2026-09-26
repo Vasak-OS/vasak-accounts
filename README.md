@@ -827,7 +827,13 @@ venga**: un `ClearStore`, un `SetStoreEnabled(true)` y un
 `SetStoreEnabled(false)` por cuenta cada 10 s, cada uno por su lado; el que
 llega antes también contesta `LimitsExceeded`. Vaciar son dos escrituras del
 llavero y un `fsync` con el almacén tomado, y dos veces en diez segundos nunca
-hace falta. `RequestSync` no tiene piso. Los tres, sólo para una cuenta del
+hace falta. `RequestSync` tiene uno más corto, **un pedido por cuenta cada
+5 s**: la vuelta misma ya espera 30 s entre una y otra de la misma cuenta, así
+que el piso sólo ahorra lo que cuesta cada llamada. Dos aplicaciones que se
+abren a la vez lo piden las dos, y la segunda recibe `LimitsExceeded`: la vuelta
+que pidió la primera sirve para las dos. Y la tabla del límite anota **como
+mucho 4096 comandos** en el último minuto, de todos: llena, el que sigue
+contesta `LimitsExceeded`, y no crece con cada conexión nueva. Los tres, sólo para una cuenta del
 último `ListAccounts` bueno (si no, `InvalidArgs`), y cuando fallan contestan
 un texto fijo, sin rutas.
 
