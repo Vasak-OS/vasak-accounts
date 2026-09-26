@@ -28,7 +28,18 @@
 //! - **fechas que se le sacan al iterador**, estén o no en lo que se pide: una
 //!   regla que empezó hace años cuenta las de antes;
 //! - `RDATE`, `EXDATE` y excepciones por objeto;
-//! - **un plazo** por objeto, que se mira cada tanto mientras se itera.
+//! - **un plazo** por objeto, que se mira en cada fecha que devuelve el
+//!   iterador;
+//! - **las fechas de un período**, antes de darle la regla a `rrule`
+//!   ([`dates_per_period`]).
+//!
+//! Lo último porque `rrule` arma **un período entero de una vez** antes de
+//! devolver la primera fecha: recorre los días del período por las horas, los
+//! minutos y los segundos de la regla y los junta en memoria. Una anual con los
+//! doce meses, los 31 días, las 24 horas, los 60 minutos y los 60 segundos son
+//! 31 millones de fechas en la primera llamada —3 s y 1,5 GB, medido— y ningún
+//! tope de acá llega a mirarse. Por eso esa cuenta se hace antes, sobre la
+//! regla: si un período puede dar más que el tope, la regla es `invalid`.
 //!
 //! Lo que pasa un tope no es un error: se devuelve lo que entró, con
 //! `truncated`. Una regla que no se entiende tampoco: el evento queda con su
@@ -80,6 +91,10 @@ pub struct ExpansionLimits {
     pub max_shift_seconds: i64,
     /// Cuánto puede tardar la expansión de un objeto.
     pub max_time: StdDuration,
+    /// Cuántas fechas puede armar `rrule` para **un** período de la regla —un
+    /// año de una anual, un mes de una mensual— antes de devolver la primera.
+    /// Una regla que puede pasarlo no se interpreta ([`dates_per_period`]).
+    pub max_dates_per_period: u64,
 }
 
 impl ExpansionLimits {
@@ -91,6 +106,7 @@ impl ExpansionLimits {
         max_alarms: 10,
         max_shift_seconds: 366 * 86_400,
         max_time: StdDuration::from_millis(250),
+        max_dates_per_period: 10_000,
     };
 }
 
@@ -440,6 +456,87 @@ fn fixed_period(frequency: rrule::Frequency) -> Option<i64> {
     }
 }
 
+/// Cuántas fechas puede armar `rrule` para **un** período de la regla, como
+/// mucho: los días del período que pueden pasar los filtros por los momentos
+/// del día.
+///
+/// `rrule` 0.14 no devuelve de a una: en cada período recorre sus días
+/// (`dayset`: el año, el mes, la semana o el día) por el producto `BYHOUR ×
+/// BYMINUTE × BYSECOND` (`timeset`), y las junta todas antes de devolver la
+/// primera. Lo que se cuenta acá es eso, sobre la regla **ya completada** por
+/// `rrule` (una anual sin días toma el día y el mes del comienzo, una semanal
+/// el día de la semana, y los momentos que falten, los del comienzo):
+///
+/// - los días: los del período, acotados por cada filtro que tenga —son todos
+///   intersección—: `BYMONTH` (31 por mes), `BYMONTHDAY` (uno por mes),
+///   `BYYEARDAY` (uno), `BYWEEKNO` (catorce por semana: la suya y la del año
+///   de al lado) y `BYDAY` (53 por día en un año, cinco en un mes, uno en una
+///   semana);
+/// - los momentos: `BYHOUR × BYMINUTE × BYSECOND` hasta la diaria; en la
+///   horaria, `BYMINUTE × BYSECOND`; en la de minutos, `BYSECOND`; en la de
+///   segundos, uno;
+/// - con `BYSETPOS`, `rrule` arma sólo las posiciones pedidas: como mucho,
+///   tantas como posiciones.
+///
+/// Es una cota por arriba: puede pasarse, nunca quedarse corta.
+/// `month_days` son los `BYMONTHDAY` distintos de la regla como vino —`rrule`
+/// aparta los negativos y no los muestra—.
+fn dates_per_period(rule: &rrule::RRule, month_days: u64) -> u64 {
+    use rrule::Frequency;
+    let at_least_one = |n: usize| (n as u64).max(1);
+    let freq = rule.get_freq();
+    let (hours, minutes, seconds) = (
+        at_least_one(rule.get_by_hour().len()),
+        at_least_one(rule.get_by_minute().len()),
+        at_least_one(rule.get_by_second().len()),
+    );
+    let moments = match freq {
+        Frequency::Yearly | Frequency::Monthly | Frequency::Weekly | Frequency::Daily => {
+            hours * minutes * seconds
+        }
+        Frequency::Hourly => minutes * seconds,
+        Frequency::Minutely => seconds,
+        Frequency::Secondly => 1,
+    };
+    let month_days = month_days.max(rule.get_by_month_day().len() as u64);
+    let months = rule.get_by_month().len() as u64;
+    let year_days = rule.get_by_year_day().len() as u64;
+    let weeks = rule.get_by_week_no().len() as u64;
+    let weekdays = rule.get_by_weekday().len() as u64;
+    // Un `BYMONTHDAY` es un día por mes: en un año, por cada mes de `BYMONTH`
+    // o por los doce.
+    let (full, per_weekday, month_day_factor) = match freq {
+        Frequency::Yearly => (366, 53, if months == 0 { 12 } else { months }),
+        Frequency::Monthly => (31, 5, 1),
+        Frequency::Weekly => (7, 1, 1),
+        _ => (1, 1, 1),
+    };
+    let mut days: u64 = full;
+    if months > 0 {
+        days = days.min(31 * months);
+    }
+    if month_days > 0 {
+        days = days.min(month_days * month_day_factor);
+    }
+    if year_days > 0 {
+        days = days.min(year_days);
+    }
+    // Un número de semana puede tocar dos semanas en el mismo año: la suya y
+    // la del año de al lado que empieza o termina adentro (la semana 1 del año
+    // que viene puede empezar el 29 de diciembre).
+    if weeks > 0 {
+        days = days.min(14 * weeks);
+    }
+    if weekdays > 0 {
+        days = days.min(per_weekday * weekdays);
+    }
+    let dates = days.saturating_mul(moments);
+    match rule.get_by_set_pos().len() {
+        0 => dates,
+        positions => dates.min(positions as u64),
+    }
+}
+
 /// La hora de pared de un instante, leída como si el reloj fuera UTC.
 fn wall(seconds: i64) -> NaiveDateTime {
     Utc.timestamp_opt(seconds.clamp(-62_135_596_800, 253_402_300_799), 0)
@@ -488,16 +585,30 @@ fn rule_instances(
         }
     }
 
-    let set = parsed
-        .build(rrule::Tz::UTC.from_utc_datetime(&from))
-        .map_err(|_| ())?
-        .limit();
+    // Los `BYMONTHDAY` como vinieron: `rrule` aparta los negativos al
+    // completar la regla y ya no los muestra.
+    let mut month_days: Vec<i8> = parsed
+        .get_by_month_day()
+        .iter()
+        .copied()
+        .filter(|d| *d != 0)
+        .collect();
+    month_days.sort_unstable();
+    month_days.dedup();
+    let dt_start = rrule::Tz::UTC.from_utc_datetime(&from);
+    let validated = parsed.validate(dt_start).map_err(|_| ())?;
+    // **Antes** de iterar: `rrule` arma el período entero en la primera
+    // llamada, y ahí ningún tope de abajo llega a mirarse.
+    if dates_per_period(&validated, month_days.len() as u64) > limits.max_dates_per_period {
+        return Err(());
+    }
+    let set = rrule::RRuleSet::new(dt_start).rrule(validated).limit();
     let mut found = Vec::new();
     let mut truncated = false;
     for (iterations, moment) in set.into_iter().enumerate() {
-        if iterations >= limits.max_iterations
-            || (iterations % 256 == 255 && Instant::now() >= deadline)
-        {
+        // El plazo, en cada fecha: una sola vuelta de `rrule` puede recorrer
+        // miles de períodos vacíos antes de dar la siguiente.
+        if iterations >= limits.max_iterations || Instant::now() >= deadline {
             truncated = true;
             break;
         }
@@ -1376,5 +1487,229 @@ mod tests {
             assert!(e.truncated);
             assert!(e.occurrences.len() <= ExpansionLimits::DEFAULT.max_occurrences);
         }
+    }
+
+    fn list(from: u32, to: u32) -> String {
+        (from..=to)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// **Una regla que llena un período no se expande.** Una anual con los
+    /// doce meses, los 31 días, las 24 horas, los 60 minutos y los 60
+    /// segundos: `rrule` arma los 31 millones de fechas del año en la primera
+    /// llamada —3 s y 1,5 GB en release, medido— antes de que se mire ningún
+    /// tope. Se rechaza antes de dársela: queda la primera vez, `invalid`.
+    #[test]
+    fn una_regla_que_llena_un_periodo_no_se_expande() {
+        let rule = format!(
+            "FREQ=YEARLY;BYMONTH={};BYMONTHDAY={};BYHOUR={};BYMINUTE={};BYSECOND={}",
+            list(1, 12),
+            list(1, 31),
+            list(0, 23),
+            list(0, 59),
+            list(0, 59)
+        );
+        let ical = event(&format!("DTSTART:20260105T100000Z\r\nRRULE:{rule}\r\n"));
+        let e = finishes_within(StdDuration::from_secs(2), move || {
+            series(&ical).materialize(
+                at("2025-09-26T00:00:00Z"),
+                at("2028-09-26T00:00:00Z"),
+                &ExpansionLimits::DEFAULT,
+            )
+        });
+        assert!(e.invalid_rule);
+        assert_eq!(starts(&e), vec!["2026-01-05T10:00:00+00:00"]);
+    }
+
+    /// Lo mismo de a una frecuencia por vez: la mensual con todo el día, la
+    /// semanal y la diaria con cada segundo pasan el tope; la horaria con cada
+    /// minuto y segundo (3600 por hora) y una anual de días hábiles a toda
+    /// hora y media no.
+    #[test]
+    fn el_tope_por_periodo_mira_cada_frecuencia() {
+        let day = format!(
+            "BYHOUR={};BYMINUTE={};BYSECOND={}",
+            list(0, 23),
+            list(0, 59),
+            list(0, 59)
+        );
+        for (rule, rejected) in [
+            (
+                format!("FREQ=MONTHLY;BYMONTHDAY={};{day}", list(1, 31)),
+                true,
+            ),
+            (
+                format!("FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR,SA,SU;{day}"),
+                true,
+            ),
+            (format!("FREQ=DAILY;{day}"), true),
+            (
+                format!(
+                    "FREQ=HOURLY;BYMINUTE={};BYSECOND={}",
+                    list(0, 59),
+                    list(0, 59)
+                ),
+                false,
+            ),
+            (
+                format!(
+                    "FREQ=YEARLY;BYMONTH={};BYDAY=MO,TU,WE,TH,FR;BYHOUR={};BYMINUTE=0,30",
+                    list(1, 12),
+                    list(8, 18)
+                ),
+                false,
+            ),
+            // Con `BYSETPOS`, `rrule` arma sólo las posiciones.
+            (
+                format!(
+                    "FREQ=YEARLY;BYMONTH={};BYMONTHDAY={};{day};BYSETPOS=1,-1",
+                    list(1, 12),
+                    list(1, 31)
+                ),
+                false,
+            ),
+        ] {
+            let ical = event(&format!("DTSTART:20260105T100000Z\r\nRRULE:{rule}\r\n"));
+            let e = finishes_within(StdDuration::from_secs(10), move || {
+                series(&ical).materialize(
+                    at("2025-09-26T00:00:00Z"),
+                    at("2028-09-26T00:00:00Z"),
+                    &ExpansionLimits::DEFAULT,
+                )
+            });
+            assert_eq!(e.invalid_rule, rejected, "{rule}");
+        }
+    }
+
+    /// **Un evento de verdad sigue expandiendo**: «el primer lunes de cada mes
+    /// a las 9 y a las 15».
+    #[test]
+    fn el_primer_lunes_de_cada_mes_a_las_nueve_y_a_las_quince_se_expande() {
+        let s = series(&event(
+            "DTSTART:20260105T090000Z\r\nDURATION:PT1H\r\n\
+             RRULE:FREQ=MONTHLY;BYDAY=1MO;BYHOUR=9,15;BYMINUTE=0;BYSECOND=0\r\n",
+        ));
+        let e = s.materialize(
+            at("2026-01-01T00:00:00Z"),
+            at("2026-04-01T00:00:00Z"),
+            &ExpansionLimits::DEFAULT,
+        );
+        assert!(!e.invalid_rule && !e.truncated);
+        assert_eq!(
+            starts(&e),
+            vec![
+                "2026-01-05T09:00:00+00:00",
+                "2026-01-05T15:00:00+00:00",
+                "2026-02-02T09:00:00+00:00",
+                "2026-02-02T15:00:00+00:00",
+                "2026-03-02T09:00:00+00:00",
+                "2026-03-02T15:00:00+00:00",
+            ]
+        );
+    }
+
+    /// **La cota cubre lo que arma `rrule` de verdad**: para cada regla, las
+    /// fechas de cada período —contadas con `rrule` 0.14, por año, mes, semana
+    /// o día— no pasan lo que dice [`dates_per_period`].
+    #[test]
+    fn la_cota_por_periodo_cubre_lo_que_arma_rrule() {
+        use chrono::Datelike;
+        let rules = [
+            "FREQ=YEARLY",
+            "FREQ=YEARLY;BYHOUR=9,15",
+            "FREQ=YEARLY;BYMONTH=1,2;BYMONTHDAY=1,2,3,-1;BYHOUR=0,12",
+            "FREQ=YEARLY;BYDAY=MO,FR;BYMINUTE=0,20,40",
+            "FREQ=YEARLY;BYYEARDAY=1,100,200,-1;BYSECOND=0,30",
+            "FREQ=YEARLY;BYWEEKNO=1,2,52;BYHOUR=8",
+            "FREQ=YEARLY;BYDAY=-1FR;BYMONTH=3,6,9,12",
+            "FREQ=MONTHLY;BYMONTHDAY=1,15,-1;BYHOUR=6,18",
+            "FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9,10,11",
+            "FREQ=MONTHLY;BYDAY=1MO,-1FR;BYHOUR=9,15",
+            "FREQ=WEEKLY;BYDAY=MO,WE,FR;BYHOUR=9;BYMINUTE=0,15,30,45",
+            "FREQ=WEEKLY",
+            "FREQ=DAILY;BYHOUR=0,6,12,18;BYMINUTE=0,30",
+            "FREQ=HOURLY;BYMINUTE=0,15,30,45;BYSECOND=0,30",
+            "FREQ=MINUTELY;BYSECOND=0,10,20,30,40,50",
+            "FREQ=YEARLY;BYDAY=1MO,20MO,-1SU",
+            "FREQ=YEARLY;BYMONTHDAY=-1,-2;BYHOUR=1",
+            "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=28,29,30,31;BYDAY=SA,SU",
+            "FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=1,-1",
+            "FREQ=YEARLY;BYMONTH=1;BYMONTHDAY=1,2,3;BYHOUR=1,2;BYSETPOS=2,3,4",
+        ];
+        let start = chrono::NaiveDate::from_ymd_opt(2026, 1, 5)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap();
+        for text in rules {
+            let parsed: rrule::RRule<rrule::Unvalidated> = text.parse().unwrap();
+            let mut month_days: Vec<i8> = parsed.get_by_month_day().to_vec();
+            month_days.sort_unstable();
+            month_days.dedup();
+            let dt = rrule::Tz::UTC.from_utc_datetime(&start);
+            let validated = parsed.validate(dt).unwrap();
+            let bound = dates_per_period(&validated, month_days.len() as u64);
+            let freq = validated.get_freq();
+            let mut per_period: BTreeMap<(i32, u32, u32, u32, u32), u64> = BTreeMap::new();
+            for moment in rrule::RRuleSet::new(dt)
+                .rrule(validated)
+                .limit()
+                .into_iter()
+                .take(20_000)
+            {
+                let key = match freq {
+                    rrule::Frequency::Yearly => (moment.year(), 0, 0, 0, 0),
+                    rrule::Frequency::Monthly => (moment.year(), moment.month(), 0, 0, 0),
+                    rrule::Frequency::Weekly => {
+                        let week = moment.iso_week();
+                        (week.year(), week.week(), 0, 0, 0)
+                    }
+                    rrule::Frequency::Daily => (moment.year(), moment.ordinal(), 0, 0, 0),
+                    rrule::Frequency::Hourly => {
+                        (moment.year(), moment.ordinal(), moment.hour(), 0, 0)
+                    }
+                    rrule::Frequency::Minutely | rrule::Frequency::Secondly => (
+                        moment.year(),
+                        moment.ordinal(),
+                        moment.hour(),
+                        moment.minute(),
+                        0,
+                    ),
+                };
+                *per_period.entry(key).or_default() += 1;
+            }
+            let most = per_period.values().copied().max().unwrap_or(0);
+            assert!(most > 0, "{text}");
+            assert!(
+                most <= bound,
+                "{text}: {most} fechas en un período, la cota dice {bound}"
+            );
+        }
+    }
+
+    /// **El plazo se mira en cada fecha.** Una regla diaria que casi nunca da
+    /// una —el 29 de febrero que cae lunes— desde el año 1, con `COUNT`, así
+    /// que no hay salto: cada vuelta de `rrule` recorre años de días vacíos, y
+    /// hasta el rango no llega a dar ni cien fechas. Mirado cada 256, el plazo
+    /// no se mira nunca y la expansión corre entera.
+    #[test]
+    fn el_plazo_se_mira_en_cada_fecha() {
+        let ical = event(
+            "DTSTART:00010101T000000Z\r\n\
+             RRULE:FREQ=DAILY;COUNT=1000000;BYMONTH=2;BYMONTHDAY=29;BYDAY=MO\r\n",
+        );
+        let limits = ExpansionLimits {
+            max_time: StdDuration::from_millis(5),
+            ..ExpansionLimits::DEFAULT
+        };
+        let e = finishes_within(StdDuration::from_secs(20), move || {
+            series(&ical).materialize(
+                at("2025-09-26T00:00:00Z"),
+                at("2028-09-26T00:00:00Z"),
+                &limits,
+            )
+        });
+        assert!(e.truncated, "el plazo tenía que cortar la expansión");
     }
 }
