@@ -34,6 +34,7 @@
 //! —la clave vive en el llavero de la sesión, y parsear lo que llega de la red
 //! tiene que pasar como la persona— y con un solo escritor no hay carreras.
 
+pub mod contacts;
 pub mod key;
 pub mod lifecycle;
 pub mod migrations;

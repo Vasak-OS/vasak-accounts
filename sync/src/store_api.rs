@@ -7,8 +7,12 @@
 //!
 //! En este punto sólo hay **estado y control**: `GetStatus`, `SetStoreEnabled`,
 //! `ClearStore`, `RequestSync` y la señal `StatusChanged`. Nada de eso lee lo
-//! guardado —todavía no hay nada guardado—, así que no pide permiso; el permiso
-//! llega con la primera lectura.
+//! guardado, así que no pide permiso; el permiso llega con la primera lectura
+//! (el PR 3 de `vasak-accounts#23`). Los contactos ya se guardan —ver
+//! `contacts_sync.rs`—, pero todavía no hay método que los devuelva.
+//!
+//! `RequestSync` es además lo que **enciende** el área de contactos de una
+//! cuenta la primera vez, y lo que la sincroniza en el momento después.
 //!
 //! Vive en el mismo nombre de bus que el resto del servicio
 //! (`ar.net.vasak.os.AccountsSync`), en `/ar/net/vasak/os/AccountsStore`.
@@ -17,10 +21,13 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tokio::sync::mpsc;
 use zbus::interface;
 use zbus::object_server::SignalContext;
 
 use crate::broker::{self, BrokerError};
+use crate::contacts_sync::{BrokerCredentials, ContactsScheduler, ContactsSync};
+use crate::dav::webdav::{HttpPolicy, Limits};
 use crate::store::key::{self, KeySource, SecretServiceKeys};
 use crate::store::lifecycle::{AccountListing, ListedAccount, Locations, StoreManager};
 use crate::store::StoreError;
@@ -39,9 +46,16 @@ const RETRY: Duration = Duration::from_secs(15);
 /// le mande señales sin parar.
 const SETTLE: Duration = Duration::from_secs(1);
 
+/// Cuántos `RequestSync` pueden esperar su vuelta. Uno de más se descarta: la
+/// cuenta ya tiene uno en la fila, o la revisión de siempre la va a alcanzar.
+const PENDING_REQUESTS: usize = 16;
+
 /// El objeto de D-Bus.
 pub struct StoreApi<K: KeySource> {
     manager: Arc<StoreManager<K>>,
+    /// Por donde se le pide a la sincronización de contactos que atienda una
+    /// cuenta ya.
+    contacts: Option<mpsc::Sender<String>>,
 }
 
 #[interface(name = "ar.net.vasak.os.AccountsStore")]
@@ -53,6 +67,11 @@ impl<K: KeySource> StoreApi<K> {
     /// `rebuilt` es una base abierta que se rehízo vacía en esta sesión porque
     /// su clave se había perdido: la ventana tiene que poder decir por qué
     /// desapareció lo que había.
+    ///
+    /// Una cuenta con contactos trae además `contacts`: en qué está esa área
+    /// (`off`, `pending`, `syncing`, `synced`, `unavailable`, `failed`), un
+    /// texto que lo explica y cuándo terminó bien la última vuelta. Nada de los
+    /// contactos mismos.
     async fn get_status(&self) -> zbus::fdo::Result<String> {
         let status = self.manager.status().await;
         serde_json::to_string(&status)
@@ -96,15 +115,32 @@ impl<K: KeySource> StoreApi<K> {
     /// Pide que la base de una cuenta se ponga al día. Lo llama una aplicación
     /// al abrirse.
     ///
-    /// Hoy se asegura de que la base esté lista —pasa la tabla del ciclo de
-    /// vida por esa cuenta—, que es lo que cualquier sincronización necesita
-    /// antes de empezar. Traer datos llega con cada área.
+    /// Pasa la tabla del ciclo de vida por esa cuenta —que es lo que cualquier
+    /// sincronización necesita antes de empezar— y, si la cuenta tiene
+    /// contactos, **enciende esa área** (queda en `stores.json`, y desde ahí se
+    /// sincroniza sola cada hora) y le pide una vuelta ya. No espera a que la
+    /// vuelta termine: el resultado se ve en `GetStatus`, con `StatusChanged`.
     async fn request_sync(
         &self,
         #[zbus(signal_context)] emitter: SignalContext<'_>,
         account_id: String,
     ) -> zbus::fdo::Result<()> {
         let result = self.manager.request_sync(&account_id).await;
+        if result.is_ok() {
+            match self.manager.activate_contacts(&account_id).await {
+                Ok(true) => {
+                    if let Some(contacts) = &self.contacts {
+                        if contacts.try_send(account_id.clone()).is_err() {
+                            tracing::debug!(
+                                "ya hay bastantes pedidos de sincronización en la fila"
+                            );
+                        }
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => tracing::warn!("no se pudo encender el área de contactos: {e}"),
+            }
+        }
         let _ = Self::status_changed(&emitter).await;
         result.map_err(to_fdo)
     }
@@ -140,6 +176,7 @@ pub fn listing_from(result: &Result<Vec<broker::Account>, BrokerError>) -> Accou
                 .map(|a| ListedAccount {
                     id: a.id.clone(),
                     capabilities: a.capabilities.clone(),
+                    needs_reauth: a.needs_reauth,
                 })
                 .collect(),
         ),
@@ -163,9 +200,31 @@ impl StoreService<SecretServiceKeys> {
     pub async fn start(connection: &zbus::Connection) -> zbus::Result<Self> {
         let keys = SecretServiceKeys::on_session_bus(connection.clone());
         let manager = Arc::new(StoreManager::new(keys, Locations::from_environment()));
-        let service = Self::serve(connection, manager).await?;
+        let (requests, pending) = mpsc::channel(PENDING_REQUESTS);
+        let service = Self::serve(connection, manager, Some(requests)).await?;
         service.watch_keyring();
+        service.sync_contacts(pending);
         Ok(service)
+    }
+
+    /// La sincronización de contactos, en una tarea propia: una revisión cada
+    /// cinco minutos, una vuelta por cuenta cada hora, y cada `RequestSync`.
+    fn sync_contacts(&self, requests: mpsc::Receiver<String>) {
+        let emitter = self.emitter.clone();
+        let notify = Arc::new(move || {
+            let emitter = emitter.clone();
+            tokio::spawn(async move {
+                let _ = StoreApi::<SecretServiceKeys>::status_changed(&emitter).await;
+            });
+        });
+        let sync = ContactsSync::new(
+            Arc::clone(&self.manager),
+            BrokerCredentials,
+            Limits::DEFAULT,
+            HttpPolicy::default(),
+            notify,
+        );
+        tokio::spawn(Arc::new(ContactsScheduler::new(sync)).run(requests));
     }
 
     /// Escucha los cambios de `Locked` del llavero y vuelve a pasar la tabla.
@@ -215,6 +274,7 @@ impl<K: KeySource> StoreService<K> {
     async fn serve(
         connection: &zbus::Connection,
         manager: Arc<StoreManager<K>>,
+        contacts: Option<mpsc::Sender<String>>,
     ) -> zbus::Result<Self> {
         connection
             .object_server()
@@ -222,6 +282,7 @@ impl<K: KeySource> StoreService<K> {
                 PATH,
                 StoreApi {
                     manager: Arc::clone(&manager),
+                    contacts,
                 },
             )
             .await?;
@@ -320,7 +381,8 @@ mod tests {
             .build();
         let (server, client) = tokio::join!(server, client);
         let (server, client) = (server.unwrap(), client.unwrap());
-        let _service = StoreService::serve(&server, Arc::clone(&manager))
+        let (requests, mut pending) = mpsc::channel(PENDING_REQUESTS);
+        let _service = StoreService::serve(&server, Arc::clone(&manager), Some(requests))
             .await
             .unwrap();
 
@@ -422,6 +484,9 @@ mod tests {
             .unwrap();
 
         call("RequestSync", "cuenta").await.unwrap();
+        // Una cuenta de correo y calendario no tiene contactos: no se enciende
+        // nada ni se pide una vuelta.
+        assert!(pending.try_recv().is_err());
         let reply = client
             .call_method(
                 None::<&str>,
@@ -450,6 +515,78 @@ mod tests {
         assert!(
             keys.state().keys.is_empty(),
             "apagar tenía que borrar la clave"
+        );
+    }
+
+    /// `RequestSync` sobre una cuenta con contactos enciende el área y le pide
+    /// una vuelta a la sincronización; el estado lo muestra.
+    #[tokio::test]
+    async fn pedir_una_sincronizacion_enciende_los_contactos() {
+        let temp = TempDir::new("api-contactos");
+        let manager = Arc::new(StoreManager::new(
+            FakeKeys::default(),
+            Ok(Locations {
+                stores: temp.0.join("stores"),
+                settings: temp.0.join("stores.json"),
+            }),
+        ));
+        let mut with_contacts = account("cuenta", false);
+        with_contacts.capabilities.push("contacts".into());
+        manager
+            .accounts_listed(listing_from(&Ok(vec![with_contacts])), Instant::now())
+            .await;
+
+        let (server_end, client_end) = tokio::net::UnixStream::pair().unwrap();
+        let server = zbus::connection::Builder::unix_stream(server_end)
+            .server(zbus::Guid::generate())
+            .unwrap()
+            .p2p()
+            .build();
+        let client = zbus::connection::Builder::unix_stream(client_end)
+            .p2p()
+            .build();
+        let (server, client) = tokio::join!(server, client);
+        let (server, client) = (server.unwrap(), client.unwrap());
+        let (requests, mut pending) = mpsc::channel(PENDING_REQUESTS);
+        let _service = StoreService::serve(&server, Arc::clone(&manager), Some(requests))
+            .await
+            .unwrap();
+
+        let status = |client: zbus::Connection| async move {
+            let json: String = client
+                .call_method(
+                    None::<&str>,
+                    PATH,
+                    Some("ar.net.vasak.os.AccountsStore"),
+                    "GetStatus",
+                    &(),
+                )
+                .await
+                .unwrap()
+                .body()
+                .deserialize()
+                .unwrap();
+            serde_json::from_str::<serde_json::Value>(&json).unwrap()
+        };
+        assert_eq!(
+            status(client.clone()).await["accounts"][0]["contacts"]["state"],
+            "off"
+        );
+
+        client
+            .call_method(
+                None::<&str>,
+                PATH,
+                Some("ar.net.vasak.os.AccountsStore"),
+                "RequestSync",
+                &("cuenta",),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.try_recv().unwrap(), "cuenta");
+        assert_eq!(
+            status(client.clone()).await["accounts"][0]["contacts"]["state"],
+            "pending"
         );
     }
 }

@@ -5,4 +5,6 @@
 //! método de escritura en el cliente (ver [`webdav::Method`]).
 
 pub mod carddav;
+#[cfg(test)]
+pub mod fake;
 pub mod webdav;

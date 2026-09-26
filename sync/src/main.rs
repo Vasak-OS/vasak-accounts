@@ -61,9 +61,7 @@ mod broker;
 mod casillas;
 mod cola;
 mod consulta;
-// Todavía sin quien lo use: la sincronización de contactos llega en el
-// commit siguiente.
-#[allow(dead_code)]
+mod contacts_sync;
 mod dav;
 mod html;
 mod imagenes;
@@ -75,7 +73,6 @@ mod smtp;
 mod store;
 mod store_api;
 mod tls;
-#[allow(dead_code)]
 mod vcard;
 
 use std::collections::HashMap;
