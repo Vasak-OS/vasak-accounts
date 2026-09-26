@@ -1969,6 +1969,7 @@ mod tests {
     use super::super::key::fake::FakeKeys;
     use super::super::paths::tests::TempDir;
     use super::*;
+    use crate::store_api::listing_from;
 
     struct Fixture {
         temp: TempDir,
@@ -2804,6 +2805,100 @@ mod tests {
         assert!(f.paths("a").db_exists().unwrap());
         assert!(f.paths("b").db_exists().unwrap());
         assert!(f.keys.state().deleted.is_empty());
+    }
+
+    /// El mismo camino entero, de punta a punta: un `ListAccounts` que el
+    /// demonio no puede responder, traducido por [`crate::store_api::listing_from`]
+    /// —la función real que decide si una respuesta es una lista o un fallo—,
+    /// y de ahí al podador.
+    ///
+    /// Es la prueba de `Vasak-OS/vasak-accounts#56`, y lo que fija es la
+    /// costura entre las dos mitades. El demonio contestaba una lista vacía
+    /// cuando no podía leer `accounts.json`; esa lista vacía la ve
+    /// [`Listings`] como «la persona no tiene cuentas», y dos listados vacíos
+    /// separados por una vuelta son exactamente lo que confirma una ausencia
+    /// para podar. Cinco minutos después, el correo, el calendario y los
+    /// contactos de la persona estaban borrados y no quedaba copia de la que
+    /// volver.
+    ///
+    /// Lo que se comprueba acá es que el otro lado del cable —el que decide que
+    /// un error es «no borrar nada»— sigue siendo así, y que no depende de
+    /// cuántas vueltas pasen: el podador no lleva la cuenta de los fallos.
+    #[tokio::test]
+    async fn un_list_accounts_que_el_demonio_no_puede_contestar_no_poda_nada() {
+        let f = Fixture::new("falla-de-lectura");
+        f.list(listing(&["correo", "calendario", "contactos"]))
+            .await;
+        for cuenta in ["correo", "calendario", "contactos"] {
+            assert!(
+                f.paths(cuenta).db_exists().unwrap(),
+                "la base de {cuenta} tenía que existir",
+            );
+        }
+
+        // Lo que llega del demonio cuando `accounts.json` no se puede leer: un
+        // error de D-Bus, que el broker vuelve como `BrokerError`.
+        let respuesta: Result<Vec<crate::broker::Account>, crate::broker::BrokerError> =
+            Err(crate::broker::BrokerError::Failed(
+                "Error al cargar cuentas: no se pudo leer \
+                 /var/lib/vasak-accounts/1000/accounts.json"
+                    .into(),
+            ));
+
+        // Muchas vueltas, y cada una con su reloj: es lo que haría falta para
+        // confirmar una ausencia. Las dos últimas, con la separación que la
+        // confirmación exige.
+        for _ in 0..5 {
+            f.list(listing_from(&respuesta)).await;
+            f.advance(PRUNE_CONFIRMATION);
+        }
+        f.list(listing_from(&respuesta)).await;
+        f.advance(PRUNE_CONFIRMATION);
+        f.list(listing_from(&respuesta)).await;
+
+        for cuenta in ["correo", "calendario", "contactos"] {
+            assert!(
+                f.paths(cuenta).db_exists().unwrap(),
+                "un error de lectura borró la base de {cuenta}",
+            );
+        }
+        assert!(
+            f.keys.state().deleted.is_empty(),
+            "no se puede borrar la clave de una cuenta que no se sabe que se fue",
+        );
+        // Y la sospecha no se movió: las tres siguen anotadas como presentes.
+        let inner = f.manager.inner.lock().await;
+        let listings = inner
+            .listings
+            .as_ref()
+            .expect("hubo un listado bueno al principio");
+        for cuenta in ["correo", "calendario", "contactos"] {
+            assert!(
+                listings.listed.contains(cuenta),
+                "{cuenta} dejó de figurar en el último listado bueno",
+            );
+        }
+        assert!(
+            listings.missing_since.is_empty(),
+            "un fallo de lectura no puede anotar una ausencia: {:?}",
+            listings.missing_since,
+        );
+    }
+
+    /// Y lo del otro lado, que es lo que la poda **sí** tiene que hacer: dos
+    /// listados buenos que no la nombran, separados por una vuelta, borran su
+    /// base. Sin esta, la de arriba no probaría nada: podría no podar porque la
+    /// poda no funciona.
+    #[tokio::test]
+    async fn dos_listados_buenos_que_no_la_nombran_si_podan() {
+        let f = Fixture::new("dos-listados-buenos");
+        f.list(listing(&["se-queda", "se-va"])).await;
+
+        f.list(listing(&["se-queda"])).await;
+        f.list_after_a_round(listing(&["se-queda"])).await;
+
+        assert!(f.paths("se-queda").db_exists().unwrap());
+        assert!(!f.paths("se-va").db_exists().unwrap());
     }
 
     /// Bien respondido y confirmado, se van sólo las bases de las cuentas que

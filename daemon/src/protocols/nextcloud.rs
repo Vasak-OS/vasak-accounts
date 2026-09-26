@@ -22,6 +22,8 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::storage::CapabilityType;
+
 /// Cuánto se le da al servidor para contestar.
 ///
 /// Corto a propósito: el sondeo lo repite el cliente, así que una petición que
@@ -341,11 +343,52 @@ pub fn dav_urls(server: &str, login_name: &str) -> DavUrls {
     }
 }
 
+/// Las capacidades para las que Nextcloud **sí** tiene una dirección que armar.
+///
+/// Es la lista de las que viven en [`DavUrls`], y es la única fuente de verdad de
+/// «esta capacidad se puede dar»: `Provider::unavailable_capabilities` la
+/// consulta para saber qué se anuncia como no disponible, y `guardar_nextcloud`
+/// la consulta para saber qué dirección guardar. Las dos salidas de la misma
+/// lista, para que no pueda pasar que una diga que hay dirección y la otra que
+/// no.
+///
+/// Lo que no está acá —`chat`, `tasks`— se habla por rutas que todavía no
+/// consume ninguna aplicación. Guardarlas con `url: null` y anunciarlas como
+/// disponibles deja una capacidad encendida sin destino: la persona la ve
+/// conectada, la aplicación la pide, y no hay a qué servidor hablarle. Es
+/// `Vasak-OS/vasak-accounts#57`.
+pub const DAV_CAPABILITIES: [CapabilityType; 3] = [
+    CapabilityType::Drive,
+    CapabilityType::Calendar,
+    CapabilityType::Contacts,
+];
+
+/// Si esta capacidad tiene una dirección DAV que se pueda armar al conectar.
+pub fn is_dav_capability(capability: &CapabilityType) -> bool {
+    DAV_CAPABILITIES.contains(capability)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct DavUrls {
     pub files: String,
     pub calendars: String,
     pub addressbooks: String,
+}
+
+impl DavUrls {
+    /// La dirección de una capacidad, o `None` si esta no es una de las que se
+    /// arman por DAV.
+    ///
+    /// Un `Option` y no un texto vacío porque «no hay dirección» es un hecho que
+    /// hay que poder preguntar, no una cadena que se armó mal.
+    pub fn for_capability(&self, capability: &CapabilityType) -> Option<&str> {
+        match capability {
+            CapabilityType::Drive => Some(&self.files),
+            CapabilityType::Calendar => Some(&self.calendars),
+            CapabilityType::Contacts => Some(&self.addressbooks),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

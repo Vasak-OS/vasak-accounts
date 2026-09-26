@@ -194,19 +194,22 @@ impl Provider {
 
     /// Las capacidades que este proveedor ofrece pero **todavía no puede dar**.
     ///
-    /// Es la única fuente de verdad de «no disponible», y se deriva de los
-    /// `[endpoints]` del archivo y no de una lista escrita a mano: una
-    /// capacidad OAuth2 sin dirección de servicio se conecta bien y después
-    /// ninguna aplicación sabe a qué servidor hablarle. Google Drive no habla
-    /// WebDAV y Microsoft no expone CalDAV ni CardDAV —ver
+    /// Es la única fuente de verdad de «no disponible», y sale de una regla por
+    /// proveedor: una capacidad que se ofrece y de la que no se sabe la dirección
+    /// se muestra **apagada**, nunca rota, y no se pide al conectar. Google Drive
+    /// no habla WebDAV y Microsoft no expone CalDAV ni CardDAV —ver
     /// `Vasak-OS/vasak-file-manager#95` y la decisión en
     /// `Vasak-OS/vasak-accounts#24`—, así que esas capacidades se muestran
-    /// **apagadas**, nunca rotas, hasta que el archivo reciba su dirección. El
-    /// día que `google.toml` traiga `[endpoints.drive]`, Drive se enciende solo.
+    /// **apagadas** hasta que el archivo reciba su dirección. El día que
+    /// `google.toml` traiga `[endpoints.drive]`, Drive se enciende solo.
     ///
-    /// Para Nextcloud siempre es vacío: sus direcciones no están en el archivo
-    /// porque se arman al conectar, a partir del servidor que escribió la
-    /// persona (`protocols::nextcloud::dav_urls`).
+    /// Para OAuth2, la dirección sale de los `[endpoints]` del archivo. Para
+    /// Nextcloud no: sus direcciones no están en el archivo porque se arman al
+    /// conectar, a partir del servidor que escribió la persona
+    /// (`protocols::nextcloud::dav_urls`). Lo que se pregunta entonces es si hay
+    /// una ruta DAV para esa capacidad —`talk` y `tasks` no la tienen, y por eso
+    /// se anuncian apagadas en vez de guardar una `url: null` y chamar la
+    /// capacidad de disponible. Es `Vasak-OS/vasak-accounts#57`.
     ///
     /// Ordenada igual que [`capabilities`](Self::capabilities), y por eso
     /// determinista: es un subconjunto suyo, en el mismo orden.
@@ -217,7 +220,11 @@ impl Provider {
                 .into_iter()
                 .filter(|c| !self.endpoints.contains_key(c))
                 .collect(),
-            ProviderKind::Nextcloud => Vec::new(),
+            ProviderKind::Nextcloud => self
+                .capabilities()
+                .into_iter()
+                .filter(|c| !crate::protocols::nextcloud::is_dav_capability(c))
+                .collect(),
         }
     }
 
@@ -903,6 +910,19 @@ mod tests {
         capabilities = ["drive", "calendar"]
     "#;
 
+    /// Un Nextcloud que además ofrece `talk` y `tasks`, que no tienen ruta DAV.
+    ///
+    /// El archivo que trae el paquete no los lista todavía —«sin `chat`
+    /// todavía: Talk se habla por otra ruta y no hay app que la consuma»—, pero
+    /// un administrador puede copiarlo a `/etc/vasak-accounts/providers.d/` y
+    /// agregarlos, y la regla tiene que aguantar eso.
+    const NEXTCLAVE: &str = r#"
+        id = "nextcloud"
+        display_name = "Nextcloud"
+        kind = "nextcloud"
+        capabilities = ["drive", "calendar", "contacts", "chat", "tasks"]
+    "#;
+
     /// Nextcloud se conecta **sin configurar nada**: las credenciales las emite
     /// el servidor de la propia persona. Si `is_configured` le exigiera un
     /// client_id, el único proveedor que funciona gratis quedaría apagado.
@@ -1227,12 +1247,12 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap_or_default();
     }
 
-    /// Nextcloud no tiene direcciones en el archivo porque se arman al conectar
-    /// desde el servidor que escribió la persona. Mirarle los `[endpoints]`
-    /// diría que nada está disponible, y es justo el proveedor que funciona
-    /// entero.
+    /// Lo que Nextcloud puede sí: `[endpoints]` está vacío —sus direcciones se
+    /// arman al conectar desde el servidor que escribió la persona— y aun así
+    /// `drive`, `calendar` y `contacts` quedan encendidas, porque hay una ruta
+    /// DAV para cada una.
     #[test]
-    fn nextcloud_no_tiene_nada_no_disponible() {
+    fn nextcloud_solo_tiene_no_disponible_lo_que_no_tiene_de_dav() {
         let dir = temp_dir();
         std::fs::write(dir.join("nextcloud.toml"), NEXTCLOUD).unwrap();
 
@@ -1244,6 +1264,64 @@ mod tests {
         assert!(nube.unavailable_capabilities().is_empty());
 
         std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// Lo que Nextcloud **no** puede todavía: `talk` y `tasks` no tienen ruta
+    /// DAV, así que tienen que salir en `unavailable_capabilities` y no pedirse
+    /// al conectar.
+    ///
+    /// Es `Vasak-OS/vasak-accounts#57`. Se anunciaban como disponibles y se
+    /// guardaban con `url: null`: la persona las veía conectadas, el primer
+    /// cliente que las pidiera recibía una capacidad sin dirección y no tenía a
+    /// qué servidor hablarle. Nadie las consume todavía, así que hoy no falla
+    /// nada —y por eso es hora de cerrarlo, antes de que las consuma alguien.
+    #[test]
+    fn lo_de_nextcloud_sin_ruta_dav_se_anuncia_no_disponible() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("nextcloud.toml"), NEXTCLAVE).unwrap();
+
+        let nube = &cargar(&dir)["nextcloud"];
+        assert_eq!(
+            nube.unavailable_capabilities(),
+            vec![CapabilityType::Chat, CapabilityType::Tasks]
+        );
+        // Y sigue siendo un subconjunto de lo que ofrece, en el mismo orden.
+        let ofrece = nube.capabilities();
+        for capacidad in nube.unavailable_capabilities() {
+            assert!(ofrece.contains(&capacidad));
+        }
+
+        // Al conectar no se piden: se descartan y se dice cuáles.
+        let filtrado = nube
+            .filter_available(&[
+                CapabilityType::Chat,
+                CapabilityType::Drive,
+                CapabilityType::Tasks,
+            ])
+            .unwrap();
+        assert_eq!(filtrado.available, vec![CapabilityType::Drive]);
+        assert_eq!(
+            filtrado.discarded,
+            vec![CapabilityType::Chat, CapabilityType::Tasks]
+        );
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// La regla y la que guarda la cuenta tienen que salir de la misma lista, o
+    /// una puede decir que hay dirección mientras la otra no la encuentra.
+    #[test]
+    fn la_lista_de_cosas_con_dav_dav_url_y_anuncio_no_se_separan() {
+        for capacidad in CapabilityType::ALL {
+            let hay_ruta = crate::protocols::nextcloud::is_dav_capability(&capacidad);
+            let rutas = crate::protocols::nextcloud::dav_urls("https://nube.ejemplo.com", "ana");
+            assert_eq!(
+                hay_ruta,
+                rutas.for_capability(&capacidad).is_some(),
+                "{:?}: la regla y la dirección no coinciden",
+                capacidad
+            );
+        }
     }
 
     /// Lo que `BeginAuth` hace con un pedido: se descarta lo que no tiene

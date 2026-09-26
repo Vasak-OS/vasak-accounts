@@ -199,6 +199,22 @@ pub struct AccountSummary {
 pub enum StorageError {
     Io(std::io::Error),
     Json(serde_json::Error),
+    /// El archivo que guarda las cuentas **no se pudo leer**, y eso no es lo
+    /// mismo que no haya cuentas.
+    ///
+    /// Existe para que la respuesta sea inequívoca. `ListAccounts` no pide
+    /// permiso y la pantalla la dibuja con lo que conteste, así que una lista
+    /// vacía significa «esta persona no conectó ninguna cuenta» y nada más. Si
+    /// un `accounts.json` que no se puede leer se contestara como lista vacía,
+    /// el sincronizador leería dos listados vacíos seguidos, concluiría que la
+    /// persona borró sus cuentas y **podaría** las bases locales de correo,
+    /// calendario y contactos: en cinco minutos, sin aviso y sin copia de la
+    /// que volver. Un error, en cambio, el sincronizador ya lo trata como «no
+    /// borrar nada».
+    Unreadable {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 impl std::fmt::Display for StorageError {
@@ -206,6 +222,9 @@ impl std::fmt::Display for StorageError {
         match self {
             StorageError::Io(e) => write!(f, "IO error: {}", e),
             StorageError::Json(e) => write!(f, "JSON error: {}", e),
+            StorageError::Unreadable { path, source } => {
+                write!(f, "no se pudo leer {}: {}", path.display(), source)
+            }
         }
     }
 }
@@ -215,6 +234,7 @@ impl std::error::Error for StorageError {
         match self {
             StorageError::Io(e) => Some(e),
             StorageError::Json(e) => Some(e),
+            StorageError::Unreadable { source, .. } => Some(source),
         }
     }
 }
@@ -237,6 +257,14 @@ impl From<serde_json::Error> for StorageError {
 
 pub struct AccountDatabase {
     path: PathBuf,
+    /// Si el directorio de la persona **ya existía** al abrir su base.
+    ///
+    /// Es lo que separa «todavía no hay cuentas» de «el archivo que las guardaba
+    /// no está», que por la respuesta se confunden. Borrar la última cuenta
+    /// nunca borra el archivo: [`AccountDatabase::remove`] escribe `[]` en él.
+    /// Así que un directorio que ya estaba y no tiene `accounts.json` no es una
+    /// cuenta nueva, es algo que se llevó el archivo o que no se puede leer.
+    directory_existed: bool,
     pub accounts: Vec<Account>,
 }
 
@@ -275,25 +303,67 @@ impl AccountDatabase {
     /// this; tests use it directly so they do not have to share a process-wide
     /// setting and can run alongside each other.
     pub fn in_directory(directory: PathBuf) -> Result<Self, StorageError> {
+        // Antes de crearla, y preguntando por el motivo: `Path::exists()`
+        // devuelve `false` también cuando lo que falló fue un permiso o el
+        // disco, así que un directorio al que no se puede leer se confunde con
+        // uno que todavía no se creó — y esa confusión es la mitad del problema
+        // que `load` resuelve.
+        let directory_existed = match std::fs::metadata(&directory) {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(source) => {
+                return Err(StorageError::Unreadable {
+                    path: directory,
+                    source,
+                });
+            }
+        };
+
         std::fs::create_dir_all(&directory)?;
         // 0700: the listing alone says which accounts exist.
         let _ = std::fs::set_permissions(&directory, PermissionsExt::from_mode(0o700));
 
         Ok(AccountDatabase {
             path: directory.join(Self::FILE_NAME),
+            directory_existed,
             accounts: Vec::new(),
         })
     }
 
     /// Lee `accounts.json` y carga las cuentas en memoria.
-    /// Si el archivo no existe, deja la lista vacía.
+    ///
+    /// **Un archivo que no se puede leer es un error, nunca una lista vacía.**
+    /// La lista vacía dice una sola cosa: que esta persona todavía no conectó
+    /// ninguna cuenta. Un `accounts.json` que falta —el disco no montó, cambió
+    /// un permiso, algo se lo llevó— contestado como lista vacía le dice al
+    /// sincronizador que la persona no tiene cuentas, y el sincronizador poda
+    /// las bases locales de las que dejó de ver en dos listados seguidos. El
+    /// resultado es que a los cinco minutos se borran el correo, el calendario y
+    /// los contactos, y no queda copia de la que volver.
+    ///
+    /// El sincronizador ya trata un error como «no borrar nada»
+    /// (`AccountListing::Failed`), así que el error es la respuesta segura.
     pub fn load(&mut self) -> Result<(), StorageError> {
-        if !self.path.exists() {
-            self.accounts.clear();
-            return Ok(());
-        }
-        let data = std::fs::read_to_string(&self.path)?;
-        self.accounts = serde_json::from_str(&data)?;
+        // Se lee y se pregunta por el motivo. `self.path.exists()` devolvía
+        // `false` para todo lo que no sea «existe» —un permiso cambiado, un
+        // directorio donde debería estar el archivo, un enlace roto— y cada uno
+        // de esos casos terminaba en una lista vacía.
+        let data = match std::fs::read(&self.path) {
+            Ok(data) => data,
+            // `NotFound` y sólo `NotFound`: si el directorio se acaba de crear,
+            // es la primera vez que se abre esta base y no hay cuentas todavía.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !self.directory_existed => {
+                self.accounts.clear();
+                return Ok(());
+            }
+            Err(source) => {
+                return Err(StorageError::Unreadable {
+                    path: self.path.clone(),
+                    source,
+                });
+            }
+        };
+        self.accounts = serde_json::from_slice(&data)?;
         Ok(())
     }
 
@@ -756,6 +826,168 @@ mod tests {
         assert!(db.get("cualquiera").is_none());
 
         std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// Un `accounts.json` que **falta después de haber existido** es una pérdida
+    /// de datos, no una cuenta nueva, y tiene que llegar como error.
+    ///
+    /// Es el caso que abre `Vasak-OS/vasak-accounts#56`, y el que borra el
+    /// correo, el calendario y los contactos de la persona. El podador del
+    /// sincronizador necesita dos listados seguidos para confirmar que una
+    /// cuenta se fue, y dos listados vacíos confirman exactamente eso: en cinco
+    /// minutos, todas las bases locales, sin aviso y sin copia.
+    ///
+    /// Borrar la última cuenta nunca borra el archivo —`remove()` escribe `[]` en
+    /// él—, así que un directorio que ya estaba y no tiene `accounts.json` no es
+    /// una persona sin cuentas: es un archivo que se perdió.
+    #[test]
+    fn un_accounts_json_que_falta_despues_de_haber_existido_da_error() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
+        db.load().unwrap();
+        db.add(sample_account()).unwrap();
+        assert!(dir.join("accounts.json").exists());
+
+        // El disco no montó, o algo se lo llevó.
+        std::fs::remove_file(dir.join("accounts.json")).unwrap();
+
+        let mut otra = AccountDatabase::in_directory(dir.clone()).unwrap();
+        let error = otra
+            .load()
+            .expect_err("un archivo que falta no es una lista vacía");
+        assert!(
+            matches!(error, StorageError::Unreadable { .. }),
+            "se esperaba Unreadable, vino {error:?}",
+        );
+        assert!(
+            otra.is_empty(),
+            "y aunque falle, no puede quedar una lista vacía por la cual pasar",
+        );
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// Un `accounts.json` que no se puede leer es un error, y lo mismo vale
+    /// cuando lo que no se puede leer es **el directorio**: `Path::exists()` no
+    /// distingue «no existe» de «no tengo permiso para saber si existe», así
+    /// que ambos terminaban como lista vacía.
+    ///
+    /// Se le quita el acceso a la carpeta que **contiene** la de la persona, y
+    /// no a la de la persona: `in_directory` vuelve a ponerla en 0700 en cada
+    /// apertura, así que poniéndole el permiso a ella la prueba no probaría
+    /// nada.
+    #[test]
+    fn un_directorio_que_no_se_puede_leer_da_error_y_no_una_lista_vacia() {
+        if running_as_root() {
+            // Root no lo bloquea un `chmod`: la prueba no probaría nada.
+            return;
+        }
+
+        let raiz = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let dir = raiz.join("1000");
+        let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
+        db.load().unwrap();
+        db.add(sample_account()).unwrap();
+
+        std::fs::set_permissions(&raiz, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let error = AccountDatabase::in_directory(dir.clone())
+            .and_then(|mut db| db.load())
+            .expect_err("un directorio ilegible no es una lista vacía");
+        assert!(
+            matches!(error, StorageError::Unreadable { .. }),
+            "se esperaba Unreadable, vino {error:?}",
+        );
+
+        std::fs::set_permissions(&raiz, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(raiz).unwrap_or_default();
+    }
+
+    /// Un directorio donde debería estar el archivo, o un archivo que es un
+    /// directorio, tienen que caer en la misma variante que el resto de «no se
+    /// pudo leer». Ya daban error antes —leer una carpeta da `EISDIR`— pero como
+    /// un `Io` cualquiera, y quien lee el error no puede distinguir «el disco
+    /// está mal» de «ahí hay algo que no es el archivo», que para esta persona
+    /// es la misma noticia.
+    #[test]
+    fn algo_que_no_es_el_archivo_tampoco_da_una_lista_vacia() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
+        db.load().unwrap();
+        db.add(sample_account()).unwrap();
+
+        std::fs::remove_file(dir.join("accounts.json")).unwrap();
+        // El directorio de la persona sigue ahí, pero donde iba el archivo hay
+        // una carpeta: leerla da EISDIR, no «no hay cuentas».
+        std::fs::create_dir(dir.join("accounts.json")).unwrap();
+
+        let mut otra = AccountDatabase::in_directory(dir.clone()).unwrap();
+        let error = otra
+            .load()
+            .expect_err("una carpeta donde va el archivo no es una lista vacía");
+        assert!(
+            matches!(error, StorageError::Unreadable { .. }),
+            "se esperaba Unreadable, vino {error:?}",
+        );
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// El mensaje del error tiene que decir **qué** no se pudo leer, y no
+    /// decir nada que sea la respuesta que no tiene que dar.
+    #[test]
+    fn el_error_de_lo_que_no_se_puede_leer_no_dice_que_no_hay_cuentas() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
+        db.load().unwrap();
+        db.add(sample_account()).unwrap();
+        std::fs::remove_file(dir.join("accounts.json")).unwrap();
+
+        let mut otra = AccountDatabase::in_directory(dir.clone()).unwrap();
+        let mensaje = otra.load().unwrap_err().to_string();
+        assert!(mensaje.contains("accounts.json"), "{mensaje}");
+        assert!(!mensaje.contains("no hay cuentas"), "{mensaje}");
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// Lo que ve quien llama por D-Bus, sin pasar por un bus: un archivo que no
+    /// se puede leer tiene que volver como error de `ListAccounts`, y la
+    /// respuesta tiene que ser distinguible de `[]`.
+    #[test]
+    fn un_error_de_lectura_no_se_puede_confundir_con_una_lista_vacia() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
+        db.load().unwrap();
+        db.add(sample_account()).unwrap();
+        std::fs::remove_file(dir.join("accounts.json")).unwrap();
+
+        // Esto es lo que hace `open_db`, que es el arranque de `ListAccounts`: el
+        // error se traduce a un error de D-Bus y `ListAccounts` no llega a armar
+        // ninguna lista.
+        let mut otra = AccountDatabase::in_directory(dir.clone()).unwrap();
+        let por_dbus = otra
+            .load()
+            .map_err(|e| format!("Error al cargar cuentas: {e}"));
+        let texto = por_dbus.expect_err("ListAccounts no puede devolver una lista vacía");
+        assert!(texto.starts_with("Error al cargar cuentas"), "{texto}");
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// Sólo para el caso de permisos: root no lo bloquea un `chmod`, y una
+    /// prueba que no bloquea nada no prueba nada. `libc` no está en las
+    /// dependencias del demonio y no se agrega por esto.
+    fn running_as_root() -> bool {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|estado| {
+                estado
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Uid:").map(str::to_string))
+            })
+            .and_then(|uids| uids.split_whitespace().next().map(str::to_string))
+            .is_some_and(|uid| uid == "0")
     }
 
     /// El directorio guarda los tokens de una persona: que otra pueda listarlo

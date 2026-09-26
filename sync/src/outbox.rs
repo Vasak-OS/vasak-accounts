@@ -21,14 +21,30 @@
 //! El directorio va en 0700 y cada archivo en 0600, porque adentro hay el texto
 //! completo de mensajes privados. En un equipo compartido, el valor por omisión
 //! los dejaría legibles para cualquier otra cuenta.
+//!
+//! ── La carpeta no se sigue ─────────────────────────────────────────────────
+//!
+//! `outbox/` se abre con `O_NOFOLLOW | O_DIRECTORY` y todo lo que hace la cola
+//! —escribir, renombrar, listar, borrar— es relativo a ese descriptor, no a la
+//! ruta. Un enlace simbólico puesto donde la cola espera una carpeta propia es
+//! **escritura arbitraria en la ruta que el atacante controle**: el mensaje sin
+//! mandar de la persona termina en una carpeta ajena, o lo lee quien la puso ahí.
+//! Es el mismo criterio que la poda del almacén y que la mudanza de
+//! `salientes/`, y acá faltaba: se abría con `create_dir_all` y se escribía por
+//! la ruta. Ver [`Outbox`].
 
-use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::ffi::{CStr, CString};
+use std::io::{Read as _, Write};
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use rustix::fs::{AtFlags, FileType, Mode, OFlags, CWD};
+use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 
 use crate::compose::Draft;
+use crate::store::paths::{open_dir_at, read_entries};
 
 /// Cuántos mensajes se aceptan sin mandar.
 ///
@@ -450,11 +466,56 @@ fn move_without_replacing(
 
 /// La cola en el disco.
 pub struct Outbox {
+    /// La carpeta, abierta **sin seguir enlaces**.
+    ///
+    /// Todo lo que hace la cola —escribir, renombrar, listar, borrar— es
+    /// relativo a este descriptor y no a la ruta, y por eso cambiar `outbox/`
+    /// por un enlace a mitad de camino no cambia a dónde sale el mensaje: lo que
+    /// importa es hacia dónde apunta el descriptor, no qué hay ahora en ese
+    /// nombre. Con la ruta sola, un enlace puesto donde el servicio espera una
+    /// carpeta propia es **escritura arbitraria en la ruta que el atacante
+    /// controle**: un mensaje sin mandar termina en una carpeta ajena, o lo lee
+    /// quien la puso ahí.
+    ///
+    /// El patrón es el de `store/paths.rs` —`O_NOFOLLOW | O_DIRECTORY` y todo
+    /// relativo al descriptor—, que la poda del almacén ya usa y que la mudanza
+    /// de `salientes/` a `outbox/` también.
+    fd: OwnedFd,
+    /// La ruta, sólo para los mensajes de error y para el diario. Por acá no
+    /// escribe nada.
     root: PathBuf,
+}
+
+/// Un enlace simbólico donde tiene que estar la carpeta, no.
+///
+/// La misma comprobación que hace `StorePaths::prepare_dir` antes de crear
+/// `stores/`, y por el mismo motivo: si la ruta se puede seguir para crearla,
+/// el `O_NOFOLLOW` de después llega tarde.
+fn reject_symlink(path: &Path, what: &str) -> Result<(), String> {
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(format!(
+            "{} es un enlace simbólico; no se usa para {what}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Un nombre de la cola como lo quieren las llamadas relativas al descriptor.
+fn entry_name(name: &str) -> Result<CString, String> {
+    CString::new(name).map_err(|_| format!("el nombre {name:?} no sirve para un archivo"))
 }
 
 impl Outbox {
     pub fn open(root: PathBuf) -> Result<Self, String> {
+        // Ni `outbox/` ni la carpeta del servicio pueden ser enlaces. Lo de más
+        // arriba —la `XDG_DATA_HOME` de la persona— sí se sigue, porque es suyo
+        // y lo puede tener donde quiera: es el mismo límite que en `stores/`.
+        if let Some(app_dir) = root.parent() {
+            reject_symlink(app_dir, "guardar")?;
+        }
+        reject_symlink(&root, "guardar")?;
+
         std::fs::create_dir_all(&root)
             .map_err(|e| format!("no se pudo crear {}: {e}", root.display()))?;
         // 0700 **siempre**, no sólo al crear: un directorio que ya existía con
@@ -472,9 +533,49 @@ impl Outbox {
                 root.display()
             )
         })?;
-        Ok(Outbox { root })
+
+        let fd = open_dir_at(CWD, &root).map_err(|e| {
+            format!(
+                "{} es un enlace simbólico o no es una carpeta; no se usa como cola: {}",
+                root.display(),
+                std::io::Error::from(e)
+            )
+        })?;
+
+        // Y que lo que se abrió sea **esto**: entre el `chmod` de arriba y esta
+        // apertura la ruta pudo cambiar de mano. El inodo se mira dos veces —por
+        // el descriptor y por el nombre, sin seguir enlaces— y tienen que ser el
+        // mismo. A partir de acá, el descriptor es la cola: cambiar la ruta no
+        // cambia dónde se escribe.
+        let abierto = rustix::fs::fstat(&fd).map_err(|e| {
+            format!(
+                "no se pudo mirar {}: {}",
+                root.display(),
+                std::io::Error::from(e)
+            )
+        })?;
+        let nombrado = rustix::fs::statat(CWD, &root, AtFlags::SYMLINK_NOFOLLOW).map_err(|e| {
+            format!(
+                "no se pudo mirar {}: {}",
+                root.display(),
+                std::io::Error::from(e)
+            )
+        })?;
+        if abierto.st_dev != nombrado.st_dev || abierto.st_ino != nombrado.st_ino {
+            return Err(format!(
+                "{} cambió mientras se abría la cola; no se usa",
+                root.display()
+            ));
+        }
+
+        Ok(Outbox { fd, root })
     }
 
+    /// La ruta del mensaje, para los mensajes de error y para las pruebas.
+    ///
+    /// **Por acá no se abre ni se borra nada**: lo que se abre y lo que se
+    /// borra es relativo a [`Outbox::fd`], así que un enlace en esta ruta no
+    /// cambia a dónde se escribe. Ver la nota del campo.
     fn path_of(&self, id: &str) -> PathBuf {
         self.root.join(format!("{id}.json"))
     }
@@ -500,23 +601,33 @@ impl Outbox {
         let json = serde_json::to_vec_pretty(outgoing)
             .map_err(|e| format!("no se pudo serializar el mensaje: {e}"))?;
 
-        let temp_path = self.root.join(format!(".{}.tmp", outgoing.id));
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
+        let temp = entry_name(&format!(".{}.tmp", outgoing.id))?;
+        let destino = entry_name(&format!("{}.json", outgoing.id))?;
+
+        // `O_NOFOLLOW` también en el temporal: si alguien puso un enlace con ese
+        // nombre, `openat` falla en vez de escribir por el enlace.
+        let abierto = rustix::fs::openat(
+            &self.fd,
+            &temp,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             // 0600: adentro está el texto completo de un mensaje privado.
-            .mode(0o600)
-            .open(&temp_path)
-            .map_err(|e| format!("no se pudo escribir el mensaje: {e}"))?;
+            Mode::from_raw_mode(0o600),
+        )
+        .map_err(|e| {
+            format!(
+                "no se pudo escribir el mensaje: {}",
+                std::io::Error::from(e)
+            )
+        })?;
+        let mut file = std::fs::File::from(abierto);
 
         file.write_all(&json)
             .and_then(|()| file.sync_all())
             .map_err(|e| format!("no se pudo escribir el mensaje: {e}"))?;
         drop(file);
 
-        std::fs::rename(&temp_path, self.path_of(&outgoing.id))
-            .map_err(|e| format!("no se pudo guardar el mensaje: {e}"))?;
+        rustix::fs::renameat(&self.fd, &temp, &self.fd, &destino)
+            .map_err(|e| format!("no se pudo guardar el mensaje: {}", std::io::Error::from(e)))?;
 
         self.sync_dir()
     }
@@ -530,18 +641,25 @@ impl Outbox {
     /// mensaje aceptado que al arrancar no está, o uno ya entregado que
     /// reaparece y se manda dos veces.
     fn sync_dir(&self) -> Result<(), String> {
-        std::fs::File::open(&self.root)
-            .and_then(|d| d.sync_all())
-            .map_err(|e| format!("no se pudo asegurar la cola en el disco: {e}"))
+        rustix::fs::fsync(&self.fd).map_err(|e| {
+            format!(
+                "no se pudo asegurar la cola en el disco: {}",
+                std::io::Error::from(e)
+            )
+        })
     }
 
     /// Saca un mensaje de la cola. Se llama cuando salió.
     pub fn remove(&self, id: &str) -> Result<(), String> {
-        match std::fs::remove_file(self.path_of(id)) {
+        let name = entry_name(&format!("{id}.json"))?;
+        match rustix::fs::unlinkat(&self.fd, &name, AtFlags::empty()) {
             Ok(()) => self.sync_dir(),
             // Que ya no esté es el resultado que se buscaba.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(format!("no se pudo quitar el mensaje: {e}")),
+            Err(Errno::NOENT) => Ok(()),
+            Err(e) => Err(format!(
+                "no se pudo quitar el mensaje: {}",
+                std::io::Error::from(e)
+            )),
         }
     }
 
@@ -549,40 +667,62 @@ impl Outbox {
     ///
     /// Un archivo que no se puede leer **se saltea** en vez de tirar la lista:
     /// uno corrupto —de un corte de luz de antes del renombre atómico, de una
-    /// versión anterior— no puede impedir que salgan los demás.
+    /// versión anterior— no puede impedir que salgan los demás. Y uno **enlazado**
+    /// tampoco: `read_outgoing` lo abre sin seguir enlaces.
     pub fn all(&self) -> Result<Vec<Outgoing>, String> {
-        let entries = match std::fs::read_dir(&self.root) {
-            Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(format!("no se pudo leer la cola: {e}")),
-        };
+        let entries = read_entries(&self.fd).map_err(|e| {
+            format!(
+                "no se pudo leer la cola {}: {}",
+                self.root.display(),
+                std::io::Error::from(e)
+            )
+        })?;
 
         let mut queued: Vec<Outgoing> = entries
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|e| e == "json"))
-            .filter_map(|p| read_outgoing(&p))
+            .into_iter()
+            .filter(|(_, kind)| *kind == FileType::RegularFile)
+            .filter(|(name, _)| name.to_string_lossy().ends_with(".json"))
+            .filter_map(|(name, _)| self.read_outgoing(&name))
             .collect();
 
-        // Por identificador, que empieza con la hora: la cola sale en el orden
+        // Por identificador, que empieza por la hora: la cola sale en el orden
         // en que se escribió, que es el que espera quien la mira.
         queued.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(queued)
     }
 
+    /// Lee un mensaje de la cola, relativo al descriptor y **sin seguir
+    /// enlaces**.
+    ///
+    /// El enlace ya lo descarta [`Outbox::all`], que mira el tipo de cada entrada
+    /// sin seguirlo; esto es la segunda cerradura, para el caso de que el tipo
+    /// que se leyó no sea el del archivo cuando se abre —el nombre se puede
+    /// cambiar entre la lectura de la carpeta y la apertura—.
+    fn read_outgoing(&self, name: &CStr) -> Option<Outgoing> {
+        let file = rustix::fs::openat(
+            &self.fd,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .ok()?;
+
+        let mut text = String::new();
+        std::fs::File::from(file).read_to_string(&mut text).ok()?;
+        match serde_json::from_str(&text) {
+            Ok(outgoing) => Some(outgoing),
+            Err(e) => {
+                tracing::warn!(
+                    "no se pudo leer {}: {e}",
+                    self.path_of(&name.to_string_lossy()).display()
+                );
+                None
+            }
+        }
+    }
+
     fn count(&self) -> Result<usize, String> {
         Ok(self.all()?.len())
-    }
-}
-
-fn read_outgoing(path: &Path) -> Option<Outgoing> {
-    let text = std::fs::read_to_string(path).ok()?;
-    match serde_json::from_str(&text) {
-        Ok(outgoing) => Some(outgoing),
-        Err(e) => {
-            tracing::warn!("no se pudo leer {}: {e}", path.display());
-            None
-        }
     }
 }
 
@@ -641,6 +781,182 @@ mod tests {
             "vasak-cola-{unique}-{:?}",
             std::thread::current().id()
         ))
+    }
+
+    /// Una carpeta de la persona con un `outbox/` adentro, como en
+    /// `$XDG_DATA_HOME/vasak-accounts-sync/outbox/`.
+    ///
+    /// El nombre del `outbox/` va aparte del de la carpeta porque es el que se
+    /// puede cambiar por un enlace. `parent` es la `XDG_DATA_HOME` y `app` la
+    /// carpeta del servicio; el primero existe para poder dejar un directorio
+    /// al lado, que es adonde apunta un enlace.
+    struct WithOutbox {
+        parent: PathBuf,
+        app: PathBuf,
+        outbox: PathBuf,
+    }
+
+    impl WithOutbox {
+        fn new(label: &str) -> Self {
+            let parent = temp_root();
+            let app = parent.join("vasak-accounts-sync");
+            let outbox = app.join(OUTBOX_DIR);
+            std::fs::create_dir_all(&outbox).unwrap();
+            tracing::debug!("cola de prueba {label} en {}", parent.display());
+            Self {
+                parent,
+                app,
+                outbox,
+            }
+        }
+
+        /// Lo que hay en la carpeta, para probar que no se escribió afuera.
+        fn contenido(&self) -> Vec<String> {
+            let mut nombres: Vec<String> = std::fs::read_dir(&self.outbox)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            nombres.sort();
+            nombres
+        }
+    }
+
+    impl Drop for WithOutbox {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.parent);
+        }
+    }
+
+    /// Un `outbox/` que es un enlace a otra carpeta no se usa, y **no se escribe
+    /// por el enlace**.
+    ///
+    /// Es `Vasak-OS/vasak-accounts#60`, y lo que cerraba era que la cola se
+    /// abría con `create_dir_all` y escribía por la ruta: un enlace puesto donde
+    /// la persona —o cualquier programa con su cuenta— puede escribir metía
+    /// cada mensaje sin mandar en la carpeta que el atacante chose, y quien la
+    /// puso ahí podía leerlos.
+    #[test]
+    fn una_cola_que_es_un_enlace_no_se_abre_ni_se_escribe_por_el() {
+        let f = WithOutbox::new("cola-enlace");
+        let ajena = f.parent.join("ajena");
+        std::fs::create_dir_all(&ajena).unwrap();
+
+        let raiz = f.outbox.clone();
+        std::fs::remove_dir(&raiz).unwrap();
+        std::os::unix::fs::symlink(&ajena, &raiz).unwrap();
+
+        // No se abre: el mensaje dice por qué, en vez de devolver una cola vacía
+        // que parece que no hay nada esperando.
+        let error = match Outbox::open(raiz.clone()) {
+            Err(error) => error,
+            Ok(_) => panic!("una cola que es un enlace no es una cola"),
+        };
+        assert!(
+            error.contains("enlace simbólico"),
+            "el error tiene que decir que es un enlace: {error}",
+        );
+
+        // Y no quedó escrito nada en la carpeta de al lado.
+        assert!(
+            std::fs::read_dir(&ajena).unwrap().next().is_none(),
+            "se escribió por el enlace: {:?}",
+            f.contenido(),
+        );
+    }
+
+    /// Lo mismo para la carpeta del servicio: si `vasak-accounts-sync/` es un
+    /// enlace, `outbox/` se crearía a través de él. Es el mismo límite que
+    /// `stores/`, y por lo mismo no se sigue.
+    #[test]
+    fn una_carpeta_de_servicio_que_es_un_enlace_no_se_sigue() {
+        let f = WithOutbox::new("servicio-enlace");
+        let ajena = f.parent.join("ajena");
+        std::fs::create_dir_all(&ajena).unwrap();
+
+        let app = f.app.clone();
+        std::fs::remove_dir_all(&app).unwrap();
+        std::os::unix::fs::symlink(&ajena, &app).unwrap();
+
+        let error = match Outbox::open(app.join(OUTBOX_DIR)) {
+            Err(error) => error,
+            Ok(_) => panic!("no se crea la cola a través de un enlace"),
+        };
+        assert!(error.contains("enlace simbólico"), "{error}");
+        assert!(
+            std::fs::read_dir(&ajena).unwrap().next().is_none(),
+            "se creó la cola del otro lado",
+        );
+    }
+
+    /// Un mensaje **enlazado** adentro de la cola tampoco se lee: la lista es
+    /// de lo que la persona escribió, y un enlace a otra carpeta con nombre de
+    /// mensaje no es un mensaje.
+    ///
+    /// El archivo de al lado es un mensaje **válido** a propósito. Con un archivo
+    /// ilegible la prueba pasaría igual, porque la cola saltea los que no se
+    /// entienden: lo que tiene que fallar es que el enlace aparezca en la lista
+    /// como si fuera un mensaje de la persona.
+    #[test]
+    fn un_mensaje_que_es_un_enlace_no_se_lee() {
+        let f = WithOutbox::new("mensaje-enlace");
+        let outbox = Outbox::open(f.outbox.clone()).unwrap();
+        outbox.enqueue(&outgoing("0001")).unwrap();
+
+        // Un mensaje entero, escrito por otro, en una carpeta de otro.
+        let ajeno = f.parent.join("ajeno");
+        std::fs::create_dir_all(&ajeno).unwrap();
+        let ajeno = ajeno.join("9999.json");
+        let otro = Outbox::open(ajeno.parent().unwrap().to_path_buf()).unwrap();
+        otro.enqueue(&outgoing("9999")).unwrap();
+
+        std::os::unix::fs::symlink(&ajeno, f.outbox.join("0002.json")).unwrap();
+
+        let all = outbox.all().unwrap();
+        let ids: Vec<&str> = all.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["0001"], "se leyó el enlace: {ids:?}");
+    }
+
+    /// Y escribir encima de un nombre que ya es un enlace tampoco pasa por él:
+    /// sin `O_NOFOLLOW` en el temporal, `openat` seguiría el enlace y el texto
+    /// del mensaje se escribiría en la carpeta de al lado.
+    #[test]
+    fn un_temporal_que_es_un_enlace_no_se_escribe() {
+        let f = WithOutbox::new("temporal-enlace");
+        let outbox = Outbox::open(f.outbox.clone()).unwrap();
+
+        let fuera = f.parent.join("fuera.txt");
+        std::fs::write(&fuera, "").unwrap();
+        std::os::unix::fs::symlink(&fuera, f.outbox.join(".0001.tmp")).unwrap();
+
+        assert!(outbox.save(&outgoing("0001")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&fuera).unwrap(),
+            "",
+            "se escribió el mensaje por el enlace",
+        );
+    }
+
+    /// Una cola de verdad sigue andando: todo lo de acá arriba no puede romper el
+    /// caso normal, que es el que usa la persona todos los días.
+    #[test]
+    fn una_cola_de_verdad_sigue_andando() {
+        let f = WithOutbox::new("cola-de-verdad");
+        let outbox = Outbox::open(f.outbox.clone()).unwrap();
+        outbox.enqueue(&outgoing("0002")).unwrap();
+        outbox.enqueue(&outgoing("0001")).unwrap();
+
+        assert_eq!(
+            f.contenido(),
+            vec!["0001.json", "0002.json"],
+            "la carpeta tiene algo que no debería",
+        );
+        let ids: Vec<String> = outbox.all().unwrap().into_iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec!["0001", "0002"]);
+
+        outbox.remove("0001").unwrap();
+        assert_eq!(f.contenido(), vec!["0002.json"]);
+        assert!(!f.outbox.exists() || f.outbox.is_dir());
     }
 
     fn outgoing(id: &str) -> Outgoing {
