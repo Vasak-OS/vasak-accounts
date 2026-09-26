@@ -24,17 +24,26 @@
 //! pasa un tope vuelve con `truncated`. El rango no pasa de
 //! [`MAX_RANGE_SECONDS`].
 //!
+//! Lo que se expande en el momento **no puede llevarse la memoria ni a los
+//! demás lectores** ([`occurrences_in`]): se lee de a tandas y se expande sin
+//! conexión tomada; una sola expansión a la vez por cuenta; y de todo lo que
+//! da no se junta más que la página y una fila.
+//!
 //! **El orden es `(comienzo, cuenta, evento, vez)`**, con el cursor en esa
 //! posición: si entre una página y la siguiente entra o se va una vez, no se
 //! repite ni se saltea ninguna de las que ya estaban. Un evento que se
 //! reescribe conserva su número, y una vez su `occurrence_id`, así que
 //! volver a expandir no mueve nada.
 
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
+
 use base64::Engine;
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
 use super::contacts_read::{InvalidArgument, MAX_CURSOR_BYTES};
+use super::readers::Reader;
 use super::{classify, paths, StoreError};
 use crate::ical::recurrence::{EventSeries, ExpansionLimits, Trigger};
 use crate::ical::{self, Component, DateValue, MAX_DESCRIPTION, MAX_TEXT};
@@ -60,7 +69,7 @@ pub const MAX_SERIES_ON_THE_FLY: usize = 2000;
 
 /// Cuánto puede tardar lo que se expande en el momento, por cuenta y por
 /// consulta.
-pub const ON_THE_FLY_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+pub const ON_THE_FLY_BUDGET: Duration = Duration::from_secs(2);
 
 /// El tope de la respuesta de un evento entero. Se puede llegar —cien
 /// asistentes y una descripción larga—: el que no entra vuelve recortado.
@@ -274,6 +283,10 @@ pub struct TaskItem {
 pub struct AccountRows<T> {
     pub rows: Vec<(ListCursor, T)>,
     pub truncated: bool,
+    /// Cuántas filas se juntaron a la vez, como mucho: nunca más que las de
+    /// la página y una. Lo mira una prueba.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub peak_rows: usize,
 }
 
 impl<T> Default for AccountRows<T> {
@@ -281,6 +294,7 @@ impl<T> Default for AccountRows<T> {
         Self {
             rows: Vec::new(),
             truncated: false,
+            peak_rows: 0,
         }
     }
 }
@@ -409,34 +423,103 @@ fn floating(zone: &str) -> bool {
     matches!(zone, "floating" | "unknown")
 }
 
-/// Las veces de los eventos de una cuenta que se ven en `range`, después de
-/// `after`, en orden, como mucho `limit + 1` —una más, para saber si hay otra
-/// página—.
-pub fn account_occurrences(
-    connection: &Connection,
-    account_id: &str,
-    range: Range,
-    calendars: Option<&[i64]>,
-    after: Option<&ListCursor>,
-    limit: usize,
-    limits: &ExpansionLimits,
-) -> Result<AccountRows<OccurrenceItem>, StoreError> {
-    let mut result = AccountRows::default();
-    let position = |start: i64, object: i64, rid: i64| ListCursor {
+/// Los topes de lo que se expande en el momento, por cuenta y por llamada.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OnTheFlyLimits {
+    /// Cuántas series, como mucho.
+    pub max_series: usize,
+    /// Cuánto puede tardar todo, esperando el turno ([`ExpansionGate`](super::readers::ExpansionGate)) o
+    /// expandiendo.
+    pub budget: Duration,
+    /// Cuántas series se leen de una vez —y cuánto iCalendar crudo—: la
+    /// conexión se suelta entre una tanda y la siguiente, y la expansión corre
+    /// sin ella.
+    pub batch_series: usize,
+    pub batch_bytes: usize,
+}
+
+impl OnTheFlyLimits {
+    pub const DEFAULT: OnTheFlyLimits = OnTheFlyLimits {
+        max_series: MAX_SERIES_ON_THE_FLY,
+        budget: ON_THE_FLY_BUDGET,
+        batch_series: 50,
+        batch_bytes: 4 * 1024 * 1024,
+    };
+}
+
+/// Lo que se pide de una lista de ocurrencias.
+#[derive(Debug, Clone, Copy)]
+pub struct OccurrenceQuery<'a> {
+    pub range: Range,
+    pub calendars: Option<&'a [i64]>,
+    pub after: Option<&'a ListCursor>,
+    pub limit: usize,
+}
+
+/// Las mejores `cap` filas por posición, sin repetidas. Lo que se junta de
+/// una cuenta para una página **nunca pasa de ahí**: lo que no entra no se
+/// arma.
+struct TopRows<T> {
+    cap: usize,
+    rows: BTreeMap<ListCursor, T>,
+    /// Cuántas hubo a la vez, como mucho.
+    peak: usize,
+}
+
+impl<T> TopRows<T> {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            rows: BTreeMap::new(),
+            peak: 0,
+        }
+    }
+
+    /// Si una fila en esa posición todavía entraría.
+    fn admits(&self, at: &ListCursor) -> bool {
+        self.rows.len() < self.cap
+            || self
+                .rows
+                .last_key_value()
+                .is_some_and(|(last, _)| at < last)
+    }
+
+    fn insert(&mut self, at: ListCursor, row: T) {
+        if !self.admits(&at) {
+            return;
+        }
+        self.rows.insert(at, row);
+        if self.rows.len() > self.cap {
+            self.rows.pop_last();
+        }
+        self.peak = self.peak.max(self.rows.len());
+    }
+}
+
+fn position(account_id: &str, start: i64, object: i64, rid: i64) -> ListCursor {
+    ListCursor {
         key: start,
         account_id: account_id.to_string(),
         id: object,
         occurrence: rid,
-    };
-    let item = |start: i64,
-                object: i64,
-                rid: i64,
-                end: i64,
-                all_day: bool,
-                title: String,
-                calendar: i64,
-                color: Option<String>,
-                zone: &str| OccurrenceItem {
+    }
+}
+
+/// Una vez, como la ve la lista.
+#[allow(clippy::too_many_arguments)]
+fn occurrence_item(
+    account_id: &str,
+    start: i64,
+    object: i64,
+    rid: i64,
+    end: i64,
+    all_day: bool,
+    title: String,
+    calendar: i64,
+    color: Option<String>,
+    zone: &str,
+) -> OccurrenceItem {
+    OccurrenceItem {
         event_id: GlobalId {
             account_id: account_id.to_string(),
             id: object,
@@ -454,19 +537,26 @@ pub fn account_occurrences(
         all_day,
         floating: floating(zone),
         color,
-    };
+    }
+}
 
-    // Lo guardado: lo que empieza desde el piso, y las veces largas que
-    // empiezan antes.
-    let floor = scan_floor(connection, range.from)?;
-    let condition = after.map(|a| a.condition(account_id));
+/// Lo guardado de una página: lo que empieza desde el piso, y las veces
+/// largas que empiezan antes. Cada parte trae como mucho `limit + 1`.
+fn stored_occurrences(
+    connection: &Connection,
+    account_id: &str,
+    query: &OccurrenceQuery<'_>,
+    top: &mut TopRows<OccurrenceItem>,
+) -> Result<(), StoreError> {
+    let floor = scan_floor(connection, query.range.from)?;
+    let condition = query.after.map(|a| a.condition(account_id));
     for part in [StoredPart::FromFloor, StoredPart::Long] {
-        let sql = occurrences_sql(part, calendars, condition.as_ref().map(|(c, _)| *c));
-        let mut params: Vec<i64> = vec![floor, range.to, range.from, range.from];
+        let sql = occurrences_sql(part, query.calendars, condition.as_ref().map(|(c, _)| *c));
+        let mut params: Vec<i64> = vec![floor, query.range.to, query.range.from, query.range.from];
         if let Some((_, values)) = &condition {
             params.extend(values);
         }
-        params.push((limit + 1) as i64);
+        params.push((query.limit + 1) as i64);
         let mut statement = connection.prepare(&sql).map_err(classify)?;
         let mut rows = statement
             .query(rusqlite::params_from_iter(params))
@@ -477,99 +567,235 @@ pub fn account_occurrences(
                 row.get(1).map_err(classify)?,
                 row.get(2).map_err(classify)?,
             );
+            let at = position(account_id, start, object, rid);
+            if !top.admits(&at) {
+                continue;
+            }
             let zone: String = row.get(8).map_err(classify)?;
-            result.rows.push((
-                position(start, object, rid),
-                item(
-                    start,
-                    object,
-                    rid,
-                    row.get(3).map_err(classify)?,
-                    row.get(4).map_err(classify)?,
-                    row.get(5).map_err(classify)?,
-                    row.get(6).map_err(classify)?,
-                    row.get(7).map_err(classify)?,
-                    &zone,
-                ),
-            ));
+            let item = occurrence_item(
+                account_id,
+                start,
+                object,
+                rid,
+                row.get(3).map_err(classify)?,
+                row.get(4).map_err(classify)?,
+                row.get(5).map_err(classify)?,
+                row.get(6).map_err(classify)?,
+                row.get(7).map_err(classify)?,
+                &zone,
+            );
+            top.insert(at, item);
         }
     }
+    Ok(())
+}
 
-    // Lo que cae fuera de la ventana de cada serie, en el momento.
+/// Una serie para expandir en el momento, leída de la base.
+struct SeriesSource {
+    object: i64,
+    calendar: i64,
+    raw: String,
+    /// Lo que ya está guardado: sus veces no se repiten.
+    skip: Option<(i64, i64)>,
+    summary: String,
+    zone: String,
+    color: Option<String>,
+}
+
+/// Una tanda de las series cuya ventana no cubre el rango, por número,
+/// después de `after_id`: como mucho `batch_series`, y hasta pasar
+/// `batch_bytes` de crudo. Dice también si quedan más.
+fn series_batch(
+    connection: &Connection,
+    query: &OccurrenceQuery<'_>,
+    after_id: i64,
+    fly: &OnTheFlyLimits,
+) -> Result<(Vec<SeriesSource>, bool), StoreError> {
     let mut statement = connection
-        .prepare(&format!(
-            "SELECT c.id, c.calendar_id, c.raw_ical, c.expanded_from, c.expanded_to, c.span,
+        .prepare_cached(&format!(
+            "SELECT c.id, c.calendar_id, c.raw_ical, c.expanded_from, c.expanded_to,
                     c.summary, c.zone, k.color
                FROM calendar_objects c
                JOIN calendars k ON k.id = c.calendar_id
               WHERE c.recurring = 1 AND c.component = 'VEVENT'
                 AND (c.starts_at IS NULL OR c.starts_at < ?1)
                 AND NOT (c.expanded_from IS NOT NULL AND c.expanded_from <= ?2 - c.span
-                         AND c.expanded_to >= ?1){}
+                         AND c.expanded_to >= ?1)
+                AND c.id > ?3{}
               ORDER BY c.id
-              LIMIT ?3",
-            calendar_filter("c.calendar_id", calendars)
+              LIMIT ?4",
+            calendar_filter("c.calendar_id", query.calendars)
         ))
         .map_err(classify)?;
-    let mut series = statement
+    let mut rows = statement
         .query(rusqlite::params![
-            range.to,
-            range.from,
-            (MAX_SERIES_ON_THE_FLY + 1) as i64
+            query.range.to,
+            query.range.from,
+            after_id,
+            (fly.batch_series.max(1) + 1) as i64
         ])
         .map_err(classify)?;
-    let deadline = std::time::Instant::now() + ON_THE_FLY_BUDGET;
-    let mut expanded = 0usize;
-    while let Some(row) = series.next().map_err(classify)? {
-        expanded += 1;
-        if expanded > MAX_SERIES_ON_THE_FLY || std::time::Instant::now() >= deadline {
-            result.truncated = true;
+    let mut batch = Vec::new();
+    let mut bytes = 0usize;
+    while let Some(row) = rows.next().map_err(classify)? {
+        if batch.len() >= fly.batch_series.max(1) || bytes >= fly.batch_bytes {
+            return Ok((batch, true));
+        }
+        let raw: String = row.get(2).map_err(classify)?;
+        bytes += raw.len();
+        batch.push(SeriesSource {
+            object: row.get(0).map_err(classify)?,
+            calendar: row.get(1).map_err(classify)?,
+            raw,
+            skip: row
+                .get::<_, Option<i64>>(3)
+                .map_err(classify)?
+                .zip(row.get::<_, Option<i64>>(4).map_err(classify)?),
+            summary: row.get(5).map_err(classify)?,
+            zone: row.get(6).map_err(classify)?,
+            color: row.get(7).map_err(classify)?,
+        });
+    }
+    Ok((batch, false))
+}
+
+/// Expande una serie en el momento y suma a la página lo que entra. **Sin
+/// conexión**: es CPU. Devuelve si la expansión pasó un tope.
+fn expand_into(
+    top: &mut TopRows<OccurrenceItem>,
+    account_id: &str,
+    query: &OccurrenceQuery<'_>,
+    source: &SeriesSource,
+    limits: &ExpansionLimits,
+) -> bool {
+    let document = ical::parse_document(&source.raw);
+    let Some(parsed) = EventSeries::from_document(&document, limits) else {
+        return false;
+    };
+    let expansion = parsed.between(query.range.from, query.range.to, source.skip, limits);
+    for occurrence in &expansion.occurrences {
+        let at = position(
+            account_id,
+            occurrence.start,
+            source.object,
+            occurrence.recurrence_id,
+        );
+        if query.after.is_some_and(|a| !a.is_before(&at)) {
+            continue;
+        }
+        // Las veces de una serie vienen en orden: si ésta ya no entra en la
+        // página, las que siguen tampoco.
+        if !top.admits(&at) {
             break;
         }
-        let object: i64 = row.get(0).map_err(classify)?;
-        let calendar: i64 = row.get(1).map_err(classify)?;
-        let raw: String = row.get(2).map_err(classify)?;
-        let skip: Option<(i64, i64)> = row
-            .get::<_, Option<i64>>(3)
-            .map_err(classify)?
-            .zip(row.get::<_, Option<i64>>(4).map_err(classify)?);
-        let summary: String = row.get(6).map_err(classify)?;
-        let zone: String = row.get(7).map_err(classify)?;
-        let color: Option<String> = row.get(8).map_err(classify)?;
-        let document = ical::parse_document(&raw);
-        let Some(parsed) = EventSeries::from_document(&document, limits) else {
-            continue;
-        };
-        let expansion = parsed.between(range.from, range.to, skip, limits);
-        result.truncated |= expansion.truncated;
-        for occurrence in expansion.occurrences {
-            let at = position(occurrence.start, object, occurrence.recurrence_id);
-            if after.is_some_and(|a| !a.is_before(&at)) {
-                continue;
-            }
-            result.rows.push((
-                at,
-                item(
-                    occurrence.start,
-                    object,
-                    occurrence.recurrence_id,
-                    occurrence.end,
-                    occurrence.all_day,
-                    parsed
-                        .title_of(&occurrence)
-                        .map_or_else(|| summary.clone(), str::to_string),
-                    calendar,
-                    color.clone(),
-                    &zone,
-                ),
-            ));
-        }
+        let item = occurrence_item(
+            account_id,
+            occurrence.start,
+            source.object,
+            occurrence.recurrence_id,
+            occurrence.end,
+            occurrence.all_day,
+            parsed
+                .title_of(occurrence)
+                .map_or_else(|| source.summary.clone(), str::to_string),
+            source.calendar,
+            source.color.clone(),
+            &source.zone,
+        );
+        top.insert(at, item);
     }
+    expansion.truncated
+}
 
-    result.rows.sort_by(|a, b| a.0.cmp(&b.0));
-    result.rows.dedup_by(|a, b| a.0 == b.0);
-    result.rows.truncate(limit + 1);
-    Ok(result)
+/// Las veces de los eventos de una cuenta que se ven en `range`, después de
+/// `after`, en orden, como mucho `limit + 1` —una más, para saber si hay otra
+/// página—. Con los topes de siempre para lo que se expande en el momento.
+pub fn account_occurrences(
+    reader: &impl Reader,
+    account_id: &str,
+    range: Range,
+    calendars: Option<&[i64]>,
+    after: Option<&ListCursor>,
+    limit: usize,
+    limits: &ExpansionLimits,
+) -> Result<AccountRows<OccurrenceItem>, StoreError> {
+    occurrences_in(
+        reader,
+        account_id,
+        &OccurrenceQuery {
+            range,
+            calendars,
+            after,
+            limit,
+        },
+        limits,
+        &OnTheFlyLimits::DEFAULT,
+    )
+}
+
+/// Lo mismo, con los topes de lo que se expande en el momento.
+///
+/// **De a partes**: una lectura trae lo guardado y la primera tanda de
+/// series; la conexión se suelta, y cada serie se expande sin ella; después
+/// otra lectura trae la tanda siguiente. Así una expansión larga no deja sin
+/// lector a nadie más —los contactos de la misma cuenta, por ejemplo—. Y **una
+/// sola a la vez por cuenta** ([`ExpansionGate`](super::readers::ExpansionGate)): la que llega mientras otra
+/// corre espera su turno dentro de su mismo plazo, y si no le llega vuelve
+/// con lo guardado y `truncated`.
+///
+/// Lo que se junta nunca pasa de `limit + 1` filas: lo expandido que no
+/// entraría en la página no se arma ([`TopRows`]).
+pub fn occurrences_in(
+    reader: &impl Reader,
+    account_id: &str,
+    query: &OccurrenceQuery<'_>,
+    limits: &ExpansionLimits,
+    fly: &OnTheFlyLimits,
+) -> Result<AccountRows<OccurrenceItem>, StoreError> {
+    let deadline = Instant::now() + fly.budget;
+    let mut top = TopRows::new(query.limit + 1);
+    let mut truncated = false;
+    let (mut batch, mut more) = reader.read(|connection| {
+        stored_occurrences(connection, account_id, query, &mut top)?;
+        series_batch(connection, query, 0, fly)
+    })?;
+    if !batch.is_empty() {
+        let turn = match reader.expansion_gate() {
+            Some(gate) => match gate.enter_until(deadline) {
+                Some(turn) => Some(turn),
+                None => {
+                    return Ok(AccountRows {
+                        peak_rows: top.peak,
+                        rows: top.rows.into_iter().collect(),
+                        truncated: true,
+                    })
+                }
+            },
+            None => None,
+        };
+        let mut seen = 0usize;
+        'series: loop {
+            let last = batch.last().map_or(0, |s| s.object);
+            for source in &batch {
+                seen += 1;
+                if seen > fly.max_series || Instant::now() >= deadline {
+                    truncated = true;
+                    break 'series;
+                }
+                truncated |= expand_into(&mut top, account_id, query, source, limits);
+            }
+            if !more {
+                break;
+            }
+            (batch, more) = reader.read(|connection| series_batch(connection, query, last, fly))?;
+        }
+        drop(turn);
+    }
+    Ok(AccountRows {
+        peak_rows: top.peak,
+        rows: top.rows.into_iter().collect(),
+        truncated,
+    })
 }
 
 /// Las tareas de una cuenta, por vencimiento —las sin vencimiento al final—,
@@ -816,22 +1042,27 @@ fn alarms_of(component: &Component, limits: &ExpansionLimits) -> Vec<AlarmItem> 
 
 /// Un evento entero, o `None` si no está, no es un evento o no tiene esa vez.
 /// Nunca el iCalendar crudo ni la dirección en el servidor.
+///
+/// La conexión se usa sólo para leer el objeto: interpretarlo y expandir la
+/// vez pedida es CPU, y corre sin ella.
 pub fn get_event(
-    connection: &Connection,
+    reader: &impl Reader,
     account_id: &str,
     id: i64,
     occurrence: Option<i64>,
     limits: &ExpansionLimits,
 ) -> Result<Option<EventDetail>, StoreError> {
-    let row: Option<(i64, String, String)> = connection
-        .query_row(
-            "SELECT calendar_id, raw_ical, zone FROM calendar_objects
-              WHERE id = ?1 AND component = 'VEVENT'",
-            [id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()
-        .map_err(classify)?;
+    let row: Option<(i64, String, String)> = reader.read(|connection| {
+        connection
+            .query_row(
+                "SELECT calendar_id, raw_ical, zone FROM calendar_objects
+                  WHERE id = ?1 AND component = 'VEVENT'",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(classify)
+    })?;
     let Some((calendar, raw, zone)) = row else {
         return Ok(None);
     };
@@ -1678,5 +1909,167 @@ mod tests {
         .unwrap();
         assert!(rows.truncated);
         assert_eq!(rows.rows.len(), 101);
+    }
+
+    /// `n` series por minuto que empiezan en 2030, después de la ventana, con
+    /// títulos de 1 KB: cada una da sus cinco mil veces en el momento.
+    fn store_with_series_after_the_window(temp: &TempDir, n: usize) -> Store {
+        let title = "x".repeat(1000);
+        let raws: Vec<(String, String)> = (0..n)
+            .map(|i| {
+                (
+                    format!("https://x/c/m{i}.ics"),
+                    format!(
+                        "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:m{i}\r\nSUMMARY:{title}\r\n\
+                         DTSTART:20300101T000000Z\r\nDURATION:PT1M\r\nRRULE:FREQ=MINUTELY\r\n\
+                         END:VEVENT\r\nEND:VCALENDAR\r\n"
+                    ),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, &str)> = raws.iter().map(|(h, r)| (h.as_str(), r.as_str())).collect();
+        store_with(temp, &refs)
+    }
+
+    /// **Lo expandido en el momento no junta más que una página.** Cuarenta
+    /// series por minuto después de la ventana, con títulos de 1 KB, y una
+    /// página de diez: se juntaban las doscientas mil veces —cada una con su
+    /// título— antes de ordenar y cortar; ahora no más de once a la vez, y la
+    /// página es la misma, en orden, y sigue con el cursor.
+    #[test]
+    fn lo_expandido_en_el_momento_no_junta_mas_que_una_pagina() {
+        let temp = TempDir::new("leer-pagina-acotada");
+        let store = store_with_series_after_the_window(&temp, 40);
+        let r = range("2030-02-01T00:00:00Z", "2030-02-02T00:00:00Z");
+        let fly = OnTheFlyLimits {
+            budget: Duration::from_secs(120),
+            ..OnTheFlyLimits::DEFAULT
+        };
+        let page = |after: Option<&ListCursor>| {
+            occurrences_in(
+                store.connection(),
+                "cuenta",
+                &OccurrenceQuery {
+                    range: r,
+                    calendars: None,
+                    after,
+                    limit: 10,
+                },
+                &ExpansionLimits::DEFAULT,
+                &fly,
+            )
+            .unwrap()
+        };
+        let first = page(None);
+        assert!(
+            first.peak_rows <= 11,
+            "se juntaron {} filas",
+            first.peak_rows
+        );
+        assert_eq!(first.rows.len(), 11);
+        // A las 00:00 del 1 de febrero empiezan las cuarenta, en orden de
+        // evento: las primeras once son las de los números 1 a 11.
+        let keys: Vec<(i64, i64)> = first.rows.iter().map(|(p, _)| (p.key, p.id)).collect();
+        let expected: Vec<(i64, i64)> = (1..=11).map(|id| (r.from, id)).collect();
+        assert_eq!(keys, expected);
+        let second = page(Some(&first.rows[9].0));
+        assert!(second.peak_rows <= 11);
+        assert_eq!(second.rows[0].0, first.rows[10].0, "sigue sin saltear");
+    }
+
+    /// **Una expansión en el momento no tiene tomado el lector.** Dos
+    /// lecturas de un año lejano con doscientas series cada una, en dos hilos,
+    /// y mientras tanto una tercera lectura —la de los contactos de otra
+    /// aplicación, por ejemplo—: contesta enseguida, porque la expansión corre
+    /// sin conexión y la segunda espera su turno sin tener ninguna.
+    #[test]
+    fn una_expansion_en_el_momento_no_tiene_tomado_el_lector() {
+        let temp = TempDir::new("leer-sin-lector");
+        let store = store_with_series_after_the_window(&temp, 200);
+        let pool = store.readers();
+        let r = range("2030-02-01T00:00:00Z", "2031-02-01T00:00:00Z");
+        let fly = OnTheFlyLimits {
+            budget: Duration::from_millis(1500),
+            ..OnTheFlyLimits::DEFAULT
+        };
+        let slow: Vec<_> = (0..2)
+            .map(|_| {
+                let pool = std::sync::Arc::clone(&pool);
+                std::thread::spawn(move || {
+                    let started = Instant::now();
+                    occurrences_in(
+                        &*pool,
+                        "cuenta",
+                        &OccurrenceQuery {
+                            range: r,
+                            calendars: None,
+                            after: None,
+                            limit: 100,
+                        },
+                        &ExpansionLimits::DEFAULT,
+                        &fly,
+                    )
+                    .unwrap();
+                    started.elapsed()
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        let books: i64 = pool
+            .read(|c| {
+                c.query_row("SELECT count(*) FROM address_books", [], |row| row.get(0))
+                    .map_err(classify)
+            })
+            .unwrap();
+        let waited = started.elapsed();
+        let took: Vec<Duration> = slow.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(books, 0);
+        assert!(
+            took.iter().all(|t| *t >= Duration::from_millis(1000)),
+            "las expansiones tenían que durar: {took:?}"
+        );
+        assert!(
+            waited < Duration::from_millis(500),
+            "la otra lectura esperó {waited:?}"
+        );
+    }
+
+    /// Si el turno de expandir no llega dentro del plazo —otra expansión de la
+    /// misma cuenta lo tiene—, vuelve lo guardado, con `truncated`.
+    #[test]
+    fn sin_turno_vuelve_lo_guardado_y_truncated() {
+        let temp = TempDir::new("leer-sin-turno");
+        let store = store_with(
+            &temp,
+            &[
+                ("https://x/c/s.ics", &weekly("s", "20260907T090000Z")),
+                ("https://x/c/v.ics", &single("v", "20300105T100000Z")),
+            ],
+        );
+        let pool = store.readers();
+        let gate = pool.expansion_gate().unwrap();
+        let _held = gate.enter_until(Instant::now()).unwrap();
+        let rows = occurrences_in(
+            &*pool,
+            "cuenta",
+            &OccurrenceQuery {
+                range: range("2030-01-01T00:00:00Z", "2030-01-15T00:00:00Z"),
+                calendars: None,
+                after: None,
+                limit: 100,
+            },
+            &ExpansionLimits::DEFAULT,
+            &OnTheFlyLimits {
+                budget: Duration::from_millis(50),
+                ..OnTheFlyLimits::DEFAULT
+            },
+        )
+        .unwrap();
+        assert!(rows.truncated);
+        assert_eq!(
+            titles(&rows),
+            vec![("2030-01-05T10:00:00+00:00".into(), "Suelto v".into())]
+        );
     }
 }

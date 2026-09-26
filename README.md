@@ -938,10 +938,14 @@ evento). Un nombre de Windows sin su `VTIMEZONE` es una zona que no se conoce.
 **Que no se dispare**: una regla la escribe cualquiera. Por objeto, 5000 veces
 en lo que se pide, 100 000 fechas sacadas a la regla —también las de antes de
 lo que se pide—, 1000 `RDATE` y 1000 `EXDATE`, 500 excepciones, 10
-recordatorios y 250 ms; por consulta en el momento, 2000 series por cuenta y
-2 s. Lo que pasa un tope se guarda con lo que entró, queda marcado y anotado en
-la bitácora de la base, sin nada del evento. Todo eso es CPU y corre fuera del
-bucle de eventos.
+recordatorios y 250 ms; y una regla que puede armar más de 10 000 fechas en un
+solo período —`rrule` arma el período entero antes de devolver la primera— no
+se interpreta. Por consulta en el momento, 2000 series por cuenta y 2 s, **una
+sola a la vez por cuenta** —la que llega mientras otra corre espera su turno
+dentro de esos 2 s—, sin tener tomada una conexión de lectura mientras expande,
+y sin juntar más que la página. Lo que pasa un tope se guarda con lo que entró,
+queda marcado y anotado en la bitácora de la base, sin nada del evento. Todo eso
+es CPU y corre fuera del bucle de eventos.
 
 Cuándo: como los contactos, el área de calendario de una cuenta **se enciende
 la primera vez que alguien la pide con permiso** y desde ahí sigue sola, pero

@@ -442,9 +442,9 @@ impl<K: KeySource> StoreApi<K> {
             let (id, after) = (account_id.clone(), after.clone());
             match self
                 .manager
-                .read(&account_id, move |c| {
+                .read_in_parts(&account_id, move |pool| {
                     calendar_read::account_occurrences(
-                        c,
+                        pool,
                         &id,
                         range,
                         filter.as_deref(),
@@ -504,9 +504,9 @@ impl<K: KeySource> StoreApi<K> {
         let account_id = id.account_id.clone();
         let event = self
             .manager
-            .read(&id.account_id, move |c| {
+            .read_in_parts(&id.account_id, move |pool| {
                 calendar_read::get_event(
-                    c,
+                    pool,
                     &account_id,
                     id.id,
                     occurrence,

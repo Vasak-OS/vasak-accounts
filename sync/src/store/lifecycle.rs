@@ -738,6 +738,27 @@ impl<K: KeySource> StoreManager<K> {
         T: Send + 'static,
         F: FnOnce(&rusqlite::Connection) -> Result<T, StoreError> + Send + 'static,
     {
+        let pool = self.open_readers(account_id).await?;
+        blocking(move || pool.read(work)).await?
+    }
+
+    /// Como [`Self::read`], pero con el grupo de lectura entero, para una
+    /// lectura **de a partes**: cada parte toma una conexión y la suelta, y lo
+    /// que hay entre una y otra —la expansión en el momento del calendario, que
+    /// es CPU— corre sin ninguna. Cada parte vuelve a mirar si el grupo se
+    /// cerró: con el llavero bloqueado a mitad, la siguiente da
+    /// `Err(Missing)`.
+    pub async fn read_in_parts<T, F>(&self, account_id: &str, work: F) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&ReadPool) -> Result<T, StoreError> + Send + 'static,
+    {
+        let pool = self.open_readers(account_id).await?;
+        blocking(move || work(&pool)).await?
+    }
+
+    /// El grupo de lectura de una base abierta, con el llavero releído.
+    async fn open_readers(&self, account_id: &str) -> Result<Arc<ReadPool>, StoreError> {
         let pool = self.reader_pool(account_id).ok_or(StoreError::Missing)?;
         if !matches!(self.keys.is_locked().await, Ok(false)) {
             pool.close();
@@ -746,7 +767,7 @@ impl<K: KeySource> StoreManager<K> {
             }
             return Err(StoreError::Key(KeyError::Locked));
         }
-        blocking(move || pool.read(work)).await?
+        Ok(pool)
     }
 
     pub fn keys(&self) -> &K {

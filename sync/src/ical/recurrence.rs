@@ -781,14 +781,21 @@ impl EventSeries {
     /// `[from, to)`; en un evento que no se repite, todas.
     pub fn materialize(&self, from: i64, to: i64, limits: &ExpansionLimits) -> Expansion {
         if self.is_recurring() {
-            self.expand(from, to, &|start, _| start >= from && start < to, limits)
+            self.expand(
+                from,
+                to,
+                &|start, _| start >= from && start < to,
+                limits,
+                true,
+            )
         } else {
-            self.expand(i64::MIN / 4, i64::MAX / 4, &|_, _| true, limits)
+            self.expand(i64::MIN / 4, i64::MAX / 4, &|_, _| true, limits, true)
         }
     }
 
     /// Lo que se ve en `[from, to)` —lo que se superpone con el rango—, sin
-    /// las veces que empiezan en `skip`: ésas ya están guardadas.
+    /// las veces que empiezan en `skip`: ésas ya están guardadas. Sin los
+    /// recordatorios: es para listar, y se guardan sólo los de la ventana.
     pub fn between(
         &self,
         from: i64,
@@ -803,6 +810,7 @@ impl EventSeries {
             to,
             &|start, end| overlaps(start, end, from, to) && !skipped(start),
             limits,
+            false,
         )
     }
 
@@ -813,6 +821,7 @@ impl EventSeries {
             recurrence_id.saturating_add(1),
             &|_, _| true,
             limits,
+            false,
         )
         .occurrences
         .into_iter()
@@ -848,13 +857,15 @@ impl EventSeries {
 
     /// La expansión: las veces de la serie cuyo comienzo cae en `[lo, hi)`
     /// —corrido lo que pueda correrlas un `THISANDFUTURE`—, con sus
-    /// excepciones aplicadas, y de ésas las que pasan `keep`.
+    /// excepciones aplicadas, y de ésas las que pasan `keep`. Con sus
+    /// recordatorios sólo si `with_alarms`: son hasta diez por vez.
     fn expand(
         &self,
         lo: i64,
         hi: i64,
         keep: &dyn Fn(i64, i64) -> bool,
         limits: &ExpansionLimits,
+        with_alarms: bool,
     ) -> Expansion {
         let deadline = Instant::now() + limits.max_time;
         let mut expansion = Expansion {
@@ -1032,7 +1043,11 @@ impl EventSeries {
                 end: b.end,
                 all_day: b.all_day,
                 title: b.title,
-                alarms: alarms_for(b.source, b.start, b.end, rid, self.first_rid()),
+                alarms: if with_alarms {
+                    alarms_for(b.source, b.start, b.end, rid, self.first_rid())
+                } else {
+                    Vec::new()
+                },
             })
             .collect();
         occurrences.sort_by_key(|o| (o.start, o.recurrence_id));
