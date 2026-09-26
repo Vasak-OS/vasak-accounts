@@ -436,8 +436,14 @@ mod tests {
             NotificationDetail::SenderAndSubject,
         ] {
             let (_, body) = notification_text(&two, "mia@ejemplo.com", detail);
-            assert!(!body.contains("Ana"), "{body}");
-            assert!(!body.contains("Juan"), "{body}");
+            assert!(
+                !body.contains("Ana"),
+                "con varios mensajes, el cuerpo nombra al primer remitente"
+            );
+            assert!(
+                !body.contains("Juan"),
+                "con varios mensajes, el cuerpo nombra al segundo remitente"
+            );
         }
     }
 
@@ -458,7 +464,10 @@ mod tests {
             NotificationDetail::SenderAndSubject,
         );
         assert!(body.contains("Ana"));
-        assert!(!body.contains(':'), "{body}");
+        assert!(
+            !body.contains(':'),
+            "el cuerpo deja los dos puntos de un asunto vacío"
+        );
     }
 
     /// La cuenta va siempre: dice a cuál de las casillas de alguien llegó.
@@ -471,7 +480,10 @@ mod tests {
             NotificationDetail::SenderAndSubject,
         ] {
             let (_, body) = notification_text(&single, "mia@ejemplo.com", detail);
-            assert!(body.contains("mia@ejemplo.com"), "{body}");
+            assert!(
+                body.contains("mia@ejemplo.com"),
+                "el cuerpo no dice a qué cuenta llegó"
+            );
         }
     }
 
@@ -555,10 +567,19 @@ mod tests {
         };
 
         let (_, body) = notification_text(&[m], "casa", NotificationDetail::SenderAndSubject);
-        assert!(!body.contains("<b>"), "{body}");
-        assert!(!body.contains("<a "), "{body}");
-        assert!(body.contains("&lt;b&gt;"), "{body}");
-        assert!(body.contains("&amp;"), "{body}");
+        assert!(
+            !body.contains("<b>"),
+            "el cuerpo interpreta el marcado del remitente"
+        );
+        assert!(
+            !body.contains("<a "),
+            "el cuerpo interpreta el enlace del asunto"
+        );
+        assert!(
+            body.contains("&lt;b&gt;"),
+            "falta el marcado del remitente escapado"
+        );
+        assert!(body.contains("&amp;"), "falta el «&» del asunto escapado");
     }
 
     /// La cuenta también: la da el servicio de cuentas, pero el nombre para
@@ -567,8 +588,14 @@ mod tests {
     fn la_cuenta_tambien_se_escapa() {
         let m = MessageSummary::default();
         let (_, body) = notification_text(&[m], "<i>casa</i>", NotificationDetail::Account);
-        assert!(!body.contains("<i>"), "{body}");
-        assert!(body.contains("&lt;i&gt;"), "{body}");
+        assert!(
+            !body.contains("<i>"),
+            "el cuerpo interpreta el marcado del nombre de la cuenta"
+        );
+        assert!(
+            body.contains("&lt;i&gt;"),
+            "falta el marcado de la cuenta escapado"
+        );
     }
 
     /// Un asunto enorme estira el cartel hasta tapar la pantalla: nadie lo corta
@@ -583,10 +610,16 @@ mod tests {
 
         let (_, body) = notification_text(&[m], "casa", NotificationDetail::SenderAndSubject);
         assert!(body.len() < 200, "quedó de {}", body.len());
-        assert!(body.contains('…'), "{body}");
+        assert!(
+            body.contains('…'),
+            "el asunto cortado no lleva el «…» del corte"
+        );
         // Y el nombre sigue estando: cada cosa se acorta por su lado, así que un
         // asunto enorme no se come a quien lo mandó.
-        assert!(body.contains("Ana"), "{body}");
+        assert!(
+            body.contains("Ana"),
+            "el corte del asunto se comió el nombre del remitente"
+        );
     }
 
     /// Cortar no puede partir un carácter por la mitad.
@@ -600,7 +633,7 @@ mod tests {
         };
 
         let (_, body) = notification_text(&[m], "casa", NotificationDetail::SenderAndSubject);
-        assert!(body.contains('ñ'), "{body}");
+        assert!(body.contains('ñ'), "el asunto cortado perdió las eñes");
     }
 
     /// Y lo normal no se toca: si esto escapara de más, un asunto con un «&»
@@ -614,7 +647,13 @@ mod tests {
         };
 
         let (_, body) = notification_text(&[m], "casa", NotificationDetail::SenderAndSubject);
-        assert!(body.contains("Ana Pérez: Factura de septiembre"), "{body}");
-        assert!(!body.contains("&amp;"), "{body}");
+        assert!(
+            body.contains("Ana Pérez: Factura de septiembre"),
+            "el cuerpo no trae el nombre y el asunto tal cual"
+        );
+        assert!(
+            !body.contains("&amp;"),
+            "el cuerpo escapa un texto que no llevaba marcado"
+        );
     }
 }
