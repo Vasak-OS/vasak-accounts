@@ -567,10 +567,14 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
         }
 
         for chunk in plan.fetch.chunks(self.limits.multiget_batch.max(1)) {
-            for card in self.fetch_cards(client, book, chunk, report).await? {
-                let Some(row) = self.row_from(card, report) else {
-                    continue;
-                };
+            let cards = self.fetch_cards(client, book, chunk, report).await?;
+            // Desarmar las tarjetas es CPU, y una armada a propósito tarda: fuera
+            // del bucle de eventos.
+            let max_vcard_bytes = self.limits.max_vcard_bytes;
+            let (rows, too_large) =
+                webdav::off_runtime(move || Ok(rows_from(cards, max_vcard_bytes))).await?;
+            report.too_large += too_large;
+            for row in rows {
                 report.fetched += 1;
                 pending_bytes += row.raw_vcard.len();
                 pending.push(ContactOp::Upsert(Box::new(row)));
@@ -637,24 +641,36 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
         }
         Ok(cards)
     }
+}
 
-    /// Lo que se guarda de una tarjeta, o nada si pasa el tope o no es una.
-    fn row_from(&self, card: CardResource, report: &mut SyncReport) -> Option<ContactRow> {
-        if card.data.len() > self.limits.max_vcard_bytes {
-            report.too_large += 1;
-            return None;
-        }
-        // Un recurso de CardDAV es una tarjeta. Si trae varias pegadas, lo que
-        // se indexa es la primera; lo crudo se guarda entero.
-        let first = vcard::split_cards(&card.data).into_iter().next()?;
-        let contact = vcard::contact_from(&first, card.href.as_str()).unwrap_or_default();
-        Some(ContactRow {
-            href: card.href.to_string(),
-            etag: card.etag,
-            raw_vcard: card.data,
-            contact,
+/// Lo que se guarda de unas tarjetas, y cuántas no, por pasar el tope.
+fn rows_from(cards: Vec<CardResource>, max_vcard_bytes: usize) -> (Vec<ContactRow>, usize) {
+    let mut too_large = 0;
+    let rows = cards
+        .into_iter()
+        .filter_map(|card| {
+            if card.data.len() > max_vcard_bytes {
+                too_large += 1;
+                return None;
+            }
+            row_from(card)
         })
-    }
+        .collect();
+    (rows, too_large)
+}
+
+/// Lo que se guarda de una tarjeta, o nada si no es una.
+fn row_from(card: CardResource) -> Option<ContactRow> {
+    // Un recurso de CardDAV es una tarjeta. Si trae varias pegadas, lo que se
+    // indexa es la primera; lo crudo se guarda entero.
+    let first = vcard::split_cards(&card.data).into_iter().next()?;
+    let contact = vcard::contact_from(&first, card.href.as_str()).unwrap_or_default();
+    Some(ContactRow {
+        href: card.href.to_string(),
+        etag: card.etag,
+        raw_vcard: card.data,
+        contact,
+    })
 }
 
 /// Lo que hay que traer: lo nuevo y lo que cambió de ETag. Sin ETag no hay

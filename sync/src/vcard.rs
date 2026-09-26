@@ -125,12 +125,25 @@ pub struct Contact {
 /// acoplamiento de más, es cómo está definido el formato. Y por eso el `=` no
 /// junta líneas por sí solo — el base64 de una foto termina en `=` y se comería
 /// la propiedad siguiente.
+///
+/// **Si una línea es `quoted-printable` se decide una sola vez**, cuando
+/// aparecen sus primeros dos puntos: lo de antes no cambia por más que se le
+/// peguen continuaciones. Mirarlo de nuevo en cada una —pasar a minúsculas
+/// todo lo que está antes de los dos puntos— hacía que una tarjeta de medio
+/// mega con los parámetros largos y miles de continuaciones tardara casi medio
+/// minuto.
 pub fn unfold_lines(text: &str) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
-    let mut continues_printable = false;
+    // De la última línea: hasta dónde se buscaron los dos puntos, y si ya
+    // aparecieron, si es `quoted-printable`.
+    let mut searched = 0;
+    let mut printable: Option<bool> = None;
 
     for raw in text.split('\n') {
         let line = raw.strip_suffix('\r').unwrap_or(raw);
+
+        let continues_printable =
+            printable == Some(true) && lines.last().is_some_and(|l| l.ends_with('='));
 
         // Continuación de la 2.1: se le saca el `=` que anunciaba que seguía y
         // se pega lo que vino, sin mirar con qué empieza.
@@ -138,40 +151,46 @@ pub fn unfold_lines(text: &str) -> Vec<String> {
             if let Some(last) = lines.last_mut() {
                 last.pop();
                 last.push_str(line);
-                continues_printable = is_unfinished_quoted_printable(last);
                 continue;
             }
         }
 
         match line.strip_prefix([' ', '\t']) {
-            Some(continuation) => match lines.last_mut() {
-                Some(last) => last.push_str(continuation),
-                None => lines.push(continuation.to_string()),
-            },
-            None => lines.push(line.to_string()),
+            Some(continuation) if !lines.is_empty() => {
+                if let Some(last) = lines.last_mut() {
+                    last.push_str(continuation);
+                }
+            }
+            Some(continuation) => {
+                lines.push(continuation.to_string());
+                (searched, printable) = (0, None);
+            }
+            None => {
+                lines.push(line.to_string());
+                (searched, printable) = (0, None);
+            }
         }
 
-        continues_printable = lines
-            .last()
-            .is_some_and(|l| is_unfinished_quoted_printable(l));
+        if printable.is_none() {
+            if let Some(last) = lines.last() {
+                match last[searched..].find(':') {
+                    Some(at) => printable = Some(is_quoted_printable(&last[..searched + at])),
+                    None => searched = last.len(),
+                }
+            }
+        }
     }
 
     lines
 }
 
-/// Si una línea es un `quoted-printable` que sigue en la siguiente.
+/// Si los parámetros de una línea —lo que está antes de sus primeros dos
+/// puntos— dicen que el valor va en `quoted-printable`.
 ///
-/// Las dos condiciones juntas: que el valor esté en `quoted-printable` **y** que
-/// termine en `=`. Con una sola no alcanza — el base64 de una foto termina en
-/// `=` y no sigue, y un valor en `quoted-printable` que termina donde termina
-/// tampoco.
-fn is_unfinished_quoted_printable(line: &str) -> bool {
-    if !line.ends_with('=') {
-        return false;
-    }
-    let Some((left, _)) = line.split_once(':') else {
-        return false;
-    };
+/// Con eso no alcanza para juntar: además el valor tiene que terminar en `=`.
+/// El base64 de una foto termina en `=` y no sigue, y un valor en
+/// `quoted-printable` que termina donde termina tampoco.
+fn is_quoted_printable(left: &str) -> bool {
     left.to_ascii_lowercase()
         .replace(' ', "")
         .contains("encoding=quoted-printable")
@@ -1163,6 +1182,79 @@ mod tests {
         assert!(c.display_name.len() <= MAX_VALUE + 4);
         assert!(c.display_name.ends_with('…'));
         assert!(!c.display_name.contains('\u{FFFD}'));
+    }
+
+    /// Corre `work` en otro hilo y falla si no termina en `budget`. Sin esto,
+    /// una prueba de tiempo sin el arreglo no falla: se cuelga.
+    fn finishes_within<T: Send + 'static>(
+        budget: std::time::Duration,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (done, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(work());
+        });
+        wait.recv_timeout(budget)
+            .unwrap_or_else(|_| panic!("no terminó en {budget:?}"))
+    }
+
+    /// **Una tarjeta armada para el desdoblado no tarda.** Doscientos sesenta
+    /// mil bytes de parámetros y ochenta y cinco mil continuaciones de
+    /// `quoted-printable` entran en el tope de una tarjeta, y volver a mirar
+    /// los parámetros en cada continuación eran minutos de CPU por tarjeta. El
+    /// valor sale entero, y la propiedad que sigue también.
+    #[test]
+    fn una_tarjeta_armada_para_el_desdoblado_no_tarda() {
+        let continuations = 85_000;
+        let card = format!(
+            "BEGIN:VCARD\nFN:Ana\nNOTE;ENCODING=QUOTED-PRINTABLE;{}:{}fin\nEMAIL:ana@x.com\nEND:VCARD\n",
+            "A".repeat(262_000),
+            "x=\n".repeat(continuations)
+        );
+        assert!(card.len() <= 512 * 1024, "{}", card.len());
+
+        let (lines, contact) = finishes_within(std::time::Duration::from_secs(5), move || {
+            let lines = unfold_lines(&card);
+            let first = split_cards(&card).into_iter().next().unwrap();
+            (lines, contact_from(&first, "").unwrap())
+        });
+
+        let note = lines.iter().find(|l| l.starts_with("NOTE;")).unwrap();
+        let value = note.split_once(':').unwrap().1;
+        assert_eq!(value.len(), continuations + 3);
+        assert!(value.ends_with("xfin"), "{}", &value[value.len() - 10..]);
+        assert_eq!(contact.display_name, "Ana");
+        assert_eq!(contact.emails[0].value, "ana@x.com");
+        assert!(contact.notes.starts_with("xxx"));
+    }
+
+    /// Y lo mismo con el plegado normal: una línea sin dos puntos que se sigue
+    /// con miles de renglones que empiezan con espacio se junta entera, y no
+    /// se vuelve a recorrer en cada pliegue buscando los dos puntos. (Sin el
+    /// arreglo esto tardaba un segundo y no cinco: la búsqueda de un byte es
+    /// rápida. La prueba guarda el resultado, no mide la diferencia.)
+    #[test]
+    fn una_linea_larga_sin_dos_puntos_se_junta_entera() {
+        let card = format!("X{}\nFN:Ana\n", "\n =".repeat(170_000));
+        let lines = finishes_within(std::time::Duration::from_secs(5), move || {
+            unfold_lines(&card)
+        });
+        assert_eq!(lines[0].len(), 1 + 170_000);
+        assert_eq!(lines[1], "FN:Ana");
+    }
+
+    /// Los dos puntos pueden llegar en un pliegue: la decisión se toma recién
+    /// ahí, y no antes con la línea a medias.
+    #[test]
+    fn el_quoted_printable_se_decide_aunque_los_dos_puntos_lleguen_plegados() {
+        let folded = "NOTE;ENCODING=QUOTED\r\n -PRINTABLE:uno=\r\ndos\r\nFN:Ana";
+        assert_eq!(
+            unfold_lines(folded),
+            vec!["NOTE;ENCODING=QUOTED-PRINTABLE:unodos", "FN:Ana"]
+        );
+        // Y una línea que no es `quoted-printable` no junta por terminar en `=`.
+        let plain = "NOTE;X=QUOTED\r\n -PRINTABLE:uno=\r\nFN:Ana";
+        assert_eq!(unfold_lines(plain).len(), 2);
     }
 
     // ── Varias tarjetas ────────────────────────────────────────────────────
