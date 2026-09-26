@@ -50,6 +50,10 @@
 //!   base **no se rehace**, queda no disponible con el motivo, y abre como
 //!   estaba en cuanto vuelve la colección. Vaciarla es la salida si el cambio
 //!   fue a propósito.
+//!   Y como un llavero que se reinicia puede servir otra colección en la ruta
+//!   fijada, antes de rehacer una base se vuelve a identificar la colección
+//!   —ruta, `Created` y dueño en el bus—: si ya no es la de la vuelta, no se
+//!   borra nada.
 //!
 //! Lo que **nunca** lleva a borrar: un error del disco, un error del llavero, un
 //! esquema más nuevo que este programa, una colección que cambió. Sólo una clave
@@ -1361,6 +1365,7 @@ impl<K: KeySource> StoreManager<K> {
                 // Lo guardado no es una clave: es lo mismo que una que no abre.
                 Err(KeyError::Malformed) => {
                     self.ensure_unlocked().await?;
+                    self.ensure_same_collection().await?;
                     self.keys.delete(account_id).await?;
                     None
                 }
@@ -1431,6 +1436,14 @@ impl<K: KeySource> StoreManager<K> {
     /// `recheck_missing_key`, se vuelve a buscar la clave y si ahora aparece no
     /// se rehace nada; y la clave nueva se guarda y se relee **antes** de tocar
     /// un archivo. Si el llavero no deja guardar, la base buena se queda.
+    ///
+    /// **Y la colección se vuelve a identificar**, al entrar y otra vez justo
+    /// antes de borrar. `moved` se calculó con la identidad del principio de la
+    /// vuelta, y la ruta fijada puede servir, después de un reinicio del
+    /// llavero, otra colección: ahí la clave «falta» porque la colección es
+    /// otra. Si cambió, no se borra nada y la cuenta queda no disponible; la
+    /// vuelta siguiente fija la nueva, ve que no es la anotada y la base queda
+    /// como estaba.
     async fn rebuild(
         &self,
         paths: &StorePaths,
@@ -1442,6 +1455,7 @@ impl<K: KeySource> StoreManager<K> {
         // Otra vez, justo antes de destruir: si el llavero se bloqueó entre la
         // búsqueda y acá, el vacío de la búsqueda no quería decir nada.
         self.ensure_unlocked().await?;
+        self.ensure_same_collection().await?;
         if key.is_none() && recheck_missing_key && self.keys.find(account_id).await?.is_some() {
             return Err(StoreError::Key(KeyError::Failed(
                 "la clave apareció al volver a buscarla: no se rehace la base, se vuelve a \
@@ -1455,6 +1469,9 @@ impl<K: KeySource> StoreManager<K> {
             Some(key) => key,
             None => self.new_key(account_id).await?,
         };
+        // La última, después de las idas y vueltas de la clave nueva: lo que
+        // sigue es lo que borra.
+        self.ensure_same_collection().await?;
         let store = create_fresh(paths.clone(), key).await?;
         store.log(
             LogLevel::Warn,
@@ -1485,6 +1502,15 @@ impl<K: KeySource> StoreManager<K> {
         match self.keys.is_locked().await? {
             false => Ok(()),
             true => Err(StoreError::Key(KeyError::Locked)),
+        }
+    }
+
+    /// Falla si la colección fijada en esta vuelta ya no es **ahora** la misma
+    /// (ver [`KeySource::pinned_is_unchanged`]).
+    async fn ensure_same_collection(&self) -> Result<(), StoreError> {
+        match self.keys.pinned_is_unchanged().await? {
+            true => Ok(()),
+            false => Err(StoreError::CollectionChanged),
         }
     }
 
@@ -1818,7 +1844,17 @@ mod tests {
 
     fn log_lines(fixture: &Fixture, account_id: &str) -> Vec<(String, String)> {
         let key = fixture.key(account_id).unwrap();
-        let store = Store::open(&fixture.paths(account_id), &key).unwrap();
+        log_lines_with(fixture, account_id, &key)
+    }
+
+    /// El `sync_log` de una base abierta con una clave dada: para cuando la
+    /// del llavero no es la de la base.
+    fn log_lines_with(
+        fixture: &Fixture,
+        account_id: &str,
+        key: &StoreKey,
+    ) -> Vec<(String, String)> {
+        let store = Store::open(&fixture.paths(account_id), key).unwrap();
         let mut statement = store
             .connection()
             .prepare("SELECT level, message FROM sync_log ORDER BY id")
@@ -2139,6 +2175,111 @@ mod tests {
             assert_eq!(f.state(id).await, StoreState::Open);
             assert!(log_lines(&f, id).is_empty(), "no se rehízo");
         }
+    }
+
+    /// El llavero se reinicia **después** de que la vuelta fijó la colección, y
+    /// en la misma ruta sirve otra, vacía. `moved` se calculó con la identidad
+    /// de antes, así que la clave «falta» y la cuenta llega a rehacerse: sin
+    /// volver a identificar la colección antes de borrar, la base buena se iba.
+    /// Tiene que quedar intacta, no disponible y sin clave nueva; y en la vuelta
+    /// siguiente la colección nueva no es la anotada, y la base sigue igual.
+    #[tokio::test]
+    async fn un_llavero_que_cambia_de_coleccion_a_mitad_de_la_vuelta_no_rehace_la_base() {
+        let f = Fixture::new("coleccion-a-mitad");
+        f.list(listing(&["cuenta"])).await;
+        let key = f.key("cuenta").unwrap();
+        let keys_before = f.keys.state().keys.clone();
+        f.keys.state().locked = true;
+        f.manager.refresh().await;
+        let stored_before = f.keys.state().stored.len();
+
+        {
+            let mut state = f.keys.state();
+            state.locked = false;
+            state.replace_after_pin = Some("coleccion-b".into());
+        }
+        f.manager.refresh().await;
+
+        assert_eq!(f.state("cuenta").await, StoreState::Unavailable);
+        assert_eq!(
+            f.manager.status().await.accounts[0].detail,
+            StoreError::CollectionChanged.to_string()
+        );
+        assert_eq!(
+            f.keys.state().stored.len(),
+            stored_before,
+            "no se tenía que guardar ninguna clave en la colección nueva"
+        );
+        assert!(
+            Store::open(&f.paths("cuenta"), &key).is_ok(),
+            "la base buena se tenía que quedar"
+        );
+        assert!(
+            log_lines_with(&f, "cuenta", &key).is_empty(),
+            "no se rehízo"
+        );
+        assert_eq!(
+            f.settings()
+                .key_collections
+                .get("cuenta")
+                .map(String::as_str),
+            Some("coleccion-a"),
+            "la colección anotada sigue siendo la de la clave"
+        );
+
+        // La vuelta siguiente fija la nueva y ve que no es la anotada.
+        f.manager.refresh().await;
+        assert_eq!(f.state("cuenta").await, StoreState::Unavailable);
+        assert!(Store::open(&f.paths("cuenta"), &key).is_ok());
+
+        // Y al volver la de antes, abre como estaba.
+        {
+            let mut state = f.keys.state();
+            state.collection = "coleccion-a".into();
+            state.keys = keys_before;
+        }
+        f.manager.refresh().await;
+        assert_eq!(f.state("cuenta").await, StoreState::Open);
+        assert!(log_lines(&f, "cuenta").is_empty());
+    }
+
+    /// El mismo reinicio, pero después de la primera comprobación: entre la
+    /// segunda búsqueda y el guardado de la clave nueva, que queda en la
+    /// colección nueva y se relee bien. Lo que salva a la base es la
+    /// comprobación de justo antes de borrar.
+    #[tokio::test]
+    async fn un_llavero_que_cambia_de_coleccion_al_guardar_la_clave_nueva_no_rehace_la_base() {
+        let f = Fixture::new("coleccion-al-guardar");
+        f.list(listing(&["cuenta"])).await;
+        let key = f.key("cuenta").unwrap();
+        f.keys.state().locked = true;
+        f.manager.refresh().await;
+
+        {
+            let mut state = f.keys.state();
+            state.locked = false;
+            // La clave no está en la colección de siempre: fila 4.
+            state.keys.clear();
+            state.replace_before_store = Some("coleccion-b".into());
+        }
+        f.manager.refresh().await;
+
+        assert_eq!(f.state("cuenta").await, StoreState::Unavailable);
+        assert!(
+            Store::open(&f.paths("cuenta"), &key).is_ok(),
+            "la base buena se tenía que quedar"
+        );
+        assert!(
+            log_lines_with(&f, "cuenta", &key).is_empty(),
+            "no se rehízo"
+        );
+        assert_eq!(
+            f.settings()
+                .key_collections
+                .get("cuenta")
+                .map(String::as_str),
+            Some("coleccion-a")
+        );
     }
 
     /// Vaciar es la salida cuando la colección cambió a propósito: la base

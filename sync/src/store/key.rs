@@ -196,6 +196,21 @@ pub trait KeySource: Send + Sync + 'static {
     /// que se reemplazó no se confunden con «se perdieron todas las claves».
     fn pin_collection(&self) -> impl Future<Output = Result<String, KeyError>> + Send;
 
+    /// Si la colección fijada sigue siendo **ahora** la que dio
+    /// [`Self::pin_collection`]: la misma ruta con el mismo `Created`, y el
+    /// mismo dueño de `org.freedesktop.secrets` en el bus.
+    ///
+    /// Fijar la ruta no alcanza. Un llavero que se reinicia a mitad de una
+    /// vuelta puede servir en esa misma ruta otra colección —recreada, u otro
+    /// llavero entero—, y ahí una clave «falta» porque la colección es otra,
+    /// no porque se perdió. Así que se pregunta justo antes de cada
+    /// recuperación que destruye algo, y un `false` corta sin borrar nada: la
+    /// vuelta siguiente fija la colección de nuevo y ve el cambio.
+    ///
+    /// Sin colección fijada contesta `false`: no hay contra qué comparar. Un
+    /// error tampoco es «sigue igual».
+    fn pinned_is_unchanged(&self) -> impl Future<Output = Result<bool, KeyError>> + Send;
+
     /// Si la colección donde viven las claves está bloqueada.
     ///
     /// Es **la** pregunta: ninguna clave se genera sin haber leído `false` acá.
@@ -261,7 +276,31 @@ pub struct SecretServiceKeys {
     owner: Arc<std::sync::Mutex<Option<OwnedUniqueName>>>,
     /// La colección fijada por [`KeySource::pin_collection`]. Mientras no se
     /// fije ninguna, cada operación lee el alias.
-    pinned: Arc<std::sync::Mutex<Option<OwnedObjectPath>>>,
+    pinned: Arc<std::sync::Mutex<Option<Pin>>>,
+}
+
+/// Una colección fijada, con lo que la identificaba al fijarla.
+#[derive(Clone)]
+struct Pin {
+    path: OwnedObjectPath,
+    /// `ruta#Created`, lo que devolvió [`KeySource::pin_collection`].
+    identity: String,
+    /// El dueño de `org.freedesktop.secrets` en ese momento. Nada en una
+    /// conexión punto a punto, donde no hay nombres.
+    owner: Option<OwnedUniqueName>,
+}
+
+impl Pin {
+    /// Si una lectura de ahora describe la misma colección que la fijada.
+    ///
+    /// El dueño cuenta aunque la identidad sea igual: un llavero reiniciado
+    /// con la misma colección da la misma `ruta#Created`, pero uno que no
+    /// tiene `Created` da siempre `ruta#?`, y ahí el dueño es lo único que
+    /// distingue a otro llavero en la misma ruta. Cortar de más cuesta una
+    /// vuelta; de menos, una base.
+    fn matches(&self, identity: &str, owner: Option<&OwnedUniqueName>) -> bool {
+        self.identity == identity && self.owner.as_ref() == owner
+    }
 }
 
 impl SecretServiceKeys {
@@ -330,7 +369,7 @@ impl SecretServiceKeys {
             .map(|pinned| pinned.clone())
             .unwrap_or(None);
         match pinned {
-            Some(path) => Ok(path),
+            Some(pin) => Ok(pin.path),
             None => self.read_default_alias().await,
         }
     }
@@ -389,6 +428,33 @@ impl SecretServiceKeys {
         // Un `Created` de otro tipo tampoco cambia solo: es siempre el mismo
         // llavero contestando lo mismo.
         Ok(u64::try_from(value).map_or_else(|_| "?".to_string(), |c| c.to_string()))
+    }
+
+    /// El nombre único del dueño de `org.freedesktop.secrets`, o nada en una
+    /// conexión punto a punto.
+    ///
+    /// Que no tenga dueño es `Unavailable`: el llavero se fue, y nada de lo que
+    /// siga se puede comparar con lo fijado.
+    async fn service_owner(&self) -> Result<Option<OwnedUniqueName>, KeyError> {
+        let Some(name) = self.destination else {
+            return Ok(None);
+        };
+        let proxy = zbus::fdo::DBusProxy::new(&self.connection)
+            .await
+            .map_err(|e| KeyError::Unavailable(format!("GetNameOwner: {e}")))?;
+        let bus_name = zbus::names::BusName::try_from(name)
+            .map_err(|e| KeyError::Failed(format!("GetNameOwner: {e}")))?;
+        proxy
+            .get_name_owner(bus_name)
+            .await
+            .map(Some)
+            .map_err(|e| KeyError::Unavailable(format!("GetNameOwner: {e}")))
+    }
+
+    /// `ruta#Created` de una colección.
+    async fn collection_identity(&self, path: &OwnedObjectPath) -> Result<String, KeyError> {
+        let created = self.collection_created(path).await?;
+        Ok(format!("{}#{created}", path.as_str()))
     }
 
     /// `Locked` de una colección.
@@ -541,13 +607,34 @@ pub fn is_lock_change(message: &zbus::Message) -> bool {
 
 impl KeySource for SecretServiceKeys {
     async fn pin_collection(&self) -> Result<String, KeyError> {
+        // El alias primero: con activación por D-Bus es lo que levanta al
+        // llavero, y antes de eso no hay dueño que leer. El dueño antes que
+        // `Created`: si el llavero cambia entre los dos, `Created` ya es del
+        // nuevo y el dueño anotado es el viejo, así que la próxima comparación
+        // corta —de más, nunca de menos—.
         let path = self.read_default_alias().await?;
-        let created = self.collection_created(&path).await?;
-        let identity = format!("{}#{created}", path.as_str());
+        let owner = self.service_owner().await?;
+        let identity = self.collection_identity(&path).await?;
         if let Ok(mut pinned) = self.pinned.lock() {
-            *pinned = Some(path);
+            *pinned = Some(Pin {
+                path,
+                identity: identity.clone(),
+                owner,
+            });
         }
         Ok(identity)
+    }
+
+    async fn pinned_is_unchanged(&self) -> Result<bool, KeyError> {
+        let pinned = self.pinned.lock().map(|p| p.clone()).unwrap_or(None);
+        let Some(pin) = pinned else {
+            return Ok(false);
+        };
+        // Ahora al revés: `Created` y después el dueño. Un reinicio antes de
+        // leer el dueño se ve en el dueño.
+        let identity = self.collection_identity(&pin.path).await?;
+        let owner = self.service_owner().await?;
+        Ok(pin.matches(&identity, owner.as_ref()))
     }
 
     async fn is_locked(&self) -> Result<bool, KeyError> {
@@ -762,6 +849,25 @@ pub(crate) mod fake {
         pub pin_gate: Option<Arc<tokio::sync::Semaphore>>,
         /// Cuántos `pin_collection` están esperando en `pin_gate`.
         pub pins_waiting: usize,
+        /// La identidad que dio el último `pin_collection`.
+        pub pinned: Option<String>,
+        /// Si está, apenas `pin_collection` contesta la colección pasa a ser
+        /// ésta, vacía: un llavero que se reinició con otra colección en la
+        /// misma ruta después de que la vuelta la fijó.
+        pub replace_after_pin: Option<String>,
+        /// Lo mismo, pero justo antes del próximo `store`: la clave nueva ya
+        /// va a parar a la colección nueva.
+        pub replace_before_store: Option<String>,
+    }
+
+    impl FakeState {
+        fn identity(&self) -> String {
+            if self.collection.is_empty() {
+                "coleccion-a".to_string()
+            } else {
+                self.collection.clone()
+            }
+        }
     }
 
     #[derive(Clone, Default)]
@@ -790,11 +896,22 @@ pub(crate) mod fake {
                 return Err(KeyError::Failed("Get(Created): no contestó".into()));
             }
             state.pins += 1;
-            Ok(if state.collection.is_empty() {
-                "coleccion-a".to_string()
-            } else {
-                state.collection.clone()
-            })
+            let identity = state.identity();
+            state.pinned = Some(identity.clone());
+            if let Some(next) = state.replace_after_pin.take() {
+                state.collection = next;
+                state.keys.clear();
+                state.malformed.clear();
+            }
+            Ok(identity)
+        }
+
+        async fn pinned_is_unchanged(&self) -> Result<bool, KeyError> {
+            let state = self.state();
+            if state.unavailable {
+                return Err(KeyError::Unavailable("sin llavero".into()));
+            }
+            Ok(state.pinned.as_deref() == Some(state.identity().as_str()))
         }
 
         async fn is_locked(&self) -> Result<bool, KeyError> {
@@ -848,6 +965,11 @@ pub(crate) mod fake {
             }
             if state.reject_stores {
                 return Err(KeyError::Failed("el llavero no dejó guardar".into()));
+            }
+            if let Some(next) = state.replace_before_store.take() {
+                state.collection = next;
+                state.keys.clear();
+                state.malformed.clear();
             }
             state.stored.push(account_id.to_string());
             state.malformed.remove(account_id);
@@ -1213,6 +1335,52 @@ mod tests {
             keys.pin_collection().await.unwrap(),
             format!("{COLLECTION_PATH}#1800")
         );
+    }
+
+    /// La colección fijada se vuelve a identificar: la misma ruta recreada
+    /// —otro `Created`— ya no es la fijada, aunque todo lo demás siga yendo a
+    /// esa ruta. Sin fijar nada, no hay contra qué comparar.
+    #[tokio::test]
+    async fn la_coleccion_fijada_recreada_en_la_misma_ruta_ya_no_es_la_misma() {
+        let (keys, _server, shared) = fake_keyring().await;
+        assert!(
+            !keys.pinned_is_unchanged().await.unwrap(),
+            "sin colección fijada no se puede decir que sigue igual"
+        );
+
+        shared.lock().unwrap().created = 1700;
+        keys.pin_collection().await.unwrap();
+        assert!(keys.pinned_is_unchanged().await.unwrap());
+
+        shared.lock().unwrap().created = 1800;
+        assert!(!keys.pinned_is_unchanged().await.unwrap());
+
+        // Y un error al leer `Created` no es «sigue igual».
+        {
+            let mut state = shared.lock().unwrap();
+            state.created = 1700;
+            state.created_failures = 1;
+        }
+        assert!(keys.pinned_is_unchanged().await.is_err());
+        assert!(keys.pinned_is_unchanged().await.unwrap());
+    }
+
+    /// Con la misma `ruta#Created`, otro dueño de `org.freedesktop.secrets`
+    /// tampoco es la colección fijada: un llavero sin `Created` da siempre
+    /// `ruta#?`, y ahí el dueño es lo único que distingue a otro.
+    #[test]
+    fn otro_dueno_del_llavero_no_es_la_coleccion_fijada() {
+        let owner = |name: &str| OwnedUniqueName::try_from(name).unwrap();
+        let pin = Pin {
+            path: OwnedObjectPath::try_from(COLLECTION_PATH).unwrap(),
+            identity: format!("{COLLECTION_PATH}#?"),
+            owner: Some(owner(":1.5")),
+        };
+        let same = format!("{COLLECTION_PATH}#?");
+        assert!(pin.matches(&same, Some(&owner(":1.5"))));
+        assert!(!pin.matches(&same, Some(&owner(":1.9"))));
+        assert!(!pin.matches(&same, None));
+        assert!(!pin.matches(&format!("{COLLECTION_PATH}#1700"), Some(&owner(":1.5"))));
     }
 
     /// Un error pasajero al leer `Created` no es «este llavero no tiene
