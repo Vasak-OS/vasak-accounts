@@ -169,8 +169,10 @@ pub trait KeySource: Send + Sync + 'static {
 
     /// La clave de una cuenta, si hay una.
     ///
-    /// `Ok(None)` sólo quiere decir «no está» si antes se leyó que la colección
-    /// no está bloqueada. Un error nunca es «no está».
+    /// Con la colección bloqueada contesta `Err(Locked)`, nunca `Ok(None)`.
+    /// Aun así, `Ok(None)` sólo quiere decir «no está» si antes se leyó que la
+    /// colección no está bloqueada: un llavero que dice «desbloqueado» y no
+    /// descifró nada también contesta vacío. Un error nunca es «no está».
     fn find(
         &self,
         account_id: &str,
@@ -183,7 +185,11 @@ pub trait KeySource: Send + Sync + 'static {
         key: &StoreKey,
     ) -> impl Future<Output = Result<(), KeyError>> + Send;
 
-    /// Borra la clave de una cuenta. Que no hubiera ninguna no es un error.
+    /// Borra la clave de una cuenta. Que no hubiera ninguna no es un error;
+    /// que la colección esté bloqueada, sí (`Err(Locked)`).
+    ///
+    /// Un `Ok(())` no prueba que la clave se haya ido: el ciclo de vida no
+    /// vuelve a usar la clave de una cuenta vaciada aunque la encuentre.
     fn delete(&self, account_id: &str) -> impl Future<Output = Result<(), KeyError>> + Send;
 
     /// Las cuentas que tienen una clave guardada, para limpiar las huérfanas.
@@ -285,12 +291,29 @@ impl SecretServiceKeys {
         Ok(path)
     }
 
+    /// `Locked` de una colección.
+    async fn collection_locked(&self, collection: &OwnedObjectPath) -> Result<bool, KeyError> {
+        self.property(collection.as_str(), COLLECTION_IFACE, "Locked")
+            .await
+    }
+
     /// Los ítems de la colección que tienen estos atributos.
+    ///
+    /// **Un vacío con la colección bloqueada es `Err(Locked)`, no «no hay».**
+    /// `vasak-keyring` sin la contraseña en memoria contesta `SearchItems` con
+    /// una lista vacía, igual que si no hubiera nada, y quien llama —`find`,
+    /// `delete`, `key_accounts`— tomaría ese vacío por «no está» o por «ya
+    /// está borrado». Así que se lee `Locked` antes de buscar, y otra vez si la
+    /// búsqueda volvió vacía, sobre **la misma** colección: un bloqueo que llega
+    /// entre la primera lectura y la búsqueda también se ve.
     async fn search(
         &self,
         attributes: &HashMap<&str, &str>,
     ) -> Result<Vec<OwnedObjectPath>, KeyError> {
         let collection = self.default_collection().await?;
+        if self.collection_locked(&collection).await? {
+            return Err(KeyError::Locked);
+        }
         let mut items: Vec<OwnedObjectPath> = self
             .call(
                 collection.as_str(),
@@ -299,6 +322,9 @@ impl SecretServiceKeys {
                 &(attributes,),
             )
             .await?;
+        if items.is_empty() && self.collection_locked(&collection).await? {
+            return Err(KeyError::Locked);
+        }
         // Ordenados, para que dos claves duplicadas den siempre la misma.
         items.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         Ok(items)
@@ -360,8 +386,7 @@ pub fn is_lock_change(message: &zbus::Message) -> bool {
 impl KeySource for SecretServiceKeys {
     async fn is_locked(&self) -> Result<bool, KeyError> {
         let collection = self.default_collection().await?;
-        self.property(collection.as_str(), COLLECTION_IFACE, "Locked")
-            .await
+        self.collection_locked(&collection).await
     }
 
     async fn find(&self, account_id: &str) -> Result<Option<StoreKey>, KeyError> {
@@ -492,6 +517,11 @@ pub(crate) mod fake {
 
     use super::*;
 
+    /// Contesta como el cliente de verdad, [`SecretServiceKeys`]: con la
+    /// colección bloqueada, `find`, `delete`, `key_accounts` y `store` dan
+    /// `Err(Locked)`. Lo que el cliente de verdad no puede ver —un `Delete` que
+    /// contesta bien y no borra, un llavero que dice «desbloqueado» y no ve
+    /// nada— va por perillas aparte, con nombre.
     #[derive(Default)]
     pub(crate) struct FakeState {
         pub locked: bool,
@@ -513,6 +543,13 @@ pub(crate) mod fake {
         pub lock_after_find: bool,
         /// Que `find` falle.
         pub fail_find: bool,
+        /// Que `delete` conteste bien y no borre nada: un llavero que miente,
+        /// o el cliente de antes, que con el llavero bloqueado recibía un
+        /// `SearchItems` vacío y contestaba `Ok(())`.
+        pub lose_deletes: bool,
+        /// Que la colección se bloquee justo después de contestar
+        /// `is_locked() == false`.
+        pub lock_after_is_locked: bool,
     }
 
     #[derive(Clone, Default)]
@@ -526,11 +563,16 @@ pub(crate) mod fake {
 
     impl KeySource for FakeKeys {
         async fn is_locked(&self) -> Result<bool, KeyError> {
-            let state = self.state();
+            let mut state = self.state();
             if state.unavailable {
                 return Err(KeyError::Unavailable("sin llavero".into()));
             }
-            Ok(state.locked)
+            let locked = state.locked;
+            if !locked && state.lock_after_is_locked {
+                state.lock_after_is_locked = false;
+                state.locked = true;
+            }
+            Ok(locked)
         }
 
         async fn find(&self, account_id: &str) -> Result<Option<StoreKey>, KeyError> {
@@ -541,10 +583,10 @@ pub(crate) mod fake {
             if state.fail_find {
                 return Err(KeyError::Failed("falló la búsqueda".into()));
             }
-            // Como el llavero de verdad antes del desbloqueo: vacío, sin
-            // distinguir «bloqueado» de «no existe».
+            // Como el cliente de verdad: la búsqueda vacía con la colección
+            // bloqueada es un bloqueo, no «no está».
             if state.locked {
-                return Ok(None);
+                return Err(KeyError::Locked);
             }
             if state.lock_after_find {
                 state.locked = true;
@@ -577,13 +619,16 @@ pub(crate) mod fake {
 
         async fn delete(&self, account_id: &str) -> Result<(), KeyError> {
             let mut state = self.state();
-            if state.locked {
+            if state.locked && !state.lose_deletes {
                 return Err(KeyError::Locked);
             }
             if state.fail_delete {
                 return Err(KeyError::Failed("no se pudo borrar".into()));
             }
             state.deleted.push(account_id.to_string());
+            if state.lose_deletes {
+                return Ok(());
+            }
             state.keys.remove(account_id);
             state.malformed.remove(account_id);
             Ok(())
@@ -592,7 +637,7 @@ pub(crate) mod fake {
         async fn key_accounts(&self) -> Result<Vec<String>, KeyError> {
             let state = self.state();
             if state.locked {
-                return Ok(Vec::new());
+                return Err(KeyError::Locked);
             }
             Ok(state
                 .keys
@@ -674,6 +719,9 @@ mod tests {
     #[derive(Default)]
     struct FakeKeyring {
         locked: bool,
+        /// Que la colección se bloquee en el momento de buscar: `SearchItems`
+        /// ya contesta vacío, aunque `Locked` se haya leído `false` antes.
+        lock_on_search: bool,
         next_item: u32,
         items: BTreeMap<String, (HashMap<String, String>, Vec<u8>)>,
         sessions: u32,
@@ -734,7 +782,11 @@ mod tests {
     #[zbus::interface(name = "org.freedesktop.Secret.Collection")]
     impl FakeCollection {
         async fn search_items(&self, attributes: HashMap<String, String>) -> Vec<OwnedObjectPath> {
-            let state = self.0.lock().unwrap();
+            let mut state = self.0.lock().unwrap();
+            if state.lock_on_search {
+                state.lock_on_search = false;
+                state.locked = true;
+            }
             // Como `vasak-keyring` antes del desbloqueo: vacío.
             if state.locked {
                 return Vec::new();
@@ -940,6 +992,43 @@ mod tests {
         shared.lock().unwrap().locked = false;
         assert!(!keys.is_locked().await.unwrap());
         assert!(keys.find("cuenta").await.unwrap().is_some());
+    }
+
+    /// `vasak-keyring` sin la contraseña en memoria contesta `SearchItems`
+    /// vacío. El cliente no puede tomar eso por «no hay clave» ni por «ya está
+    /// borrada»: `delete` y `find` avisan el bloqueo, y la clave sigue ahí.
+    #[tokio::test]
+    async fn borrar_con_el_llavero_bloqueado_avisa_el_bloqueo_y_no_borra() {
+        let (keys, _server, shared) = fake_keyring().await;
+        let key = StoreKey::generate().unwrap();
+        keys.store("cuenta", &key).await.unwrap();
+
+        shared.lock().unwrap().locked = true;
+        assert_eq!(keys.delete("cuenta").await, Err(KeyError::Locked));
+        assert_eq!(keys.find("cuenta").await, Err(KeyError::Locked));
+        assert_eq!(keys.key_accounts().await, Err(KeyError::Locked));
+
+        shared.lock().unwrap().locked = false;
+        assert_eq!(keys.find("cuenta").await.unwrap(), Some(key));
+    }
+
+    /// Un bloqueo que llega entre la lectura de `Locked` y la búsqueda
+    /// tampoco se lee como vacío: se vuelve a mirar `Locked` después.
+    #[tokio::test]
+    async fn un_bloqueo_durante_la_busqueda_no_se_lee_como_vacio() {
+        let (keys, _server, shared) = fake_keyring().await;
+        let key = StoreKey::generate().unwrap();
+        keys.store("cuenta", &key).await.unwrap();
+
+        shared.lock().unwrap().lock_on_search = true;
+        assert_eq!(keys.delete("cuenta").await, Err(KeyError::Locked));
+
+        shared.lock().unwrap().locked = false;
+        shared.lock().unwrap().lock_on_search = true;
+        assert_eq!(keys.find("cuenta").await, Err(KeyError::Locked));
+
+        shared.lock().unwrap().locked = false;
+        assert_eq!(keys.find("cuenta").await.unwrap(), Some(key));
     }
 
     /// Un secreto que no escribió este servicio no se usa como clave.

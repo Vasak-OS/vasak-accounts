@@ -21,6 +21,12 @@
 //!   Con el llavero bloqueado se borran los archivos, y la clave queda anotada
 //!   para borrarse en el primer desbloqueo; hasta entonces esa cuenta no vuelve
 //!   a tener base, para no rehacerla con la clave vieja.
+//! - **Una cuenta vaciada o apagada no vuelve a usar nunca la clave que
+//!   encuentre.** Queda en `pending_key_deletions` aunque el `Delete` haya
+//!   contestado bien —un `Ok` no prueba que la clave se fue: el llavero pudo
+//!   bloquearse a mitad, o mentir—, y sale de ahí recién cuando una clave
+//!   **nueva** quedó guardada y releída. Mientras tanto, lo que `find` devuelva
+//!   para esa cuenta se descarta.
 //! - **Al desconectar una cuenta** se borra la base de toda cuenta que no esté
 //!   en `ListAccounts`, **sólo si `ListAccounts` respondió bien**, y comparando
 //!   contra todas las cuentas: una que pide reautenticarse sigue siendo de la
@@ -126,8 +132,11 @@ pub enum AccountListing {
 pub struct StoreSettings {
     #[serde(default)]
     pub accounts: BTreeMap<String, AccountSettings>,
-    /// Cuentas cuya clave hay que borrar del llavero en cuanto se pueda: se
-    /// vaciaron o apagaron con el llavero bloqueado.
+    /// Cuentas cuya clave del llavero no se vuelve a usar: se vaciaron o se
+    /// apagaron. Se intenta borrarla en cada vuelta con el llavero
+    /// desbloqueado, y la cuenta sale de acá recién cuando tiene una clave
+    /// nueva guardada. Una cuenta apagada, o que ya no está, se queda: son unos
+    /// bytes, y sacarla sin una clave nueva es justo lo que esta lista evita.
     #[serde(default)]
     pub pending_key_deletions: BTreeSet<String>,
 }
@@ -539,13 +548,13 @@ impl<K: KeySource> StoreManager<K> {
         }
 
         inner.keyring = KeyringState::Unlocked;
-        self.flush_pending_deletions(locations, &mut settings).await;
+        let cleared = self.flush_pending_deletions(&settings).await;
         if let Some(listed) = &inner.listed {
             self.sweep_orphan_keys(listed).await;
         }
 
         for id in targets {
-            self.bring_account(inner, locations, &mut settings, &id)
+            self.bring_account(inner, locations, &mut settings, &cleared, &id)
                 .await;
         }
     }
@@ -556,6 +565,7 @@ impl<K: KeySource> StoreManager<K> {
         inner: &mut Inner,
         locations: &Locations,
         settings: &mut StoreSettings,
+        cleared: &BTreeSet<String>,
         account_id: &str,
     ) {
         if !settings.is_enabled(account_id) {
@@ -572,7 +582,8 @@ impl<K: KeySource> StoreManager<K> {
             return;
         }
 
-        if settings.pending_key_deletions.contains(account_id) {
+        let pending = settings.pending_key_deletions.contains(account_id);
+        if pending && !cleared.contains(account_id) {
             // No se rehace con la clave vieja: primero tiene que irse.
             let entry = inner.entry(account_id);
             entry.close();
@@ -587,7 +598,15 @@ impl<K: KeySource> StoreManager<K> {
             return;
         }
 
-        let result = self.bring_up(&locations.stores, account_id).await;
+        let result = self.bring_up(&locations.stores, account_id, pending).await;
+        if pending && result.is_ok() {
+            // Recién ahora: hay una clave nueva guardada y releída, que
+            // reemplazó a la vieja en el llavero.
+            settings.pending_key_deletions.remove(account_id);
+            if let Err(e) = settings.save(&locations.settings) {
+                tracing::warn!("{e}");
+            }
+        }
         if matches!(result, Err(StoreError::Key(KeyError::Locked))) {
             inner.keyring = KeyringState::Locked;
         }
@@ -613,19 +632,33 @@ impl<K: KeySource> StoreManager<K> {
     }
 
     /// Las filas 2 a 5 de la tabla. Devuelve la base abierta y si se rehízo.
-    async fn bring_up(&self, root: &Path, account_id: &str) -> Result<(Store, bool), StoreError> {
+    ///
+    /// Con `discard_found_key`, lo que haya en el llavero para esta cuenta no se
+    /// usa: es una cuenta vaciada o apagada, y una clave que aparece ahí es la
+    /// vieja —un `Delete` que contestó bien y no borró—. Se sigue como si no
+    /// hubiera clave, y la nueva la reemplaza.
+    async fn bring_up(
+        &self,
+        root: &Path,
+        account_id: &str,
+        discard_found_key: bool,
+    ) -> Result<(Store, bool), StoreError> {
         let paths = StorePaths::new(root, account_id)?;
 
-        let key = match self.keys.find(account_id).await {
-            Ok(key) => key,
-            // Lo guardado no es una clave: es lo mismo que una que no abre.
-            Err(KeyError::Malformed) => {
-                self.ensure_unlocked().await?;
-                self.keys.delete(account_id).await?;
-                None
+        let key = if discard_found_key {
+            None
+        } else {
+            match self.keys.find(account_id).await {
+                Ok(key) => key,
+                // Lo guardado no es una clave: es lo mismo que una que no abre.
+                Err(KeyError::Malformed) => {
+                    self.ensure_unlocked().await?;
+                    self.keys.delete(account_id).await?;
+                    None
+                }
+                // Cualquier otro error **no** es «no hay clave».
+                Err(e) => return Err(e.into()),
             }
-            // Cualquier otro error **no** es «no hay clave».
-            Err(e) => return Err(e.into()),
         };
 
         // Un error del disco al mirar si hay base no es «no hay base»: se corta
@@ -728,9 +761,11 @@ impl<K: KeySource> StoreManager<K> {
 
     /// Borra la base de una cuenta: primero la clave, después los archivos.
     ///
-    /// Si la clave no se puede borrar —llavero bloqueado, o un error— queda
-    /// anotada en `stores.json` y se borra en la próxima vuelta con el llavero
-    /// desbloqueado. Los archivos se borran igual.
+    /// La cuenta queda anotada en `pending_key_deletions` **siempre**, también
+    /// si el `Delete` contestó bien: un `Ok` no prueba que la clave se fue, y
+    /// rehacer la base con la clave vieja sería deshacer el «vaciar». Sale de
+    /// la lista cuando tiene una clave nueva (ver `bring_account`). Los
+    /// archivos se borran igual.
     async fn remove_store(
         &self,
         locations: &Locations,
@@ -740,25 +775,15 @@ impl<K: KeySource> StoreManager<K> {
     ) -> Result<(), StoreError> {
         let paths = StorePaths::new(&locations.stores, account_id)?;
 
-        let key_deleted = if unlocked {
-            match self.keys.delete(account_id).await {
-                Ok(()) => true,
-                Err(e) => {
-                    tracing::warn!("'{account_id}': la clave se borra después: {e}");
-                    false
-                }
+        if unlocked {
+            if let Err(e) = self.keys.delete(account_id).await {
+                tracing::warn!("'{account_id}': la clave se borra después: {e}");
             }
-        } else {
-            false
-        };
-        let changed = if key_deleted {
-            settings.pending_key_deletions.remove(account_id)
-        } else {
-            settings
-                .pending_key_deletions
-                .insert(account_id.to_string())
-        };
-        if changed {
+        }
+        if settings
+            .pending_key_deletions
+            .insert(account_id.to_string())
+        {
             if let Err(e) = settings.save(&locations.settings) {
                 tracing::warn!("{e}");
             }
@@ -767,24 +792,20 @@ impl<K: KeySource> StoreManager<K> {
         blocking(move || paths.remove()).await?
     }
 
-    /// Borra las claves anotadas para borrar.
-    async fn flush_pending_deletions(&self, locations: &Locations, settings: &mut StoreSettings) {
-        let pending: Vec<String> = settings.pending_key_deletions.iter().cloned().collect();
-        let mut changed = false;
-        for account_id in pending {
-            match self.keys.delete(&account_id).await {
+    /// Intenta borrar las claves anotadas. Devuelve las cuentas cuyo `Delete`
+    /// contestó bien en esta vuelta, que son las únicas que pueden volver a
+    /// tener base ahora; siguen en la lista hasta tener una clave nueva.
+    async fn flush_pending_deletions(&self, settings: &StoreSettings) -> BTreeSet<String> {
+        let mut cleared = BTreeSet::new();
+        for account_id in &settings.pending_key_deletions {
+            match self.keys.delete(account_id).await {
                 Ok(()) => {
-                    settings.pending_key_deletions.remove(&account_id);
-                    changed = true;
+                    cleared.insert(account_id.clone());
                 }
                 Err(e) => tracing::warn!("'{account_id}': la clave vieja sigue en el llavero: {e}"),
             }
         }
-        if changed {
-            if let Err(e) = settings.save(&locations.settings) {
-                tracing::warn!("{e}");
-            }
-        }
+        cleared
     }
 
     /// Borra las claves de cuentas que ya no están: las de una cuenta quitada
@@ -1466,7 +1487,11 @@ mod tests {
 
         f.manager.clear("cuenta").await.unwrap();
 
-        assert_eq!(f.keys.state().deleted, vec!["cuenta".to_string()]);
+        // Se borra al vaciar, y otra vez antes de crear la nueva: la cuenta
+        // sigue anotada hasta tener clave nueva.
+        let deleted = f.keys.state().deleted.clone();
+        assert!(!deleted.is_empty() && deleted.iter().all(|id| id == "cuenta"));
+        assert!(f.settings().pending_key_deletions.is_empty());
         let new_key = f.key("cuenta").unwrap();
         assert_ne!(new_key, old_key);
         assert_eq!(f.state("cuenta").await, StoreState::Open);
@@ -1498,6 +1523,60 @@ mod tests {
         assert!(f.settings().pending_key_deletions.is_empty());
         assert_ne!(f.key("cuenta").unwrap(), old_key);
         assert_eq!(f.state("cuenta").await, StoreState::Open);
+    }
+
+    /// El llavero se bloquea entre el `is_locked` y el `Delete` de «vaciar», y
+    /// el `Delete` contesta bien sin borrar —lo que hacía el cliente antes,
+    /// con un `SearchItems` vacío—. La cuenta queda anotada igual, y al
+    /// desbloquear la base nueva lleva **otra** clave: la vieja no se reusa.
+    #[tokio::test]
+    async fn vaciar_con_bloqueo_a_mitad_no_reusa_la_clave_vieja() {
+        let f = Fixture::new("vaciar-carrera");
+        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        let old_key = f.key("cuenta").unwrap();
+        {
+            let mut state = f.keys.state();
+            state.lose_deletes = true;
+            state.lock_after_is_locked = true;
+        }
+
+        f.manager.clear("cuenta").await.unwrap();
+        assert!(
+            f.settings().pending_key_deletions.contains("cuenta"),
+            "la cuenta tenía que quedar anotada"
+        );
+
+        f.keys.state().locked = false;
+        f.manager.refresh().await;
+        assert_eq!(f.state("cuenta").await, StoreState::Open);
+        assert_ne!(
+            f.key("cuenta").unwrap(),
+            old_key,
+            "la clave vieja no se vuelve a usar"
+        );
+        assert!(Store::open(&f.paths("cuenta"), &old_key).is_err());
+        assert!(f.settings().pending_key_deletions.is_empty());
+    }
+
+    /// Lo mismo sin bloqueo: un `Delete` que contesta bien y no borra no hace
+    /// que apagar y volver a encender reuse la clave vieja.
+    #[tokio::test]
+    async fn apagar_y_encender_con_un_delete_que_no_borra_no_reusa_la_clave_vieja() {
+        let f = Fixture::new("delete-mentiroso");
+        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        let old_key = f.key("cuenta").unwrap();
+        f.keys.state().lose_deletes = true;
+
+        f.manager.set_enabled("cuenta", false).await.unwrap();
+        assert!(f.settings().pending_key_deletions.contains("cuenta"));
+        // Apagada sigue anotada: no tiene clave nueva.
+        f.manager.refresh().await;
+        assert!(f.settings().pending_key_deletions.contains("cuenta"));
+
+        f.manager.set_enabled("cuenta", true).await.unwrap();
+        assert_eq!(f.state("cuenta").await, StoreState::Open);
+        assert_ne!(f.key("cuenta").unwrap(), old_key);
+        assert!(f.settings().pending_key_deletions.is_empty());
     }
 
     /// Si la clave vieja no se puede borrar, la cuenta no vuelve a tener base:
