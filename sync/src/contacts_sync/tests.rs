@@ -1601,11 +1601,12 @@ async fn una_tarjeta_de_mas_no_se_retiene_en_la_tanda() {
         deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
         stored_bytes: 0,
     };
-    let cards = f
+    let (cards, missing) = f
         .sync
         .fetch_cards(&client, &books[0], &hrefs, &mut round)
         .await
         .unwrap();
+    assert_eq!(missing, 0, "una de más no falta: volvió");
     assert_eq!(cards.len(), 1, "se retuvieron las de más");
     assert!(cards.iter().all(|c| c.data.len() <= 1024));
     assert_eq!(round.report.too_large, 20);
@@ -1614,4 +1615,59 @@ async fn una_tarjeta_de_mas_no_se_retiene_en_la_tanda() {
     assert_eq!((report.fetched, report.too_large), (1, 20));
     assert_eq!(f.names().await, vec!["Ana"]);
     assert_eq!(f.token(0).await, Some(f.server_token()));
+}
+
+/// **N7** (la nota 2 de integridad del #52): **una tarjeta pedida que no
+/// vuelve no deja guardar el token.** El servidor lista `a%40b.vcf` y el
+/// `multiget` la contesta como `a@b.vcf`, que a propósito no se iguala: se
+/// descartaba como no pedida y el token se guardaba igual. Ahora lo traído se
+/// escribe, la libreta falla sin guardar el token y la vuelta siguiente la
+/// vuelve a pedir; si sigue faltando [`MISSING_ROUNDS`] vueltas seguidas, la
+/// libreta se da por al día igual y queda en la bitácora.
+#[tokio::test]
+async fn una_tarjeta_pedida_que_no_vuelve_no_deja_guardar_el_token() {
+    let f = Fixture::new("contactos-pedida-que-no-vuelve").await;
+    f.server.put(0, "ana.vcf", &card("1", "Ana", "ana@x.com"));
+    f.synced().await;
+    let old = f.token(0).await.unwrap();
+
+    f.server
+        .put(0, "juan.vcf", &card("2", "Juan", "juan@x.com"));
+    f.server
+        .put(0, "a%40b.vcf", &card("3", "Arroba", "a@x.com"));
+    f.server.state().multiget_href = Some(|href| href.replace("%40", "@"));
+
+    for round in 1..MISSING_ROUNDS {
+        let before = f.server.requests().len();
+        let outcome = f.sync().await;
+        assert_eq!(outcome_kind(&outcome), "Failed", "vuelta {round}");
+        assert_eq!(f.token(0).await, Some(old.clone()), "vuelta {round}");
+        assert_eq!(f.names().await, vec!["Ana", "Juan"]);
+        assert_eq!(f.contacts_status().await["state"], "failed");
+        assert!(f
+            .requests_since(before)
+            .iter()
+            .any(|r| r.is_multiget() && r.body.contains("a%40b.vcf")));
+    }
+    let report = f.synced().await;
+    assert_eq!(report.missing, 1);
+    assert_eq!(f.token(0).await, Some(f.server_token()));
+    let logged: i64 = f
+        .query(|c| {
+            c.query_row(
+                "SELECT count(*) FROM sync_log WHERE message LIKE '%no volvieron%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        })
+        .await;
+    assert_eq!(logged, 1);
+
+    f.server.state().multiget_href = None;
+    f.server
+        .put(0, "a%40b.vcf", &card("3", "Arroba Pérez", "a@x.com"));
+    let report = f.synced().await;
+    assert_eq!((report.fetched, report.missing), (1, 0));
+    assert_eq!(f.names().await, vec!["Ana", "Arroba Pérez", "Juan"]);
 }

@@ -50,7 +50,10 @@ use std::time::Duration;
 
 use crate::dav::carddav::{self, AddressBook, CardResource};
 use crate::dav::webdav::{self, href_key, DavClient, DavCredential, DavError, HttpPolicy, Limits};
-use crate::dav_sync::{self, AreaSync, CollectionCap, ListedCollection, Plan, RoundError};
+use crate::dav_sync::{
+    self, AreaSync, CollectionCap, ListedCollection, MissingStreaks, Plan, RoundError, Settled,
+    MISSING_ROUNDS,
+};
 // La credencial y cuándo le toca a cada cuenta son de las dos
 // sincronizaciones: viven en `dav_sync.rs`.
 pub use crate::dav_sync::{BrokerCredentials, CredentialError, CredentialSource};
@@ -60,7 +63,7 @@ use crate::store::contacts::{
 };
 use crate::store::key::{KeyError, KeySource};
 use crate::store::lifecycle::{AreaState, StoreManager, CONTACTS_AREA};
-use crate::store::{Store, StoreError};
+use crate::store::{LogLevel, Store, StoreError};
 use crate::vcard;
 
 /// Cada cuánto se sincronizan los contactos de una cuenta encendida (supuesto
@@ -105,6 +108,9 @@ pub struct SyncReport {
     /// Tarjetas que vinieron en un `multiget` sin haberlas pedido, o
     /// repetidas: no se guardan.
     pub unrequested: usize,
+    /// Tarjetas pedidas que no volvieron en [`MISSING_ROUNDS`] vueltas
+    /// seguidas, y con las que la libreta se dio por al día igual.
+    pub missing: usize,
 }
 
 /// Cómo terminó una vuelta de una cuenta.
@@ -196,6 +202,8 @@ pub struct ContactsSync<K: KeySource, C: CredentialSource> {
     /// Lo que se llama cuando cambia el estado que se publica: la señal
     /// `StatusChanged`.
     notify: Arc<dyn Fn() + Send + Sync>,
+    /// Cuántas vueltas seguidas le faltó algo pedido a cada libreta.
+    missing: MissingStreaks,
 }
 
 impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
@@ -212,6 +220,7 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
             limits,
             policy,
             notify,
+            missing: MissingStreaks::default(),
         }
     }
 
@@ -485,8 +494,10 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
             }
         }
 
+        let mut missing = 0;
         for chunk in plan.fetch.chunks(self.limits.multiget_batch.max(1)) {
-            let cards = self.fetch_cards(client, book, chunk, round).await?;
+            let (cards, lost) = self.fetch_cards(client, book, chunk, round).await?;
+            missing += lost;
             // Desarmar las tarjetas es CPU, y una armada a propósito tarda: fuera
             // del bucle de eventos.
             let max_vcard_bytes = self.limits.max_vcard_bytes;
@@ -506,14 +517,43 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
         }
 
         // El último lote, aunque esté vacío: es el que guarda el token. Salvo
-        // que el listado haya traído tarjetas de otro origen: lo traído se
-        // escribe, pero la libreta no queda al día (ver `Plan::foreign`).
+        // que el listado haya traído tarjetas de otro origen (ver
+        // `Plan::foreign`), o que algo pedido no haya vuelto (ver
+        // `MissingStreaks`): lo traído se escribe, pero la libreta no queda al
+        // día.
+        let settled = self.missing.settle(account_id, &stored.href, missing);
+        let settles = settles && !matches!(settled, Settled::Retry(_));
         let progress = settles.then_some(BookProgress {
             token: plan.token,
             ctag: plan.ctag,
         });
         self.write(account_id, stored, &mut pending, progress, round)
-            .await
+            .await?;
+        match settled {
+            Settled::Complete => Ok(()),
+            Settled::Retry(count) => {
+                tracing::warn!(
+                    "'{account_id}': {count} tarjetas pedidas no volvieron; la libreta no se da \
+                     por al día y se vuelven a pedir"
+                );
+                Err(SyncError::Dav(DavError::MissingResources(count)))
+            }
+            Settled::GaveUp(count) => {
+                round.report.missing += count;
+                let message = format!(
+                    "{count} tarjetas pedidas no volvieron en {MISSING_ROUNDS} vueltas seguidas: \
+                     la libreta se dio por al día sin ellas, y llegan cuando cambien en el \
+                     servidor"
+                );
+                tracing::warn!("'{account_id}': {message}");
+                let _ = self
+                    .store(account_id, move |s| {
+                        s.log(LogLevel::Warn, Some(CONTACTS_AREA), &message)
+                    })
+                    .await;
+                Ok(())
+            }
+        }
     }
 
     async fn write(
@@ -551,15 +591,17 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
 
     /// Una tanda de `multiget`. Si la respuesta pasa el tope, se parte en dos
     /// hasta llegar a una tarjeta sola, y ésa se saltea: una tarjeta enorme no
-    /// puede trabar la libreta entera para siempre.
+    /// puede trabar la libreta entera para siempre. Devuelve también cuántas
+    /// de las pedidas no volvieron.
     async fn fetch_cards(
         &self,
         client: &DavClient,
         book: &AddressBook,
         hrefs: &[url::Url],
         round: &mut Round,
-    ) -> Result<Vec<CardResource>, SyncError> {
+    ) -> Result<(Vec<CardResource>, usize), SyncError> {
         let mut cards = Vec::new();
+        let mut missing = 0;
         let mut parts = vec![hrefs.to_vec()];
         while let Some(part) = parts.pop() {
             match round
@@ -571,6 +613,7 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
                     // Lo que pasaba el tope ya se descartó al leer la
                     // respuesta: acá no llega.
                     round.report.too_large += fetched.too_large;
+                    missing += fetched.missing.len();
                     cards.extend(fetched.items);
                 }
                 Err(SyncError::Dav(DavError::BodyTooLarge(_))) if part.len() > 1 => {
@@ -582,7 +625,7 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
                 Err(e) => return Err(e),
             }
         }
-        Ok(cards)
+        Ok((cards, missing))
     }
 }
 

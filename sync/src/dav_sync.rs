@@ -15,6 +15,8 @@
 //!   lo sabe, con el tope de recursos por colección mirado antes de escribir.
 //!   Un listado que trae recursos de otro origen no borra nada y no deja la
 //!   colección al día ([`Plan::foreign`]);
+//! - lo pedido que no volvió ([`MissingStreaks`]): la colección no se da por
+//!   al día hasta [`MISSING_ROUNDS`] vueltas seguidas;
 //! - y cuándo le toca a cada cuenta ([`DavScheduler`]).
 //!
 //! Salió de `contacts_sync.rs` sin cambiar lo que hace: las pruebas de los
@@ -444,6 +446,65 @@ pub fn to_fetch(
         })
         .map(|(url, _)| url)
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Lo pedido que no volvió
+// ---------------------------------------------------------------------------
+
+/// Cuántas vueltas seguidas puede faltar lo pedido de una colección antes de
+/// darla por al día igual (supuesto 75 del #55).
+pub const MISSING_ROUNDS: u32 = 3;
+
+/// Cómo queda una colección según lo pedido que no volvió en esta vuelta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settled {
+    /// Volvió todo: se guarda el token y el `getctag`.
+    Complete,
+    /// Faltaron éstos: lo traído se escribe, pero **ni el token ni el
+    /// `getctag`**, y la colección cuenta como fallida. La vuelta siguiente
+    /// vuelve a pedirlos.
+    Retry(usize),
+    /// Faltaron éstos en [`MISSING_ROUNDS`] vueltas seguidas: se guarda el
+    /// token igual, y queda anotado en la bitácora de la base. Un recurso que
+    /// el servidor nunca devuelve no traba la colección para siempre.
+    GaveUp(usize),
+}
+
+/// Cuántas vueltas seguidas le faltó algo pedido a cada colección, por cuenta.
+///
+/// **N7 del #55** (la nota 2 de integridad del #52): un recurso pedido en el
+/// `multiget` que no volvía —omitido, con un `404` adentro, o con un reservado
+/// escapado de otra forma, que a propósito no se iguala (ver [`href_key`])— no
+/// dejaba rastro, y el token y el `getctag` se guardaban igual: faltaba, o
+/// quedaba viejo, hasta que cambiara en el servidor, y si el `getctag` no se
+/// movía no volvía nunca.
+///
+/// Una cuenta por colección y no por recurso: la memoria no depende de cuánto
+/// falte, y como el token no avanza, la vuelta siguiente pide lo mismo. Vive
+/// en la memoria del proceso: un reinicio vuelve a dar [`MISSING_ROUNDS`]
+/// vueltas.
+#[derive(Debug, Default)]
+pub struct MissingStreaks(std::sync::Mutex<HashMap<(String, String), u32>>);
+
+impl MissingStreaks {
+    /// Anota lo que faltó en esta vuelta de una colección (`collection`, por
+    /// su clave) y dice cómo queda.
+    pub fn settle(&self, account_id: &str, collection: &str, missing: usize) -> Settled {
+        let mut streaks = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (account_id.to_string(), collection.to_string());
+        if missing == 0 {
+            streaks.remove(&key);
+            return Settled::Complete;
+        }
+        let streak = streaks.get(&key).copied().unwrap_or(0) + 1;
+        if streak >= MISSING_ROUNDS {
+            streaks.remove(&key);
+            return Settled::GaveUp(missing);
+        }
+        streaks.insert(key, streak);
+        Settled::Retry(missing)
+    }
 }
 
 // ---------------------------------------------------------------------------

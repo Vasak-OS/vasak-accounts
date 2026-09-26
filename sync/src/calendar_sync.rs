@@ -59,8 +59,8 @@ use chrono::{DateTime, Utc};
 use crate::dav::caldav::{self, CalendarCollection, CalendarResource};
 use crate::dav::webdav::{self, href_key, DavClient, DavCredential, DavError, HttpPolicy, Limits};
 use crate::dav_sync::{
-    self, AreaSync, CollectionCap, CredentialError, CredentialSource, ListedCollection, Plan,
-    RoundError,
+    self, AreaSync, CollectionCap, CredentialError, CredentialSource, ListedCollection,
+    MissingStreaks, Plan, RoundError, Settled, MISSING_ROUNDS,
 };
 use crate::ical::recurrence::ExpansionLimits;
 use crate::store::calendar::{
@@ -113,6 +113,9 @@ pub struct CalendarReport {
     pub foreign: usize,
     /// Objetos que vinieron en un `multiget` sin haberlos pedido.
     pub unrequested: usize,
+    /// Objetos pedidos que no volvieron en [`MISSING_ROUNDS`] vueltas
+    /// seguidas, y con los que el calendario se dio por al día igual.
+    pub missing: usize,
     /// Objetos guardados cuya expansión pasó un tope o no se entendió: se
     /// guardaron con las ocurrencias que entraron, y quedan marcados.
     pub capped_series: usize,
@@ -200,6 +203,8 @@ pub struct CalendarSync<K: KeySource, C: CredentialSource> {
     policy: HttpPolicy,
     notify: Arc<dyn Fn() + Send + Sync>,
     clock: Clock,
+    /// Cuántas vueltas seguidas le faltó algo pedido a cada calendario.
+    missing: MissingStreaks,
 }
 
 impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
@@ -218,6 +223,7 @@ impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
             policy,
             notify,
             clock: Arc::new(Utc::now),
+            missing: MissingStreaks::default(),
         }
     }
 
@@ -541,8 +547,10 @@ impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
             }
         }
 
+        let mut missing = 0;
         for chunk in plan.fetch.chunks(self.limits.multiget_batch.max(1)) {
-            let objects = self.fetch_objects(client, calendar, chunk, round).await?;
+            let (objects, lost) = self.fetch_objects(client, calendar, chunk, round).await?;
+            missing += lost;
             // Leer y expandir es CPU, y un objeto armado a propósito tarda:
             // fuera del bucle de eventos y fuera de la cerradura del almacén.
             // Y el plazo de la vuelta se mira entre objeto y objeto: una
@@ -574,14 +582,43 @@ impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
         }
 
         // El último lote, aunque esté vacío: es el que guarda el token. Salvo
-        // que el listado haya traído objetos de otro origen: lo traído se
-        // escribe, pero el calendario no queda al día (ver `Plan::foreign`).
+        // que el listado haya traído objetos de otro origen (ver
+        // `Plan::foreign`), o que algo pedido no haya vuelto (ver
+        // `MissingStreaks`): lo traído se escribe, pero el calendario no queda
+        // al día.
+        let settled = self.missing.settle(account_id, &stored.href, missing);
+        let settles = settles && !matches!(settled, Settled::Retry(_));
         let progress = settles.then_some(CalendarProgress {
             token: plan.token,
             ctag: plan.ctag,
         });
         self.write(account_id, stored, &mut batch, progress, round)
-            .await
+            .await?;
+        match settled {
+            Settled::Complete => Ok(()),
+            Settled::Retry(count) => {
+                tracing::warn!(
+                    "'{account_id}': {count} objetos pedidos no volvieron; el calendario no se da \
+                     por al día y se vuelven a pedir"
+                );
+                Err(SyncError::Dav(DavError::MissingResources(count)))
+            }
+            Settled::GaveUp(count) => {
+                round.report.missing += count;
+                let message = format!(
+                    "{count} objetos pedidos no volvieron en {MISSING_ROUNDS} vueltas seguidas: \
+                     el calendario se dio por al día sin ellos, y llegan cuando cambien en el \
+                     servidor"
+                );
+                tracing::warn!("'{account_id}': {message}");
+                let _ = self
+                    .store(account_id, move |s| {
+                        s.log(LogLevel::Warn, Some(CALENDAR_AREA), &message)
+                    })
+                    .await;
+                Ok(())
+            }
+        }
     }
 
     async fn write(
@@ -635,15 +672,17 @@ impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
     }
 
     /// Una tanda de `multiget`. Si la respuesta pasa el tope, se parte en dos
-    /// hasta llegar a un objeto solo, y ése se saltea.
+    /// hasta llegar a un objeto solo, y ése se saltea. Devuelve también
+    /// cuántos de los pedidos no volvieron.
     async fn fetch_objects(
         &self,
         client: &DavClient,
         calendar: &CalendarCollection,
         hrefs: &[url::Url],
         round: &mut Round,
-    ) -> Result<Vec<CalendarResource>, SyncError> {
+    ) -> Result<(Vec<CalendarResource>, usize), SyncError> {
         let mut objects = Vec::new();
+        let mut missing = 0;
         let mut parts = vec![hrefs.to_vec()];
         while let Some(part) = parts.pop() {
             match round
@@ -655,6 +694,7 @@ impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
                     // Lo que pasaba el tope ya se descartó al leer la
                     // respuesta: acá no llega.
                     round.report.too_large += fetched.too_large;
+                    missing += fetched.missing.len();
                     objects.extend(fetched.items);
                 }
                 Err(SyncError::Dav(DavError::BodyTooLarge(_))) if part.len() > 1 => {
@@ -666,7 +706,7 @@ impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
                 Err(e) => return Err(e),
             }
         }
-        Ok(objects)
+        Ok((objects, missing))
     }
 
     /// Corre la ventana de una cuenta si no es la de hoy: vuelve a expandir

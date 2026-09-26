@@ -196,6 +196,9 @@ pub enum DavError {
     TooManyCards(usize),
     TooManyCalendars(usize),
     TooManyObjects(usize),
+    /// Lo pedido en un `multiget` que no volvió, cuántos: la colección no se
+    /// da por al día y se vuelve a pedir en la vuelta siguiente.
+    MissingResources(usize),
 }
 
 impl std::fmt::Display for DavError {
@@ -234,6 +237,11 @@ impl std::fmt::Display for DavError {
             DavError::TooManyObjects(cap) => {
                 write!(f, "un calendario tiene más de {cap} eventos y tareas")
             }
+            DavError::MissingResources(count) => write!(
+                f,
+                "el servidor no devolvió {count} de los elementos que se le pidieron; se vuelven \
+                 a pedir en la próxima vuelta"
+            ),
         }
     }
 }
@@ -1688,6 +1696,7 @@ mod tests {
             DavError::TooManyCards(20_000),
             DavError::TooManyCalendars(100),
             DavError::TooManyObjects(50_000),
+            DavError::MissingResources(50),
         ];
         for error in &all {
             match error {
@@ -1702,7 +1711,8 @@ mod tests {
                 | DavError::TooManyAddressBooks(_)
                 | DavError::TooManyCards(_)
                 | DavError::TooManyCalendars(_)
-                | DavError::TooManyObjects(_) => {}
+                | DavError::TooManyObjects(_)
+                | DavError::MissingResources(_) => {}
             }
         }
         all

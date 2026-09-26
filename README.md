@@ -894,7 +894,12 @@ distintos, 64 atributos por elemento y sin DTD, leído fuera del bucle de evento
 20 000 tarjetas por libreta, 512 KiB por tarjeta y 1 GiB de tarjetas por
 cuenta; 50 correos, teléfonos y relaciones por contacto; y 10 minutos por vuelta
 de cada cuenta, para que una lenta no frene a las otras. Del `multiget` se
-guarda sólo lo que se pidió. Los errores que se ven en el estado tienen texto
+guarda sólo lo que se pidió, y lo que pasa el tope de tamaño se descarta al
+leer cada respuesta, sin retenerlo. Lo pedido que no vuelve —omitido, con un
+`404` adentro, o con la dirección escrita de otra forma— no deja guardar el
+token: la colección se ve fallida y se vuelve a pedir, y si sigue faltando tres
+vueltas seguidas se da por al día igual, con una línea en la bitácora de la
+base. Los errores que se ven en el estado tienen texto
 fijo: lo que mandó el servidor va sólo al diario, recortado. Sólo `https`, sin
 seguir redirecciones, y **una dirección de otro origen que la cuenta no se pide
 ni se guarda**: la credencial va sólo al servidor de la cuenta. Y como un

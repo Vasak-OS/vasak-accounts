@@ -1045,11 +1045,12 @@ async fn una_tanda_del_calendario_no_retiene_lo_que_pasa_el_tope() {
         stored_alarms: 0,
         window: Window::around(Utc.timestamp_opt(TODAY, 0).unwrap()),
     };
-    let objects = f
+    let (objects, missing) = f
         .sync
         .fetch_objects(&client, &calendars[0], &hrefs, &mut round)
         .await
         .unwrap();
+    assert_eq!(missing, 0, "uno de más no falta: volvió");
     assert_eq!(objects.len(), 1, "se retuvieron los de más");
     assert!(objects.iter().all(|o| o.data.len() <= 1024));
     assert_eq!(round.report.too_large, 20);
@@ -1139,4 +1140,71 @@ async fn un_objeto_que_vuelve_con_otro_origen_no_se_borra() {
     assert_eq!(report.fetched, 1);
     assert_eq!(f.summaries().await, vec!["Cuatro", "Dos", "Uno cambiado"]);
     assert_eq!(f.token(0).await, Some(f.server_token()));
+}
+
+// ── Lo pedido que no vuelve (N7) ────────────────────────────────────────────
+
+/// Cuántas líneas de la bitácora de la base dicen algo.
+async fn log_lines_containing(f: &Fixture, needle: &'static str) -> i64 {
+    f.query(move |c| {
+        c.query_row(
+            "SELECT count(*) FROM sync_log WHERE message LIKE '%' || ?1 || '%'",
+            [needle],
+            |row| row.get(0),
+        )
+        .unwrap()
+    })
+    .await
+}
+
+/// **N7**: **un objeto pedido que no vuelve no deja guardar el token.** El
+/// servidor lista `a%40b.ics` y el `multiget` lo contesta como `a@b.ics`, que
+/// a propósito no se iguala (un reservado escapado): se descartaba como no
+/// pedido, y el token se guardaba igual, así que faltaba hasta que cambiara.
+/// Ahora lo traído se escribe, pero el calendario falla sin guardar el token y
+/// la vuelta siguiente lo vuelve a pedir. Si sigue faltando
+/// [`MISSING_ROUNDS`] vueltas seguidas, se da por al día igual y queda en la
+/// bitácora: un recurso que el servidor nunca devuelve no traba el calendario
+/// para siempre.
+#[tokio::test]
+async fn un_objeto_pedido_que_no_vuelve_no_deja_guardar_el_token() {
+    let f = Fixture::new("calendario-pedido-que-no-vuelve").await;
+    f.server
+        .put(0, "uno.ics", &event("u", "Uno", "20260928T140000Z"));
+    f.synced().await;
+    let old = f.token(0).await.unwrap();
+
+    f.server
+        .put(0, "dos.ics", &event("d", "Dos", "20260929T140000Z"));
+    f.server
+        .put(0, "a%40b.ics", &event("a", "Arroba", "20260930T140000Z"));
+    f.server.state().multiget_href = Some(|href| href.replace("%40", "@"));
+
+    for round in 1..MISSING_ROUNDS {
+        let before = f.server.requests().len();
+        let outcome = f.sync().await;
+        assert_eq!(outcome_kind(&outcome), "Failed", "vuelta {round}");
+        assert_eq!(f.token(0).await, Some(old.clone()), "vuelta {round}");
+        // Lo que sí volvió se escribe.
+        assert_eq!(f.summaries().await, vec!["Dos", "Uno"]);
+        assert_eq!(f.calendar_status().await["state"], "failed");
+        // Y se vuelve a pedir el que faltó.
+        assert!(f
+            .requests_since(before)
+            .iter()
+            .any(|r| r.is_multiget() && r.body.contains("a%40b.ics")));
+    }
+    // La vuelta número `MISSING_ROUNDS` se da por al día sin él, y lo anota.
+    let report = f.synced().await;
+    assert_eq!(report.missing, 1);
+    assert_eq!(f.token(0).await, Some(f.server_token()));
+    assert_eq!(log_lines_containing(&f, "no volvieron").await, 1);
+
+    // Cuando el servidor lo contesta bien y cambia, llega.
+    f.server.state().multiget_href = None;
+    f.server
+        .put(0, "a%40b.ics", &event("a", "Arroba", "20260930T150000Z"));
+    let report = f.synced().await;
+    assert_eq!((report.fetched, report.missing), (1, 0));
+    assert_eq!(f.summaries().await, vec!["Arroba", "Dos", "Uno"]);
 }
