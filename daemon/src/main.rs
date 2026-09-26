@@ -959,15 +959,13 @@ impl AccountManager {
             .capabilities
             .iter()
             .map(|capacidad| {
-                let url = match capacidad {
-                    CapabilityType::Drive => Some(rutas.files.as_str()),
-                    CapabilityType::Calendar => Some(rutas.calendars.as_str()),
-                    CapabilityType::Contacts => Some(rutas.addressbooks.as_str()),
-                    // Talk y las tareas se hablan por otras rutas que todavía no
-                    // consume nadie. Se guarda el servidor y el usuario, que es
-                    // lo que hará falta cuando exista la app de chats.
-                    _ => None,
-                };
+                // De `DavUrls`, y no de un `match` escrito acá: la misma lista
+                // que dice qué capacidades tienen dirección es la que decide lo
+                // que se anuncia como no disponible, así que no pueden
+                // separarse. `BeginAuth` ya descarta lo que no está en esa
+                // lista, pero si algo llegara igual, queda `null` y no una URL
+                // armada a mano que no va a ningún lado.
+                let url = rutas.for_capability(capacidad);
                 (
                     *capacidad,
                     serde_json::json!({
