@@ -53,6 +53,9 @@ impl<K: KeySource> StoreApi<K> {
 
     /// Enciende o apaga la base de una cuenta. Apagarla la borra: la clave del
     /// llavero primero, después los archivos.
+    ///
+    /// Sólo para una cuenta del último `ListAccounts` bueno; con otra —o antes
+    /// del primero— contesta `InvalidArgs`, como `RequestSync`.
     async fn set_store_enabled(
         &self,
         #[zbus(signal_context)] emitter: SignalContext<'_>,
@@ -69,6 +72,9 @@ impl<K: KeySource> StoreApi<K> {
     ///
     /// **Lo que había se pierde** y se vuelve a traer del servidor. Quien llama
     /// tiene que preguntar antes; acá no hay cómo.
+    ///
+    /// Sólo para una cuenta del último `ListAccounts` bueno; con otra —o antes
+    /// del primero— contesta `InvalidArgs`, como `RequestSync`.
     async fn clear_store(
         &self,
         #[zbus(signal_context)] emitter: SignalContext<'_>,
@@ -366,12 +372,15 @@ mod tests {
         assert_eq!(status["accounts"][0]["account_id"], "cuenta");
         assert_eq!(status["accounts"][0]["state"], "open");
 
-        // Un identificador con barra: argumento inválido, y nada se toca.
-        let error = call("ClearStore", "../cuenta").await.unwrap_err();
-        assert!(
-            matches!(&error, zbus::Error::MethodError(name, _, _) if name.as_str().ends_with("InvalidArgs")),
-            "{error:?}"
-        );
+        // Un identificador con barra, o una cuenta que no está: argumento
+        // inválido, y nada se toca.
+        for bad in ["../cuenta", "desconocida"] {
+            let error = call("ClearStore", bad).await.unwrap_err();
+            assert!(
+                matches!(&error, zbus::Error::MethodError(name, _, _) if name.as_str().ends_with("InvalidArgs")),
+                "{error:?}"
+            );
+        }
 
         let rule = zbus::MatchRule::builder()
             .msg_type(zbus::message::Type::Signal)

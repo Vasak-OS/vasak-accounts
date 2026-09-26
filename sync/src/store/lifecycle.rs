@@ -417,10 +417,14 @@ impl<K: KeySource> StoreManager<K> {
     ///
     /// Apagar la borra —clave y archivos—: una base apagada que sigue en el
     /// disco no es una base apagada.
+    ///
+    /// Sólo para una cuenta del último `ListAccounts` bueno (ver
+    /// [`Self::require_listed`]).
     pub async fn set_enabled(&self, account_id: &str, enabled: bool) -> Result<(), StoreError> {
         paths::validate_account_id(account_id)?;
-        let locations = self.locations()?;
         let mut inner = self.inner.lock().await;
+        Self::require_listed(&inner, account_id)?;
+        let locations = self.locations()?;
 
         let mut settings = StoreSettings::load(&locations.settings)?;
         settings
@@ -444,10 +448,14 @@ impl<K: KeySource> StoreManager<K> {
 
     /// `ClearStore`: borra la base de una cuenta —clave y archivos— y, si está
     /// encendida, la vuelve a crear vacía con una clave nueva.
+    ///
+    /// Sólo para una cuenta del último `ListAccounts` bueno (ver
+    /// [`Self::require_listed`]).
     pub async fn clear(&self, account_id: &str) -> Result<(), StoreError> {
         paths::validate_account_id(account_id)?;
-        let locations = self.locations()?;
         let mut inner = self.inner.lock().await;
+        Self::require_listed(&inner, account_id)?;
+        let locations = self.locations()?;
 
         let mut settings = StoreSettings::load(&locations.settings)?;
         inner.entry(account_id).close();
@@ -459,6 +467,22 @@ impl<K: KeySource> StoreManager<K> {
             self.run(&mut inner, Some(account_id)).await;
         }
         Ok(())
+    }
+
+    /// Falla con `UnknownAccount` —lo mismo que `RequestSync`— si la cuenta
+    /// no está en el último `ListAccounts` que respondió bien.
+    ///
+    /// Los identificadores llegan por D-Bus de cualquier proceso de la sesión,
+    /// y cada uno aceptado deja una entrada en `stores.json`, en memoria y en
+    /// `pending_key_deletions`: sin esto crecerían sin tope con nombres
+    /// inventados. **Antes del primer `ListAccounts` bueno se rechaza todo**:
+    /// todavía no se sabe qué cuentas hay, y la ventana que llama las sacó de
+    /// ese mismo listado, así que un reintento después del arranque alcanza.
+    fn require_listed(inner: &Inner, account_id: &str) -> Result<(), StoreError> {
+        match &inner.listed {
+            Some(listed) if listed.contains(account_id) => Ok(()),
+            _ => Err(StoreError::UnknownAccount(account_id.to_string())),
+        }
     }
 
     /// Pasa la tabla por las cuentas: todas, o una.
@@ -1690,6 +1714,59 @@ mod tests {
         ));
         assert!(f.paths("cuenta").db_exists().unwrap());
         assert!(f.key("cuenta").is_some());
+    }
+
+    /// Apagar y vaciar sólo aceptan cuentas del último `ListAccounts` bueno.
+    /// Con identificadores inventados, `stores.json` y lo que se guarda en
+    /// memoria crecían sin tope desde el bus. Y antes del primer listado bueno
+    /// no hay cuentas conocidas: se rechaza todo.
+    #[tokio::test]
+    async fn apagar_o_vaciar_una_cuenta_que_no_esta_se_rechaza() {
+        let f = Fixture::new("desconocidas");
+        assert!(matches!(
+            f.manager.set_enabled("cuenta", false).await,
+            Err(StoreError::UnknownAccount(_))
+        ));
+        assert!(matches!(
+            f.manager.clear("cuenta").await,
+            Err(StoreError::UnknownAccount(_))
+        ));
+        assert!(!f.locations().settings.exists());
+
+        // Un listado que falló tampoco da cuentas conocidas.
+        f.manager.accounts_listed(AccountListing::Failed).await;
+        assert!(matches!(
+            f.manager.set_enabled("cuenta", false).await,
+            Err(StoreError::UnknownAccount(_))
+        ));
+
+        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        for i in 0..300 {
+            let invented = format!("inventada{i}");
+            assert!(matches!(
+                f.manager.set_enabled(&invented, false).await,
+                Err(StoreError::UnknownAccount(_))
+            ));
+            assert!(matches!(
+                f.manager.clear(&invented).await,
+                Err(StoreError::UnknownAccount(_))
+            ));
+        }
+        let settings = StoreSettings::load(&f.locations().settings).unwrap();
+        assert!(settings.accounts.is_empty());
+        assert!(settings.pending_key_deletions.is_empty());
+        assert_eq!(f.manager.inner.lock().await.entries.len(), 1);
+
+        // Una cuenta listada sí, aunque no tenga nada que guardar.
+        f.manager
+            .accounts_listed(AccountListing::Listed(vec![
+                account("cuenta", &["email"]),
+                account("archivos", &["files"]),
+            ]))
+            .await;
+        f.manager.set_enabled("cuenta", false).await.unwrap();
+        f.manager.set_enabled("archivos", false).await.unwrap();
+        assert_eq!(f.settings().accounts.len(), 2);
     }
 
     #[tokio::test]
