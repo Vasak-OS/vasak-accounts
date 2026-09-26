@@ -365,11 +365,14 @@ pub fn migrate_legacy_outbox(app_dir: &Path) -> Result<Migration, String> {
     let entries = read_entries(&old_fd).map_err(|e| errno("leer", LEGACY_OUTBOX_DIR, e))?;
     let mut moved = 0;
     let mut kept = Vec::new();
-    for (name, kind) in entries {
+    for (name, _) in entries {
         let file_name = name.to_string_lossy().into_owned();
-        let is_ours = rustix::fs::statat(&old_fd, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
-            .is_ok_and(|stat| owned(&stat));
-        if kind != FileType::RegularFile || !is_ours {
+        // El tipo y el dueño salen del mismo `statat`: el tipo que trajo la
+        // lectura de la carpeta es de otro momento, y entre los dos la entrada
+        // se puede cambiar por un enlace.
+        let movable = rustix::fs::statat(&old_fd, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+            .is_ok_and(|stat| is_movable(&stat, me));
+        if !movable {
             tracing::warn!(
                 "{file_name} no es un archivo de esta cuenta; se queda en {}",
                 shown(LEGACY_OUTBOX_DIR)
@@ -413,6 +416,14 @@ pub fn migrate_legacy_outbox(app_dir: &Path) -> Result<Migration, String> {
     }
 
     Ok(Migration::Merged { moved, kept })
+}
+
+/// Si una entrada de `salientes/` se puede mudar: un archivo regular, no un
+/// enlace ni una carpeta, y de quien corre el servicio. Se decide con un solo
+/// `stat` (sin seguir enlaces), así el tipo y el dueño son del mismo momento.
+fn is_movable(stat: &rustix::fs::Stat, me: rustix::process::Uid) -> bool {
+    rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::RegularFile
+        && rustix::process::Uid::from_raw(stat.st_uid) == me
 }
 
 /// Mueve un archivo de una carpeta a otra **sin reemplazar** uno que ya esté.
@@ -1248,6 +1259,31 @@ mod tests {
 
     /// Lo que no es un archivo —una carpeta, un enlace— no se mueve, y por eso
     /// la vieja no queda vacía y no se borra.
+    /// Lo que decide la mudanza de cada entrada sale de un solo `stat`: el
+    /// archivo propio pasa; un enlace, una carpeta o un archivo de otro, no.
+    #[test]
+    fn solo_se_muda_un_archivo_regular_propio() {
+        use rustix::fs::{statat, AtFlags, CWD};
+        let temp = TempDir::new("mudanza-quien");
+        let file = temp.0.join("0001.json");
+        std::fs::write(&file, "uno").unwrap();
+        let link = temp.0.join("0002.json");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let dir = temp.0.join("sub");
+        std::fs::create_dir(&dir).unwrap();
+        let me = rustix::process::getuid();
+        let other = rustix::process::Uid::from_raw(me.as_raw().wrapping_add(1));
+        let stat = |path: &std::path::Path| statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+
+        assert!(is_movable(&stat(&file), me), "un archivo propio se muda");
+        assert!(!is_movable(&stat(&link), me), "un enlace no se muda");
+        assert!(!is_movable(&stat(&dir), me), "una carpeta no se muda");
+        assert!(
+            !is_movable(&stat(&file), other),
+            "un archivo de otro no se muda"
+        );
+    }
+
     #[test]
     fn lo_que_no_es_un_archivo_se_queda_en_la_vieja() {
         let temp = legacy_app_dir("mudanza-rara", &[("0002.json", "dos")]);
