@@ -1062,6 +1062,34 @@ impl<K: KeySource> StoreManager<K> {
         })
     }
 
+    /// Todas las cuentas que tienen un área, en orden de identificador, con lo
+    /// mismo que [`Self::area_account`]. Es lo que leen las lecturas que
+    /// juntan todas las cuentas —el calendario de un widget—.
+    pub async fn area_accounts(&self, area: &'static str) -> Vec<(String, AreaAccount)> {
+        let inner = self.inner.lock().await;
+        let settings = self
+            .locations()
+            .ok()
+            .and_then(|l| StoreSettings::load(&l.settings).ok())
+            .unwrap_or_default();
+        inner
+            .area_accounts
+            .get(area)
+            .into_iter()
+            .flatten()
+            .map(|(id, display_name)| {
+                (
+                    id.clone(),
+                    AreaAccount {
+                        display_name: display_name.clone(),
+                        active: settings.is_active(id, area),
+                        syncable: inner.is_syncable(area, id),
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// Después de vaciar una base con alguna área encendida: sube la
     /// generación de cada una en la base nueva, y eso sale como `Changed`.
     /// Quien tenía una lista leída se entera de que ya no vale sin esperar a

@@ -354,6 +354,7 @@ impl Zones {
     /// el evento a la hora local de quien mira es lo más parecido a lo que
     /// quiso decir quien lo escribió, y no lo corre a otro día. Quien necesite
     /// saber que pasó eso pregunta con [`Self::lookup`].
+    #[cfg(test)]
     pub fn resolve(&self, tzid: &str) -> Zone {
         self.lookup(tzid).unwrap_or(Zone::Floating)
     }

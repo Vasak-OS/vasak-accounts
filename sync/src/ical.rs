@@ -271,6 +271,7 @@ impl ZoneKind {
     }
 
     /// Si la hora depende de dónde esté quien mira.
+    #[cfg(test)]
     pub fn is_floating(self) -> bool {
         matches!(self, ZoneKind::Floating | ZoneKind::Unknown)
     }
@@ -349,6 +350,10 @@ impl DateValue {
 /// Las formas y lo que quieren decir están en [`DateValue::parse`]. Con `TZID`
 /// y con hora flotante se trataban antes como UTC, y eso quería decir que una
 /// reunión de las 14:00 en Buenos Aires se mostraba a las 11:00.
+///
+/// La usan las pruebas que vinieron de `vasak-calendar`; el almacén va por
+/// [`DateValue`], que además dice cómo quedó la zona.
+#[cfg(test)]
 pub fn parse_date(value: &str, params: &[String], zones: &Zones) -> Option<(DateTime<Utc>, bool)> {
     let date = DateValue::parse(value, params)?;
     let all_day = date.is_date();
@@ -606,6 +611,10 @@ pub fn event_of(component: &Component, zones: &Zones) -> Option<Event> {
 /// venir después del evento que lo usa, y el formato no fija el orden. Y lo que
 /// está anidado adentro de un evento —el `VALARM`, con su propio `SUMMARY` y a
 /// veces su propio `DTSTART`— es del recordatorio, no del evento.
+///
+/// La usan las pruebas que vinieron de `vasak-calendar`; el almacén va por
+/// [`parse_document`] y [`event_of`], objeto por objeto.
+#[cfg(test)]
 pub fn events_from(ical: &str) -> Vec<Event> {
     let document = parse_document(ical);
     document

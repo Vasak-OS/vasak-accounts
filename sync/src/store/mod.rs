@@ -35,6 +35,7 @@
 //! tiene que pasar como la persona— y con un solo escritor no hay carreras.
 
 pub mod calendar;
+pub mod calendar_read;
 pub mod contacts;
 pub mod contacts_read;
 pub mod key;

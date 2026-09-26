@@ -276,7 +276,7 @@ pub fn parse_duration(value: &str) -> Option<i64> {
 }
 
 /// El recordatorio de un `VALARM`, si se entiende.
-fn alarm_of(alarm: &Component) -> Option<AlarmSpec> {
+pub fn alarm_of(alarm: &Component) -> Option<AlarmSpec> {
     let trigger = alarm.first("TRIGGER")?;
     let action = alarm
         .value("ACTION")

@@ -60,17 +60,12 @@
 mod access;
 mod attachments;
 mod broker;
-// La arranca `store_api.rs`, en el commit que sigue.
-#[allow(dead_code)]
 mod calendar_sync;
 mod compose;
 mod contacts_sync;
 mod dav;
 mod dav_sync;
 mod html;
-// Lo que se lee del calendario para las aplicaciones llega en el commit que
-// sigue.
-#[allow(dead_code)]
 mod ical;
 mod images;
 mod imap;
