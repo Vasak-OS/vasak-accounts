@@ -114,6 +114,19 @@ pub const CONTACTS_AREA: &str = "contacts";
 /// (supuesto 8 de `vasak-accounts#23`).
 pub const CALENDAR_AREA: &str = "calendar";
 
+/// Lo que se anota en `key_collections` de una base creada mientras la
+/// colección del llavero cambiaba: su clave quedó en una colección que no es
+/// la fijada en esa vuelta, y todavía no se sabe cuál.
+///
+/// No es una identidad —las de verdad son una ruta del bus, que empieza con
+/// `/`—, así que nunca coincide con la colección de una vuelta: para
+/// [`StoreManager::refresh`] la base está en «otra colección», no se busca su
+/// clave ni se rehace, y queda no disponible hasta adoptar la colección donde
+/// su clave la abre (`StoreManager::adopt_collection`) o hasta vaciarla.
+/// Dejarla sin anotar la hacía pasar por una base de antes, que con la clave
+/// ausente se rehace (N5 de la segunda revisión de seguridad del #55).
+pub const PENDING_ADOPTION: &str = "?pending-adoption";
+
 /// Las áreas que se sincronizan por DAV y se encienden la primera vez que
 /// alguien las pide con permiso. El correo llega después.
 pub const SYNCED_AREAS: [&str; 2] = [CONTACTS_AREA, CALENDAR_AREA];
@@ -400,6 +413,9 @@ pub struct StoreSettings {
     /// el llavero se reemplazó—, la clave no «falta»: está en otra parte, y la
     /// base **no se rehace**. Queda no disponible y el estado lo dice, hasta
     /// que vuelva la colección o la persona la vacíe.
+    ///
+    /// Una base creada mientras la colección cambiaba lleva
+    /// [`PENDING_ADOPTION`] hasta que se adopta la colección de su clave.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub key_collections: BTreeMap<String, String>,
 }
@@ -1410,12 +1426,23 @@ impl<K: KeySource> StoreManager<K> {
             return;
         }
 
+        let recorded = settings.key_collections.get(account_id).map(String::as_str);
+        let unrecorded = recorded.is_none();
+        let awaiting = recorded == Some(PENDING_ADOPTION);
         if inner.entry(account_id).store.is_some() {
-            if !settings.key_collections.contains_key(account_id) {
+            if unrecorded || awaiting {
                 self.adopt_collection(locations, settings, collection, account_id)
                     .await;
             }
             return;
+        }
+        if awaiting {
+            // Cerrada y a la espera de adoptar: se adopta antes de abrir si su
+            // clave está en la colección fijada y la abre. Si no, la marca
+            // hace que `moved` dé que sí, y la base no se toca: ni se busca la
+            // clave ni se rehace.
+            self.adopt_collection(locations, settings, collection, account_id)
+                .await;
         }
 
         let moved = settings
@@ -1434,23 +1461,29 @@ impl<K: KeySource> StoreManager<K> {
             // entre que se fijó y que se guardó la clave nueva la dejó en la
             // nueva: anotar la de antes ataba la base a una colección donde su
             // clave no está, y después de reiniciar quedaba `unavailable` por
-            // `CollectionChanged` hasta vaciarla. Si cambió, no se anota nada
-            // y la base queda abierta: la vuelta siguiente, con la colección
-            // nueva fijada, la adopta ([`Self::adopt_collection`]), y un
-            // reinicio antes de eso la encuentra en la nueva como a una base
-            // de antes.
-            match self.keys.pinned_is_unchanged().await {
-                Ok(true) => {
-                    settings
-                        .key_collections
-                        .insert(account_id.to_string(), collection.to_string());
-                    if let Err(e) = settings.save(&locations.settings) {
-                        tracing::warn!("{e}");
-                    }
+            // `CollectionChanged` hasta vaciarla. Si cambió, se anota la marca
+            // [`PENDING_ADOPTION`] y la base queda abierta: la vuelta
+            // siguiente, con la colección nueva fijada, la adopta
+            // ([`Self::adopt_collection`]), y un reinicio antes de eso también,
+            // antes de abrirla. **No se deja sin anotar**: sin anotar es una
+            // base de antes, y en una base de antes una clave que falta la
+            // rehace. Con la marca, si la colección de la vuelta no tiene su
+            // clave —una tercera—, la base queda como estaba y no disponible.
+            let recorded = match self.keys.pinned_is_unchanged().await {
+                Ok(true) => collection,
+                Ok(false) | Err(_) => {
+                    tracing::info!(
+                        "'{account_id}': la colección del llavero cambió mientras se abría la \
+                         base; queda a la espera de adoptar la colección de su clave"
+                    );
+                    PENDING_ADOPTION
                 }
-                Ok(false) | Err(_) => tracing::info!(
-                    "'{account_id}': la colección del llavero cambió mientras se abría la base;                      se anota en la vuelta siguiente"
-                ),
+            };
+            settings
+                .key_collections
+                .insert(account_id.to_string(), recorded.to_string());
+            if let Err(e) = settings.save(&locations.settings) {
+                tracing::warn!("{e}");
             }
         }
         if pending && result.is_ok() {
@@ -1488,11 +1521,13 @@ impl<K: KeySource> StoreManager<K> {
         }
     }
 
-    /// Una base abierta sin colección anotada —porque la colección cambió en la
-    /// vuelta en que se abrió— adopta la de esta vuelta, **si su clave está
-    /// ahí y es la que la abre**: la clave se busca en la colección fijada y se
-    /// prueba contra el archivo. Si no está, o es otra, no se anota nada y la
-    /// base sigue abierta como estaba; nada se borra.
+    /// Una base sin colección anotada —una de antes de anotarlas, abierta— o
+    /// con la marca [`PENDING_ADOPTION`] —la colección cambió en la vuelta en
+    /// que se creó; abierta o cerrada— adopta la de esta vuelta, **si su clave
+    /// está ahí y es la que la abre**: la clave se busca en la colección fijada
+    /// y se prueba contra el archivo. Si no está, o es otra, no se anota nada y
+    /// la base sigue como estaba; nada se borra, y nada se genera: sólo `find`,
+    /// que con el llavero bloqueado es un error y sale.
     async fn adopt_collection(
         &self,
         locations: &Locations,
@@ -2528,9 +2563,94 @@ mod tests {
             state.keys.insert("cuenta".into(), "c".repeat(64));
         }
         f.manager.refresh().await;
-        assert!(!f.settings().key_collections.contains_key("cuenta"));
+        assert_eq!(
+            f.settings()
+                .key_collections
+                .get("cuenta")
+                .map(String::as_str),
+            Some(PENDING_ADOPTION)
+        );
         assert!(f.manager.is_open("cuenta").await, "la base sigue abierta");
         assert!(f.keys.state().deleted.is_empty(), "no se borró nada");
+    }
+
+    /// **N5**: una base creada mientras la colección cambiaba (la clave quedó
+    /// en B, la vuelta había fijado A) y cerrada antes de adoptar B no se
+    /// rehace si vuelve en una tercera colección sin su clave. Sin anotar, se
+    /// la tomaba por una base de antes: `Rebuilt`, la clave vieja ya no abría
+    /// el archivo y quedaba un secreto huérfano en B. Con la marca, queda
+    /// `Unavailable`, intacta, y al volver B la adopta y abre.
+    #[tokio::test]
+    async fn una_base_creada_mientras_cambia_la_coleccion_no_se_rehace_en_una_tercera() {
+        let f = Fixture::new("coleccion-tercera");
+        f.keys.state().replace_before_store = Some("coleccion-b".into());
+        f.list(listing(&["cuenta"])).await;
+        assert_eq!(f.state("cuenta").await, StoreState::Open);
+        let key = f.key("cuenta").unwrap();
+        let keys_in_b = f.keys.state().keys.clone();
+
+        // Se cierra antes de la adopción: el llavero se bloquea.
+        f.keys.state().locked = true;
+        f.manager.refresh().await;
+        assert!(!f.manager.is_open("cuenta").await);
+
+        // Vuelve en una tercera colección, sin la clave.
+        {
+            let mut state = f.keys.state();
+            state.locked = false;
+            state.collection = "coleccion-c".into();
+            state.keys.clear();
+        }
+        f.manager.refresh().await;
+        assert_eq!(
+            f.state("cuenta").await,
+            StoreState::Unavailable,
+            "la base creada con la colección cambiando se rehízo"
+        );
+        assert_eq!(f.keys.state().stored.len(), 1, "se generó otra clave");
+        assert!(f.keys.state().deleted.is_empty(), "se borró una clave");
+        assert!(
+            Store::open(&f.paths("cuenta"), &key).is_ok(),
+            "la clave vieja ya no abre la base"
+        );
+        assert!(log_lines_with(&f, "cuenta", &key).is_empty(), "se rehízo");
+
+        // Tampoco con el llavero bloqueado en esa colección: ni clave ni base.
+        f.keys.state().locked = true;
+        f.manager.refresh().await;
+        f.keys.state().locked = false;
+        f.manager.refresh().await;
+        assert_eq!(f.keys.state().stored_while_locked, 0);
+        assert_eq!(f.keys.state().stored.len(), 1);
+
+        // Un reinicio en la tercera tampoco la rehace.
+        let restarted = StoreManager::new(f.keys.clone(), Ok(f.locations()));
+        restarted
+            .accounts_listed(listing(&["cuenta"]), Instant::now())
+            .await;
+        assert_eq!(
+            restarted.status().await.accounts[0].state,
+            StoreState::Unavailable
+        );
+        assert_eq!(f.keys.state().stored.len(), 1);
+
+        // Y al volver B, la adopta y abre la misma base.
+        {
+            let mut state = f.keys.state();
+            state.collection = "coleccion-b".into();
+            state.keys = keys_in_b;
+        }
+        f.manager.refresh().await;
+        assert_eq!(f.state("cuenta").await, StoreState::Open);
+        assert_eq!(
+            f.settings()
+                .key_collections
+                .get("cuenta")
+                .map(String::as_str),
+            Some("coleccion-b")
+        );
+        assert!(log_lines_with(&f, "cuenta", &key).is_empty(), "se rehízo");
+        assert_eq!(f.keys.state().stored.len(), 1);
     }
 
     /// Vaciar es la salida cuando la colección cambió a propósito: la base
