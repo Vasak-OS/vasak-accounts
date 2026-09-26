@@ -1341,8 +1341,12 @@ pub fn delta_from(
 ) -> Result<SyncDelta, DavError> {
     let document = parse_xml(xml, limits)?;
     let multistatus = parse_multistatus(&document)?;
+    // El token y cada ETag, con el tope de lo que se guarda: `changed` junta
+    // lo de hasta [`Limits::max_sync_rounds`] respuestas de `507`, y un ETag
+    // de dieciséis kilobytes por recurso eran cientos de megas retenidos antes
+    // de pedir nada. Uno de más es `None`, y el recurso se trae igual.
     let mut delta = SyncDelta {
-        token: multistatus.sync_token.clone(),
+        token: storable(multistatus.sync_token.as_deref()),
         ..Default::default()
     };
 
@@ -1363,7 +1367,7 @@ pub fn delta_from(
             // cambió ni que se fue: se deja para la próxima.
             Some(code) if !(200..300).contains(&code) => {}
             _ => {
-                let etag = response.text(NS_DAV, "getetag").map(str::to_string);
+                let etag = storable(response.text(NS_DAV, "getetag"));
                 delta.changed.push((url, etag));
             }
         }
@@ -2135,6 +2139,32 @@ mod tests {
         assert_eq!(parse_multistatus(&empty).unwrap(), Multistatus::default());
     }
 
+    /// **N9**: el ETag de un `sync-collection` tiene el tope de lo que se
+    /// guarda al leerlo, como el de un `PROPFIND` o un `multiget`. Sin él,
+    /// cincuenta respuestas de `507` retenían unos 800 MB de ETags.
+    #[test]
+    fn un_etag_desmedido_en_las_diferencias_no_se_guarda() {
+        let collection = url::Url::parse("https://nube.ejemplo.com/dav/personal/").unwrap();
+        let big = "e".repeat(100 * 1024);
+        let xml = format!(
+            r#"<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">
+  <d:response><d:href>/dav/personal/a.ics</d:href>
+    <d:propstat><d:prop><d:getetag>{big}</d:getetag></d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+  <d:response><d:href>/dav/personal/b.ics</d:href>
+    <d:propstat><d:prop><d:getetag>"corto"</d:getetag></d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+  <d:sync-token>{big}</d:sync-token>
+</d:multistatus>"#
+        );
+        let delta = delta_from(&xml, &collection, &Limits::DEFAULT).unwrap();
+        assert_eq!(delta.changed.len(), 2, "el recurso se trae igual");
+        assert_eq!(delta.changed[0].1, None, "el ETag desmedido se guardó");
+        assert_eq!(delta.changed[1].1.as_deref(), Some("\"corto\""));
+        assert_eq!(delta.token, None, "el token desmedido se guardó");
+    }
+
+    /// El pedido de diferencias es XML válido y lleva el token escapado.
     #[test]
     fn el_pedido_de_diferencias_es_xml_valido_y_escapa_el_token() {
         for token in [None, Some("http://x/?a=1&b=<2>")] {
