@@ -31,6 +31,14 @@ pub const PATH: &str = "/ar/net/vasak/os/AccountsStore";
 /// Cuánto se espera para volver a escuchar al llavero si se cortó.
 const RETRY: Duration = Duration::from_secs(15);
 
+/// Cuánto se espera después de un aviso del llavero antes de pasar la tabla.
+///
+/// Junta en una sola vuelta los avisos que llegan de a varios —uno por
+/// colección, o un desbloqueo seguido de otro cambio— y pone un techo a cuántas
+/// veces por segundo el sync le vuelve a preguntar al llavero, aunque alguien
+/// le mande señales sin parar.
+const SETTLE: Duration = Duration::from_secs(1);
+
 /// El objeto de D-Bus.
 pub struct StoreApi<K: KeySource> {
     manager: Arc<StoreManager<K>>,
@@ -164,10 +172,14 @@ impl StoreService<SecretServiceKeys> {
     ///
     /// Es lo que abre las bases al iniciar sesión, cuando el llavero se
     /// desbloquea después de que este servicio arrancó. Lo contrario —que se
-    /// bloquee— lo levanta la revisión de cada cinco minutos: `vasak-keyring`
-    /// no avisa al bloquear.
+    /// bloquee— **no es inmediato**: `vasak-keyring` no avisa al bloquear, así
+    /// que lo levanta la revisión de cada cinco minutos, y hasta entonces —hasta
+    /// 300 segundos— la base sigue abierta con su clave en memoria.
+    ///
+    /// Sólo cuentan los avisos del dueño de `org.freedesktop.secrets`, y cada
+    /// uno espera [`SETTLE`] antes de reaccionar.
     fn watch_keyring(&self) {
-        use futures_util::StreamExt;
+        use futures_util::{FutureExt, StreamExt};
 
         let manager = Arc::clone(&self.manager);
         let emitter = self.emitter.clone();
@@ -176,7 +188,16 @@ impl StoreService<SecretServiceKeys> {
                 match manager.keys().lock_changes().await {
                     Ok(mut changes) => {
                         while let Some(Ok(message)) = changes.next().await {
-                            if key::is_lock_change(&message) && manager.refresh().await {
+                            if !key::is_lock_change(&message)
+                                || !manager.keys().is_from_keyring(&message).await
+                            {
+                                continue;
+                            }
+                            tokio::time::sleep(SETTLE).await;
+                            // Lo que llegó mientras tanto queda cubierto por
+                            // esta misma vuelta.
+                            while let Some(Some(_)) = changes.next().now_or_never() {}
+                            if manager.refresh().await {
                                 let _ =
                                     StoreApi::<SecretServiceKeys>::status_changed(&emitter).await;
                             }

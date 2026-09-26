@@ -40,15 +40,21 @@
 //! criptografía— para lo mismo.
 //!
 //! La sesión es `plain`: el secreto viaja por el bus de sesión sin cifrar, como
-//! en cualquier cliente que no negocie Diffie-Hellman. El bus de sesión es de la
-//! persona y ningún otro usuario lo ve; negociar sumaría una biblioteca de
-//! criptografía para proteger el secreto de procesos que igual pueden pedírselo
-//! al llavero (ver la frontera del cifrado en `store/mod.rs`).
+//! en cualquier cliente que no negocie Diffie-Hellman. Lo ve el bus mismo
+//! —`dbus-broker`, que lo copia de un proceso al otro— y cualquier proceso de la
+//! persona que se ponga de monitor (`BecomeMonitor`, que el bus de sesión le
+//! permite al mismo usuario). Ningún otro usuario lo ve. Negociar no sumaría una
+//! biblioteca compartida —`libcrypto.so.3` ya está, por SQLCipher— pero sí
+//! crates (`aes`, `cbc`, `hkdf`, `num-bigint`), y contra el mismo usuario no
+//! gana nada: ese proceso le puede pedir la clave al llavero directamente (ver
+//! la frontera del cifrado en `store/mod.rs`). Así que queda `plain`.
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use zbus::names::{OwnedUniqueName, UniqueName};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Type, Value};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -239,6 +245,9 @@ pub struct SecretServiceKeys {
     /// El nombre del llavero en el bus, o nada en una conexión punto a punto
     /// —las pruebas—, donde no hay nombres.
     destination: Option<&'static str>,
+    /// El nombre único del dueño de `destination` la última vez que se
+    /// preguntó, para saber de quién es una señal.
+    owner: Arc<std::sync::Mutex<Option<OwnedUniqueName>>>,
 }
 
 impl SecretServiceKeys {
@@ -248,6 +257,7 @@ impl SecretServiceKeys {
         Self {
             connection,
             destination: Some(SERVICE_NAME),
+            owner: Arc::default(),
         }
     }
 
@@ -257,6 +267,7 @@ impl SecretServiceKeys {
         Self {
             connection,
             destination: None,
+            owner: Arc::default(),
         }
     }
 
@@ -370,21 +381,77 @@ impl SecretServiceKeys {
     /// Escucha los cambios de `Locked` de las colecciones.
     ///
     /// Lo que llega es sólo un aviso de que **puede** haber cambiado: quien lo
-    /// recibe vuelve a leer la propiedad. Así una señal falsa —cualquier proceso
-    /// de la sesión puede emitir una— no cambia nada, y una perdida la levanta
-    /// la revisión por reloj.
+    /// recibe vuelve a leer la propiedad. Así una señal falsa no cambia nada, y
+    /// una perdida la levanta la revisión por reloj. Y además se filtra por
+    /// remitente, dos veces: la regla le pide al bus sólo las del dueño de
+    /// `org.freedesktop.secrets`, y quien recibe mira [`Self::is_from_keyring`]
+    /// —zbus reparte a cada flujo todo lo que llega a la conexión, y no puede
+    /// comparar un nombre conocido—. Sin eso, cualquier proceso de la sesión
+    /// podía hacer que el sync volviera a pasar la tabla —y a hablar con el
+    /// llavero— tantas veces como señales mandara.
     pub async fn lock_changes(&self) -> Result<zbus::MessageStream, KeyError> {
-        let rule = zbus::MatchRule::builder()
-            .msg_type(zbus::message::Type::Signal)
-            .interface(PROPERTIES_IFACE)
-            .and_then(|r| r.member("PropertiesChanged"))
-            .and_then(|r| r.arg(0, COLLECTION_IFACE))
-            .map_err(|e| KeyError::Failed(format!("no se pudo armar el filtro: {e}")))?
-            .build();
+        let rule = lock_change_rule(self.destination)?;
         zbus::MessageStream::for_match_rule(rule, &self.connection, None)
             .await
             .map_err(|e| KeyError::Unavailable(format!("no se puede escuchar al llavero: {e}")))
     }
+
+    /// Si un mensaje lo mandó el llavero.
+    ///
+    /// En el bus, el remitente es el nombre único de quien lo mandó, y se
+    /// compara con el dueño de `org.freedesktop.secrets`. Si no coincide con el
+    /// que se sabía, se vuelve a preguntar: el llavero pudo haberse reiniciado
+    /// con otro nombre único. En una conexión punto a punto no hay remitentes, y
+    /// lo que llega es del otro lado.
+    pub async fn is_from_keyring(&self, message: &zbus::Message) -> bool {
+        let Some(name) = self.destination else {
+            return true;
+        };
+        let header = message.header();
+        let sender = header.sender();
+        let known = self.owner.lock().map(|owner| owner.clone()).unwrap_or(None);
+        if sent_by(sender, known.as_deref()) {
+            return true;
+        }
+
+        let Ok(proxy) = zbus::fdo::DBusProxy::new(&self.connection).await else {
+            return false;
+        };
+        let Ok(bus_name) = zbus::names::BusName::try_from(name) else {
+            return false;
+        };
+        let Ok(current) = proxy.get_name_owner(bus_name).await else {
+            return false;
+        };
+        let accepted = sent_by(sender, Some(&current));
+        if let Ok(mut owner) = self.owner.lock() {
+            *owner = Some(current);
+        }
+        accepted
+    }
+}
+
+/// La regla de los cambios de `Locked`: señales `PropertiesChanged` de
+/// `org.freedesktop.Secret.Collection`, y en el bus sólo del llavero.
+fn lock_change_rule(sender: Option<&'static str>) -> Result<zbus::MatchRule<'static>, KeyError> {
+    let mut builder = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface(PROPERTIES_IFACE)
+        .and_then(|r| r.member("PropertiesChanged"))
+        .and_then(|r| r.arg(0, COLLECTION_IFACE))
+        .map_err(|e| KeyError::Failed(format!("no se pudo armar el filtro: {e}")))?;
+    if let Some(sender) = sender {
+        builder = builder
+            .sender(sender)
+            .map_err(|e| KeyError::Failed(format!("no se pudo armar el filtro: {e}")))?;
+    }
+    Ok(builder.build())
+}
+
+/// Si el remitente de un mensaje es el dueño que se conoce. Sin dueño conocido,
+/// o sin remitente, no.
+fn sent_by(sender: Option<&UniqueName<'_>>, owner: Option<&UniqueName<'_>>) -> bool {
+    matches!((sender, owner), (Some(sender), Some(owner)) if sender == owner)
 }
 
 /// Si un `PropertiesChanged` habla de `Locked` de una colección.
@@ -482,8 +549,18 @@ impl KeySource for SecretServiceKeys {
             let item_attributes: HashMap<String, String> = self
                 .property(item.as_str(), ITEM_IFACE, "Attributes")
                 .await?;
-            if let Some(account_id) = item_attributes.get(ACCOUNT_ATTRIBUTE) {
-                accounts.push(account_id.clone());
+            // Cualquier proceso de la sesión puede plantar un ítem con este
+            // esquema, y lo que devuelve esto termina en el diario y en una
+            // ruta: un identificador que no es uno de los nuestros se descarta,
+            // sin repetirlo.
+            match item_attributes.get(ACCOUNT_ATTRIBUTE) {
+                Some(account_id) if super::paths::validate_account_id(account_id).is_ok() => {
+                    accounts.push(account_id.clone());
+                }
+                Some(_) => tracing::warn!(
+                    "se descartó un ítem del almacén en el llavero con un identificador de cuenta inválido"
+                ),
+                None => {}
             }
         }
         accounts.sort();
@@ -1104,6 +1181,68 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(is_lock_change(&message));
+    }
+
+    /// Un ítem con el esquema del almacén lo puede plantar cualquiera: uno con
+    /// un identificador que no es uno de los nuestros no sale de acá.
+    #[tokio::test]
+    async fn las_cuentas_del_llavero_descartan_identificadores_invalidos() {
+        let (keys, server, shared) = fake_keyring().await;
+        keys.store("cuenta", &StoreKey::generate().unwrap())
+            .await
+            .unwrap();
+        {
+            let mut state = shared.lock().unwrap();
+            for (n, bad) in ["../x", "a\nfalso: se borró todo", ""]
+                .into_iter()
+                .enumerate()
+            {
+                state.items.insert(
+                    format!("{COLLECTION_PATH}/items/plantado{n}"),
+                    (
+                        HashMap::from([
+                            (SCHEMA_ATTRIBUTE.to_string(), SCHEMA.to_string()),
+                            (ACCOUNT_ATTRIBUTE.to_string(), bad.to_string()),
+                        ]),
+                        vec![b'0'; 64],
+                    ),
+                );
+            }
+        }
+        // Los ítems plantados también tienen que existir como objetos para que
+        // se lea su propiedad `Attributes`.
+        for n in 0..3 {
+            let path = format!("{COLLECTION_PATH}/items/plantado{n}");
+            server
+                .object_server()
+                .at(path.clone(), FakeItem(shared.clone(), path))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            keys.key_accounts().await.unwrap(),
+            vec!["cuenta".to_string()]
+        );
+    }
+
+    /// En el bus, la regla pide sólo las señales del llavero; y una señal se
+    /// acepta sólo si la mandó su dueño.
+    #[test]
+    fn los_avisos_del_llavero_se_filtran_por_remitente() {
+        let rule = lock_change_rule(Some(SERVICE_NAME)).unwrap();
+        assert_eq!(
+            rule.sender().map(|s| s.as_str()),
+            Some("org.freedesktop.secrets")
+        );
+        assert!(lock_change_rule(None).unwrap().sender().is_none());
+
+        let owner = UniqueName::try_from(":1.7").unwrap();
+        let other = UniqueName::try_from(":1.42").unwrap();
+        assert!(sent_by(Some(&owner), Some(&owner)));
+        assert!(!sent_by(Some(&other), Some(&owner)));
+        assert!(!sent_by(None, Some(&owner)));
+        assert!(!sent_by(Some(&owner), None));
     }
 
     /// Una colección por omisión que no existe es «no disponible», no «vacía».
