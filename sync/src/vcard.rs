@@ -57,6 +57,11 @@ const MAX_PROPERTIES: usize = 1000;
 /// lista al dibujarla.
 const MAX_VALUE: usize = 4096;
 
+/// Tope de una etiqueta: «casa», «trabajo», «celular». Una de más no es una
+/// etiqueta, y cada una es una columna del almacén por cada correo y cada
+/// teléfono.
+pub const MAX_LABEL: usize = 64;
+
 /// Cuántos correos, cuántos teléfonos y cuántas relaciones se leen de un
 /// contacto, cada uno por su lado.
 ///
@@ -309,7 +314,8 @@ pub fn split_fields(value: &str) -> Vec<String> {
     fields.into_iter().map(|f| unescape_text(&f)).collect()
 }
 
-/// La etiqueta de una propiedad: «casa», «trabajo», «celular».
+/// La etiqueta de una propiedad: «casa», «trabajo», «celular», hasta
+/// [`MAX_LABEL`].
 ///
 /// Se leen las dos formas: `TYPE=HOME` de la 3.0 y la 4.0, y `HOME` suelto de
 /// la 2.1. Sin la segunda, cualquier agenda exportada de un teléfono viejo
@@ -338,7 +344,7 @@ pub fn label_from(params: &[String]) -> String {
         })
         .map(|p| p.trim().trim_matches('"').to_string())
         .find(|p| meaningful(p))
-        .map(|p| p.to_ascii_lowercase())
+        .map(|p| cut(&p.to_ascii_lowercase(), MAX_LABEL).to_string())
         .unwrap_or_default()
 }
 
@@ -558,10 +564,14 @@ pub fn contact_from(raw: &str, href: &str) -> Option<Contact> {
     // El nombre que se muestra: el `FN` si está, y si no se arma con el `N`.
     // Una tarjeta sin `FN` es inválida según el estándar y aparece igual, así
     // que armarlo es la diferencia entre ver a alguien y ver un renglón vacío.
+    //
+    // Los dos con el tope de un valor: el `N` no pasa por `truncated`, y el
+    // nombre va a la columna, a la clave de orden con sus dos índices y al
+    // índice de búsqueda.
     if contact.display_name.trim().is_empty() {
-        contact.display_name = display_name_from(&structured_name);
+        contact.display_name = truncated(&display_name_from(&structured_name));
     }
-    contact.sort_name = sort_name_from(&structured_name, &contact.display_name);
+    contact.sort_name = truncated(&sort_name_from(&structured_name, &contact.display_name));
 
     let has_something = !contact.display_name.trim().is_empty()
         || !contact.emails.is_empty()
@@ -579,7 +589,7 @@ fn apple_label(raw: &str) -> String {
         .strip_prefix("_$!<")
         .and_then(|rest| rest.strip_suffix(">!$_"))
         .unwrap_or(trimmed);
-    truncated(&inner.to_lowercase())
+    cut(&inner.to_lowercase(), MAX_LABEL).to_string()
 }
 
 /// Saca el esquema de un valor, **sin mirar mayúsculas**.
@@ -609,16 +619,25 @@ fn push_field(target: &mut Vec<Field>, property: &Property, value: String) {
     });
 }
 
-/// Un valor que no rompa la lista al dibujarla.
+/// Un valor que no rompa la lista al dibujarla: hasta [`MAX_VALUE`], con
+/// «…» si se cortó.
 fn truncated(value: &str) -> String {
     if value.len() <= MAX_VALUE {
         return value.to_string();
     }
-    let mut cut = MAX_VALUE;
-    while cut > 0 && !value.is_char_boundary(cut) {
-        cut -= 1;
+    format!("{}…", cut(value, MAX_VALUE))
+}
+
+/// Lo primero de un texto, hasta `cap` bytes y sin partir un carácter.
+fn cut(value: &str, cap: usize) -> &str {
+    if value.len() <= cap {
+        return value;
     }
-    format!("{}…", &value[..cut])
+    let mut end = cap;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 /// Arma «Ana Pérez» a partir del `N`, que viene al revés y por partes.
@@ -1255,6 +1274,58 @@ mod tests {
         // Y una línea que no es `quoted-printable` no junta por terminar en `=`.
         let plain = "NOTE;X=QUOTED\r\n -PRINTABLE:uno=\r\nFN:Ana";
         assert_eq!(unfold_lines(plain).len(), 2);
+    }
+
+    /// **El nombre armado con el `N` también tiene tope.** Sin `FN`, un `N` de
+    /// seiscientos mil bytes daba un nombre y una clave de orden de seiscientos
+    /// mil, que iban a la columna, a los dos índices de orden y al de búsqueda:
+    /// cinco veces lo que mandó el servidor.
+    #[test]
+    fn un_n_desmedido_no_pasa_el_tope_del_nombre() {
+        let card = format!(
+            "BEGIN:VCARD\r\nN:{};{};;;\r\nEND:VCARD",
+            "a".repeat(300_000),
+            "b".repeat(300_000)
+        );
+        let c = contact_from(&card, "").unwrap();
+        assert!(
+            c.display_name.len() <= MAX_VALUE + 3,
+            "{}",
+            c.display_name.len()
+        );
+        assert!(c.sort_name.len() <= MAX_VALUE + 3, "{}", c.sort_name.len());
+        assert!(c.display_name.starts_with("bbb"));
+        assert!(c.sort_name.starts_with("aaa"));
+
+        // Y con un `FN` largo y un `N` corto, el de orden sale del `FN` recortado.
+        let only_fn = format!("BEGIN:VCARD\r\nFN:{}\r\nEND:VCARD", "ñ".repeat(10_000));
+        let c = contact_from(&only_fn, "").unwrap();
+        assert!(c.sort_name.len() <= MAX_VALUE + 3);
+    }
+
+    /// **Una etiqueta desmedida se recorta.** Cada correo y cada teléfono
+    /// guarda la suya: cien mil bytes de `TYPE=` por dato eran cincuenta datos
+    /// de cien mil.
+    #[test]
+    fn una_etiqueta_desmedida_se_recorta() {
+        let card = format!(
+            "BEGIN:VCARD\r\nFN:Ana\r\nEMAIL;TYPE={}:a@b\r\nTEL;{}:1\r\n\
+             item1.X-ABRELATEDNAMES:Marta\r\nitem1.X-ABLabel:{}\r\nEND:VCARD",
+            "x".repeat(100_000),
+            "ñ".repeat(100_000),
+            "z".repeat(100_000)
+        );
+        let c = contact_from(&card, "").unwrap();
+        assert!(
+            c.emails[0].label.len() <= MAX_LABEL,
+            "{}",
+            c.emails[0].label.len()
+        );
+        assert!(c.emails[0].label.starts_with("xxx"));
+        assert!(c.phones[0].label.len() <= MAX_LABEL);
+        assert!(c.phones[0].label.starts_with('ñ'), "sin partir un carácter");
+        assert!(c.related[0].label.len() <= MAX_LABEL);
+        assert_eq!(c.emails[0].value, "a@b");
     }
 
     // ── Varias tarjetas ────────────────────────────────────────────────────
