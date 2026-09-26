@@ -47,6 +47,7 @@ use crate::store::contacts_read::{self, Cursor, InvalidArgument};
 use crate::store::key::{self, KeyError, KeySource, SecretServiceKeys};
 use crate::store::lifecycle::{
     AccountListing, Consent, ListedAccount, Locations, Status, StoreManager, CONTACTS_AREA,
+    SYNCED_AREAS,
 };
 use crate::store::{paths, StoreError};
 
@@ -95,9 +96,12 @@ impl<K: KeySource> StoreApi<K> {
     async fn get_status(&self, #[zbus(header)] header: Header<'_>) -> zbus::fdo::Result<String> {
         let status = self.manager.status().await;
         let sender = sender_of(&header);
-        let contacts_allowed =
-            self.access.cached(sender.as_deref(), CONTACTS_RESOURCE) == Some(true);
-        serde_json::to_string(&visible_status(&status, contacts_allowed))
+        let allowed: Vec<&str> = [(CONTACTS_AREA, CONTACTS_RESOURCE)]
+            .into_iter()
+            .filter(|(_, resource)| self.access.cached(sender.as_deref(), resource) == Some(true))
+            .map(|(area, _)| area)
+            .collect();
+        serde_json::to_string(&visible_status(&status, &allowed))
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
     }
 
@@ -145,7 +149,7 @@ impl<K: KeySource> StoreApi<K> {
         let result = self.manager.clear(&account_id).await;
         if result.is_ok() {
             self.manager.announce_cleared(&account_id).await;
-            if matches!(self.manager.contacts_account(&account_id).await, Ok(a) if a.active && a.syncable)
+            if matches!(self.manager.area_account(CONTACTS_AREA, &account_id).await, Ok(a) if a.active && a.syncable)
             {
                 self.ask_for_sync(&account_id);
             }
@@ -175,12 +179,12 @@ impl<K: KeySource> StoreApi<K> {
         self.admit_control(&header, &account_id, ControlAction::Sync)
             .await?;
         // Si hace falta preguntar se mira acá, pero **encender lo decide
-        // `activate_contacts`** con lo que haya en ese momento, y sin un «sí»
+        // `activate_area`** con lo que haya en ese momento, y sin un «sí»
         // no enciende: si la cuenta cambia en el medio —un `ListAccounts`
         // mientras se pasa la tabla—, no se enciende nada sin permiso, y el
         // próximo `RequestSync` pregunta.
         let mut consent = Consent::NotAsked;
-        if let Ok(account) = self.manager.contacts_account(&account_id).await {
+        if let Ok(account) = self.manager.area_account(CONTACTS_AREA, &account_id).await {
             if account.syncable && !account.active {
                 self.authorize(&header, &account.display_name).await?;
                 consent = Consent::Granted;
@@ -188,7 +192,11 @@ impl<K: KeySource> StoreApi<K> {
         }
         let result = self.manager.request_sync(&account_id).await;
         if result.is_ok() {
-            match self.manager.activate_contacts(&account_id, consent).await {
+            match self
+                .manager
+                .activate_area(CONTACTS_AREA, &account_id, consent)
+                .await
+            {
                 Ok(true) => self.ask_for_sync(&account_id),
                 Ok(false) => {}
                 Err(e) => tracing::warn!("no se pudo encender el área de contactos: {e}"),
@@ -402,14 +410,14 @@ impl<K: KeySource> StoreApi<K> {
     ) -> zbus::fdo::Result<()> {
         let account = self
             .manager
-            .contacts_account(account_id)
+            .area_account(CONTACTS_AREA, account_id)
             .await
             .map_err(to_fdo)?;
         self.authorize(header, &account.display_name).await?;
         if !account.active && account.syncable {
             match self
                 .manager
-                .activate_contacts(account_id, Consent::Granted)
+                .activate_area(CONTACTS_AREA, account_id, Consent::Granted)
                 .await
             {
                 Ok(true) => self.ask_for_sync(account_id),
@@ -485,23 +493,24 @@ fn to_fdo(error: StoreError) -> zbus::fdo::Error {
 ///
 /// **Cualquiera**: el llavero, y por cuenta su identificador —que
 /// `ListAccounts` del servicio de cuentas ya da a cualquiera—, el estado de la
-/// base y el del área de contactos, como códigos fijos.
+/// base y el de cada área (contactos, calendario), como códigos fijos.
 ///
-/// **Con `store.contacts`** (`contacts_allowed`), en las cuentas con
-/// contactos, además: el texto de la base (`detail`, siempre fijo), cuánto
-/// ocupa (`size_bytes`), y el texto y la última vuelta buena del área
-/// (`detail`, `last_synced_at`). Cuánto ocupa la base es cuánto tiene la
-/// persona guardado, y cuándo se sincronizó dice cuándo usó la cuenta: no es
-/// para cualquiera.
+/// **Con el permiso de alguna de las áreas de una cuenta** (`allowed`: las
+/// áreas cuyo `store.<área>` está concedido en la caché), en esa cuenta,
+/// además: el texto de la base (`detail`, siempre fijo) y cuánto ocupa
+/// (`size_bytes`). Y **en cada área cuyo permiso tiene**, su texto y su última
+/// vuelta buena (`detail`, `last_synced_at`). Cuánto ocupa la base es cuánto
+/// tiene la persona guardado, y cuándo se sincronizó dice cuándo usó la
+/// cuenta: no es para cualquiera.
 ///
 /// Ningún texto lleva rutas ni lo que escribió un servidor, en ningún caso:
-/// son fijos desde `lifecycle.rs` y `contacts_sync.rs`.
-pub fn visible_status(status: &Status, contacts_allowed: bool) -> serde_json::Value {
+/// son fijos desde `lifecycle.rs` y las sincronizaciones.
+pub fn visible_status(status: &Status, allowed: &[&str]) -> serde_json::Value {
     let accounts: Vec<serde_json::Value> = status
         .accounts
         .iter()
         .map(|account| {
-            let detailed = contacts_allowed && account.has_contacts;
+            let detailed = allowed.iter().any(|area| account.has_area(area));
             let mut entry = serde_json::json!({
                 "account_id": account.account_id,
                 "state": account.state,
@@ -510,13 +519,16 @@ pub fn visible_status(status: &Status, contacts_allowed: bool) -> serde_json::Va
                 entry["detail"] = account.detail.clone().into();
                 entry["size_bytes"] = account.size_bytes.into();
             }
-            if let Some(contacts) = &account.contacts {
-                let mut area = serde_json::json!({ "state": contacts.state });
-                if detailed {
-                    area["detail"] = contacts.detail.clone().into();
-                    area["last_synced_at"] = contacts.last_synced_at.clone().into();
+            for area in SYNCED_AREAS {
+                let Some(state) = account.area(area) else {
+                    continue;
+                };
+                let mut shown = serde_json::json!({ "state": state.state });
+                if allowed.contains(&area) && account.has_area(area) {
+                    shown["detail"] = state.detail.clone().into();
+                    shown["last_synced_at"] = state.last_synced_at.clone().into();
                 }
-                entry[CONTACTS_AREA] = area;
+                entry[area] = shown;
             }
             entry
         })
@@ -1050,7 +1062,7 @@ mod tests {
     /// La carrera de `RequestSync`: decide si pregunta con una mirada —la
     /// cuenta pide reautenticarse, así que no se encendería y no pregunta— y
     /// mientras pasa la tabla llega un `ListAccounts` en que ya no lo pide.
-    /// Encender lo decide recién `activate_contacts`, y sin un «sí» no
+    /// Encender lo decide recién `activate_area`, y sin un «sí» no
     /// enciende: el área queda apagada y nadie preguntó nada.
     #[tokio::test]
     async fn pedir_una_vuelta_no_enciende_los_contactos_si_la_cuenta_cambia_en_el_medio() {
@@ -1092,7 +1104,7 @@ mod tests {
         relist.await.unwrap();
         assert!(
             api.manager
-                .contacts_account("cuenta")
+                .area_account(CONTACTS_AREA, "cuenta")
                 .await
                 .is_ok_and(|a| a.syncable),
             "la cuenta ya se podía sincronizar cuando se encendía"
@@ -1283,7 +1295,12 @@ mod tests {
         let (reader, _s1) = api.client(":1.7").await;
         let (stranger, _s2) = api.client(":1.8").await;
         api.manager
-            .set_contacts_status("cuenta", crate::store::lifecycle::AreaState::Synced, "")
+            .set_area_status(
+                CONTACTS_AREA,
+                "cuenta",
+                crate::store::lifecycle::AreaState::Synced,
+                "",
+            )
             .await;
 
         let public = status(&stranger).await;

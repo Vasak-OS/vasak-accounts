@@ -286,7 +286,7 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
     async fn set_status(&self, account_id: &str, state: AreaState, detail: &str) {
         if self
             .manager
-            .set_contacts_status(account_id, state, detail)
+            .set_area_status(CONTACTS_AREA, account_id, state, detail)
             .await
         {
             (self.notify)();
@@ -297,7 +297,11 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
     pub async fn sync_account(&self, account_id: &str) -> SyncOutcome {
         // Antes de nada, y releyendo el llavero: con la base cerrada no se le
         // pide nada ni al servicio de cuentas ni al servidor.
-        if !self.manager.prepare_for_sync(account_id).await {
+        if !self
+            .manager
+            .prepare_for_sync(CONTACTS_AREA, account_id)
+            .await
+        {
             self.set_status(account_id, AreaState::Pending, CLOSED_DETAIL)
                 .await;
             return SyncOutcome::StoreClosed;
@@ -878,7 +882,7 @@ impl<K: KeySource, C: CredentialSource> ContactsScheduler<K, C> {
 
     /// Las cuentas a las que les toca, una por una.
     pub async fn run_due(&self, now: Instant) {
-        for account_id in self.sync.manager.contacts_targets().await {
+        for account_id in self.sync.manager.area_targets(CONTACTS_AREA).await {
             let due = self
                 .last_attempt
                 .lock()
@@ -907,7 +911,7 @@ impl<K: KeySource, C: CredentialSource> ContactsScheduler<K, C> {
         if self
             .sync
             .manager
-            .contacts_targets()
+            .area_targets(CONTACTS_AREA)
             .await
             .iter()
             .any(|id| id == account_id)

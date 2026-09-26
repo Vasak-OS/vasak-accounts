@@ -108,7 +108,7 @@ impl Fixture {
             )
             .await;
         assert!(manager
-            .activate_contacts(ACCOUNT, Consent::Granted)
+            .activate_area(CONTACTS_AREA, ACCOUNT, Consent::Granted)
             .await
             .unwrap());
 
@@ -680,7 +680,7 @@ async fn con_el_llavero_bloqueado_no_se_pide_ni_se_escribe_nada() {
 
     // Al desbloquear, la base se abre y no tiene nada.
     f.keys.state().locked = false;
-    assert!(f.manager.prepare_for_sync(ACCOUNT).await);
+    assert!(f.manager.prepare_for_sync(CONTACTS_AREA, ACCOUNT).await);
     assert_eq!(f.count("SELECT count(*) FROM contacts").await, 0);
 }
 
@@ -708,7 +708,7 @@ async fn si_el_llavero_se_bloquea_a_mitad_no_se_escribe_lo_que_llego() {
 
     f.server.state().on_request = None;
     f.keys.state().locked = false;
-    assert!(f.manager.prepare_for_sync(ACCOUNT).await);
+    assert!(f.manager.prepare_for_sync(CONTACTS_AREA, ACCOUNT).await);
     assert_eq!(f.count("SELECT count(*) FROM contacts").await, 0);
     assert_eq!(f.token(0).await, None);
 }
@@ -758,7 +758,7 @@ async fn vaciar_a_mitad_de_la_vuelta_no_deja_el_token_viejo() {
         "la vuelta se corta al ver la base nueva"
     );
     f.server.state().on_request = None;
-    assert!(f.manager.prepare_for_sync(ACCOUNT).await);
+    assert!(f.manager.prepare_for_sync(CONTACTS_AREA, ACCOUNT).await);
     assert_eq!(f.token(second).await, None, "el token viejo no quedó");
 
     // La vuelta siguiente trae todo otra vez, las dos libretas.
@@ -1299,11 +1299,11 @@ async fn una_cuenta_lenta_no_frena_a_las_otras() {
         )
         .await;
     assert!(manager
-        .activate_contacts("lenta", Consent::Granted)
+        .activate_area(CONTACTS_AREA, "lenta", Consent::Granted)
         .await
         .unwrap());
     assert!(manager
-        .activate_contacts("rapida", Consent::Granted)
+        .activate_area(CONTACTS_AREA, "rapida", Consent::Granted)
         .await
         .unwrap());
 
