@@ -731,6 +731,39 @@ async fn una_direccion_de_otro_origen_no_se_pide_ni_se_guarda() {
     assert_eq!(stored, 0);
 }
 
+/// **Un `multiget` que trae tarjetas no pedidas no las guarda.** El servidor
+/// suma tres con dirección de la misma libreta a cada respuesta: si se
+/// guardaran, una sola tarjeta cambiada podía meter ciento cincuenta mil por
+/// vuelta, por encima del tope de la libreta, y quedarse para siempre.
+#[tokio::test]
+async fn un_multiget_que_trae_tarjetas_no_pedidas_no_las_guarda() {
+    let f = Fixture::new("contactos-no-pedidas").await;
+    f.server.put(0, "ana.vcf", &card("1", "Ana", "ana@x.com"));
+    f.server
+        .put(0, "juan.vcf", &card("2", "Juan", "juan@x.com"));
+    f.server.state().extra_multiget_xml = (0..3)
+        .map(|i| {
+            format!(
+                "<d:response><d:href>/dav/ana/personal/intrusa{i}.vcf</d:href>\
+                 <d:propstat><d:prop><d:getetag>\"i\"</d:getetag><c:address-data>{}\
+                 </c:address-data></d:prop><d:status>HTTP/1.1 200 OK</d:status>\
+                 </d:propstat></d:response>",
+                card(&format!("9{i}"), &format!("Intrusa {i}"), "i@x.com")
+            )
+        })
+        .collect();
+
+    let report = f.synced().await;
+    assert_eq!(report.fetched, 2);
+    assert_eq!(report.unrequested, 3);
+    assert_eq!(f.names().await, vec!["Ana", "Juan"]);
+    assert_eq!(
+        f.count("SELECT count(*) FROM contacts WHERE href LIKE '%intrusa%'")
+            .await,
+        0
+    );
+}
+
 /// **Una respuesta anidada de más no tumba el sincronizador.** Diez mil
 /// niveles en el listado de libretas —el primer pedido de cada vuelta— son
 /// cien kilobytes; leídos sin tope, desbordan la pila y el proceso aborta, con

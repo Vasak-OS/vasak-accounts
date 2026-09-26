@@ -85,6 +85,8 @@ pub struct FakeState {
     pub extra_books_xml: String,
     /// `<d:response>` de más que se suman a cada `sync-collection`.
     pub extra_sync_xml: String,
+    /// `<d:response>` de más que se suman a cada `addressbook-multiget`.
+    pub extra_multiget_xml: String,
 }
 
 #[derive(Clone)]
@@ -120,6 +122,7 @@ impl FakeDav {
             hide_reports: false,
             extra_books_xml: String::new(),
             extra_sync_xml: String::new(),
+            extra_multiget_xml: String::new(),
         }));
 
         let shared = Arc::clone(&state);
@@ -466,6 +469,7 @@ fn answer(state: &mut FakeState, request: &RecordedRequest) -> (u16, String) {
                     )),
                 }
             }
+            xml.push_str(&state.extra_multiget_xml);
             xml.push_str(TAIL);
             (207, xml)
         }

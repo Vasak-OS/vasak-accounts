@@ -158,6 +158,9 @@ pub struct SyncReport {
     pub too_large: usize,
     /// Direcciones de otro origen que se descartaron.
     pub foreign: usize,
+    /// Tarjetas que vinieron en un `multiget` sin haberlas pedido, o
+    /// repetidas: no se guardan.
+    pub unrequested: usize,
 }
 
 /// Cómo terminó una vuelta de una cuenta.
@@ -629,7 +632,10 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
         let mut parts = vec![hrefs.to_vec()];
         while let Some(part) = parts.pop() {
             match carddav::multiget(client, &book.href, &part).await {
-                Ok(fetched) => cards.extend(fetched),
+                Ok((fetched, unrequested)) => {
+                    report.unrequested += unrequested;
+                    cards.extend(fetched);
+                }
                 Err(DavError::BodyTooLarge(_)) if part.len() > 1 => {
                     let (first, second) = part.split_at(part.len() / 2);
                     parts.push(second.to_vec());

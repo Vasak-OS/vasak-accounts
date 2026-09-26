@@ -289,12 +289,37 @@ pub async fn list_etags(client: &DavClient, book: &url::Url) -> Result<Etags, Da
     Ok(etags)
 }
 
-/// Unas tarjetas de una libreta, por su dirección.
+/// Se queda con las tarjetas que se pidieron, **una vez cada una**, y cuenta
+/// las que no.
+///
+/// Un servidor puede contestar un `multiget` de una tarjeta con dieciséis
+/// megas de tarjetas que nadie pidió: guardarlas saltaría el tope de tarjetas
+/// por libreta, que se mira sobre lo que se pide, y llenaría la base con
+/// contactos que el servidor nunca listó. Una repetida es lo mismo: la
+/// primera que llega es la que vale.
+pub fn keep_requested(cards: Vec<CardResource>, hrefs: &[url::Url]) -> (Vec<CardResource>, usize) {
+    let mut pending: std::collections::HashSet<&str> = hrefs.iter().map(url::Url::as_str).collect();
+    let mut unrequested = 0;
+    let kept = cards
+        .into_iter()
+        .filter(|card| {
+            let requested = pending.remove(card.href.as_str());
+            if !requested {
+                unrequested += 1;
+            }
+            requested
+        })
+        .collect();
+    (kept, unrequested)
+}
+
+/// Unas tarjetas de una libreta, por su dirección. Sólo las pedidas, una vez
+/// cada una ([`keep_requested`]); devuelve también cuántas vinieron de más.
 pub async fn multiget(
     client: &DavClient,
     book: &url::Url,
     hrefs: &[url::Url],
-) -> Result<Vec<CardResource>, DavError> {
+) -> Result<(Vec<CardResource>, usize), DavError> {
     // 1: las tarjetas de esta libreta. El estándar lo pide, y hay servidores
     // que sin esto devuelven vacío.
     let reply = client
@@ -303,11 +328,20 @@ pub async fn multiget(
     let xml = expect_multistatus(reply)?;
     let limits = *client.limits();
     let book = book.clone();
-    let (cards, foreign) = off_runtime(move || cards_from(&xml, &book, &limits)).await?;
+    let requested = hrefs.to_vec();
+    let (cards, foreign, unrequested) = off_runtime(move || {
+        let (cards, foreign) = cards_from(&xml, &book, &limits)?;
+        let (cards, unrequested) = keep_requested(cards, &requested);
+        Ok((cards, foreign, unrequested))
+    })
+    .await?;
     if foreign > 0 {
         tracing::warn!("se descartaron {foreign} tarjetas con dirección de otro servidor");
     }
-    Ok(cards)
+    if unrequested > 0 {
+        tracing::warn!("se descartaron {unrequested} tarjetas que no se pidieron");
+    }
+    Ok((cards, unrequested))
 }
 
 #[cfg(test)]
@@ -532,6 +566,38 @@ END:VCARD
             etags,
             vec![(url("https://x/libro/a.vcf"), Some("\"1\"".to_string()))]
         );
+    }
+
+    fn resource(href: &str, data: &str) -> CardResource {
+        CardResource {
+            href: url(href),
+            etag: None,
+            data: data.into(),
+        }
+    }
+
+    /// **Del `multiget` sólo se guarda lo que se pidió, una vez cada una.** Lo
+    /// demás se cuenta y se tira: si no, una respuesta de una tarjeta pedida
+    /// podía traer ciento cincuenta mil, por encima del tope de la libreta.
+    #[test]
+    fn del_multiget_solo_queda_lo_pedido_una_vez() {
+        let asked = [url("https://x/libro/a.vcf"), url("https://x/libro/b.vcf")];
+        let (kept, unrequested) = keep_requested(
+            vec![
+                resource("https://x/libro/a.vcf", "primera"),
+                resource("https://x/libro/intrusa.vcf", "x"),
+                resource("https://x/libro/a.vcf", "repetida"),
+                resource("https://x/libro/b.vcf", "b"),
+            ],
+            &asked,
+        );
+        let hrefs: Vec<&str> = kept.iter().map(|c| c.href.as_str()).collect();
+        assert_eq!(
+            hrefs,
+            vec!["https://x/libro/a.vcf", "https://x/libro/b.vcf"]
+        );
+        assert_eq!(kept[0].data, "primera");
+        assert_eq!(unrequested, 2);
     }
 
     #[test]
