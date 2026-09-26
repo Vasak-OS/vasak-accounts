@@ -34,9 +34,6 @@
 //! —la clave vive en el llavero de la sesión, y parsear lo que llega de la red
 //! tiene que pasar como la persona— y con un solo escritor no hay carreras.
 
-// La escritura del calendario la usa la sincronización del calendario, que
-// llega unos commits después.
-#[allow(dead_code)]
 pub mod calendar;
 pub mod contacts;
 pub mod contacts_read;

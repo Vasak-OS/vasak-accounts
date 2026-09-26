@@ -9,7 +9,7 @@
 //! **El iCalendar crudo**, que es la fuente de verdad (decisión 3 del taller), y
 //! derivado de él: lo que hace falta para listar ([`ObjectIndex`]) y, si es un
 //! evento, **sus ocurrencias** ya expandidas, con sus recordatorios. Derivar es
-//! CPU —leer el archivo, expandir la serie— y lo hace [`derive_object`], que
+//! CPU —leer el archivo, expandir la serie— y lo hace [`derive_with_occurrences`], que
 //! quien escribe llama fuera del bucle de eventos y fuera de la cerradura del
 //! almacén: el lote llega a la transacción ya armado.
 //!
@@ -242,11 +242,12 @@ fn instant(date: Option<DateValue>, zones: &ical::timezones::Zones) -> Option<i6
 /// (`STATUS:CANCELLED` en la serie) se guarda sin ocurrencias: no ocupa lugar
 /// en el día de nadie. Un recurso que no es ni evento ni tarea se guarda con lo
 /// derivado vacío, para que su ETag no lo vuelva a pedir.
+#[cfg(test)]
 pub fn derive_object(raw: &str, window: Window, limits: &ExpansionLimits) -> ObjectIndex {
     derive_with_occurrences(raw, window, limits).0
 }
 
-/// Lo mismo que [`derive_object`], con las ocurrencias.
+/// Lo mismo, con las ocurrencias: es lo que escribe la sincronización.
 pub fn derive_with_occurrences(
     raw: &str,
     window: Window,

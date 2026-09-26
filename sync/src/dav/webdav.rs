@@ -191,8 +191,6 @@ pub enum DavError {
     TooManyAddressBooks(usize),
     TooManyCards(usize),
     TooManyCalendars(usize),
-    // La construye la sincronización del calendario, unos commits después.
-    #[allow(dead_code)]
     TooManyObjects(usize),
 }
 
