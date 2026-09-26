@@ -338,27 +338,42 @@ impl std::fmt::Debug for DavCredential {
 /// Arma la credencial a partir de lo que guardó el servicio al conectar.
 ///
 /// Viene de `credencial_desde` de `vasak-contacts`. `config` es lo que
-/// contesta `GetAccountData` para la capacidad, ya sacado del envoltorio.
+/// contesta `GetAccountData` para la capacidad, ya sacado del envoltorio;
+/// `capability` es esa capacidad —`contacts`, `calendar`—, y sólo cambia qué
+/// nombran los textos de error: la libreta o el calendario.
 pub fn credential_from(
     config: &serde_json::Value,
     secret: Zeroizing<String>,
+    capability: &str,
 ) -> Result<DavCredential, String> {
     let field = |name: &str| config.get(name).and_then(|v| v.as_str());
+    // Textos fijos, por área: ninguno lleva nada de lo guardado.
+    let (missing, not_an_address, with_userinfo) = match capability {
+        "calendar" => (
+            "la cuenta no guardó la dirección de su calendario; volvé a conectarla desde \
+             Configuración",
+            "la dirección guardada del calendario no es una dirección",
+            "la dirección guardada del calendario trae usuario y contraseña adentro",
+        ),
+        _ => (
+            "la cuenta no guardó la dirección de su libreta; volvé a conectarla desde \
+             Configuración",
+            "la dirección guardada de la libreta no es una dirección",
+            "la dirección guardada de la libreta trae usuario y contraseña adentro",
+        ),
+    };
 
-    let home = field("url").ok_or(
-        "la cuenta no guardó la dirección de su libreta; volvé a conectarla desde Configuración",
-    )?;
+    let home = field("url").ok_or(missing)?;
     let username = field("username")
         .ok_or("la cuenta no guardó el usuario")?
         .to_string();
 
-    let home = url::Url::parse(home.trim())
-        .map_err(|_| "la dirección guardada de la libreta no es una dirección".to_string())?;
+    let home = url::Url::parse(home.trim()).map_err(|_| not_an_address.to_string())?;
     if home.scheme() != "https" {
         return Err(DavError::InsecureUrl.to_string());
     }
     if !home.username().is_empty() || home.password().is_some() {
-        return Err("la dirección guardada de la libreta trae usuario y contraseña adentro".into());
+        return Err(with_userinfo.into());
     }
 
     // El `client_id` es la marca de que la cuenta pasó por un flujo OAuth2, así
@@ -1581,7 +1596,26 @@ mod tests {
     // ── La credencial, desde lo que guardó el servicio ────────────────────
 
     fn from(config: serde_json::Value) -> Result<DavCredential, String> {
-        credential_from(&config, Zeroizing::new("la-contrasena".into()))
+        credential_from(&config, Zeroizing::new("la-contrasena".into()), "contacts")
+    }
+
+    /// Los textos de la credencial nombran lo que es de cada área: el
+    /// calendario no dice «libreta».
+    #[test]
+    fn la_credencial_del_calendario_no_habla_de_la_libreta() {
+        let calendar = |config: serde_json::Value| {
+            credential_from(&config, Zeroizing::new("x".into()), "calendar").unwrap_err()
+        };
+        for error in [
+            calendar(serde_json::json!({ "username": "ana" })),
+            calendar(serde_json::json!({ "username": "ana", "url": "no es una dirección" })),
+            calendar(serde_json::json!({ "username": "ana", "url": "https://a:b@x/" })),
+        ] {
+            assert!(error.contains("calendario"), "{error}");
+            assert!(!error.contains("libreta"), "{error}");
+        }
+        let contacts = from(serde_json::json!({ "username": "ana" })).unwrap_err();
+        assert!(contacts.contains("libreta"), "{contacts}");
     }
 
     /// El secreto no puede aparecer en un registro ni en un pánico.

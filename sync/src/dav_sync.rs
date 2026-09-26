@@ -91,7 +91,7 @@ impl CredentialSource for BrokerCredentials {
         // La configuración viene envuelta: el servicio devuelve la cuenta
         // entera con la capacidad adentro.
         let config = data.get("config").unwrap_or(&data);
-        webdav::credential_from(config, secret).map_err(CredentialError::Failed)
+        webdav::credential_from(config, secret, capability).map_err(CredentialError::Failed)
     }
 }
 

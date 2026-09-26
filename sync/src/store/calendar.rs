@@ -96,7 +96,7 @@ impl Window {
         }
     }
 
-    fn encode(self) -> String {
+    pub(crate) fn encode(self) -> String {
         format!("{},{}", self.start, self.end)
     }
 

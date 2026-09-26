@@ -89,6 +89,10 @@ const DENIED_DETAIL: &str = "el servicio de cuentas no le da al sincronizador pe
 const CLOSED_DETAIL: &str =
     "la base no está abierta: se sincroniza cuando se desbloquee el llavero";
 
+/// Lo que se ve cuando la ventana de la base se corrió a mitad de la vuelta.
+const WINDOW_MOVED_DETAIL: &str = "la ventana del calendario se corrió a mitad de la \
+     sincronización: no se guardó lo expandido con la anterior, y sigue en la próxima revisión";
+
 /// El reloj de la ventana. Uno inyectado en las pruebas.
 pub type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 
@@ -129,6 +133,10 @@ pub enum CalendarOutcome {
     /// El servicio de cuentas no da permiso.
     Denied,
     Synced(CalendarReport),
+    /// La ventana de la base se corrió mientras se expandía un lote: no se
+    /// escribió ese lote ni el token. No cuenta como intento: sigue en la
+    /// revisión siguiente, con la ventana nueva.
+    WindowMoved,
     /// Con el texto que va al estado, sin direcciones ni datos.
     Failed(String),
 }
@@ -299,12 +307,19 @@ impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
                 CalendarOutcome::Synced(report)
             }
             Err(SyncError::Store(StoreError::Key(KeyError::Locked)))
-            | Err(SyncError::Store(StoreError::Missing))
-            | Err(SyncError::WindowMoved) => {
+            | Err(SyncError::Store(StoreError::Missing)) => {
                 tracing::info!("'{account_id}': la base se cerró a mitad de la sincronización");
                 self.set_status(account_id, AreaState::Pending, CLOSED_DETAIL)
                     .await;
                 CalendarOutcome::StoreClosed
+            }
+            // No es la base cerrada: decirlo así mandaba a desbloquear un
+            // llavero que estaba abierto.
+            Err(SyncError::WindowMoved) => {
+                tracing::info!("'{account_id}': la ventana se corrió a mitad de la sincronización");
+                self.set_status(account_id, AreaState::Pending, WINDOW_MOVED_DETAIL)
+                    .await;
+                CalendarOutcome::WindowMoved
             }
             Err(SyncError::Store(e)) => {
                 tracing::warn!("'{account_id}': no se pudo guardar el calendario: {e}");
@@ -920,7 +935,10 @@ impl<K: KeySource, C: CredentialSource> AreaSync for CalendarSync<K, C> {
     }
 
     async fn attempt(&self, account_id: &str) -> bool {
-        self.sync_account(account_id).await != CalendarOutcome::StoreClosed
+        !matches!(
+            self.sync_account(account_id).await,
+            CalendarOutcome::StoreClosed | CalendarOutcome::WindowMoved
+        )
     }
 
     /// La ventana de cada cuenta encendida, si el día cambió.

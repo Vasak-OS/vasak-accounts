@@ -14,8 +14,10 @@ use super::*;
 use crate::dav::fake::{event, task, FakeDav, RecordedRequest};
 use crate::dav::webdav::AuthKind;
 use crate::store::key::fake::FakeKeys;
+use crate::store::key::StoreKey;
 use crate::store::lifecycle::{AccountListing, Consent, ListedAccount, Locations};
 use crate::store::paths::tests::TempDir;
+use crate::store::paths::StorePaths;
 
 const ACCOUNT: &str = "cuenta";
 
@@ -63,6 +65,7 @@ fn outcome_kind(outcome: &CalendarOutcome) -> &'static str {
         CalendarOutcome::StoreClosed => "StoreClosed",
         CalendarOutcome::Denied => "Denied",
         CalendarOutcome::Synced(_) => "Synced",
+        CalendarOutcome::WindowMoved => "WindowMoved",
         CalendarOutcome::Failed(_) => "Failed",
     }
 }
@@ -1533,4 +1536,59 @@ async fn una_cuenta_lenta_no_frena_a_las_otras_en_el_calendario() {
     };
     assert_eq!(count("rapida").await, 1);
     assert_eq!(count("lenta").await, 0);
+}
+
+// ── Los textos del estado ───────────────────────────────────────────────────
+
+/// **La ventana que se corre a mitad no se publica como «la base no está
+/// abierta».** Otro escritor corre la ventana de la base mientras la vuelta
+/// espera el `multiget`: el lote expandido con la anterior no se escribe, el
+/// token tampoco, y el estado dice lo que pasó —no manda a desbloquear un
+/// llavero abierto—. No cuenta como intento, y la vuelta siguiente, con la
+/// ventana nueva, termina.
+#[tokio::test]
+async fn la_ventana_que_se_corre_a_mitad_no_se_ve_como_base_cerrada() {
+    let f = Fixture::new("calendario-ventana-a-mitad").await;
+    f.server
+        .put(0, "a.ics", &event("a", "Uno", "20260928T140000Z"));
+    f.synced().await;
+    let old = f.token(0).await.unwrap();
+    f.server
+        .put(0, "b.ics", &event("b", "Dos", "20260929T140000Z"));
+
+    // Al llegar el `multiget`, otra conexión corre la ventana de la base un
+    // día: la de la vuelta ya no es la de la base.
+    let paths = StorePaths::new(&f._temp.0.join("data/stores"), ACCOUNT).unwrap();
+    let hex = f.keys.state().keys[ACCOUNT].clone();
+    let moved = Window::around(Utc.timestamp_opt(TODAY + 86_400, 0).unwrap());
+    f.server.state().on_request = Some(Box::new(move |request| {
+        if request.is_multiget() {
+            let key = StoreKey::from_secret(Zeroizing::new(hex.as_bytes().to_vec())).unwrap();
+            let store = Store::open(&paths, &key).unwrap();
+            store
+                .connection()
+                .execute(
+                    "UPDATE store_meta SET value = ?1 WHERE key = 'calendar.window'",
+                    [moved.encode()],
+                )
+                .unwrap();
+        }
+    }));
+
+    let outcome = f.sync().await;
+    assert_eq!(outcome_kind(&outcome), "WindowMoved");
+    let status = f.calendar_status().await;
+    let detail = status["detail"].as_str().unwrap();
+    assert_ne!(detail, CLOSED_DETAIL);
+    assert!(detail.contains("ventana"), "{detail}");
+    assert!(!detail.contains("llavero"), "{detail}");
+    assert_eq!(f.summaries().await, vec!["Uno"]);
+    assert_eq!(f.token(0).await, Some(old));
+
+    // Con la ventana nueva ya en la base, la vuelta siguiente termina.
+    f.server.state().on_request = None;
+    let report = f.synced().await;
+    assert_eq!(report.fetched, 1);
+    assert_eq!(f.summaries().await, vec!["Dos", "Uno"]);
+    assert_eq!(f.token(0).await, Some(f.server_token()));
 }
