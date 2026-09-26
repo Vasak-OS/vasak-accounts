@@ -631,6 +631,66 @@ async fn mas_de_quinientos_objetos_van_en_varios_lotes_con_el_token_en_el_ultimo
     assert_eq!(calendar_changes, 4);
 }
 
+/// **Un corte a mitad no pierde el token viejo**: el primer lote queda
+/// escrito, el token no se guarda —va con el último—, y la vuelta siguiente
+/// sigue desde ahí y termina.
+#[tokio::test]
+async fn un_corte_a_mitad_no_pierde_el_token_viejo() {
+    let f = Fixture::new("calendario-corte").await;
+    for i in 0..1203 {
+        f.server.put(
+            0,
+            &format!("{i:05}.ics"),
+            &event(
+                &format!("{i:05}"),
+                &format!("Evento {i:05}"),
+                "20261010T100000Z",
+            ),
+        );
+    }
+    // Diez `multiget` de cincuenta son el primer lote de quinientos; el
+    // duodécimo falla.
+    f.server.state().fail_multiget_from = Some(12);
+    assert!(matches!(f.sync().await, CalendarOutcome::Failed(_)));
+    assert_eq!(f.count("SELECT count(*) FROM calendar_objects").await, 500);
+    assert_eq!(f.token(0).await, None, "el token va con el último lote");
+
+    f.server.state().fail_multiget_from = None;
+    let report = f.synced().await;
+    // Lo que quedó escrito no se vuelve a pedir: su ETag es el mismo.
+    assert_eq!(report.fetched, 703);
+    assert_eq!(report.batches, 2);
+    assert_eq!(f.count("SELECT count(*) FROM calendar_objects").await, 1203);
+    assert_eq!(f.token(0).await, Some(f.server_token()));
+}
+
+/// Una cuenta que pasaría el tope de ocurrencias no escribe ese lote ni
+/// guarda el token.
+#[tokio::test]
+async fn una_cuenta_que_pasa_el_tope_de_ocurrencias_no_sigue_escribiendo() {
+    let limits = Limits {
+        max_account_occurrences: 100,
+        ..Limits::DEFAULT
+    };
+    let f = Fixture::with(
+        "calendario-tope-ocurrencias",
+        limits,
+        ExpansionLimits::DEFAULT,
+    )
+    .await;
+    f.server.put(0, "d.ics", &daily("d", "20260901T080000Z"));
+    let outcome = f.sync().await;
+    assert!(
+        matches!(outcome, CalendarOutcome::Failed(_)),
+        "{}",
+        outcome_kind(&outcome)
+    );
+    assert_eq!(f.count("SELECT count(*) FROM occurrences").await, 0);
+    assert_eq!(f.count("SELECT count(*) FROM calendar_objects").await, 0);
+    assert_eq!(f.token(0).await, None);
+    assert_eq!(f.calendar_status().await["state"], "failed");
+}
+
 // ── La expansión y la ventana ───────────────────────────────────────────────
 
 /// **Una regla que se dispara no cuelga la vuelta ni llena la base**: una por

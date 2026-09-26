@@ -1440,7 +1440,8 @@ pub(crate) mod tests {
     }
 
     /// Una serie que se reescribió mientras se expandía no se toca: la
-    /// sincronización ya la dejó con la ventana nueva.
+    /// sincronización ya la dejó con la ventana nueva, y lo expandido desde lo
+    /// de antes —otra regla— no se le suma.
     #[test]
     fn correr_la_ventana_no_pisa_una_serie_que_cambio() {
         let temp = TempDir::new("cal-correr-cambio");
@@ -1471,7 +1472,9 @@ pub(crate) mod tests {
             .iter()
             .map(|s| shift_series(s, later, &ExpansionLimits::DEFAULT))
             .collect();
-        // En el medio, la sincronización la reescribe con la ventana nueva.
+        assert!(!shifts[0].added.is_empty());
+        // En el medio, la sincronización la reescribe —ahora es diaria, a otra
+        // hora— con la ventana nueva.
         store
             .connection
             .execute(
@@ -1479,14 +1482,12 @@ pub(crate) mod tests {
                 rusqlite::params![later.encode(), WINDOW_KEY],
             )
             .unwrap();
+        let daily = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:s\r\nSUMMARY:Diaria\r\n\
+                     DTSTART:20260105T100000Z\r\nRRULE:FREQ=DAILY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
         store
             .apply_calendar_objects(
                 &cal,
-                &[ObjectOp::Upsert(object(
-                    href,
-                    &weekly("s", "20260105T090000Z"),
-                    later,
-                ))],
+                &[ObjectOp::Upsert(object(href, daily, later))],
                 later,
                 None,
                 u64::MAX,
