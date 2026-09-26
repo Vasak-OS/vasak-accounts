@@ -2,7 +2,7 @@
 //!
 //! Sólo escritura y lo que la sincronización necesita leer para decidir qué
 //! pedir (los ETag y el token de cada libreta). Listar y buscar para las
-//! aplicaciones es del PR 3.
+//! aplicaciones vive en `contacts_read.rs`, sobre las conexiones de lectura.
 //!
 //! **Todo en lotes**: una transacción lleva como mucho [`WRITE_BATCH_ROWS`]
 //! contactos —cada uno con sus correos, sus teléfonos y su entrada del
@@ -11,12 +11,18 @@
 //! sincronización se corta a mitad, lo escrito queda y el token es el de
 //! antes, y la próxima vuelta repite desde ahí sin perder nada. Escribir dos
 //! veces la misma tarjeta es escribirla una.
+//!
+//! **Cada lote que cambia algo sube la generación de los contactos** (ver
+//! [`super::read_generation`]), en su misma transacción, y lo anota para que
+//! `with_store` lo anuncie con la señal `Changed`. Un lote que no cambió nada
+//! —el último de una libreta al día, que sólo guarda el token— no la sube.
 
 use std::collections::HashMap;
 
 use rusqlite::OptionalExtension;
 
-use super::{classify, Store, StoreError};
+use super::lifecycle::CONTACTS_AREA;
+use super::{bump_generation, classify, Store, StoreError};
 use crate::vcard::{self, Contact};
 
 /// Cuántos contactos entran en una transacción, como mucho.
@@ -107,6 +113,21 @@ impl Store {
     ) -> Result<Vec<StoredAddressBook>, StoreError> {
         let transaction = self.connection.transaction().map_err(classify)?;
         let mut stored = Vec::with_capacity(books.len());
+        // Si alguna es nueva o cambió de nombre: volver a listar las mismas
+        // libretas no es un cambio.
+        let mut changed = false;
+        {
+            let mut current = transaction
+                .prepare_cached("SELECT display_name FROM address_books WHERE href = ?1")
+                .map_err(classify)?;
+            for (href, name) in books {
+                let before: Option<String> = current
+                    .query_row([href], |row| row.get(0))
+                    .optional()
+                    .map_err(classify)?;
+                changed |= before.as_deref() != Some(name.as_str());
+            }
+        }
         {
             let mut statement = transaction
                 .prepare_cached(
@@ -129,7 +150,15 @@ impl Store {
                 );
             }
         }
+        let generation = if changed {
+            Some(bump_generation(&transaction, CONTACTS_AREA)?)
+        } else {
+            None
+        };
         transaction.commit().map_err(classify)?;
+        if let Some(generation) = generation {
+            self.note_change(CONTACTS_AREA, generation);
+        }
         Ok(stored)
     }
 
@@ -148,12 +177,22 @@ impl Store {
                 rusqlite::params![book_id, WRITE_BATCH_ROWS as i64],
             )
             .map_err(classify)?;
+        let mut changed = removed > 0;
         if removed == 0 {
-            transaction
+            changed |= transaction
                 .execute("DELETE FROM address_books WHERE id = ?1", [book_id])
-                .map_err(classify)?;
+                .map_err(classify)?
+                > 0;
         }
+        let generation = if changed {
+            Some(bump_generation(&transaction, CONTACTS_AREA)?)
+        } else {
+            None
+        };
         transaction.commit().map_err(classify)?;
+        if let Some(generation) = generation {
+            self.note_change(CONTACTS_AREA, generation);
+        }
         Ok(removed)
     }
 
@@ -251,6 +290,8 @@ impl Store {
         // la transacción: una dirección que aparece dos veces en el lote se
         // cuenta contra lo que dejó la anterior.
         let mut net: i64 = 0;
+        // Si el lote cambió algo que se ve: borrar lo que no estaba no cuenta.
+        let mut changed = false;
         for op in ops {
             match op {
                 ContactOp::Delete(href) => {
@@ -264,6 +305,7 @@ impl Store {
                                 .optional()
                         })
                         .map_err(classify)?;
+                    changed |= freed.is_some();
                     net -= freed.unwrap_or(0);
                 }
                 ContactOp::Upsert(row) => {
@@ -279,6 +321,7 @@ impl Store {
                         .map_err(classify)?;
                     net += row.raw_vcard.len() as i64 - replaced.unwrap_or(0);
                     upsert_contact(&transaction, book.id, row, &at)?;
+                    changed = true;
                 }
             }
         }
@@ -310,7 +353,15 @@ impl Store {
                 .map_err(classify)?;
         }
 
+        let generation = if changed {
+            Some(bump_generation(&transaction, CONTACTS_AREA)?)
+        } else {
+            None
+        };
         transaction.commit().map_err(classify)?;
+        if let Some(generation) = generation {
+            self.note_change(CONTACTS_AREA, generation);
+        }
         Ok(Applied::Written { net_bytes: net })
     }
 }
@@ -419,7 +470,7 @@ pub(crate) mod tests {
         Store::create(&paths, &key).unwrap()
     }
 
-    fn row(href: &str, name: &str, email: &str) -> Box<ContactRow> {
+    pub(crate) fn row(href: &str, name: &str, email: &str) -> Box<ContactRow> {
         let raw = format!("BEGIN:VCARD\r\nFN:{name}\r\nEMAIL:{email}\r\nEND:VCARD");
         Box::new(ContactRow {
             href: href.into(),
@@ -434,6 +485,119 @@ pub(crate) mod tests {
             .connection()
             .query_row(sql, [], |row| row.get(0))
             .unwrap()
+    }
+
+    /// La generación de los contactos sube una vez por lote que cambió algo, y
+    /// no con uno que no cambió nada: el último de una libreta al día, borrar
+    /// lo que no estaba, volver a listar las mismas libretas, o un lote que no
+    /// entró en el tope.
+    #[test]
+    fn cada_lote_que_cambia_sube_la_generacion_y_el_que_no_la_deja() {
+        let temp = TempDir::new("generacion");
+        let mut store = open_store(&temp);
+        let generation = |store: &Store| {
+            super::super::read_generation(store.connection(), CONTACTS_AREA).unwrap()
+        };
+        assert_eq!(generation(&store), 0);
+        assert!(store.take_changes().is_empty());
+
+        let book = store
+            .upsert_address_books(&[("https://x/a/".into(), "A".into())])
+            .unwrap()
+            .remove(0);
+        let first = store.take_changes();
+        assert_eq!(first, vec![(CONTACTS_AREA, generation(&store))]);
+        assert!(first[0].1 > 0);
+
+        // Las mismas libretas otra vez: nada.
+        store
+            .upsert_address_books(&[("https://x/a/".into(), "A".into())])
+            .unwrap();
+        assert!(store.take_changes().is_empty());
+
+        store
+            .apply_contacts(
+                &book,
+                &[ContactOp::Upsert(row(
+                    "https://x/a/1.vcf",
+                    "Ana",
+                    "a@x.com",
+                ))],
+                None,
+                u64::MAX,
+            )
+            .unwrap();
+        let second = store.take_changes();
+        assert_eq!(second.len(), 1);
+        assert!(second[0].1 > first[0].1, "sólo crece");
+
+        // El último lote, vacío, que sólo guarda el token; y borrar lo que no
+        // estaba.
+        let finish = BookProgress {
+            token: Some("t2".into()),
+            ctag: None,
+        };
+        store
+            .apply_contacts(&book, &[], Some(&finish), u64::MAX)
+            .unwrap();
+        store
+            .apply_contacts(
+                &book,
+                &[ContactOp::Delete("https://x/a/nunca.vcf".into())],
+                None,
+                u64::MAX,
+            )
+            .unwrap();
+        assert!(store.take_changes().is_empty());
+
+        // Uno que no entra en el tope no escribió nada.
+        let before = generation(&store);
+        let over = store
+            .apply_contacts(
+                &book,
+                &[ContactOp::Upsert(row(
+                    "https://x/a/2.vcf",
+                    "Beto",
+                    "b@x.com",
+                ))],
+                None,
+                1,
+            )
+            .unwrap();
+        assert_eq!(over, Applied::OverCap);
+        assert!(store.take_changes().is_empty());
+        assert_eq!(generation(&store), before);
+
+        // Borrar la libreta de a tandas: cambia.
+        while store.remove_address_book_chunk(book.id).unwrap() > 0 {}
+        assert_eq!(store.take_changes().len(), 1);
+        assert!(generation(&store) > before);
+    }
+
+    /// La generación vive en la base: cerrar y volver a abrir no la vuelve a
+    /// cero, y una base nueva empieza más arriba que la anterior.
+    #[test]
+    fn la_generacion_sobrevive_a_reabrir_y_una_base_nueva_empieza_mas_arriba() {
+        let temp = TempDir::new("generacion-persiste");
+        let mut store = open_store(&temp);
+        store
+            .upsert_address_books(&[("https://x/a/".into(), "A".into())])
+            .unwrap();
+        let written = store.take_changes()[0].1;
+        drop(store);
+
+        let paths = StorePaths::new(&temp.0, "cuenta").unwrap();
+        let key = StoreKey::from_secret(Zeroizing::new(vec![b'a'; 64])).unwrap();
+        let store = Store::open(&paths, &key).unwrap();
+        assert_eq!(
+            super::super::read_generation(store.connection(), CONTACTS_AREA).unwrap(),
+            written
+        );
+        drop(store);
+
+        let other = TempDir::new("generacion-nueva");
+        let mut fresh = open_store(&other);
+        assert!(fresh.touch(CONTACTS_AREA).unwrap() > written);
     }
 
     /// Volver a escribir una tarjeta la reemplaza: mismo `id`, sus datos

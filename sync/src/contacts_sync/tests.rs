@@ -100,6 +100,7 @@ impl Fixture {
             .accounts_listed(
                 AccountListing::Listed(vec![ListedAccount {
                     id: ACCOUNT.into(),
+                    display_name: "Trabajo".into(),
                     capabilities: vec!["contacts".into()],
                     needs_reauth: false,
                 }]),
@@ -1284,6 +1285,7 @@ async fn una_cuenta_lenta_no_frena_a_las_otras() {
     ));
     let listed = |id: &str| ListedAccount {
         id: id.into(),
+        display_name: id.into(),
         capabilities: vec!["contacts".into()],
         needs_reauth: false,
     };
@@ -1382,6 +1384,34 @@ async fn mas_de_quinientas_tarjetas_van_en_varios_lotes() {
     assert_eq!(f.count("SELECT count(*) FROM contacts").await, 1203);
     assert_eq!(f.count("SELECT count(*) FROM contact_emails").await, 1203);
     assert_eq!(f.token(0).await, Some(f.server_token()));
+}
+
+/// **`Changed` sale una vez por lote que cambió algo**: la libreta nueva y los
+/// tres lotes de tarjetas son cuatro avisos, con la generación creciendo; una
+/// vuelta sin cambios no avisa nada, aunque escriba su último lote vacío.
+#[tokio::test]
+async fn cada_lote_que_cambia_se_anuncia_una_vez_y_una_vuelta_sin_cambios_no() {
+    let f = Fixture::new("contactos-changed").await;
+    let mut changes = f.manager.subscribe_changes();
+    put_many(&f.server, 0, 0..1203);
+
+    let report = f.synced().await;
+    assert_eq!(report.batches, 3);
+    let mut got = Vec::new();
+    while let Ok(change) = changes.try_recv() {
+        got.push(change);
+    }
+    assert_eq!(got.len(), 4, "la libreta y los tres lotes");
+    assert!(got
+        .iter()
+        .all(|c| c.area == "contacts" && c.account_id == ACCOUNT));
+    assert!(got.windows(2).all(|w| w[0].generation < w[1].generation));
+
+    f.synced().await;
+    assert!(
+        changes.try_recv().is_err(),
+        "una vuelta que no cambió nada no avisa"
+    );
 }
 
 /// **Un corte a mitad no pierde el token viejo**: el servidor falla en el

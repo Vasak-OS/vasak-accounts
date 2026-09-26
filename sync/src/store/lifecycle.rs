@@ -67,6 +67,20 @@
 //! [`StoreManager::with_store`], con la cerradura del administrador tomada y el
 //! llavero releído en ese momento. Con el llavero bloqueado no se escribe nada
 //! —se pasa la tabla, que cierra la base— y la sincronización se corta ahí.
+//!
+//! **Y dos lectores**, que no pasan por esa cerradura: [`StoreManager::read`]
+//! toma una de las conexiones de sólo lectura de la base ([`ReadPool`]) y lee
+//! en WAL lo último que se confirmó, sin esperar a que termine un lote. El
+//! diseño pedía un actor por cuenta —un hilo dueño de la conexión, con órdenes
+//! por canal—; no hace falta: el único escritor ya lo garantiza la cerradura
+//! (un lote por vez, de a lo sumo 500 filas), y los lectores no pueden
+//! escribir —`SQLITE_OPEN_READONLY` y `query_only`—, así que no hay un segundo
+//! escritor posible aunque lean en paralelo. Un actor sumaría un hilo por
+//! cuenta para ordenar algo que ya está en orden.
+//!
+//! **Cada lote que cambia algo se anuncia**: lo que la base anotó que cambió
+//! ([`Store::take_changes`]) sale por [`StoreManager::subscribe_changes`] al
+//! terminar el lote, una vez por área, y de ahí a la señal `Changed`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::OpenOptionsExt;
@@ -79,6 +93,7 @@ use tokio::sync::Mutex;
 
 use super::key::{KeyError, KeySource, StoreKey};
 use super::paths::{self, StorePaths};
+use super::readers::ReadPool;
 use super::{LogLevel, Store, StoreError};
 
 /// Las capacidades de una cuenta que van a tener lugar en el almacén.
@@ -260,6 +275,10 @@ pub struct AccountStatus {
     /// El área de contactos, sólo en las cuentas que tienen contactos.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub contacts: Option<AreaStatus>,
+    /// Si la cuenta tiene la capacidad de contactos, aunque no se sincronice.
+    /// No se publica: decide quién ve el detalle.
+    #[serde(skip)]
+    pub has_contacts: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -272,6 +291,9 @@ pub struct Status {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListedAccount {
     pub id: String,
+    /// Cómo la llama la persona. Va al diálogo de permiso: de qué cuenta se
+    /// trata.
+    pub display_name: String,
     pub capabilities: Vec<String>,
     /// La base se conserva igual; lo que no se hace es sincronizarla: pedirle
     /// el token daría error en cada vuelta.
@@ -517,6 +539,10 @@ struct Inner {
     wanted: BTreeSet<String>,
     /// De ésas, las que tienen contactos que sincronizar.
     with_contacts: BTreeSet<String>,
+    /// De las que tienen almacén, las que tienen la capacidad de contactos
+    /// —también las que piden reautenticarse: lo guardado se puede leer igual—,
+    /// con el nombre que les puso la persona.
+    contacts_accounts: BTreeMap<String, String>,
     entries: BTreeMap<String, Entry>,
 }
 
@@ -547,17 +573,112 @@ impl Inner {
 /// escribe en serio llega con los datos, y va a tener su propio hilo por cuenta.
 pub struct StoreManager<K: KeySource> {
     keys: K,
-    locations: Result<Locations, String>,
+    locations: Result<Locations, StoreError>,
     inner: Mutex<Inner>,
+    /// Las conexiones de lectura de cada base abierta. Aparte de `inner` para
+    /// que leer no espere a la cerradura que tiene tomada un lote de escritura.
+    /// Una base que se cierra cierra su grupo, y el que queda acá no sirve más
+    /// ([`ReadPool::is_closed`]) hasta que otra apertura lo reemplace.
+    readers: std::sync::Mutex<BTreeMap<String, Arc<ReadPool>>>,
+    /// Por dónde sale cada cambio, si alguien escucha.
+    changes: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<StoreChange>>>,
+}
+
+/// Lo que [`StoreManager::contacts_account`] sabe de una cuenta con contactos.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactsAccount {
+    pub display_name: String,
+    /// Si alguien ya la pidió y se sincroniza sola.
+    pub active: bool,
+    /// Si se puede sincronizar: no pide reautenticarse.
+    pub syncable: bool,
+}
+
+/// Un lote que cambió lo guardado de un área de una cuenta. Es lo que lleva la
+/// señal `Changed`: **cuándo**, no **qué**.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreChange {
+    pub area: &'static str,
+    pub account_id: String,
+    pub generation: u64,
 }
 
 impl<K: KeySource> StoreManager<K> {
     pub fn new(keys: K, locations: Result<Locations, StoreError>) -> Self {
         Self {
             keys,
-            locations: locations.map_err(|e| e.to_string()),
+            locations,
             inner: Mutex::new(Inner::default()),
+            readers: std::sync::Mutex::new(BTreeMap::new()),
+            changes: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Los cambios, de acá en adelante, en orden. Hay un solo oyente: uno nuevo
+    /// reemplaza al anterior.
+    pub fn subscribe_changes(&self) -> tokio::sync::mpsc::UnboundedReceiver<StoreChange> {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        *self.changes.lock().unwrap_or_else(|p| p.into_inner()) = Some(sender);
+        receiver
+    }
+
+    fn announce(&self, account_id: &str, changes: Vec<(&'static str, u64)>) {
+        if changes.is_empty() {
+            return;
+        }
+        let sink = self.changes.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(sink) = sink.as_ref() {
+            for (area, generation) in changes {
+                let _ = sink.send(StoreChange {
+                    area,
+                    account_id: account_id.to_string(),
+                    generation,
+                });
+            }
+        }
+    }
+
+    /// Anota el grupo de lectura de una base recién abierta. De paso se van los
+    /// que ya se cerraron.
+    fn register_readers(&self, account_id: &str, store: &Store) {
+        let mut readers = self.readers.lock().unwrap_or_else(|p| p.into_inner());
+        readers.retain(|_, pool| !pool.is_closed());
+        readers.insert(account_id.to_string(), store.readers());
+    }
+
+    fn reader_pool(&self, account_id: &str) -> Option<Arc<ReadPool>> {
+        self.readers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(account_id)
+            .filter(|pool| !pool.is_closed())
+            .cloned()
+    }
+
+    /// Lee algo de la base abierta de una cuenta, por una de sus conexiones de
+    /// sólo lectura. **No toma la cerradura del administrador**: un lote de
+    /// escritura largo no la hace esperar, y ve lo último que se confirmó.
+    ///
+    /// Con la base cerrada, `Err(Missing)`. Con el llavero bloqueado —o sin
+    /// poder saberlo—, `Err(Key(Locked))` y nada leído: el llavero se relee en
+    /// cada lectura, igual que antes de cada lote, porque `vasak-keyring` no
+    /// avisa al bloquearse. Las conexiones de lectura se cierran en el acto, y
+    /// la de escritura con la tabla —ya, si el escritor no está ocupado; si
+    /// no, lo hace él antes de su próximo lote—.
+    pub async fn read<T, F>(&self, account_id: &str, work: F) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&rusqlite::Connection) -> Result<T, StoreError> + Send + 'static,
+    {
+        let pool = self.reader_pool(account_id).ok_or(StoreError::Missing)?;
+        if !matches!(self.keys.is_locked().await, Ok(false)) {
+            pool.close();
+            if let Ok(mut inner) = self.inner.try_lock() {
+                self.run(&mut inner, Some(account_id)).await;
+            }
+            return Err(StoreError::Key(KeyError::Locked));
+        }
+        blocking(move || pool.read(work)).await?
     }
 
     pub fn keys(&self) -> &K {
@@ -565,9 +686,7 @@ impl<K: KeySource> StoreManager<K> {
     }
 
     fn locations(&self) -> Result<&Locations, StoreError> {
-        self.locations
-            .as_ref()
-            .map_err(|detail| StoreError::Io(detail.clone()))
+        self.locations.as_ref().map_err(Clone::clone)
     }
 
     /// El estado de todas las bases.
@@ -611,6 +730,7 @@ impl<K: KeySource> StoreManager<K> {
                     detail,
                     size_bytes,
                     contacts,
+                    has_contacts: inner.contacts_accounts.contains_key(id),
                 }
             })
             .collect();
@@ -675,6 +795,11 @@ impl<K: KeySource> StoreManager<K> {
         // Las que ya no tienen nada que guardar se cierran. Cerrar no es
         // borrar: una que reaparece en el próximo listado se vuelve a abrir con
         // su clave.
+        inner.contacts_accounts = accounts
+            .iter()
+            .filter(|a| wanted.contains(&a.id) && a.capabilities.iter().any(|c| c == CONTACTS_AREA))
+            .map(|a| (a.id.clone(), a.display_name.clone()))
+            .collect();
         inner.entries.retain(|id, _| wanted.contains(id));
         inner.wanted = wanted;
         inner.with_contacts = with_contacts;
@@ -799,6 +924,51 @@ impl<K: KeySource> StoreManager<K> {
         Ok(true)
     }
 
+    /// Una cuenta del último listado bueno, para los comandos que la nombran.
+    pub async fn is_known(&self, account_id: &str) -> bool {
+        Self::require_listed(&*self.inner.lock().await, account_id).is_ok()
+    }
+
+    /// Lo que hace falta saber para leer los contactos de una cuenta: cómo se
+    /// llama —para el diálogo de permiso— y si su área ya está encendida.
+    ///
+    /// `UnknownAccount` si la cuenta no está en el último listado, no tiene
+    /// almacén o no tiene contactos.
+    pub async fn contacts_account(&self, account_id: &str) -> Result<ContactsAccount, StoreError> {
+        paths::validate_account_id(account_id)?;
+        let inner = self.inner.lock().await;
+        Self::require_listed(&inner, account_id)?;
+        let Some(display_name) = inner.contacts_accounts.get(account_id) else {
+            return Err(StoreError::UnknownAccount(account_id.to_string()));
+        };
+        let active = self
+            .locations()
+            .ok()
+            .and_then(|l| StoreSettings::load(&l.settings).ok())
+            .is_some_and(|s| s.is_active(account_id, CONTACTS_AREA));
+        Ok(ContactsAccount {
+            display_name: display_name.clone(),
+            active,
+            syncable: inner.with_contacts.contains(account_id),
+        })
+    }
+
+    /// Después de vaciar una base con los contactos encendidos: sube la
+    /// generación de la base nueva, y eso sale como `Changed`. Quien tenía una
+    /// lista leída se entera de que ya no vale sin esperar a la sincronización.
+    pub async fn announce_cleared(&self, account_id: &str) {
+        match self.contacts_account(account_id).await {
+            Ok(account) if account.active => {}
+            _ => return,
+        }
+        if let Err(e) = self
+            .with_store(account_id, |store| store.touch(CONTACTS_AREA).map(|_| ()))
+            .await
+        {
+            tracing::debug!("no se pudo anunciar la base vaciada de «{account_id}»: {e}");
+        }
+    }
+
     /// Las cuentas cuyos contactos hay que sincronizar: con contactos, con la
     /// base encendida y con el área encendida.
     pub async fn contacts_targets(&self) -> Vec<String> {
@@ -863,19 +1033,23 @@ impl<K: KeySource> StoreManager<K> {
         };
         match blocking(move || {
             let result = work(&mut store);
-            (store, result)
+            let changes = store.take_changes();
+            (store, result, changes)
         })
         .await
         {
-            Ok((store, result)) => {
+            Ok((store, result, changes)) => {
                 inner.entry(account_id).store = Some(store);
+                // Lo confirmado se anuncia aunque el trabajo haya terminado
+                // con un error después: ya está en la base.
+                self.announce(account_id, changes);
                 result
             }
             Err(e) => {
                 // La tarea se cayó con la base adentro: se cerró al soltarse.
                 inner
                     .entry(account_id)
-                    .set(StoreState::Unavailable, e.to_string());
+                    .set(StoreState::Unavailable, e.public_detail());
                 Err(e)
             }
         }
@@ -935,11 +1109,11 @@ impl<K: KeySource> StoreManager<K> {
 
         let locations = match &self.locations {
             Ok(locations) => locations,
-            Err(detail) => {
+            Err(e) => {
                 for id in &targets {
                     let entry = inner.entry(id);
                     entry.close();
-                    entry.set(StoreState::Unavailable, detail.clone());
+                    entry.set(StoreState::Unavailable, e.public_detail());
                 }
                 return;
             }
@@ -953,7 +1127,7 @@ impl<K: KeySource> StoreManager<K> {
                 for id in &targets {
                     let entry = inner.entry(id);
                     entry.close();
-                    entry.set(StoreState::Unavailable, e.to_string());
+                    entry.set(StoreState::Unavailable, e.public_detail());
                 }
                 return;
             }
@@ -971,13 +1145,15 @@ impl<K: KeySource> StoreManager<K> {
         let locked = match locked {
             Ok(locked) => locked,
             Err(e) => {
+                tracing::info!("el llavero no contesta: {e}");
+                let e = StoreError::Key(e);
                 // Sin saber si el llavero está abierto, la clave no se usa: se
                 // cierra todo y se espera.
                 inner.keyring = KeyringState::Unavailable;
                 for (id, entry) in inner.entries.iter_mut() {
                     entry.close();
                     if settings.is_enabled(id) {
-                        entry.set(StoreState::Unavailable, e.to_string());
+                        entry.set(StoreState::Unavailable, e.public_detail());
                     } else {
                         entry.set(StoreState::Disabled, "");
                     }
@@ -989,7 +1165,7 @@ impl<K: KeySource> StoreManager<K> {
                         } else {
                             StoreState::Disabled
                         };
-                        inner.entry(id).set(state, e.to_string());
+                        inner.entry(id).set(state, e.public_detail());
                     }
                 }
                 return;
@@ -1103,6 +1279,9 @@ impl<K: KeySource> StoreManager<K> {
         if matches!(result, Err(StoreError::Key(KeyError::Locked))) {
             inner.keyring = KeyringState::Locked;
         }
+        if let Ok((store, _)) = &result {
+            self.register_readers(account_id, store);
+        }
         let entry = inner.entry(account_id);
         match result {
             Ok((store, false)) => {
@@ -1119,7 +1298,7 @@ impl<K: KeySource> StoreManager<K> {
             Err(StoreError::Key(KeyError::Locked)) => entry.set(StoreState::Locked, ""),
             Err(e) => {
                 tracing::warn!("la base de «{account_id}» no está disponible: {e}");
-                entry.set(StoreState::Unavailable, e.to_string());
+                entry.set(StoreState::Unavailable, e.public_detail());
             }
         }
     }
@@ -1596,6 +1775,7 @@ mod tests {
     fn account(id: &str, capabilities: &[&str]) -> ListedAccount {
         ListedAccount {
             id: id.into(),
+            display_name: format!("Cuenta {id}"),
             capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
             needs_reauth: false,
         }
@@ -2933,5 +3113,153 @@ mod tests {
         assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
         assert!(!f.manager.is_open("cuenta").await, "la base se cerró");
         assert_eq!(f.state("cuenta").await, StoreState::Locked);
+    }
+
+    // ── Las lecturas ────────────────────────────────────────────────────────
+
+    /// Leer no toma la cerradura del administrador ni espera a un lote: con un
+    /// lote de escritura a medias —la transacción abierta y la cerradura
+    /// tomada—, una lectura contesta enseguida con lo último confirmado.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn leer_no_espera_a_un_lote_de_escritura_largo() {
+        let f = Arc::new(Fixture::new("leer-mientras-escribe"));
+        f.list(listing(&["cuenta"])).await;
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let writer = {
+            let f = Arc::clone(&f);
+            tokio::spawn(async move {
+                f.manager
+                    .with_store("cuenta", move |store| {
+                        let tx = store
+                            .connection
+                            .unchecked_transaction()
+                            .map_err(super::super::classify)?;
+                        tx.execute(
+                            "INSERT INTO store_meta (key, value) VALUES ('a-medias', '1')",
+                            [],
+                        )
+                        .map_err(super::super::classify)?;
+                        let _ = started_tx.send(());
+                        let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                        tx.commit().map_err(super::super::classify)
+                    })
+                    .await
+            })
+        };
+        started_rx.await.unwrap();
+
+        let count = |f: Arc<Fixture>| async move {
+            f.manager
+                .read("cuenta", |c| {
+                    c.query_row(
+                        "SELECT count(*) FROM store_meta WHERE key = 'a-medias'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(super::super::classify)
+                })
+                .await
+        };
+        let during = tokio::time::timeout(Duration::from_secs(5), count(Arc::clone(&f)))
+            .await
+            .expect("la lectura esperó al lote");
+        assert_eq!(during, Ok(0), "lo que no se confirmó no se ve");
+
+        release_tx.send(()).unwrap();
+        writer.await.unwrap().unwrap();
+        assert_eq!(count(Arc::clone(&f)).await, Ok(1));
+    }
+
+    /// Con el llavero bloqueado, leer no da nada: error claro, y los lectores
+    /// y la base se cierran en el acto, sin esperar a la revisión.
+    #[tokio::test]
+    async fn leer_con_el_llavero_bloqueado_no_da_nada_y_cierra_todo() {
+        let f = Fixture::new("leer-bloqueado");
+        f.list(listing(&["cuenta"])).await;
+        let pool = f.manager.reader_pool("cuenta").unwrap();
+        assert_eq!(pool.open_connections(), 2);
+
+        f.keys.state().locked = true;
+        let read = f
+            .manager
+            .read("cuenta", |c| {
+                c.query_row("SELECT count(*) FROM store_meta", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map_err(super::super::classify)
+            })
+            .await;
+        assert_eq!(read, Err(StoreError::Key(KeyError::Locked)));
+        assert!(pool.is_closed());
+        assert_eq!(pool.open_connections(), 0);
+        assert!(!f.manager.is_open("cuenta").await);
+
+        // Y al desbloquear, lectores nuevos.
+        f.keys.state().locked = false;
+        f.manager.refresh().await;
+        let again = f.manager.reader_pool("cuenta").unwrap();
+        assert!(!again.is_closed());
+        assert!(!Arc::ptr_eq(&pool, &again));
+    }
+
+    /// Una base cerrada —bloqueo, apagado— no se puede leer, y lo que se
+    /// cierra cierra también sus lectores.
+    #[tokio::test]
+    async fn apagar_la_base_cierra_sus_lectores() {
+        let f = Fixture::new("leer-apagada");
+        f.list(listing(&["cuenta"])).await;
+        let pool = f.manager.reader_pool("cuenta").unwrap();
+        f.manager.set_enabled("cuenta", false).await.unwrap();
+        assert!(pool.is_closed());
+        assert_eq!(
+            f.manager.read("cuenta", |_| Ok(())).await,
+            Err(StoreError::Missing)
+        );
+    }
+
+    /// `with_store` anuncia lo que cambió al terminar cada lote: una vez por
+    /// área aunque el lote haya cambiado varias cosas, y nada si no cambió
+    /// nada.
+    #[tokio::test]
+    async fn cada_lote_se_anuncia_una_vez_y_el_que_no_cambia_nada_no() {
+        let f = Fixture::new("anuncios");
+        f.list(listing(&["cuenta"])).await;
+        let mut changes = f.manager.subscribe_changes();
+
+        f.manager
+            .with_store("cuenta", |store| {
+                let book = store
+                    .upsert_address_books(&[("https://x/a/".into(), "A".into())])?
+                    .remove(0);
+                store.apply_contacts(
+                    &book,
+                    &[super::super::contacts::ContactOp::Upsert(
+                        super::super::contacts::tests::row("https://x/a/1.vcf", "Ana", "a@x.com"),
+                    )],
+                    None,
+                    u64::MAX,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let change = changes.try_recv().unwrap();
+        assert_eq!(change.area, CONTACTS_AREA);
+        assert_eq!(change.account_id, "cuenta");
+        assert!(
+            changes.try_recv().is_err(),
+            "una vez por lote, no por escritura"
+        );
+
+        f.manager
+            .with_store("cuenta", |store| {
+                store.upsert_address_books(&[("https://x/a/".into(), "A".into())])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(changes.try_recv().is_err(), "sin cambios, sin aviso");
     }
 }

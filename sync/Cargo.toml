@@ -65,8 +65,14 @@ rustix = { version = "1", features = ["fs", "process"] }
 # lo que cierra las entidades externas y las expansiones en cadena. Es la misma
 # que usaba `vasak-contacts`, de donde viene el parser. Ver `dav/webdav.rs`.
 roxmltree = "0.21"
+# El momento de arranque de un proceso y la pregunta a `vasak-permissions`,
+# compartidos con el servicio de cuentas. Ver `common/` y `access.rs`.
+vasak-accounts-common.workspace = true
 
 [dev-dependencies]
 # Las conexiones punto a punto de zbus, para probar el cliente del llavero y la
-# interfaz del almacén contra un servidor falso, sin `dbus-daemon`.
-zbus = { workspace = true, features = ["p2p"] }
+# interfaz del almacén contra un servidor falso, sin `dbus-daemon`. Con
+# `bus-impl`, que sólo habilita ponerle nombre único a una punta —lo que haría
+# el bus—: el permiso de lectura se decide por el remitente, y sin nombre no
+# hay remitente. No suma ninguna crate.
+zbus = { workspace = true, features = ["p2p", "bus-impl"] }

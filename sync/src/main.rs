@@ -30,10 +30,11 @@
 //! correo y vive en `mensaje.rs`, con su propia discusión escrita arriba.
 //!
 //! Prepara además una base **cifrada** por cuenta —el almacén local de
-//! `store/`, con su estado en `ar.net.vasak.os.AccountsStore`— y guarda ahí los
-//! **contactos** de las cuentas que los piden (`contacts_sync.rs`). El correo
-//! todavía no pasa por ahí: lo que dicen los dos párrafos que siguen sigue
-//! siendo cierto hasta que pase.
+//! `store/`, publicado en `ar.net.vasak.os.AccountsStore`— y guarda ahí los
+//! **contactos** de las cuentas que los piden (`contacts_sync.rs`), que las
+//! aplicaciones leen por esa interfaz con el permiso `store.contacts`
+//! (`access.rs`). El correo todavía no pasa por ahí: lo que dicen los dos
+//! párrafos que siguen sigue siendo cierto hasta que pase.
 //!
 //! **La lista vive en memoria, no en un archivo.** Un caché en disco guardaría el
 //! remitente y el asunto de todo el correo de la persona en texto plano, para
@@ -56,6 +57,7 @@
 //! (`cola.rs`) que sobrevive a que se apague el equipo, y un despachador lo
 //! manda por SMTP (`smtp.rs`) en cuanto el servidor lo acepta.
 
+mod access;
 mod adjuntos;
 mod avisos;
 mod broker;
