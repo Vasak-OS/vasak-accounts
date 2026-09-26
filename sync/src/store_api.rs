@@ -244,7 +244,8 @@ impl<K: KeySource> StoreApi<K> {
             })
             .await
             .map_err(read_error)?;
-        contacts_read::to_capped_json(&page, 2 * contacts_read::MAX_PAGE_BYTES).map_err(read_error)
+        contacts_read::to_capped_json(&page, contacts_read::MAX_PAGE_REPLY_BYTES)
+            .map_err(read_error)
     }
 
     /// Una página de la búsqueda, con la misma forma y el mismo cursor que
@@ -288,13 +289,16 @@ impl<K: KeySource> StoreApi<K> {
                 .await
                 .map_err(read_error)?,
         };
-        contacts_read::to_capped_json(&page, 2 * contacts_read::MAX_PAGE_BYTES).map_err(read_error)
+        contacts_read::to_capped_json(&page, contacts_read::MAX_PAGE_REPLY_BYTES)
+            .map_err(read_error)
     }
 
     /// Un contacto entero, leído de su tarjeta en el momento: `{id,
     /// address_book_id, uid, display_name, emails, phones, organization,
-    /// notes, related}`, cada correo, teléfono o relación como `{label,
-    /// value}`. `null` si ya no está. Nunca la tarjeta cruda.
+    /// notes, related, truncated}`, cada correo, teléfono o relación como
+    /// `{label, value}`. `null` si ya no está. Nunca la tarjeta cruda. Uno que
+    /// no entra en 1 MiB llega recortado —sin sus últimas relaciones,
+    /// teléfonos y correos— y con `truncated: true`.
     ///
     /// Pide `store.contacts`.
     async fn get_contact(

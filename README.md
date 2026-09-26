@@ -742,7 +742,7 @@ del mismo nombre de bus. Todo contesta en JSON.
 | `ListAddressBooks(account_id)` | `store.contacts` | Las libretas: `[{id, display_name, contacts}]`. |
 | `ListContacts(account_id, address_book_id, cursor, limit)` | `store.contacts` | Una página por nombre, de todas las libretas (`""`) o de una: `{items: [{id, address_book_id, display_name, email, phone}], next_cursor}`. |
 | `SearchContacts(account_id, query, cursor, limit)` | `store.contacts` | Lo mismo, buscando por el principio de cada palabra en nombre, correos, teléfonos y organización. |
-| `GetContact(account_id, contact_id)` | `store.contacts` | Un contacto entero, leído de su vCard en el momento: `{id, address_book_id, uid, display_name, emails, phones, organization, notes, related}`, o `null`. |
+| `GetContact(account_id, contact_id)` | `store.contacts` | Un contacto entero, leído de su vCard en el momento: `{id, address_book_id, uid, display_name, emails, phones, organization, notes, related, truncated}`, o `null`. |
 | `GetStatus()` | nada | El estado, recortado según quién pregunta (abajo). |
 | `SetStoreEnabled(account_id, enabled)` | límite | Enciende o apaga. Apagar borra. |
 | `ClearStore(account_id)` | límite | Borra y, si está encendida, la vuelve a crear vacía con otra clave; los contactos se vuelven a traer ya. |
@@ -763,6 +763,19 @@ texto**: cada palabra va entre comillas al índice, así que `OR`, `NOT`, `NEAR`
 comillas, guiones o paréntesis son letras y no operadores. Una búsqueda vacía,
 de más de 256 bytes o de más de 8 palabras es `InvalidArgs`. Un contacto sin
 nada que mostrar se guarda pero no se lista.
+
+**Los topes se miden como se mandan**: una página lleva hasta 4 MiB de filas
+contadas en JSON, escapes incluidos, y se corta **antes** de la fila que no
+entra, con el cursor apuntando a ella; nunca es un error. Una fila que sola no
+entra en una página se saltea (queda anotado en el diario) y la lista sigue
+después de ella. `GetContact` contesta hasta 1 MiB: un contacto más grande —150
+valores de 4096 bytes con comillas, que el JSON escribe dobles, pasan el mega—
+llega **recortado** desde el final (primero las relaciones, después los
+teléfonos, después los correos) y con `truncated: true`; lo que falta sigue en
+el servidor. Y el parser saca de todo lo que se muestra los caracteres de
+control —que no se ven y en el JSON pesan seis bytes cada uno—; en la nota
+quedan los saltos de línea y la tabulación, y en los demás valores pasan a ser
+un espacio.
 
 **El permiso de lectura.** Por cada lectura, el nombre único de quien llama, su
 pid y su pidfd (`GetConnectionCredentials`: `ProcessID` y `ProcessFD`, que el

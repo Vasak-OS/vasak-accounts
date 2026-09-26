@@ -16,8 +16,14 @@
 //! es `InvalidArgs`, nunca «desde el principio».
 //!
 //! Una página trae como mucho [`MAX_PAGE`] contactos (0 pide
-//! [`DEFAULT_PAGE`]) y [`MAX_PAGE_BYTES`] de texto; la que se corta por tamaño
-//! trae su cursor igual. La búsqueda ordena y pagina igual que la lista.
+//! [`DEFAULT_PAGE`]) y [`MAX_PAGE_BYTES`] de JSON, **medido como se manda**:
+//! cada fila cuenta lo que ocupa serializada, escapes incluidos. La que se
+//! corta por tamaño se corta **antes** de la fila que no entra, y trae su
+//! cursor apuntando ahí; nunca es un error. Una fila que sola no entra en una
+//! página —el parser no deja armar una, pero la base puede tener datos de
+//! antes— se saltea con un aviso en el diario, y el cursor sigue después de
+//! ella: la lista nunca queda trabada. La búsqueda ordena y pagina igual que
+//! la lista.
 //!
 //! Los contactos sin nada que mostrar (`display_name = ''`) se guardan —son del
 //! servidor, y sin su ETag se volverían a pedir— pero **no se listan** ni se
@@ -46,15 +52,26 @@ pub const MAX_PAGE: u32 = 1000;
 /// Lo que trae una página si no se pide cuánto.
 pub const DEFAULT_PAGE: u32 = 100;
 
-/// El tope de texto de una página: con nombres y datos en el tope de la
-/// tarjeta, mil contactos podrían ser una docena de megas por el bus.
+/// El tope de las filas de una página, en bytes de su JSON: con nombres y
+/// datos en el tope de la tarjeta, mil contactos podrían ser una docena de
+/// megas por el bus.
 pub const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// El tope de la respuesta entera de una página: sus filas, más el sobre
+/// (`{"items":[…],"next_cursor":…}`) y el cursor, que no pasa de
+/// [`MAX_CURSOR_BYTES`]. Con las filas medidas como se mandan, una página no
+/// llega nunca: es la cuenta, no un margen.
+pub const MAX_PAGE_REPLY_BYTES: usize = MAX_PAGE_BYTES + MAX_CURSOR_BYTES + 64;
 
 /// El tope de la respuesta de un contacto entero.
 ///
-/// Los topes del parser ya lo acotan —50 correos, 50 teléfonos y 50
-/// relaciones, de hasta 4096 bytes cada valor—, así que no se llega; si
-/// algún día cambian, esto no deja pasar una respuesta desmedida.
+/// **Se puede llegar**: 50 correos, 50 teléfonos y 50 relaciones de hasta
+/// 4096 bytes cada valor son 600 KiB de texto, y con comillas o barras —que el
+/// JSON escribe dobles— pasan el mega. Un contacto que no entra se devuelve
+/// **recortado**, con `truncated: true`: se sacan del final las relaciones,
+/// después los teléfonos y después los correos, hasta que entra. Nunca es un
+/// error: un contacto que no se pudiera abrir nunca sería peor que uno al que
+/// le faltan los últimos datos, que siguen en el servidor.
 pub const MAX_CONTACT_BYTES: usize = 1024 * 1024;
 
 /// El largo máximo de una búsqueda, en bytes.
@@ -63,9 +80,16 @@ pub const MAX_QUERY_BYTES: usize = 256;
 /// Cuántas palabras puede tener una búsqueda.
 pub const MAX_QUERY_TERMS: usize = 8;
 
-/// El largo máximo de un cursor: la clave de orden entra en el tope de un valor
-/// de la tarjeta, con margen para el base64.
-const MAX_CURSOR_BYTES: usize = 16 * 1024;
+/// El largo máximo de un cursor.
+///
+/// La clave de orden sale del nombre, que el parser corta a 4096 bytes más
+/// «…»; en minúsculas crece como mucho la mitad. En el JSON del cursor, lo que
+/// más crece es un carácter de control: seis bytes (`\u0001`). El parser ya
+/// no los deja pasar, pero una base escrita antes puede tenerlos, así que la
+/// cuenta es con ellos: 4099 × 6 más el identificador, en base64, son unos
+/// 33 KiB. Con 16 KiB el cursor de una fila así no se podía volver a leer, y
+/// la lista no pasaba de esa página.
+pub const MAX_CURSOR_BYTES: usize = 64 * 1024;
 
 /// Un argumento que no se puede usar. El texto es fijo y dice cuál.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,6 +238,9 @@ pub struct ContactDetail {
     pub organization: String,
     pub notes: String,
     pub related: Vec<Field>,
+    /// Si no entraba en [`MAX_CONTACT_BYTES`] y se le sacaron datos del
+    /// final: relaciones, después teléfonos, después correos.
+    pub truncated: bool,
 }
 
 /// Las libretas, por nombre.
@@ -312,10 +339,14 @@ fn page(
         .map_err(classify)?;
 
     let mut items = Vec::new();
+    // La última fila que se miró, se haya entregado o salteado: de ahí sigue
+    // la página siguiente.
     let mut last: Option<Cursor> = None;
     let mut bytes = 0usize;
     let mut more = false;
+    let mut fetched = 0usize;
     while let Some(row) = rows.next().map_err(classify)? {
+        fetched += 1;
         let summary = ContactSummary {
             id: row.get::<_, i64>(0).map_err(classify)?.to_string(),
             address_book_id: row.get::<_, i64>(1).map_err(classify)?.to_string(),
@@ -323,20 +354,39 @@ fn page(
             email: row.get(4).map_err(classify)?,
             phone: row.get(5).map_err(classify)?,
         };
-        let size = summary.display_name.len()
-            + summary.email.as_ref().map_or(0, String::len)
-            + summary.phone.as_ref().map_or(0, String::len)
-            + 128;
-        if items.len() == limit || (!items.is_empty() && bytes + size > byte_cap) {
+        // Lo que cuesta en la respuesta: su JSON, escapes incluidos, y la coma
+        // que la separa de la siguiente. Contar los bytes crudos dejaba pasar
+        // una página de controles —seis bytes cada uno en el JSON— que después
+        // no entraba en la respuesta.
+        let size = serde_json::to_string(&summary)
+            .map_or(usize::MAX, |json| json.len())
+            .saturating_add(1);
+        if items.len() == limit || (!items.is_empty() && bytes.saturating_add(size) > byte_cap) {
             more = true;
             break;
         }
-        bytes += size;
-        last = Some(Cursor {
+        let position = Cursor {
             sort_key: row.get(3).map_err(classify)?,
             id: row.get(0).map_err(classify)?,
-        });
+        };
+        if size > byte_cap {
+            // Sola no entra en ninguna página: se saltea, y la siguiente
+            // empieza después de ella.
+            tracing::warn!(
+                "un contacto no entra en una página ({size} bytes) y no se lista; \
+                 GetContact lo devuelve recortado"
+            );
+            last = Some(position);
+            continue;
+        }
+        bytes += size;
+        last = Some(position);
         items.push(summary);
+    }
+    // Se miraron todas las pedidas más una sin cortar: hubo filas salteadas,
+    // y puede haber más después.
+    if fetched > limit {
+        more = true;
     }
     Ok(Page {
         items,
@@ -362,17 +412,51 @@ pub fn get_contact(connection: &Connection, id: i64) -> Result<Option<ContactDet
     let Some(contact) = vcard::contact_from(&raw, "") else {
         return Ok(None);
     };
-    Ok(Some(ContactDetail {
-        id: id.to_string(),
-        address_book_id: address_book_id.to_string(),
-        uid: contact.uid,
-        display_name: contact.display_name,
-        emails: contact.emails,
-        phones: contact.phones,
-        organization: contact.organization,
-        notes: contact.notes,
-        related: contact.related,
-    }))
+    Ok(Some(fit_contact(
+        ContactDetail {
+            id: id.to_string(),
+            address_book_id: address_book_id.to_string(),
+            uid: contact.uid,
+            display_name: contact.display_name,
+            emails: contact.emails,
+            phones: contact.phones,
+            organization: contact.organization,
+            notes: contact.notes,
+            related: contact.related,
+            truncated: false,
+        },
+        MAX_CONTACT_BYTES,
+    )))
+}
+
+/// Cuánto ocupa algo en JSON.
+fn json_len<T: Serialize>(value: &T) -> usize {
+    serde_json::to_string(value).map_or(usize::MAX, |json| json.len())
+}
+
+/// Un contacto que entra en `cap` bytes de JSON: entero si entra, y si no,
+/// sin sus últimas relaciones, después sin sus últimos teléfonos y después
+/// sin sus últimos correos, con `truncated`. Lo que queda —nombre,
+/// organización, nota, de a 4096 bytes— entra siempre.
+fn fit_contact(mut contact: ContactDetail, cap: usize) -> ContactDetail {
+    if json_len(&contact) <= cap {
+        return contact;
+    }
+    contact.truncated = true;
+    let mut size = json_len(&contact);
+    for kind in 0..3 {
+        let fields = match kind {
+            0 => &mut contact.related,
+            1 => &mut contact.phones,
+            _ => &mut contact.emails,
+        };
+        while size > cap {
+            let Some(field) = fields.pop() else { break };
+            // El elemento y, si no era el único, la coma que lo separaba.
+            size = size.saturating_sub(json_len(&field) + usize::from(!fields.is_empty()));
+        }
+    }
+    contact
 }
 
 /// Lo que se contesta por el bus, en JSON, sin pasar de `cap` bytes.
@@ -576,6 +660,89 @@ mod tests {
         let small = page(store.connection(), None, None, None, 1000, 600).unwrap();
         assert!(small.items.len() < 10 && !small.items.is_empty());
         assert!(small.next_cursor.is_some());
+    }
+
+    /// Una fila como las que podía guardar el parser de antes: el nombre y
+    /// la clave de orden llenos de caracteres de control, que en el JSON
+    /// pesan seis bytes cada uno.
+    fn stored_before_the_fix(n: usize) -> Box<ContactRow> {
+        let mut row = named(n, "x");
+        let name = format!("{n:04}{}", "\u{1}".repeat(4000));
+        row.contact.display_name = name.clone();
+        row.contact.sort_name = name;
+        row
+    }
+
+    /// Las páginas se miden como se mandan: 400 filas de 4 KB de controles
+    /// son 9,6 MB de JSON. Contando los bytes crudos entraban todas en una
+    /// página que después no pasaba el tope de la respuesta, y la lista no
+    /// avanzaba. Ahora cada página entra, y el cursor —también lleno de
+    /// controles— se vuelve a leer hasta el final.
+    #[test]
+    fn una_pagina_con_controles_en_los_nombres_no_pasa_el_tope_del_json() {
+        let temp = TempDir::new("pagina-controles");
+        let mut store = open_store(&temp);
+        let b = book(&mut store, "https://x/a/", "A");
+        add(
+            &mut store,
+            &b,
+            (0..400).map(stored_before_the_fix).collect(),
+        );
+
+        let mut seen = Vec::new();
+        let mut cursor: Option<Cursor> = None;
+        let mut pages = 0;
+        loop {
+            pages += 1;
+            assert!(pages < 50, "la lista no termina");
+            let page = list_contacts(store.connection(), None, cursor.as_ref(), 1000).unwrap();
+            assert!(!page.items.is_empty(), "una página vacía antes del final");
+            assert!(
+                to_capped_json(&page, MAX_PAGE_REPLY_BYTES).is_ok(),
+                "la página {pages} no entra en la respuesta"
+            );
+            seen.extend(page.items.into_iter().map(|c| c.id));
+            let Some(next) = page.next_cursor else { break };
+            assert!(
+                Cursor::decode(&next).is_ok(),
+                "el cursor de la página {pages} no se puede volver a leer"
+            );
+            cursor = Cursor::decode(&next).unwrap();
+        }
+        assert!(pages > 1, "tenía que cortarse por tamaño");
+        let unique: std::collections::BTreeSet<&String> = seen.iter().collect();
+        assert_eq!((seen.len(), unique.len()), (400, 400));
+    }
+
+    /// Una fila que sola no entra en una página se saltea, y la lista sigue
+    /// después de ella: ni un error, ni una página que vuelve siempre igual.
+    #[test]
+    fn una_fila_que_sola_no_entra_se_saltea_y_la_lista_sigue() {
+        let temp = TempDir::new("pagina-fila-grande");
+        let mut store = open_store(&temp);
+        let b = book(&mut store, "https://x/a/", "A");
+        add(
+            &mut store,
+            &b,
+            vec![
+                named(0, "C 0"),
+                named(1, "C 1"),
+                named(2, &format!("C 2 {}", "x".repeat(2000))),
+                named(3, "C 3"),
+                named(4, "C 4"),
+            ],
+        );
+        let mut seen = Vec::new();
+        let mut cursor: Option<Cursor> = None;
+        for _ in 0..10 {
+            let page = page(store.connection(), None, None, cursor.as_ref(), 1000, 600).unwrap();
+            seen.extend(page.items.into_iter().map(|c| c.display_name));
+            match page.next_cursor {
+                Some(next) => cursor = Cursor::decode(&next).unwrap(),
+                None => break,
+            }
+        }
+        assert_eq!(seen, vec!["C 0", "C 1", "C 3", "C 4"]);
     }
 
     #[test]
@@ -813,6 +980,95 @@ mod tests {
             "ni la dirección en el servidor"
         );
         assert_eq!(get_contact(store.connection(), id + 1000).unwrap(), None);
+    }
+
+    fn add_raw(store: &mut Store, book: &StoredAddressBook, raw: &str) -> i64 {
+        add(
+            store,
+            book,
+            vec![Box::new(ContactRow {
+                href: "https://x/a/grande.vcf".into(),
+                etag: None,
+                contact: vcard::contact_from(raw, "https://x/a/grande.vcf").unwrap(),
+                raw_vcard: raw.into(),
+            })],
+        );
+        parse_id(
+            &list_contacts(store.connection(), None, None, 1)
+                .unwrap()
+                .items[0]
+                .id,
+        )
+        .unwrap()
+    }
+
+    /// Una tarjeta de 450 KB —menos que el tope de una tarjeta— con 150
+    /// valores de 3000 caracteres de control: en el JSON eran 2,7 MB y
+    /// `GetContact` no contestaba nunca. Sin los controles, entra entera.
+    #[test]
+    fn un_contacto_con_controles_se_devuelve_entero() {
+        let temp = TempDir::new("contacto-controles");
+        let mut store = open_store(&temp);
+        let b = book(&mut store, "https://x/a/", "A");
+        let noise = "\u{1}".repeat(3000);
+        let mut raw = String::from("BEGIN:VCARD\r\nFN:Ana\r\n");
+        for n in 0..50 {
+            raw.push_str(&format!("EMAIL:a{n}{noise}@x.com\r\n"));
+            raw.push_str(&format!("TEL:+54 {n}{noise}\r\n"));
+            raw.push_str(&format!("RELATED:text:Juan {n}{noise}\r\n"));
+        }
+        raw.push_str("END:VCARD");
+        assert!(raw.len() < 512 * 1024);
+        let id = add_raw(&mut store, &b, &raw);
+
+        let contact = get_contact(store.connection(), id).unwrap().unwrap();
+        assert!(!contact.truncated, "tenía que entrar entero");
+        assert_eq!(contact.emails.len(), 50);
+        assert_eq!(contact.emails[7].value, "a7@x.com");
+        assert!(to_capped_json(&contact, MAX_CONTACT_BYTES).is_ok());
+    }
+
+    /// Un contacto que no entra en 1 MiB de JSON —150 valores de 4000
+    /// comillas, que el JSON escribe dobles— llega recortado desde el final,
+    /// con `truncated`, y nunca como error.
+    #[test]
+    fn un_contacto_que_no_entra_se_devuelve_recortado() {
+        let temp = TempDir::new("contacto-recortado");
+        let mut store = open_store(&temp);
+        let b = book(&mut store, "https://x/a/", "A");
+        let quotes = "\"".repeat(4000);
+        let mut raw = String::from("BEGIN:VCARD\r\nFN:Ana\r\nNOTE:una nota\r\n");
+        for n in 0..50 {
+            raw.push_str(&format!("EMAIL:a{n}{quotes}\r\n"));
+            raw.push_str(&format!("TEL:{n}{quotes}\r\n"));
+            raw.push_str(&format!("RELATED:text:{n}{quotes}\r\n"));
+        }
+        raw.push_str("END:VCARD");
+        let id = add_raw(&mut store, &b, &raw);
+
+        let contact = get_contact(store.connection(), id).unwrap().unwrap();
+        assert!(contact.truncated);
+        let json = to_capped_json(&contact, MAX_CONTACT_BYTES);
+        assert!(json.is_ok(), "el contacto recortado tenía que entrar");
+        assert!(json.unwrap().contains("\"truncated\":true"));
+        assert_eq!(contact.display_name, "Ana");
+        assert_eq!(contact.notes, "una nota");
+        assert_eq!(
+            contact.emails.len(),
+            50,
+            "los correos, lo último que se saca"
+        );
+        assert_eq!(contact.phones.len(), 50);
+        assert!(
+            contact.related.len() < 50,
+            "se sacan primero las relaciones"
+        );
+        let kept_in_order = contact.related.iter().enumerate().all(|(n, r)| {
+            r.value
+                .trim_start_matches("text:")
+                .starts_with(&format!("{n}\""))
+        });
+        assert!(kept_in_order, "se sacan del final");
     }
 
     #[test]
