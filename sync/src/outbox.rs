@@ -190,14 +190,251 @@ pub fn outbox_dir() -> PathBuf {
 }
 
 /// La misma decisión sin leer el entorno, para poder probarla.
-///
+fn outbox_dir_under(base: Option<PathBuf>) -> PathBuf {
+    app_data_dir_under(base).join(OUTBOX_DIR)
+}
+
+/// La carpeta del servicio en los datos del usuario, de donde cuelga la cola.
+pub fn app_data_dir() -> PathBuf {
+    app_data_dir_under(dirs::data_dir())
+}
+
 /// Sin base absoluta, `/tmp`: perder un correo sin mandar es peor que dejarlo
 /// ahí, en 0600. (El almacén no tiene repuesto, ver `store/paths.rs`.)
-fn outbox_dir_under(base: Option<PathBuf>) -> PathBuf {
+fn app_data_dir_under(base: Option<PathBuf>) -> PathBuf {
     crate::xdg::absolute_base(base)
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join(crate::xdg::APP_DIR)
-        .join("salientes")
+}
+
+/// La carpeta de la cola, dentro de la del servicio.
+const OUTBOX_DIR: &str = "outbox";
+
+/// Donde vivía la cola hasta la 0.16.0.
+const LEGACY_OUTBOX_DIR: &str = "salientes";
+
+/// Qué hizo la mudanza de `salientes/` a `outbox/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Migration {
+    /// No había `salientes/`: no hay nada que mudar.
+    NothingToMove,
+    /// `outbox/` no estaba y `salientes/` pasó entera, de un solo renombre.
+    Renamed,
+    /// Estaban las dos. Pasaron los archivos que no chocaban con uno de
+    /// `outbox/`; los que chocaban —o no eran archivos— siguen en
+    /// `salientes/`, con sus nombres acá. `salientes/` se borró sólo si quedó
+    /// vacía.
+    Merged { moved: usize, kept: Vec<String> },
+}
+
+/// Muda la cola de `salientes/` a `outbox/`, al arrancar.
+///
+/// Hasta la 0.16.0 la cola vivía en `$XDG_DATA_HOME/vasak-accounts-sync/
+/// salientes/`. Un mensaje que quedó ahí sin salir lo escribió alguien, y
+/// tiene que salir igual después de actualizar: por eso se muda la carpeta y
+/// no se cambia sólo la ruta.
+///
+/// - Si `outbox/` no está, `salientes/` se renombra entera, que es atómico: o
+///   pasa todo o no pasa nada.
+/// - **Si están las dos** —se volvió a una versión anterior y se la usó, o se
+///   restauró una copia de seguridad— no se pisa nada. Cada archivo pasa de
+///   una a otra con `renameat2(RENAME_NOREPLACE)`, que falla en vez de
+///   reemplazar; uno que ya existe en `outbox/` con el mismo nombre se queda en
+///   `salientes/`, y se dice en el diario. Los nombres son el identificador del
+///   mensaje, que empieza con la hora en microsegundos: dos iguales son el
+///   mismo mensaje, y el de `outbox/` es el que la versión de ahora ya estuvo
+///   intentando. `salientes/` se borra sólo si quedó vacía.
+/// - **Ningún enlace simbólico se sigue**: ni `vasak-accounts-sync/`, ni
+///   `salientes/`, ni `outbox/`, ni lo que hay adentro. Todo se hace relativo a
+///   descriptores abiertos con `O_NOFOLLOW`, como la poda del almacén; lo de
+///   más arriba —la `XDG_DATA_HOME` de la persona— sí se sigue, porque es suyo.
+///   Un enlace en cualquiera de las dos carpetas es un error y no se toca nada.
+/// - Sólo se mueve lo que es **de esta persona**: la carpeta vieja, la nueva y
+///   cada archivo tienen que ser suyos. En `/tmp` —el repuesto sin base
+///   absoluta— otra cuenta del equipo podría haber dejado una `salientes/`
+///   propia, y mudarla sería mandar correo que escribió otro.
+/// - `outbox/` queda en 0700, como la deja `Outbox::open`.
+///
+/// Un error no borra nada ni tiene que impedir que arranque el servicio: quien
+/// llama lo anota y sigue, y lo que haya quedado en `salientes/` espera ahí.
+pub fn migrate_legacy_outbox(app_dir: &Path) -> Result<Migration, String> {
+    use rustix::fs::{AtFlags, FileType, Mode, RenameFlags, CWD};
+    use rustix::io::Errno;
+
+    use crate::store::paths::{open_dir_at, read_entries};
+
+    let shown = |name: &str| app_dir.join(name).display().to_string();
+    let errno = |what: &str, name: &str, e: Errno| {
+        format!(
+            "no se pudo {what} {}: {}",
+            shown(name),
+            std::io::Error::from(e)
+        )
+    };
+    let not_ours = |name: &str| format!("{} no es de esta cuenta; no se muda la cola", shown(name));
+    let me = rustix::process::getuid();
+    let owned = |stat: &rustix::fs::Stat| rustix::process::Uid::from_raw(stat.st_uid) == me;
+
+    let app_fd = match open_dir_at(CWD, app_dir) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(Migration::NothingToMove),
+        Err(Errno::LOOP) | Err(Errno::NOTDIR) => {
+            return Err(format!(
+                "{} es un enlace simbólico o no es una carpeta; no se muda la cola",
+                app_dir.display()
+            ))
+        }
+        Err(e) => return Err(errno("abrir", "", e)),
+    };
+
+    let legacy = match rustix::fs::statat(&app_fd, LEGACY_OUTBOX_DIR, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(Errno::NOENT) => return Ok(Migration::NothingToMove),
+        Err(e) => return Err(errno("mirar", LEGACY_OUTBOX_DIR, e)),
+    };
+    if FileType::from_raw_mode(legacy.st_mode) != FileType::Directory {
+        return Err(format!(
+            "{} es un enlace simbólico o no es una carpeta; no se muda la cola",
+            shown(LEGACY_OUTBOX_DIR)
+        ));
+    }
+    if !owned(&legacy) {
+        return Err(not_ours(LEGACY_OUTBOX_DIR));
+    }
+
+    let close_outbox = |app_fd: &std::os::fd::OwnedFd| -> Result<(), String> {
+        let outbox = open_dir_at(app_fd, OUTBOX_DIR).map_err(|e| errno("abrir", OUTBOX_DIR, e))?;
+        rustix::fs::fchmod(&outbox, Mode::from_raw_mode(0o700))
+            .map_err(|e| errno("cerrar el acceso a", OUTBOX_DIR, e))?;
+        rustix::fs::fsync(&outbox).map_err(|e| errno("asegurar en el disco", OUTBOX_DIR, e))?;
+        rustix::fs::fsync(app_fd).map_err(|e| errno("asegurar en el disco", "", e))
+    };
+
+    match rustix::fs::statat(&app_fd, OUTBOX_DIR, AtFlags::SYMLINK_NOFOLLOW) {
+        Err(Errno::NOENT) => {
+            let renamed = match rustix::fs::renameat_with(
+                &app_fd,
+                LEGACY_OUTBOX_DIR,
+                &app_fd,
+                OUTBOX_DIR,
+                RenameFlags::NOREPLACE,
+            ) {
+                // Un sistema de archivos que no conoce la bandera: el renombre
+                // de siempre sirve igual, porque una carpeta sólo reemplaza a
+                // otra **vacía**, y una con algo adentro lo hace fallar.
+                Err(Errno::INVAL) | Err(Errno::NOSYS) => {
+                    rustix::fs::renameat(&app_fd, LEGACY_OUTBOX_DIR, &app_fd, OUTBOX_DIR)
+                }
+                other => other,
+            };
+            match renamed {
+                Ok(()) => {
+                    close_outbox(&app_fd)?;
+                    return Ok(Migration::Renamed);
+                }
+                // Apareció `outbox/` entre la mirada y el renombre: se juntan.
+                Err(Errno::EXIST) | Err(Errno::NOTEMPTY) => {}
+                Err(e) => return Err(errno("renombrar", LEGACY_OUTBOX_DIR, e)),
+            }
+        }
+        Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::Directory => {}
+        Ok(_) => {
+            return Err(format!(
+                "{} es un enlace simbólico o no es una carpeta; no se muda la cola",
+                shown(OUTBOX_DIR)
+            ))
+        }
+        Err(e) => return Err(errno("mirar", OUTBOX_DIR, e)),
+    }
+
+    // Las dos existen: archivo por archivo, sin pisar ninguno.
+    let old_fd = open_dir_at(&app_fd, LEGACY_OUTBOX_DIR)
+        .map_err(|e| errno("abrir", LEGACY_OUTBOX_DIR, e))?;
+    let new_fd = open_dir_at(&app_fd, OUTBOX_DIR).map_err(|e| errno("abrir", OUTBOX_DIR, e))?;
+    // Otra vez, sobre lo que quedó abierto: lo que se miró antes por el nombre
+    // lo pudo haber cambiado otro entre medio.
+    let old_stat = rustix::fs::fstat(&old_fd).map_err(|e| errno("mirar", LEGACY_OUTBOX_DIR, e))?;
+    if !owned(&old_stat) {
+        return Err(not_ours(LEGACY_OUTBOX_DIR));
+    }
+    let new_stat = rustix::fs::fstat(&new_fd).map_err(|e| errno("mirar", OUTBOX_DIR, e))?;
+    if !owned(&new_stat) {
+        return Err(not_ours(OUTBOX_DIR));
+    }
+
+    let entries = read_entries(&old_fd).map_err(|e| errno("leer", LEGACY_OUTBOX_DIR, e))?;
+    let mut moved = 0;
+    let mut kept = Vec::new();
+    for (name, kind) in entries {
+        let file_name = name.to_string_lossy().into_owned();
+        let is_ours = rustix::fs::statat(&old_fd, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+            .is_ok_and(|stat| owned(&stat));
+        if kind != FileType::RegularFile || !is_ours {
+            tracing::warn!(
+                "{file_name} no es un archivo de esta cuenta; se queda en {}",
+                shown(LEGACY_OUTBOX_DIR)
+            );
+            kept.push(file_name);
+            continue;
+        }
+        match move_without_replacing(&old_fd, &new_fd, name.as_c_str()) {
+            Ok(()) => moved += 1,
+            Err(Errno::EXIST) => {
+                tracing::warn!(
+                    "{file_name} ya está en {}; el de {} se queda donde está",
+                    shown(OUTBOX_DIR),
+                    shown(LEGACY_OUTBOX_DIR)
+                );
+                kept.push(file_name);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "no se pudo mover {file_name} a {}: {}; se queda en {}",
+                    shown(OUTBOX_DIR),
+                    std::io::Error::from(e),
+                    shown(LEGACY_OUTBOX_DIR)
+                );
+                kept.push(file_name);
+            }
+        }
+    }
+    rustix::fs::fsync(&old_fd).map_err(|e| errno("asegurar en el disco", LEGACY_OUTBOX_DIR, e))?;
+    drop(old_fd);
+    drop(new_fd);
+    close_outbox(&app_fd)?;
+
+    if kept.is_empty() {
+        match rustix::fs::unlinkat(&app_fd, LEGACY_OUTBOX_DIR, AtFlags::REMOVEDIR) {
+            // Ganó algo entre medio: se queda, con eso adentro.
+            Ok(()) | Err(Errno::NOTEMPTY) | Err(Errno::EXIST) | Err(Errno::NOENT) => {}
+            Err(e) => return Err(errno("borrar", LEGACY_OUTBOX_DIR, e)),
+        }
+        rustix::fs::fsync(&app_fd).map_err(|e| errno("asegurar en el disco", "", e))?;
+    }
+
+    Ok(Migration::Merged { moved, kept })
+}
+
+/// Mueve un archivo de una carpeta a otra **sin reemplazar** uno que ya esté.
+///
+/// `renameat2(RENAME_NOREPLACE)`; en un sistema de archivos que no conoce la
+/// bandera, un enlace duro nuevo —que tampoco reemplaza: falla con `EEXIST`— y
+/// después se borra el viejo. Nunca el renombre de siempre, que pisaría.
+fn move_without_replacing(
+    from: &std::os::fd::OwnedFd,
+    to: &std::os::fd::OwnedFd,
+    name: &std::ffi::CStr,
+) -> rustix::io::Result<()> {
+    use rustix::fs::{AtFlags, RenameFlags};
+    use rustix::io::Errno;
+
+    match rustix::fs::renameat_with(from, name, to, name, RenameFlags::NOREPLACE) {
+        Err(Errno::INVAL) | Err(Errno::NOSYS) => {
+            rustix::fs::linkat(from, name, to, name, AtFlags::empty())?;
+            rustix::fs::unlinkat(from, name, AtFlags::empty())
+        }
+        other => other,
+    }
 }
 
 /// La cola en el disco.
@@ -721,7 +958,7 @@ mod tests {
     fn la_cola_cuelga_del_directorio_de_datos() {
         assert_eq!(
             outbox_dir_under(Some(PathBuf::from("/home/pato/.local/share"))),
-            PathBuf::from("/home/pato/.local/share/vasak-accounts-sync/salientes")
+            PathBuf::from("/home/pato/.local/share/vasak-accounts-sync/outbox")
         );
     }
 
@@ -737,7 +974,7 @@ mod tests {
         for relative in ["", "datos", "./datos", "../datos"] {
             assert_eq!(
                 outbox_dir_under(Some(PathBuf::from(relative))),
-                PathBuf::from("/tmp/vasak-accounts-sync/salientes"),
+                PathBuf::from("/tmp/vasak-accounts-sync/outbox"),
                 "una base de {relative:?} no tiene que usarse"
             );
         }
@@ -885,5 +1122,316 @@ mod tests {
         );
         let ids: Vec<&str> = ready.iter().map(|o| o.id.as_str()).collect();
         assert_eq!(ids, ["0001", "0005"]);
+    }
+
+    // ── La mudanza de `salientes/` a `outbox/` ──────────────────────────────
+
+    use crate::store::paths::tests::TempDir;
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    /// Una carpeta del servicio con `salientes/` en 0700, como la dejaba la
+    /// versión anterior, y los archivos que se le pidan en 0600.
+    fn legacy_app_dir(label: &str, files: &[(&str, &str)]) -> TempDir {
+        let temp = TempDir::new(label);
+        let legacy = temp.0.join(LEGACY_OUTBOX_DIR);
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for (name, content) in files {
+            std::fs::write(legacy.join(name), content).unwrap();
+            std::fs::set_permissions(legacy.join(name), std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+        temp
+    }
+
+    /// Lo de siempre: sólo está la vieja, y pasa entera de un renombre.
+    #[test]
+    fn la_cola_vieja_pasa_entera_de_un_renombre() {
+        let temp = legacy_app_dir(
+            "mudanza-simple",
+            &[("0001.json", "uno"), (".0002.tmp", "x")],
+        );
+        // Abierta de más, como la podía dejar una copia de seguridad: la nueva
+        // queda en 0700.
+        std::fs::set_permissions(
+            temp.0.join(LEGACY_OUTBOX_DIR),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        assert_eq!(migrate_legacy_outbox(&temp.0), Ok(Migration::Renamed));
+
+        let outbox = temp.0.join(OUTBOX_DIR);
+        assert_eq!(
+            std::fs::read_to_string(outbox.join("0001.json")).unwrap(),
+            "uno"
+        );
+        assert!(outbox.join(".0002.tmp").exists());
+        assert!(!temp.0.join(LEGACY_OUTBOX_DIR).exists());
+        assert_eq!(mode_of(&outbox), 0o700);
+        assert_eq!(mode_of(&outbox.join("0001.json")), 0o600);
+
+        // Y la segunda vez no hay nada que hacer.
+        assert_eq!(migrate_legacy_outbox(&temp.0), Ok(Migration::NothingToMove));
+    }
+
+    /// Las dos existen: pasa lo que no choca, lo que choca se queda en la vieja
+    /// sin tocar la nueva, y la vieja no se borra porque no quedó vacía.
+    #[test]
+    fn si_estan_las_dos_no_se_pisa_nada() {
+        let temp = legacy_app_dir(
+            "mudanza-doble",
+            &[("0001.json", "el de antes"), ("0002.json", "dos")],
+        );
+        let outbox = temp.0.join(OUTBOX_DIR);
+        std::fs::create_dir(&outbox).unwrap();
+        std::fs::write(outbox.join("0001.json"), "el de ahora").unwrap();
+
+        assert_eq!(
+            migrate_legacy_outbox(&temp.0),
+            Ok(Migration::Merged {
+                moved: 1,
+                kept: vec!["0001.json".into()]
+            })
+        );
+
+        let legacy = temp.0.join(LEGACY_OUTBOX_DIR);
+        assert_eq!(
+            std::fs::read_to_string(outbox.join("0001.json")).unwrap(),
+            "el de ahora"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outbox.join("0002.json")).unwrap(),
+            "dos"
+        );
+        assert_eq!(
+            std::fs::read_to_string(legacy.join("0001.json")).unwrap(),
+            "el de antes"
+        );
+        assert!(!legacy.join("0002.json").exists());
+        assert_eq!(mode_of(&outbox), 0o700);
+    }
+
+    /// Las dos existen y nada choca: pasa todo y la vieja se va, vacía.
+    #[test]
+    fn si_estan_las_dos_y_nada_choca_la_vieja_se_va() {
+        let temp = legacy_app_dir(
+            "mudanza-junta",
+            &[("0002.json", "dos"), ("0003.json", "tres")],
+        );
+        let outbox = temp.0.join(OUTBOX_DIR);
+        std::fs::create_dir(&outbox).unwrap();
+        std::fs::write(outbox.join("0001.json"), "uno").unwrap();
+
+        assert_eq!(
+            migrate_legacy_outbox(&temp.0),
+            Ok(Migration::Merged {
+                moved: 2,
+                kept: Vec::new()
+            })
+        );
+        assert!(!temp.0.join(LEGACY_OUTBOX_DIR).exists());
+        let mut names: Vec<String> = std::fs::read_dir(&outbox)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["0001.json", "0002.json", "0003.json"]);
+    }
+
+    /// Lo que no es un archivo —una carpeta, un enlace— no se mueve, y por eso
+    /// la vieja no queda vacía y no se borra.
+    #[test]
+    fn lo_que_no_es_un_archivo_se_queda_en_la_vieja() {
+        let temp = legacy_app_dir("mudanza-rara", &[("0002.json", "dos")]);
+        let legacy = temp.0.join(LEGACY_OUTBOX_DIR);
+        let elsewhere = temp.0.join("Documentos");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("carta.json"), "ajena").unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("carta.json"), legacy.join("0003.json")).unwrap();
+        std::fs::create_dir(legacy.join("sub")).unwrap();
+        std::fs::create_dir(temp.0.join(OUTBOX_DIR)).unwrap();
+
+        let Ok(Migration::Merged { moved, mut kept }) = migrate_legacy_outbox(&temp.0) else {
+            panic!("tenía que juntarlas");
+        };
+        kept.sort();
+        assert_eq!(moved, 1);
+        assert_eq!(kept, ["0003.json", "sub"]);
+        assert!(std::fs::symlink_metadata(legacy.join("0003.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!temp.0.join(OUTBOX_DIR).join("0003.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(elsewhere.join("carta.json")).unwrap(),
+            "ajena"
+        );
+    }
+
+    /// Sin la vieja no hay nada que hacer, esté o no la nueva, y esté o no la
+    /// carpeta del servicio.
+    #[test]
+    fn sin_la_carpeta_vieja_no_se_hace_nada() {
+        let temp = TempDir::new("mudanza-nada");
+        assert_eq!(
+            migrate_legacy_outbox(&temp.0.join("no-existe")),
+            Ok(Migration::NothingToMove)
+        );
+        assert_eq!(migrate_legacy_outbox(&temp.0), Ok(Migration::NothingToMove));
+        assert!(!temp.0.join(OUTBOX_DIR).exists(), "no se crea nada");
+
+        std::fs::create_dir(temp.0.join(OUTBOX_DIR)).unwrap();
+        std::fs::write(temp.0.join(OUTBOX_DIR).join("0001.json"), "uno").unwrap();
+        assert_eq!(migrate_legacy_outbox(&temp.0), Ok(Migration::NothingToMove));
+        assert_eq!(
+            std::fs::read_to_string(temp.0.join(OUTBOX_DIR).join("0001.json")).unwrap(),
+            "uno"
+        );
+    }
+
+    /// Un enlace en lugar de cualquiera de las carpetas no se sigue: es un
+    /// error, y no se mueve ni se borra nada de ningún lado.
+    #[test]
+    fn un_enlace_en_lugar_de_una_carpeta_no_se_sigue() {
+        // `salientes/` es un enlace.
+        let temp = TempDir::new("mudanza-enlace-vieja");
+        let elsewhere = temp.0.join("Documentos");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("0001.json"), "ajeno").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, temp.0.join(LEGACY_OUTBOX_DIR)).unwrap();
+        assert!(migrate_legacy_outbox(&temp.0).is_err());
+        assert!(!temp.0.join(OUTBOX_DIR).exists());
+        assert!(std::fs::symlink_metadata(temp.0.join(LEGACY_OUTBOX_DIR))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(elsewhere.join("0001.json").exists());
+
+        // `outbox/` es un enlace.
+        let temp = legacy_app_dir("mudanza-enlace-nueva", &[("0001.json", "uno")]);
+        let elsewhere = temp.0.join("Documentos");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, temp.0.join(OUTBOX_DIR)).unwrap();
+        assert!(migrate_legacy_outbox(&temp.0).is_err());
+        assert!(temp.0.join(LEGACY_OUTBOX_DIR).join("0001.json").exists());
+        assert!(!elsewhere.join("0001.json").exists());
+
+        // La carpeta del servicio es un enlace.
+        let temp = TempDir::new("mudanza-enlace-servicio");
+        let real = legacy_app_dir("mudanza-enlace-real", &[("0001.json", "uno")]);
+        let linked = temp.0.join("vasak-accounts-sync");
+        std::os::unix::fs::symlink(&real.0, &linked).unwrap();
+        assert!(migrate_legacy_outbox(&linked).is_err());
+        assert!(real.0.join(LEGACY_OUTBOX_DIR).join("0001.json").exists());
+        assert!(!real.0.join(OUTBOX_DIR).exists());
+    }
+
+    /// **Lo que importa de la mudanza.** Un mensaje que la versión anterior
+    /// encoló en `salientes/` —con su formato, las claves en español— aparece
+    /// en la lista de salida después de mudar y es de los que el despachador
+    /// toma en la vuelta siguiente, entero.
+    #[test]
+    fn un_mensaje_encolado_en_la_ruta_vieja_sobrevive_y_sale() {
+        // Tal cual lo escribía la 0.16.0: `to_vec_pretty` de su `Salida`.
+        let written_by_0_16_0 = r#"{
+  "id": "00063f0a5b1c2d3e-00000007",
+  "account_id": "7f3a",
+  "borrador": {
+    "de": "ana@ejemplo.com",
+    "nombre": "Ana",
+    "para": [
+      "juan@otro.com"
+    ],
+    "cc": [],
+    "asunto": "La factura",
+    "cuerpo": "Va adjunta.",
+    "en_respuesta_a": "",
+    "referencias": [],
+    "adjuntos": []
+  },
+  "identificador": "<1757500000000000.0000000000000007@ejemplo.com>",
+  "fecha": "Thu, 10 Sep 2026 12:00:00 +0000",
+  "intentos": 0,
+  "estado": "pendiente",
+  "ultimo_error": "",
+  "programado_para": "",
+  "proximo_intento": ""
+}"#;
+        let temp = legacy_app_dir(
+            "mudanza-mensaje",
+            &[("00063f0a5b1c2d3e-00000007.json", written_by_0_16_0)],
+        );
+
+        assert_eq!(migrate_legacy_outbox(&temp.0), Ok(Migration::Renamed));
+
+        let queued = Outbox::open(temp.0.join(OUTBOX_DIR))
+            .unwrap()
+            .all()
+            .unwrap();
+        assert_eq!(queued.len(), 1);
+        let listed = view(queued.clone(), chrono::Utc::now());
+        assert_eq!(listed[0]["id"], "00063f0a5b1c2d3e-00000007");
+        assert_eq!(listed[0]["borrador"]["asunto"], "La factura");
+
+        let ready = ready_to_send(queued, chrono::Utc::now());
+        assert_eq!(ready.len(), 1, "el despachador tiene que tomarlo");
+        let next = &ready[0];
+        assert_eq!(next.account_id, "7f3a");
+        assert_eq!(next.draft.from, "ana@ejemplo.com");
+        assert_eq!(next.draft.to, ["juan@otro.com"]);
+        assert_eq!(next.draft.subject, "La factura");
+        assert_eq!(next.draft.body, "Va adjunta.");
+        assert_eq!(
+            next.message_id,
+            "<1757500000000000.0000000000000007@ejemplo.com>"
+        );
+        assert_eq!(next.state, DeliveryState::Pending);
+
+        // Y lo que se mandaría es el mensaje que se escribió, con su
+        // identificador y su fecha de entonces.
+        let message =
+            crate::compose::build_message(&next.draft, &next.message_id, &next.date).unwrap();
+        assert!(message.contains("Subject: La factura"), "{message}");
+        assert!(
+            message.contains("Message-ID: <1757500000000000.0000000000000007@ejemplo.com>"),
+            "{message}"
+        );
+        assert!(
+            message.contains("Date: Thu, 10 Sep 2026 12:00:00 +0000"),
+            "{message}"
+        );
+    }
+
+    /// Lo mismo cuando están las dos: lo que pasó desde la vieja sale igual.
+    #[test]
+    fn un_mensaje_que_pasa_al_juntarlas_tambien_sale() {
+        let old = serde_json::to_vec_pretty(&outgoing("0002")).unwrap();
+        let temp = legacy_app_dir(
+            "mudanza-mensaje-junta",
+            &[("0002.json", std::str::from_utf8(&old).unwrap())],
+        );
+        let outbox = Outbox::open(temp.0.join(OUTBOX_DIR)).unwrap();
+        outbox.enqueue(&outgoing("0001")).unwrap();
+
+        assert_eq!(
+            migrate_legacy_outbox(&temp.0),
+            Ok(Migration::Merged {
+                moved: 1,
+                kept: Vec::new()
+            })
+        );
+        let ids: Vec<String> = ready_to_send(outbox.all().unwrap(), chrono::Utc::now())
+            .into_iter()
+            .map(|o| o.id)
+            .collect();
+        assert_eq!(ids, ["0001", "0002"]);
     }
 }

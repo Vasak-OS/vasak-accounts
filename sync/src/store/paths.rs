@@ -374,7 +374,10 @@ impl StoresRoot {
     }
 }
 
-fn open_dir_at<Fd: AsFd, P: rustix::path::Arg>(dir: Fd, path: P) -> rustix::io::Result<OwnedFd> {
+pub(crate) fn open_dir_at<Fd: AsFd, P: rustix::path::Arg>(
+    dir: Fd,
+    path: P,
+) -> rustix::io::Result<OwnedFd> {
     rustix::fs::openat(
         dir,
         path,
@@ -385,7 +388,7 @@ fn open_dir_at<Fd: AsFd, P: rustix::path::Arg>(dir: Fd, path: P) -> rustix::io::
 
 /// Lo que hay en una carpeta abierta, con el tipo de cada cosa **sin seguir
 /// enlaces**. Sin `.` ni `..`.
-fn read_entries(dir: &OwnedFd) -> rustix::io::Result<Vec<(CString, FileType)>> {
+pub(crate) fn read_entries(dir: &OwnedFd) -> rustix::io::Result<Vec<(CString, FileType)>> {
     let mut reader = rustix::fs::Dir::read_from(dir)?;
     let mut entries = Vec::new();
     while let Some(entry) = reader.read() {

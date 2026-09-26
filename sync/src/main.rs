@@ -1733,6 +1733,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("no se pudo apagar el volcado de memoria del proceso: {e}");
     }
 
+    // Antes que nada que pueda tocar la cola: hasta la 0.16.0 vivía en
+    // `salientes/`, y lo que quedó ahí sin salir tiene que salir igual. Un error
+    // no frena el servicio —el correo que llega no depende de esto— y lo que no
+    // se pudo mudar sigue en `salientes/`, sin borrar.
+    migrate_outbox();
+
     let service = Service::default();
 
     // El bus de **sesión**: es un servicio del usuario y lo que publica es suyo.
@@ -1814,6 +1820,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 service.state.lock().await.rejected.clear();
             }
         }
+    }
+}
+
+/// Muda la cola de salida vieja y deja en el diario qué pasó.
+///
+/// Ver `outbox::migrate_legacy_outbox`.
+fn migrate_outbox() {
+    let app_dir = outbox::app_data_dir();
+    match outbox::migrate_legacy_outbox(&app_dir) {
+        Ok(outbox::Migration::NothingToMove) => {}
+        Ok(outbox::Migration::Renamed) => {
+            tracing::info!(
+                "la cola de salida pasó de {0}/salientes a {0}/outbox",
+                app_dir.display()
+            );
+        }
+        Ok(outbox::Migration::Merged { moved, kept }) => {
+            tracing::info!(
+                "{moved} mensajes de la cola de salida pasaron de {0}/salientes a {0}/outbox",
+                app_dir.display()
+            );
+            if !kept.is_empty() {
+                tracing::warn!(
+                    "{} archivos se quedaron en {}/salientes porque ya estaban en outbox o no \
+                     se pudieron mover: {kept:?}. No salen desde ahí; hay que resolverlos a mano",
+                    kept.len(),
+                    app_dir.display()
+                );
+            }
+        }
+        Err(e) => tracing::warn!(
+            "no se pudo mudar la cola de salida vieja: {e}. Lo que haya en \
+             {}/salientes se queda ahí y no sale hasta que se resuelva",
+            app_dir.display()
+        ),
     }
 }
 
