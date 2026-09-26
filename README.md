@@ -417,18 +417,27 @@ vasak-accounts/
         ├── broker.rs        # le pide al servicio, como cualquier aplicación
         ├── imap.rs          # lo justo para contar el correo sin leer
         ├── store_api.rs     # ar.net.vasak.os.AccountsStore: lecturas, estado y control
-        ├── access.rs        # el permiso store.contacts de quien lee, y su caché
+        ├── access.rs        # el permiso store.<área> de quien lee, y su caché
+        ├── dav_sync.rs      # lo que comparten las dos sincronizaciones DAV
         ├── contacts_sync.rs # los contactos de cada cuenta al almacén, y cuándo
+        ├── calendar_sync.rs # el calendario de cada cuenta al almacén, y la ventana
         ├── vcard.rs         # leer una vCard (2.1, 3.0 y 4.0), sin escribir
+        ├── ical.rs          # leer iCalendar: eventos, tareas, recordatorios
+        ├── ical/
+        │   ├── timezones.rs  # la zona de cada fecha: IANA, VTIMEZONE, flotante
+        │   └── recurrence.rs # las repeticiones, con rrule y con topes
         ├── dav/             # hablar con servidores DAV, sólo lectura
         │   ├── webdav.rs     # la credencial, el cliente, multistatus, sync-collection
-        │   └── carddav.rs    # libretas, ETag y addressbook-multiget
+        │   ├── carddav.rs    # libretas y addressbook-multiget
+        │   └── caldav.rs     # calendarios y calendar-multiget
         └── store/           # el almacén local cifrado, una base por cuenta
             ├── key.rs        # la clave en el llavero (Secret Service)
             ├── paths.rs      # dónde vive cada base, y con qué permisos
             ├── migrations.rs # el esquema, versión por versión
             ├── contacts.rs   # los contactos en la base, de a lotes
             ├── contacts_read.rs # listar, paginar y buscar contactos
+            ├── calendar.rs   # el calendario en la base, de a lotes, y la ventana
+            ├── calendar_read.rs # rangos, eventos y tareas, de todas las cuentas
             ├── readers.rs    # las dos conexiones de sólo lectura de cada base
             └── lifecycle.rs  # cuándo se crea, se abre, se cierra y se borra
 ```
@@ -658,10 +667,11 @@ El sync prepara una base **SQLCipher** por cuenta, en
 `$XDG_DATA_HOME/vasak-accounts-sync/stores/<account_id>/store.db` (carpeta 0700,
 archivos 0600, reaplicados en cada apertura). Tiene su clave, dónde quedó la
 sincronización de cada colección, una bitácora con tope de mil filas y su ciclo
-de vida. **Desde la 0.15.0 guarda los contactos** de las cuentas que los piden
-(ver abajo), **cifrados en reposo** como todo lo demás de la base. El calendario
-y el correo llegan después, de a uno (`vasak-accounts#23`); mientras tanto la
-lista de mensajes sigue en memoria, como dice arriba.
+de vida. **Desde la 0.15.0 guarda los contactos**, y **desde la 0.17.0 el
+calendario** —eventos y tareas— de las cuentas que los piden (ver abajo),
+**cifrados en reposo** como todo lo demás de la base. El correo llega después
+(`vasak-accounts#23`); mientras tanto la lista de mensajes sigue en memoria,
+como dice arriba.
 
 La clave son 32 bytes al azar guardados en el llavero de la sesión (Secret
 Service, esquema `ar.net.vasak.os.AccountsStore`), y se le pasan a SQLCipher
@@ -691,8 +701,8 @@ texto de un `PRAGMA`.
 **Lo que el cifrado protege, y lo que no.** Protege en reposo: el disco robado,
 la copia de seguridad, otra cuenta del equipo. No protege contra un proceso que
 corre como la misma persona: el llavero le entrega los secretos a cualquiera de
-sus procesos. El permiso para leer el almacén (`store.contacts`, abajo) es
-consentimiento y visibilidad, no una frontera.
+sus procesos. El permiso para leer el almacén (`store.contacts`,
+`store.calendar`, abajo) es consentimiento y visibilidad, no una frontera.
 
 Encendido por omisión. Lo que la persona decide por cuenta vive en
 `$XDG_CONFIG_HOME/vasak-accounts-sync/stores.json`. Apagar o vaciar borra
@@ -743,10 +753,14 @@ del mismo nombre de bus. Todo contesta en JSON.
 | `ListContacts(account_id, address_book_id, cursor, limit)` | `store.contacts` | Una página por nombre, de todas las libretas (`""`) o de una: `{items: [{id, address_book_id, display_name, email, phone}], next_cursor}`. |
 | `SearchContacts(account_id, query, cursor, limit)` | `store.contacts` | Lo mismo, buscando por el principio de cada palabra en nombre, correos, teléfonos y organización. |
 | `GetContact(account_id, contact_id)` | `store.contacts` | Un contacto entero, leído de su vCard en el momento: `{id, address_book_id, uid, display_name, emails, phones, organization, notes, related, truncated}`, o `null`. |
+| `ListCalendars()` | `store.calendar` | Los calendarios de **todas las cuentas**: `[{id, account_id, display_name, color, components}]`. |
+| `ListOccurrences(from, to, calendar_ids, cursor, limit)` | `store.calendar` | Las veces de los eventos de todas las cuentas que se ven en `[from, to)` (RFC 3339, hasta 400 días), por comienzo: `{items: [{event_id, occurrence_id, calendar_id, title, start, end, all_day, floating, color}], next_cursor, truncated}`. |
+| `GetEvent(event_id, occurrence_id)` | `store.calendar` | Un evento entero —o una vez suya— leído de su iCalendar en el momento, o `null`. |
+| `ListTasks(calendar_ids, include_completed, cursor, limit)` | `store.calendar` | Las tareas por vencimiento: `{items: [{task_id, calendar_id, title, due, all_day, status, priority, completed, done, color}], next_cursor}`. |
 | `GetStatus()` | nada | El estado, recortado según quién pregunta (abajo). |
 | `SetStoreEnabled(account_id, enabled)` | límite | Enciende o apaga. Apagar borra. |
-| `ClearStore(account_id)` | límite | Borra y, si está encendida, la vuelve a crear vacía con otra clave; los contactos se vuelven a traer ya. |
-| `RequestSync(account_id)` | límite, y `store.contacts` si enciende los contactos | Deja lista la base y, si tiene contactos, los sincroniza ya. |
+| `ClearStore(account_id)` | límite | Borra y, si está encendida, la vuelve a crear vacía con otra clave; lo de cada área encendida se vuelve a traer ya. |
+| `RequestSync(account_id)` | límite, y el permiso de cada área que encendería | Deja lista la base y sincroniza ya cada área que tenga. Un área cuyo permiso dice que no queda apagada; `AccessDenied` sólo si no quedó ninguna encendida. |
 
 Y dos señales: `StatusChanged`, sin detalle, y **`Changed(area, account_id,
 generation)`**, una por cada lote de la sincronización que cambió algo guardado
@@ -816,12 +830,12 @@ que un proceso de la persona se haga pasar por otra de sus aplicaciones.
 
 **Lo que ve cualquiera en `GetStatus`**: el estado del llavero y, por cuenta,
 el estado de su base (`locked`, `open`, `rebuilt`, `disabled`, `unavailable`) y
-el de su área de contactos (`off`, `pending`, `syncing`, `synced`,
-`unavailable`, `failed`). Nada más. El texto que explica cada estado, cuánto
-ocupa la base (`size_bytes`) y cuándo terminó bien la última vuelta
-(`last_synced_at`) los ve sólo quien tiene `store.contacts` —una lectura
-concedida en los últimos 30 s—, en las cuentas con contactos. `GetStatus`
-nunca abre un diálogo. Los textos son fijos siempre: ninguno lleva una ruta ni
+el de cada área —`contacts`, `calendar`— (`off`, `pending`, `syncing`,
+`synced`, `unavailable`, `failed`). Nada más. El texto que explica la base y
+cuánto ocupa (`size_bytes`) los ve quien tiene el permiso de **alguna** de las
+áreas de esa cuenta —una lectura concedida en los últimos 30 s—; el texto de un
+área y cuándo terminó bien su última vuelta (`last_synced_at`), quien tiene el
+permiso de **esa** área. `GetStatus` nunca abre un diálogo. Los textos son fijos siempre: ninguno lleva una ruta ni
 algo que haya escrito un servidor o el llavero.
 
 **El límite de los comandos**: `SetStoreEnabled`, `ClearStore` y `RequestSync`
@@ -890,6 +904,63 @@ anteriores no le dan al sincronizador `account.contacts` —el área se ve
 `unavailable` y no se reintenta hasta la hora siguiente— ni lo tienen como
 delegado: `CheckPermissionFor` lo rechaza, y **toda lectura contesta
 `AccessDenied`**.
+
+#### El calendario
+
+Qué se guarda: por cada calendario de la cuenta —con su nombre, su color, si es
+un color, y si guarda eventos, tareas o las dos—, **cada objeto tal como vino
+del servidor**: un recurso, con la serie y sus excepciones juntas, que es la
+fuente de verdad. Derivado de él, sólo para listar: el título, el comienzo y el
+fin (el vencimiento, en una tarea), si es de todo el día, si se repite, cómo
+quedó su zona, el estado, la prioridad; y **las veces que ocurre cada evento**
+con sus recordatorios. Sale sólo por las lecturas de arriba, con
+`store.calendar`, y lo que se devuelve se lee del iCalendar: nunca el crudo ni
+su dirección en el servidor. Las tareas van con el calendario, con la misma
+capacidad y el mismo permiso.
+
+**La ventana.** Se guardan todos los objetos, y las veces de cada **serie** se
+guardan en **`[hoy − 12 meses, hoy + 24 meses]`**; un evento que no se repite,
+entero. **La ventana se corre una vez por día**, sin volver a la red: de cada
+serie se borra lo que quedó afuera y se expande lo que entró, desde lo guardado.
+`ListOccurrences` de un rango fuera de la ventana **expande en el momento**, con
+topes; lo que queda afuera por un tope vuelve con `truncated: true`.
+
+**Las repeticiones** se expanden con `rrule` en el reloj de pared de la zona del
+evento —un semanal a las 9:00 de Madrid sigue a las 9:00 de Madrid después del
+cambio de hora—, con `RDATE`, `EXDATE`, las excepciones (`RECURRENCE-ID`,
+también `RANGE=THISANDFUTURE`), `DTEND` o `DURATION`, todo el día y hora
+flotante. La zona sale del `TZID` de IANA, o del `VTIMEZONE` del archivo
+(`X-LIC-LOCATION`, un desplazamiento fijo o las reglas de Outlook). **Una zona
+que no se conoce no pierde el evento**: se toma como hora flotante —la de quien
+mira— y queda marcada (`floating` en la lista, `timezone_unknown` en el
+evento). Un nombre de Windows sin su `VTIMEZONE` es una zona que no se conoce.
+
+**Que no se dispare**: una regla la escribe cualquiera. Por objeto, 5000 veces
+en lo que se pide, 100 000 fechas sacadas a la regla —también las de antes de
+lo que se pide—, 1000 `RDATE` y 1000 `EXDATE`, 500 excepciones, 10
+recordatorios y 250 ms; por consulta en el momento, 2000 series por cuenta y
+2 s. Lo que pasa un tope se guarda con lo que entró, queda marcado y anotado en
+la bitácora de la base, sin nada del evento. Todo eso es CPU y corre fuera del
+bucle de eventos.
+
+Cuándo: como los contactos, el área de calendario de una cuenta **se enciende
+la primera vez que alguien la pide con permiso** y desde ahí sigue sola, pero
+**cada 15 minutos**. `ListCalendars`, `ListOccurrences` y `ListTasks` juntan
+**todas las cuentas** con calendario —el permiso es por aplicación y no por
+cuenta—, con identificadores globales `"<cuenta>/<número>"`, y la primera
+lectura con permiso enciende el calendario de todas.
+
+Cómo: la credencial con la capacidad `calendar`; los calendarios por
+`PROPFIND`; por cada uno `sync-collection` o ETag y `calendar-multiget` de a
+tandas; de a 500 objetos —y 20 000 ocurrencias— por transacción, con el token
+en el último lote. Con el llavero bloqueado no se pide ni se escribe nada. Los
+topes de la red son los de los contactos, con 100 calendarios por cuenta, 50 000
+objetos por calendario, 512 KiB por objeto, 1 GiB de iCalendar por cuenta y un
+millón de ocurrencias guardadas por cuenta.
+
+**Hace falta `vasak-permissions` 0.15.0 o posterior** también para el
+calendario: las anteriores no le dan al sincronizador `account.calendar` ni lo
+tienen como delegado de `store.calendar`.
 
 ## Nextcloud: el único que no hay que configurar
 

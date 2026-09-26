@@ -20,7 +20,7 @@
 //!    acepta sin pidfd la de un proceso que terminó antes del `accept`. Sólo
 //!    un bus que no lo da nunca se juzga por el pid, como antes. El pidfd se
 //!    suelta apenas se comprobó, antes de la pregunta.
-//! 4. `CheckPermissionFor(pid, arranque, "store.contacts", cuenta)` en
+//! 4. `CheckPermissionFor(pid, arranque, "store.<área>", cuenta)` en
 //!    `vasak-permissions`, en el bus del sistema. El sincronizador es un
 //!    delegado de ese servicio desde su 0.15.0: pregunta **por quien lo
 //!    llamó**, y la decisión queda anotada contra esa aplicación, no contra el
@@ -111,7 +111,8 @@ pub const CACHE_TTL: Duration = Duration::from_secs(30);
 /// la persona conteste un diálogo.
 pub const CHECK_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Leer los contactos guardados. El recurso de `vasak-permissions`.
+/// Leer los contactos guardados. El recurso de `vasak-permissions`, distinto
+/// de `account.contacts`, que entrega la credencial.
 pub const CONTACTS_RESOURCE: &str = "store.contacts";
 
 /// El recurso de `vasak-permissions` para leer el calendario guardado —los
