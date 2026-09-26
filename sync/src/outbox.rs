@@ -486,6 +486,17 @@ pub struct Outbox {
     root: PathBuf,
 }
 
+/// ¿Este `errno` dice que donde la cola espera una carpeta hay un enlace o no hay
+/// una carpeta?
+///
+/// **No hay un errno único**: `ELOOP` en Linux, `ENOTDIR` en Darwin, `EMLINK` en
+/// FreeBSD. Los tres van, por eso y no por olvidarse uno. Y lo que **no** son
+/// enlaces se caen al mensaje genérico: sin permisos (`EACCES`), sin
+/// descriptores (`EMFILE`), sin el padre (`NOENT`).
+fn es_enlace(e: Errno) -> bool {
+    matches!(e, Errno::LOOP | Errno::NOTDIR | Errno::MLINK)
+}
+
 /// Un enlace simbólico donde tiene que estar la carpeta, no.
 ///
 /// La misma comprobación que hace `StorePaths::prepare_dir` antes de crear
@@ -534,13 +545,24 @@ impl Outbox {
             )
         })?;
 
-        let fd = open_dir_at(CWD, &root).map_err(|e| {
-            format!(
-                "{} es un enlace simbólico o no es una carpeta; no se usa como cola: {}",
-                root.display(),
-                std::io::Error::from(e)
-            )
-        })?;
+        // El motivo se mira antes de decir cuál es, con [`es_enlace`].
+        let fd = match open_dir_at(CWD, &root) {
+            Ok(fd) => fd,
+            Err(e) if es_enlace(e) => {
+                return Err(format!(
+                    "{} es un enlace simbólico o no es una carpeta; no se usa como cola: {}",
+                    root.display(),
+                    std::io::Error::from(e)
+                ));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "no se pudo abrir la cola {}: {}",
+                    root.display(),
+                    std::io::Error::from(e)
+                ));
+            }
+        };
 
         // Y que lo que se abrió sea **esto**: entre el `chmod` de arriba y esta
         // apertura la ruta pudo cambiar de mano. El inodo se mira dos veces —por
@@ -935,6 +957,38 @@ mod tests {
             "",
             "se escribió el mensaje por el enlace",
         );
+    }
+
+    /// **El mensaje dice el motivo que hay, no «es un enlace» a secas.**
+    ///
+    /// `open_dir_at` falla por permisos, por descriptores, por un padre que no
+    /// está, y por un enlace. Decirle a la persona «es un enlace simbólico» cuando
+    /// lo que se le acabaron fueron los descriptores hace que se pierda tiempo
+    /// buscando un enlace que no hay.
+    ///
+    /// Se prueba la regla y no un `EMFILE` de verdad: provocarlo dejaría al
+    /// proceso al límite de descriptores y es un `EMFILE` de verdad, no un
+    /// `EMFILE` de mentira. El mensaje del enlace en el camino real lo comprueba
+    /// `una_cola_que_es_un_enlace_no_se_abre_ni_se_escribe_por_el`.
+    #[test]
+    fn el_error_de_la_cola_dice_el_motivo_que_hay() {
+        // Los tres que son enlace o «no es una carpeta», por los tres sistemas.
+        for e in [Errno::LOOP, Errno::NOTDIR, Errno::MLINK] {
+            assert!(es_enlace(e), "{e:?} es un enlace y no se lo trata como tal");
+        }
+        // Y los que no son, que tienen que caer al mensaje genérico.
+        for e in [
+            Errno::NOENT,
+            Errno::ACCESS,
+            Errno::MFILE,
+            Errno::PERM,
+            Errno::NAMETOOLONG,
+        ] {
+            assert!(
+                !es_enlace(e),
+                "{e:?} no es un enlace y se lo culpa como tal"
+            );
+        }
     }
 
     /// Una cola de verdad sigue andando: todo lo de acá arriba no puede romper el

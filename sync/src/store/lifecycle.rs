@@ -2885,6 +2885,53 @@ mod tests {
         );
     }
 
+    /// Lo mismo con el otro error de lectura que puede llegar: **el directorio de
+    /// la persona se perdió entero**. Es el caso que el primer arreglo de
+    /// `vasak-accounts#56` no cubría, porque `in_directory` lo volvía a crear y
+    /// contestaba lista vacía — indistinguible de una primera instalación. Con
+    /// el marcador ya no: llega un error, y lo que importa es que el podador no
+    /// lo confunda con dos confirmaciones.
+    ///
+    /// Es el hermano de la prueba de arriba con el mensaje real que produce
+    /// `StorageError::Unreadable` en ese caso, para que quede fijado de qué
+    /// depende la costura.
+    #[tokio::test]
+    async fn un_directorio_perdido_tambien_es_no_poda_nada() {
+        let f = Fixture::new("directorio-perdido");
+        f.list(listing(&["correo", "calendario"])).await;
+        for cuenta in ["correo", "calendario"] {
+            assert!(f.paths(cuenta).db_exists().unwrap());
+        }
+
+        let respuesta: Result<Vec<crate::broker::Account>, crate::broker::BrokerError> =
+            Err(crate::broker::BrokerError::Failed(
+                "Error al cargar cuentas: no se pudo leer /var/lib/vasak-accounts/1000: \
+                 el directorio no está, pero /var/lib/vasak-accounts/.instalado-1000 dice \
+                 que existió; no se lo vuelve a crear en silencio"
+                    .into(),
+            ));
+
+        for _ in 0..3 {
+            f.list(listing_from(&respuesta)).await;
+            f.advance(PRUNE_CONFIRMATION);
+        }
+        f.list(listing_from(&respuesta)).await;
+        f.advance(PRUNE_CONFIRMATION);
+        f.list(listing_from(&respuesta)).await;
+
+        for cuenta in ["correo", "calendario"] {
+            assert!(
+                f.paths(cuenta).db_exists().unwrap(),
+                "un directorio perdido borró la base de {cuenta}",
+            );
+        }
+        assert!(
+            f.keys.state().deleted.is_empty(),
+            "no se puede borrar la clave de una cuenta que no se sabe que se fue",
+        );
+        assert_eq!(f.manager.inner.lock().await.wanted.len(), 2);
+    }
+
     /// Y lo del otro lado, que es lo que la poda **sí** tiene que hacer: dos
     /// listados buenos que no la nombran, separados por una vuelta, borran su
     /// base. Sin esta, la de arriba no probaría nada: podría no podar porque la
