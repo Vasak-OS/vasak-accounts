@@ -731,6 +731,27 @@ async fn una_direccion_de_otro_origen_no_se_pide_ni_se_guarda() {
     assert_eq!(stored, 0);
 }
 
+/// **Una respuesta anidada de más no tumba el sincronizador.** Diez mil
+/// niveles en el listado de libretas —el primer pedido de cada vuelta— son
+/// cien kilobytes; leídos sin tope, desbordan la pila y el proceso aborta, con
+/// el correo adentro, y `Restart=on-failure` lo vuelve a levantar para caer
+/// igual. Tiene que ser una vuelta fallida y nada más.
+#[tokio::test(flavor = "multi_thread")]
+async fn una_respuesta_anidada_no_tumba_el_sincronizador() {
+    let f = Fixture::new("contactos-anidada").await;
+    f.server.put(0, "ana.vcf", &card("1", "Ana", "ana@x.com"));
+    f.server.state().extra_books_xml = format!(
+        "<d:response><d:href>/x/</d:href>{}{}</d:response>",
+        "<d:x>".repeat(10_000),
+        "</d:x>".repeat(10_000)
+    );
+
+    let outcome = f.sync().await;
+    assert!(matches!(outcome, SyncOutcome::Failed(_)), "{outcome:?}");
+    assert_eq!(f.count("SELECT count(*) FROM contacts").await, 0);
+    assert_eq!(f.contacts_status().await["state"], "failed");
+}
+
 /// Una respuesta que pasa el tope no se lee —con `Content-Length` se corta
 /// antes de leer, sin él mientras llega— y no se guarda nada.
 #[tokio::test]

@@ -18,7 +18,10 @@
 //!   llega y no después de leerla entera.
 //! - **El XML sin DTD**: `roxmltree` la rechaza por omisión, que es lo que
 //!   cierra las entidades externas y las expansiones en cadena. Y con tope de
-//!   nodos.
+//!   nodos, de profundidad y de espacios de nombres, mirados antes de armarlo
+//!   ([`check_shape`]): `roxmltree` baja de forma recursiva —un anidado de
+//!   más aborta el proceso— y tarda como el cubo con miles de espacios de
+//!   nombres. Se lee fuera del bucle de eventos ([`off_runtime`]).
 //! - **Cada dirección que manda el servidor se resuelve contra la colección y
 //!   se rechaza si es de otro origen** —esquema, máquina y puerto— antes de
 //!   pedirla o guardarla ([`resolve_href`]). La credencial viaja sólo al origen
@@ -59,6 +62,21 @@ pub struct Limits {
     /// Nodos de un documento XML. Una respuesta de veinte mil tarjetas son unos
     /// ciento sesenta mil; un millón es un documento hecho de etiquetas vacías.
     pub max_xml_nodes: u32,
+    /// Niveles de anidado de un documento XML. Un `multistatus` de verdad
+    /// tiene menos de diez. `roxmltree` baja por los elementos de forma
+    /// recursiva y sin tope propio: unos miles de niveles desbordan la pila,
+    /// y eso **aborta el proceso** entero, sin pánico que atrapar.
+    pub max_xml_depth: usize,
+    /// Espacios de nombres **distintos** —cada par prefijo y dirección— que
+    /// declara un documento. Un servidor de verdad usa entre tres y seis. Con
+    /// miles, `roxmltree` tarda un tiempo que crece como el cubo: copia los
+    /// que están a la vista en cada elemento que declara uno.
+    ///
+    /// Distintos y no cada declaración: hay servidores que repiten
+    /// `xmlns="DAV:"` en cada elemento, y eso no le cuesta nada a `roxmltree`
+    /// (los que están a la vista siguen siendo pocos). Lo que cuesta es cuántos
+    /// hay a la vista a la vez, y eso no pasa de los distintos.
+    pub max_xml_namespaces: usize,
     /// Libretas por cuenta.
     pub max_address_books: usize,
     /// Tarjetas por libreta.
@@ -77,6 +95,8 @@ impl Limits {
     pub const DEFAULT: Limits = Limits {
         max_body_bytes: 16 * 1024 * 1024,
         max_xml_nodes: 1_000_000,
+        max_xml_depth: 64,
+        max_xml_namespaces: 32,
         max_address_books: 100,
         max_cards_per_book: 20_000,
         max_vcard_bytes: 512 * 1024,
@@ -515,11 +535,6 @@ impl DavClient {
             body,
         })
     }
-
-    /// Lee un documento XML con los topes de este cliente.
-    pub fn parse<'a>(&self, xml: &'a str) -> Result<roxmltree::Document<'a>, DavError> {
-        parse_xml(xml, self.limits.max_xml_nodes)
-    }
 }
 
 /// Lee el cuerpo de una respuesta, cortando apenas pasa el tope.
@@ -554,20 +569,223 @@ pub async fn body_with_cap(
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
-/// Lee un documento, **sin DTD** y con tope de nodos.
+/// Lee un documento, **sin DTD**, con tope de nodos, de profundidad y de
+/// espacios de nombres.
 ///
 /// Un XML que no se entiende es un error y no una lista vacía: una respuesta
 /// cortada a la mitad —una conexión que se interrumpió, un servidor que
 /// contestó una página de error— no puede verse igual que «esta cuenta no
 /// tiene nada».
-pub fn parse_xml(xml: &str, max_nodes: u32) -> Result<roxmltree::Document<'_>, DavError> {
+///
+/// Antes de `roxmltree` pasa [`check_shape`], una lectura lineal que mira la
+/// profundidad y los espacios de nombres: son los dos topes que `roxmltree` no
+/// tiene y que un documento chico puede usar para tumbar o trabar el programa.
+/// Es trabajo de CPU: quien lo llama desde el bucle de eventos lo hace con
+/// [`off_runtime`].
+pub fn parse_xml<'a>(xml: &'a str, limits: &Limits) -> Result<roxmltree::Document<'a>, DavError> {
+    check_shape(xml, limits).map_err(|reason| DavError::BadXml(reason.to_string()))?;
     let options = roxmltree::ParsingOptions {
         allow_dtd: false,
-        nodes_limit: max_nodes,
+        nodes_limit: limits.max_xml_nodes,
         ..roxmltree::ParsingOptions::default()
     };
     roxmltree::Document::parse_with_options(xml, options)
         .map_err(|e| DavError::BadXml(e.to_string()))
+}
+
+/// Corre un trabajo de CPU —leer un XML, desarmar tarjetas— fuera de los
+/// hilos del bucle de eventos.
+///
+/// Un documento de dieciséis megas tarda lo suyo aun con los topes, y mientras
+/// ocupa un hilo del bucle, la sincronización no atiende nada más. Si el
+/// trabajo cae con un pánico, vuelve como un XML que no se entiende y no se
+/// lleva la tarea puesta.
+pub async fn off_runtime<T, F>(work: F) -> Result<T, DavError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, DavError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|_| DavError::BadXml("la lectura de la respuesta se cayó".into()))?
+}
+
+/// Cuánto trabajo de espacios de nombres se le deja hacer a `roxmltree` en un
+/// documento.
+///
+/// Cada elemento que declara alguno le cuesta, más o menos, el cuadrado de los
+/// que hay a la vista. Con el tope de distintos eso es mil por elemento, y un
+/// millón de elementos así son dos segundos de CPU en release y quince en
+/// depuración, por respuesta. Un servidor que repite `xmlns` en cada elemento
+/// tiene tres o cuatro a la vista: dieciséis por elemento, y con este tope le
+/// alcanza para un millón de elementos, que es el tope de nodos.
+const NAMESPACE_WORK_BUDGET: usize = 16_000_000;
+
+/// Busca `needle` desde `from`, y devuelve dónde **termina**.
+fn end_of(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    bytes
+        .get(from..)?
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|at| from + at + needle.len())
+}
+
+/// Mira la forma de un documento sin armarlo: cuántos niveles de anidado
+/// tiene y cuántos espacios de nombres distintos declara.
+///
+/// Una sola pasada por los bytes, sin recursión y sin guardar nada que crezca
+/// con el documento: la memoria es la de los espacios de nombres que ya se
+/// vieron, que tienen tope. Salta comentarios, `CDATA` e instrucciones de
+/// proceso, y dentro de una etiqueta respeta las comillas de los atributos —un
+/// `>` o un `xmlns` dentro de un valor no cuentan— y reconoce la que se cierra
+/// sola (`/>`), que no abre un nivel. Una DTD se rechaza acá mismo, que es lo
+/// que igual haría `roxmltree`.
+///
+/// No valida el XML: eso lo hace `roxmltree` después. Lo que no entiende lo
+/// rechaza, y un documento bien formado nunca cae acá por algo que no sea uno
+/// de los dos topes.
+pub fn check_shape(xml: &str, limits: &Limits) -> Result<(), &'static str> {
+    let bytes = xml.as_bytes();
+    let mut depth = 0usize;
+    let mut namespaces: Vec<Declaration<'_>> = Vec::new();
+    let mut namespace_work = 0usize;
+    let mut at = 0;
+
+    while let Some(offset) = bytes[at..].iter().position(|&b| b == b'<') {
+        let start = at + offset;
+        let rest = &bytes[start..];
+        if rest.starts_with(b"<!--") {
+            at = end_of(bytes, start + 4, b"-->").ok_or("un comentario sin cerrar")?;
+            continue;
+        }
+        if rest.starts_with(b"<![CDATA[") {
+            at = end_of(bytes, start + 9, b"]]>").ok_or("un CDATA sin cerrar")?;
+            continue;
+        }
+        if rest.starts_with(b"<?") {
+            at = end_of(bytes, start + 2, b"?>").ok_or("una instrucción sin cerrar")?;
+            continue;
+        }
+        if rest.starts_with(b"<!") {
+            return Err("trae una DTD");
+        }
+        if rest.starts_with(b"</") {
+            depth = depth.saturating_sub(1);
+            at = end_of(bytes, start + 2, b">").ok_or("una etiqueta sin cerrar")?;
+            continue;
+        }
+
+        // Una etiqueta que abre: hasta su `>`, fuera de comillas.
+        let mut i = start + 1;
+        let mut quote: Option<u8> = None;
+        let mut after_space = false;
+        let mut last = 0u8;
+        let mut declares = false;
+        loop {
+            let &c = bytes.get(i).ok_or("una etiqueta sin cerrar")?;
+            if let Some(q) = quote {
+                if c == q {
+                    quote = None;
+                }
+                i += 1;
+                continue;
+            }
+            match c {
+                b'>' => break,
+                b'"' | b'\'' => quote = Some(c),
+                c if c.is_ascii_whitespace() => {
+                    after_space = true;
+                    i += 1;
+                    continue;
+                }
+                _ if after_space => {
+                    if let Some((declared, end)) = namespace_at(bytes, i)? {
+                        declares = true;
+                        if !namespaces.contains(&declared) {
+                            namespaces.push(declared);
+                            if namespaces.len() > limits.max_xml_namespaces {
+                                return Err("declara demasiados espacios de nombres");
+                            }
+                        }
+                        last = b'"';
+                        after_space = false;
+                        i = end;
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            after_space = false;
+            last = c;
+            i += 1;
+        }
+
+        if declares {
+            namespace_work = namespace_work.saturating_add(namespaces.len().pow(2));
+            if namespace_work > NAMESPACE_WORK_BUDGET {
+                return Err("declara espacios de nombres en demasiados elementos");
+            }
+        }
+        if last != b'/' {
+            depth += 1;
+            if depth > limits.max_xml_depth {
+                return Err("está anidado de más");
+            }
+        }
+        at = i + 1;
+    }
+
+    Ok(())
+}
+
+/// Una declaración de espacio de nombres: el prefijo (vacío para el de
+/// omisión) y la dirección, tal como vinieron.
+type Declaration<'a> = (&'a [u8], &'a [u8]);
+
+/// Si en `at` empieza la declaración de un espacio de nombres —`xmlns="…"` o
+/// `xmlns:p="…"`—, el par (prefijo, dirección) tal como vino y dónde termina
+/// el valor. `xmlnsx="…"` es un atributo cualquiera.
+fn namespace_at(bytes: &[u8], at: usize) -> Result<Option<(Declaration<'_>, usize)>, &'static str> {
+    let Some(rest) = bytes.get(at..).filter(|r| r.starts_with(b"xmlns")) else {
+        return Ok(None);
+    };
+    let mut i = 5;
+    let prefix = match rest.get(i) {
+        Some(b':') => {
+            let begin = i + 1;
+            i = begin;
+            while rest
+                .get(i)
+                .is_some_and(|&c| c != b'=' && !c.is_ascii_whitespace() && c != b'>')
+            {
+                i += 1;
+            }
+            &rest[begin..i]
+        }
+        Some(&c) if c == b'=' || c.is_ascii_whitespace() => &rest[i..i],
+        _ => return Ok(None),
+    };
+    while rest.get(i).is_some_and(u8::is_ascii_whitespace) {
+        i += 1;
+    }
+    if rest.get(i) != Some(&b'=') {
+        return Err("un atributo sin valor");
+    }
+    i += 1;
+    while rest.get(i).is_some_and(u8::is_ascii_whitespace) {
+        i += 1;
+    }
+    let quote = match rest.get(i) {
+        Some(&q) if q == b'"' || q == b'\'' => q,
+        _ => return Err("un atributo sin comillas"),
+    };
+    let begin = i + 1;
+    let length = rest[begin..]
+        .iter()
+        .position(|&c| c == quote)
+        .ok_or("un atributo sin cerrar")?;
+    let value = &rest[begin..begin + length];
+    Ok(Some(((prefix, value), at + begin + length + 1)))
 }
 
 // ---------------------------------------------------------------------------
@@ -773,50 +991,39 @@ pub enum SyncCollection {
 
 /// Si un cuerpo de error es la condición `DAV:valid-sync-token` (RFC 6578,
 /// 3.2) o `DAV:supported-report` (RFC 3253, 3.6).
-fn has_precondition(client: &DavClient, body: &str, name: &str) -> bool {
-    client.parse(body).is_ok_and(|document| {
+fn has_precondition(body: &str, name: &str, limits: &Limits) -> bool {
+    parse_xml(body, limits).is_ok_and(|document| {
         document
             .descendants()
             .any(|n| n.has_tag_name((NS_DAV, name)))
     })
 }
 
-/// Pide las diferencias de una colección desde `token` (o todo, sin token).
-///
-/// - `207` → las diferencias. Lo que viene con `404` en su `<d:response>` se
-///   borró; lo que trae `getetag`, cambió; un `507` sobre la colección misma
-///   es una respuesta truncada.
-/// - `403` o `409` con `DAV:valid-sync-token` → [`SyncCollection::InvalidToken`].
-/// - `400`, `405`, `415`, `501`, o `403` con `DAV:supported-report` →
-///   [`SyncCollection::NotSupported`].
-pub async fn sync_collection(
-    client: &DavClient,
-    collection: &url::Url,
-    token: Option<&str>,
-) -> Result<SyncCollection, DavError> {
-    let reply = client
-        .request(
-            Method::Report,
-            collection,
-            // La RFC lo define sólo con `Depth: 0`; con otro valor es un 400.
-            "0",
-            sync_collection_body(token),
-        )
-        .await?;
+/// Cómo se lee un cuerpo de error de `sync-collection`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    InvalidToken,
+    NotSupported,
+    Other,
+}
 
-    match reply.status {
-        207 => {}
-        403 | 409 if has_precondition(client, &reply.body, "valid-sync-token") => {
-            return Ok(SyncCollection::InvalidToken)
-        }
-        403 if has_precondition(client, &reply.body, "supported-report") => {
-            return Ok(SyncCollection::NotSupported)
-        }
-        400 | 405 | 415 | 501 => return Ok(SyncCollection::NotSupported),
-        other => return Err(DavError::Status(other)),
+fn refusal_from(status: u16, body: &str, limits: &Limits) -> Refusal {
+    match status {
+        403 | 409 if has_precondition(body, "valid-sync-token", limits) => Refusal::InvalidToken,
+        403 if has_precondition(body, "supported-report", limits) => Refusal::NotSupported,
+        400 | 405 | 415 | 501 => Refusal::NotSupported,
+        _ => Refusal::Other,
     }
+}
 
-    let document = client.parse(&reply.body)?;
+/// Las diferencias de un `207` de `sync-collection`, ya resueltas contra la
+/// colección.
+pub fn delta_from(
+    xml: &str,
+    collection: &url::Url,
+    limits: &Limits,
+) -> Result<SyncDelta, DavError> {
+    let document = parse_xml(xml, limits)?;
     let multistatus = parse_multistatus(&document)?;
     let mut delta = SyncDelta {
         token: multistatus.sync_token.clone(),
@@ -846,6 +1053,50 @@ pub async fn sync_collection(
         }
     }
 
+    Ok(delta)
+}
+
+/// Pide las diferencias de una colección desde `token` (o todo, sin token).
+///
+/// - `207` → las diferencias. Lo que viene con `404` en su `<d:response>` se
+///   borró; lo que trae `getetag`, cambió; un `507` sobre la colección misma
+///   es una respuesta truncada.
+/// - `403` o `409` con `DAV:valid-sync-token` → [`SyncCollection::InvalidToken`].
+/// - `400`, `405`, `415`, `501`, o `403` con `DAV:supported-report` →
+///   [`SyncCollection::NotSupported`].
+///
+/// Los dos cuerpos, el de las diferencias y el de un rechazo, se leen fuera
+/// del bucle de eventos ([`off_runtime`]).
+pub async fn sync_collection(
+    client: &DavClient,
+    collection: &url::Url,
+    token: Option<&str>,
+) -> Result<SyncCollection, DavError> {
+    let reply = client
+        .request(
+            Method::Report,
+            collection,
+            // La RFC lo define sólo con `Depth: 0`; con otro valor es un 400.
+            "0",
+            sync_collection_body(token),
+        )
+        .await?;
+
+    let limits = *client.limits();
+    let status = reply.status;
+    if status != 207 {
+        let body = reply.body;
+        let refusal = off_runtime(move || Ok(refusal_from(status, &body, &limits))).await?;
+        return match refusal {
+            Refusal::InvalidToken => Ok(SyncCollection::InvalidToken),
+            Refusal::NotSupported => Ok(SyncCollection::NotSupported),
+            Refusal::Other => Err(DavError::Status(status)),
+        };
+    }
+
+    let collection = collection.clone();
+    let body = reply.body;
+    let delta = off_runtime(move || delta_from(&body, &collection, &limits)).await?;
     Ok(SyncCollection::Delta(delta))
 }
 
@@ -1101,6 +1352,13 @@ mod tests {
 
     // ── El XML ─────────────────────────────────────────────────────────────
 
+    fn nodes(max_xml_nodes: u32) -> Limits {
+        Limits {
+            max_xml_nodes,
+            ..Limits::DEFAULT
+        }
+    }
+
     /// Sin DTD: es lo que cierra las entidades externas y las expansiones en
     /// cadena («mil millones de risas»).
     #[test]
@@ -1109,13 +1367,13 @@ mod tests {
 <!DOCTYPE d [<!ENTITY a "aaaaaaaaaa"><!ENTITY b "&a;&a;&a;&a;&a;">]>
 <d:multistatus xmlns:d="DAV:">&b;</d:multistatus>"#;
         assert!(matches!(
-            parse_xml(with_dtd, 1_000_000),
+            parse_xml(with_dtd, &Limits::DEFAULT),
             Err(DavError::BadXml(_))
         ));
         let external = r#"<?xml version="1.0"?>
 <!DOCTYPE d [<!ENTITY x SYSTEM "file:///etc/passwd">]>
 <d:multistatus xmlns:d="DAV:">&x;</d:multistatus>"#;
-        assert!(parse_xml(external, 1_000_000).is_err());
+        assert!(parse_xml(external, &Limits::DEFAULT).is_err());
     }
 
     #[test]
@@ -1124,8 +1382,138 @@ mod tests {
             r#"<d:multistatus xmlns:d="DAV:">{}</d:multistatus>"#,
             "<d:x/>".repeat(200)
         );
-        assert!(parse_xml(&many, 1_000).is_ok());
-        assert!(parse_xml(&many, 100).is_err());
+        assert!(parse_xml(&many, &nodes(1_000)).is_ok());
+        assert!(parse_xml(&many, &nodes(100)).is_err());
+    }
+
+    /// Corre `work` en otro hilo y falla si no termina en `budget`. Sin esto,
+    /// una prueba de tiempo sin el arreglo no falla: se cuelga.
+    fn finishes_within<T: Send + 'static>(
+        budget: std::time::Duration,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (done, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(work());
+        });
+        wait.recv_timeout(budget)
+            .unwrap_or_else(|_| panic!("no terminó en {budget:?}"))
+    }
+
+    fn nested(levels: usize) -> String {
+        format!(
+            r#"<d:multistatus xmlns:d="DAV:">{}{}</d:multistatus>"#,
+            "<d:x>".repeat(levels),
+            "</d:x>".repeat(levels)
+        )
+    }
+
+    /// **Un XML anidado de más no tumba el proceso.** `roxmltree` baja por los
+    /// elementos de forma recursiva: cien mil niveles —trescientos kilobytes,
+    /// muy por debajo del tope del cuerpo— desbordan la pila, y un desborde de
+    /// pila aborta el programa entero, correo incluido. Tiene que volver como
+    /// un error, y el proceso seguir.
+    #[test]
+    fn un_xml_demasiado_anidado_se_rechaza_sin_caer() {
+        let deep = nested(100_000);
+        assert!(deep.len() < 2 * 1024 * 1024);
+        assert!(matches!(
+            parse_xml(&deep, &Limits::DEFAULT),
+            Err(DavError::BadXml(_))
+        ));
+        // Y el tope es justo: el multistatus más sus niveles.
+        let limit = Limits::DEFAULT.max_xml_depth;
+        assert!(parse_xml(&nested(limit - 1), &Limits::DEFAULT).is_ok());
+        assert!(parse_xml(&nested(limit), &Limits::DEFAULT).is_err());
+    }
+
+    /// Lo que no abre un nivel no cuenta: la etiqueta que se cierra sola, un
+    /// comentario, un `CDATA`, una instrucción de proceso, y un `>` o un
+    /// `xmlns` dentro del valor de un atributo, con comillas dobles o simples.
+    #[test]
+    fn la_forma_del_xml_respeta_comentarios_cdata_y_comillas() {
+        let limits = Limits {
+            max_xml_depth: 3,
+            max_xml_namespaces: 2,
+            ..Limits::DEFAULT
+        };
+        let fine = r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" a='x > y xmlns:p="1"'>
+  <!-- <d:a><d:b><d:c><d:e> xmlns:q="2" -->
+  <d:response b="/>" c = 'xmlns:r="3"'>
+    <d:href><![CDATA[<d:a><d:b><d:c>]]></d:href>
+    <d:x/><d:y /><d:z w="/"/>
+    <?proceso <d:a><d:b> ?>
+  </d:response>
+  <d:response xmlnsx="no-es-un-espacio" xmlns:c="urn:c"><d:x/></d:response>
+</d:multistatus>"#;
+        assert_eq!(check_shape(fine, &limits), Ok(()));
+        assert!(parse_xml(fine, &limits).is_ok());
+
+        let deep = r#"<d:multistatus xmlns:d="DAV:"><d:a><d:b><d:c/></d:b></d:a></d:multistatus>"#;
+        assert_eq!(check_shape(deep, &limits), Ok(()));
+        let deeper =
+            r#"<d:multistatus xmlns:d="DAV:"><d:a><d:b><d:c></d:c></d:b></d:a></d:multistatus>"#;
+        assert!(check_shape(deeper, &limits).is_err());
+
+        let many = r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:c" xmlns = "urn:x"/>"#;
+        assert!(check_shape(many, &limits).is_err());
+        assert!(check_shape("<!DOCTYPE d><d/>", &limits).is_err());
+        for broken in ["<a", "<a b='x>", "<!-- sin cerrar", "<![CDATA[ x", "<? x"] {
+            assert!(check_shape(broken, &limits).is_err(), "{broken}");
+        }
+    }
+
+    /// **Miles de espacios de nombres no traban el programa.** Una raíz que
+    /// declara cinco mil prefijos y cinco mil hijos que declaran uno cada uno
+    /// son doscientos kilobytes, y `roxmltree` tarda más de dos minutos en
+    /// leerlos: copia los que están a la vista en cada elemento que declara uno.
+    /// Tiene que rechazarse enseguida.
+    #[test]
+    fn un_xml_con_miles_de_espacios_de_nombres_se_rechaza_enseguida() {
+        let n = 5000;
+        let root: String = (0..n).map(|i| format!(r#" xmlns:p{i}="u{i}""#)).collect();
+        let children = r#"<a xmlns:z="q"/>"#.repeat(n);
+        let xml = format!(r#"<d:multistatus xmlns:d="DAV:"{root}>{children}</d:multistatus>"#);
+
+        let result = finishes_within(std::time::Duration::from_secs(5), move || {
+            parse_xml(&xml, &Limits::DEFAULT).map(|_| ())
+        });
+        assert!(matches!(result, Err(DavError::BadXml(_))), "{result:?}");
+    }
+
+    /// Y dentro del tope de distintos, lo que cuesta es cuántos elementos
+    /// declaran con muchos a la vista: treinta en la raíz y novecientos mil
+    /// hijos que declaran uno son catorce megas —dentro del tope del cuerpo— y
+    /// dos segundos de `roxmltree` en release, quince en depuración, por cada
+    /// respuesta. También se rechaza enseguida.
+    #[test]
+    fn muchos_elementos_que_declaran_con_muchos_a_la_vista_se_rechazan() {
+        let root: String = (0..30).map(|i| format!(r#" xmlns:p{i}="u{i}""#)).collect();
+        let children = r#"<a xmlns:z="q"/>"#.repeat(900_000);
+        let xml = format!(r#"<d:multistatus xmlns:d="DAV:"{root}>{children}</d:multistatus>"#);
+        assert!(xml.len() < Limits::DEFAULT.max_body_bytes);
+
+        let result = finishes_within(std::time::Duration::from_secs(5), move || {
+            parse_xml(&xml, &Limits::DEFAULT).map(|_| ())
+        });
+        assert!(matches!(result, Err(DavError::BadXml(_))), "{result:?}");
+    }
+
+    /// Y la misma declaración repetida en cada elemento —hay servidores que
+    /// ponen `xmlns="DAV:"` en todos— no cuenta de más: a la vista sigue
+    /// habiendo una.
+    #[test]
+    fn una_declaracion_repetida_en_cada_elemento_no_cuenta_de_mas() {
+        let responses = r#"<response xmlns="DAV:"><href xmlns="DAV:">/a.vcf</href><propstat xmlns="DAV:"><prop><getetag xmlns="DAV:">"1"</getetag><address-data xmlns="urn:ietf:params:xml:ns:carddav">BEGIN:VCARD</address-data></prop><status>HTTP/1.1 200 OK</status></propstat></response>"#
+            .repeat(20_000);
+        let xml = format!(r#"<multistatus xmlns="DAV:">{responses}</multistatus>"#);
+
+        let count = finishes_within(std::time::Duration::from_secs(10), move || {
+            let document = parse_xml(&xml, &Limits::DEFAULT).unwrap();
+            parse_multistatus(&document).unwrap().responses.len()
+        });
+        assert_eq!(count, 20_000);
     }
 
     const SYNC: &str = r#"<?xml version="1.0"?>
@@ -1150,7 +1538,7 @@ mod tests {
     /// «se borró».
     #[test]
     fn el_multistatus_separa_el_estado_de_la_respuesta_del_de_sus_propiedades() {
-        let document = parse_xml(SYNC, 1_000).unwrap();
+        let document = parse_xml(SYNC, &Limits::DEFAULT).unwrap();
         let multistatus = parse_multistatus(&document).unwrap();
 
         assert_eq!(multistatus.sync_token.as_deref(), Some("https://x/sync/42"));
@@ -1167,10 +1555,10 @@ mod tests {
     #[test]
     fn lo_que_no_es_un_multistatus_no_se_lee_como_vacio() {
         for garbage in ["<html/>", r#"<d:error xmlns:d="DAV:"/>"#] {
-            let document = parse_xml(garbage, 1_000).unwrap();
+            let document = parse_xml(garbage, &Limits::DEFAULT).unwrap();
             assert!(parse_multistatus(&document).is_err(), "{garbage}");
         }
-        let empty = parse_xml(r#"<d:multistatus xmlns:d="DAV:"/>"#, 1_000).unwrap();
+        let empty = parse_xml(r#"<d:multistatus xmlns:d="DAV:"/>"#, &Limits::DEFAULT).unwrap();
         assert_eq!(parse_multistatus(&empty).unwrap(), Multistatus::default());
     }
 

@@ -18,8 +18,8 @@
 //! No crea, no edita y no borra nada en el servidor.
 
 use super::webdav::{
-    self, href_for_request, parse_multistatus, resolve_href, same_collection, xml_escape,
-    DavClient, DavError, Method, NS_DAV,
+    self, href_for_request, off_runtime, parse_multistatus, resolve_href, same_collection,
+    xml_escape, DavClient, DavError, Limits, Method, NS_DAV,
 };
 
 pub const NS_CARDDAV: &str = "urn:ietf:params:xml:ns:carddav";
@@ -87,9 +87,9 @@ fn storable(text: Option<&str>) -> Option<String> {
 pub fn address_books_from(
     xml: &str,
     base: &url::Url,
-    max_nodes: u32,
+    limits: &Limits,
 ) -> Result<(Vec<AddressBook>, usize), DavError> {
-    let document = webdav::parse_xml(xml, max_nodes)?;
+    let document = webdav::parse_xml(xml, limits)?;
     let multistatus = parse_multistatus(&document)?;
     let mut foreign = 0;
 
@@ -148,9 +148,9 @@ pub fn address_books_from(
 pub fn cards_from(
     xml: &str,
     base: &url::Url,
-    max_nodes: u32,
+    limits: &Limits,
 ) -> Result<(Vec<CardResource>, usize), DavError> {
-    let document = webdav::parse_xml(xml, max_nodes)?;
+    let document = webdav::parse_xml(xml, limits)?;
     let multistatus = parse_multistatus(&document)?;
     let mut foreign = 0;
 
@@ -180,8 +180,8 @@ pub fn cards_from(
 /// Saca el ETag de cada tarjeta de un `PROPFIND` sobre una libreta, para los
 /// servidores que no saben `sync-collection`. Sin la libreta misma ni las
 /// subcarpetas.
-pub fn etags_from(xml: &str, book: &url::Url, max_nodes: u32) -> Result<(Etags, usize), DavError> {
-    let document = webdav::parse_xml(xml, max_nodes)?;
+pub fn etags_from(xml: &str, book: &url::Url, limits: &Limits) -> Result<(Etags, usize), DavError> {
+    let document = webdav::parse_xml(xml, limits)?;
     let multistatus = parse_multistatus(&document)?;
     let mut foreign = 0;
 
@@ -262,7 +262,8 @@ pub async fn list_address_books(client: &DavClient) -> Result<Vec<AddressBook>, 
         .request(Method::Propfind, &home, "1", address_books_query())
         .await?;
     let xml = expect_multistatus(reply)?;
-    let (books, foreign) = address_books_from(&xml, &home, client.limits().max_xml_nodes)?;
+    let limits = *client.limits();
+    let (books, foreign) = off_runtime(move || address_books_from(&xml, &home, &limits)).await?;
     if foreign > 0 {
         tracing::warn!("se descartaron {foreign} libretas con dirección de otro servidor");
     }
@@ -279,7 +280,9 @@ pub async fn list_etags(client: &DavClient, book: &url::Url) -> Result<Etags, Da
         .request(Method::Propfind, book, "1", etags_query())
         .await?;
     let xml = expect_multistatus(reply)?;
-    let (etags, foreign) = etags_from(&xml, book, client.limits().max_xml_nodes)?;
+    let limits = *client.limits();
+    let book = book.clone();
+    let (etags, foreign) = off_runtime(move || etags_from(&xml, &book, &limits)).await?;
     if foreign > 0 {
         tracing::warn!("se descartaron {foreign} tarjetas con dirección de otro servidor");
     }
@@ -298,7 +301,9 @@ pub async fn multiget(
         .request(Method::Report, book, "1", multiget_body(hrefs))
         .await?;
     let xml = expect_multistatus(reply)?;
-    let (cards, foreign) = cards_from(&xml, book, client.limits().max_xml_nodes)?;
+    let limits = *client.limits();
+    let book = book.clone();
+    let (cards, foreign) = off_runtime(move || cards_from(&xml, &book, &limits)).await?;
     if foreign > 0 {
         tracing::warn!("se descartaron {foreign} tarjetas con dirección de otro servidor");
     }
@@ -309,7 +314,10 @@ pub async fn multiget(
 mod tests {
     use super::*;
 
-    const NODES: u32 = 100_000;
+    const NODES: &Limits = &Limits {
+        max_xml_nodes: 100_000,
+        ..Limits::DEFAULT
+    };
 
     fn url(text: &str) -> url::Url {
         url::Url::parse(text).unwrap()
