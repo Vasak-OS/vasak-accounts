@@ -59,6 +59,19 @@ struct Fixture {
     notified: Arc<AtomicUsize>,
 }
 
+/// El nombre de la variante, sin lo que lleva adentro. Los mensajes de las
+/// pruebas no repiten nada de lo que devolvió una vuelta: la vuelta se hace con
+/// una credencial, y lo que sale de ella no se escribe en ningún lado, tampoco
+/// en la salida de una prueba que falla.
+fn outcome_kind(outcome: &SyncOutcome) -> &'static str {
+    match outcome {
+        SyncOutcome::StoreClosed => "StoreClosed",
+        SyncOutcome::Denied => "Denied",
+        SyncOutcome::Synced(_) => "Synced",
+        SyncOutcome::Failed(_) => "Failed",
+    }
+}
+
 fn credential_for(server: &FakeDav) -> DavCredential {
     DavCredential {
         home: server.home_url(),
@@ -130,7 +143,7 @@ impl Fixture {
     async fn synced(&self) -> SyncReport {
         match self.sync().await {
             SyncOutcome::Synced(report) => report,
-            other => panic!("la vuelta no terminó bien: {other:?}"),
+            other => panic!("la vuelta no terminó bien: {}", outcome_kind(&other)),
         }
     }
 
@@ -482,7 +495,11 @@ async fn un_507_que_no_avanza_el_token_no_borra_ni_guarda_nada() {
     f.server.put(0, "zoe.vcf", &card("4", "Zoe", "zoe@x.com"));
 
     let outcome = f.sync().await;
-    assert!(matches!(outcome, SyncOutcome::Failed(_)), "{outcome:?}");
+    assert!(
+        matches!(outcome, SyncOutcome::Failed(_)),
+        "{}",
+        outcome_kind(&outcome)
+    );
     assert_eq!(f.names().await, vec!["Ana", "Juan", "Luis"]);
     assert_eq!(f.token(0).await, Some(old));
     let syncs = f
@@ -902,9 +919,12 @@ async fn un_xml_roto_no_lleva_texto_del_servidor_al_estado() {
 
     let outcome = f.sync().await;
     let SyncOutcome::Failed(shown) = outcome else {
-        panic!("tenía que fallar: {outcome:?}");
+        panic!("tenía que fallar: {}", outcome_kind(&outcome));
     };
-    assert!(!shown.contains("otro-sitio"), "{shown}");
+    assert!(
+        !shown.contains("otro-sitio"),
+        "el estado repite texto del servidor"
+    );
     let detail = f.contacts_status().await["detail"]
         .as_str()
         .unwrap()
@@ -930,7 +950,11 @@ async fn una_respuesta_anidada_no_tumba_el_sincronizador() {
     );
 
     let outcome = f.sync().await;
-    assert!(matches!(outcome, SyncOutcome::Failed(_)), "{outcome:?}");
+    assert!(
+        matches!(outcome, SyncOutcome::Failed(_)),
+        "{}",
+        outcome_kind(&outcome)
+    );
     assert_eq!(f.count("SELECT count(*) FROM contacts").await, 0);
     assert_eq!(f.contacts_status().await["state"], "failed");
 }
@@ -954,9 +978,12 @@ async fn una_respuesta_que_pasa_el_tope_no_se_lee() {
 
         let outcome = f.sync().await;
         let SyncOutcome::Failed(detail) = outcome else {
-            panic!("tenía que fallar: {outcome:?}");
+            panic!("tenía que fallar: {}", outcome_kind(&outcome));
         };
-        assert!(detail.contains("65536 bytes"), "{detail}");
+        assert!(
+            detail.contains("65536 bytes"),
+            "el detalle no nombra el tope"
+        );
         assert_eq!(f.count("SELECT count(*) FROM contacts").await, 0);
         assert_eq!(f.contacts_status().await["state"], "failed");
     }
@@ -1020,7 +1047,10 @@ async fn una_libreta_que_pasa_el_tope_de_tarjetas_no_se_guarda() {
     let SyncOutcome::Failed(detail) = f.sync().await else {
         panic!("tenía que fallar");
     };
-    assert!(detail.contains("más de 5 tarjetas"), "{detail}");
+    assert!(
+        detail.contains("más de 5 tarjetas"),
+        "el detalle no nombra el tope"
+    );
     assert_eq!(f.count("SELECT count(*) FROM contacts").await, 0);
     assert!(!f.server.requests().iter().any(|r| r.is_multiget()));
 }
@@ -1039,7 +1069,10 @@ async fn una_cuenta_que_pasa_el_tope_de_libretas_no_se_guarda() {
     let SyncOutcome::Failed(detail) = f.sync().await else {
         panic!("tenía que fallar");
     };
-    assert!(detail.contains("más de 2 libretas"), "{detail}");
+    assert!(
+        detail.contains("más de 2 libretas"),
+        "el detalle no nombra el tope"
+    );
     assert_eq!(f.count("SELECT count(*) FROM address_books").await, 0);
 }
 
@@ -1062,9 +1095,12 @@ async fn una_cuenta_que_pasa_el_tope_de_bytes_no_sigue_escribiendo() {
     put_many(&f.server, 0, 3..20);
     let outcome = f.sync().await;
     let SyncOutcome::Failed(detail) = outcome else {
-        panic!("tenía que fallar: {outcome:?}");
+        panic!("tenía que fallar: {}", outcome_kind(&outcome));
     };
-    assert!(detail.contains(&format!("{} bytes", 5 * one)), "{detail}");
+    assert!(
+        detail.contains(&format!("{} bytes", 5 * one)),
+        "el detalle no nombra el tope"
+    );
     assert_eq!(f.count("SELECT count(*) FROM contacts").await, 3);
     assert_eq!(f.token(0).await, Some(old), "el token no se movió");
     assert_eq!(f.contacts_status().await["state"], "failed");
@@ -1206,7 +1242,11 @@ async fn un_corte_a_mitad_no_pierde_el_token_viejo() {
         state.fail_multiget_from = Some(state.multigets + 11);
     }
     let outcome = f.sync().await;
-    assert!(matches!(outcome, SyncOutcome::Failed(_)), "{outcome:?}");
+    assert!(
+        matches!(outcome, SyncOutcome::Failed(_)),
+        "{}",
+        outcome_kind(&outcome)
+    );
     assert_eq!(f.token(0).await, Some(old.clone()), "el token no se movió");
     assert_eq!(f.count("SELECT count(*) FROM contacts").await, 502);
 
@@ -1239,8 +1279,8 @@ async fn el_estado_del_area_no_lleva_datos_ni_direcciones() {
     let contacts = &json["accounts"][0]["contacts"];
     assert_eq!(contacts["state"], "synced");
     assert!(contacts["last_synced_at"].is_string());
-    for secret in ["Ana", "ana@x.com", "127.0.0.1", "/dav/", "la-clave"] {
-        assert!(!status.contains(secret), "«{secret}» en {status}");
+    for forbidden in ["Ana", "ana@x.com", "127.0.0.1", "/dav/", "la-clave"] {
+        assert!(!status.contains(forbidden), "«{forbidden}» en el estado");
     }
 
     // Y un fallo del servidor tampoco lleva la dirección, y conserva cuándo
