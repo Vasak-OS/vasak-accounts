@@ -530,7 +530,10 @@ async fn una_direccion_de_otro_origen_no_se_pide_ni_se_guarda() {
         );
     }
     let report = f.synced().await;
-    assert!(report.foreign >= 2, "{}", report.foreign);
+    assert!(
+        report.foreign >= 2,
+        "el informe no cuenta los objetos de otro origen"
+    );
     assert_eq!(f.summaries().await, vec!["Uno"]);
     assert_eq!(f.count("SELECT count(*) FROM calendars").await, 1);
     assert!(
@@ -1284,7 +1287,10 @@ async fn una_cuenta_que_pasa_el_tope_de_calendarios_no_se_guarda() {
     let CalendarOutcome::Failed(detail) = f.sync().await else {
         panic!("tenía que fallar");
     };
-    assert!(detail.contains("más de 2 calendarios"), "{detail}");
+    assert!(
+        detail.contains("más de 2 calendarios"),
+        "el motivo no dice que se pasó el tope de calendarios"
+    );
     assert_eq!(f.count("SELECT count(*) FROM calendars").await, 0);
     assert!(!f.server.requests().iter().any(|r| r.is_sync_collection()));
 }
@@ -1309,7 +1315,10 @@ async fn un_calendario_que_pasa_el_tope_de_objetos_no_se_pide() {
     let CalendarOutcome::Failed(detail) = f.sync().await else {
         panic!("tenía que fallar");
     };
-    assert!(detail.contains("más de 5 eventos y tareas"), "{detail}");
+    assert!(
+        detail.contains("más de 5 eventos y tareas"),
+        "el motivo no dice que se pasó el tope de objetos"
+    );
     assert_eq!(f.count("SELECT count(*) FROM calendar_objects").await, 0);
     assert!(!f.server.requests().iter().any(|r| r.is_multiget()));
     assert_eq!(f.token(0).await, None);
@@ -1580,8 +1589,14 @@ async fn la_ventana_que_se_corre_a_mitad_no_se_ve_como_base_cerrada() {
     let status = f.calendar_status().await;
     let detail = status["detail"].as_str().unwrap();
     assert_ne!(detail, CLOSED_DETAIL);
-    assert!(detail.contains("ventana"), "{detail}");
-    assert!(!detail.contains("llavero"), "{detail}");
+    assert!(
+        detail.contains("ventana"),
+        "el motivo no dice que se corrió la ventana"
+    );
+    assert!(
+        !detail.contains("llavero"),
+        "el motivo habla del llavero, como una base cerrada"
+    );
     assert_eq!(f.summaries().await, vec!["Uno"]);
     assert_eq!(f.token(0).await, Some(old));
 
