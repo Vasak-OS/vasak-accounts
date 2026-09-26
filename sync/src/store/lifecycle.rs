@@ -682,6 +682,7 @@ impl<K: KeySource> StoreManager<K> {
                             account_id,
                             Some(key),
                             "la clave del llavero no abre la base",
+                            false,
                         )
                         .await
                         .map(|store| (store, true)),
@@ -698,7 +699,14 @@ impl<K: KeySource> StoreManager<K> {
                     &paths,
                     account_id,
                     None,
-                    "la clave de la base no estaba en el llavero",
+                    if discard_found_key {
+                        "la base se había vaciado o apagado y quedaban archivos"
+                    } else {
+                        "la clave de la base no estaba en el llavero"
+                    },
+                    // Una cuenta vaciada no vuelve a buscar: lo que encuentre
+                    // es la clave vieja.
+                    !discard_found_key,
                 )
                 .await
                 .map(|store| (store, true)),
@@ -706,16 +714,33 @@ impl<K: KeySource> StoreManager<K> {
     }
 
     /// Borra una base que no se puede abrir y la vuelve a crear vacía.
+    ///
+    /// **El orden es lo que salva a la fila 4.** `vasak-keyring` puede
+    /// contestar `Locked == false` y un `SearchItems` vacío a la vez —una
+    /// contraseña que no descifró, la escritura bloqueada, un
+    /// `VASAK_KEYRING_PASSWORD` equivocado—, y ahí «no hay clave» es mentira.
+    /// Así que, antes de destruir: se vuelve a leer `Locked`; con
+    /// `recheck_missing_key`, se vuelve a buscar la clave y si ahora aparece no
+    /// se rehace nada; y la clave nueva se guarda y se relee **antes** de tocar
+    /// un archivo. Si el llavero no deja guardar, la base buena se queda.
     async fn rebuild(
         &self,
         paths: &StorePaths,
         account_id: &str,
         key: Option<StoreKey>,
         reason: &str,
+        recheck_missing_key: bool,
     ) -> Result<Store, StoreError> {
         // Otra vez, justo antes de destruir: si el llavero se bloqueó entre la
         // búsqueda y acá, el vacío de la búsqueda no quería decir nada.
         self.ensure_unlocked().await?;
+        if key.is_none() && recheck_missing_key && self.keys.find(account_id).await?.is_some() {
+            return Err(StoreError::Key(KeyError::Failed(
+                "la clave apareció al volver a buscarla: no se rehace la base, se vuelve a \
+                 intentar en la próxima vuelta"
+                    .into(),
+            )));
+        }
         tracing::warn!("'{account_id}': {reason}; se rehace la base vacía");
 
         let key = match key {
@@ -1144,6 +1169,54 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].0, "warn");
         assert!(lines[0].1.contains("no estaba en el llavero"));
+    }
+
+    /// Fila 4 con un llavero que dice «desbloqueado», no ve la clave y no deja
+    /// guardar otra —`vasak-keyring` con la base sin descifrar—: la base buena
+    /// sobrevive, porque la clave nueva se pide **antes** de borrar. Fija ese
+    /// orden.
+    #[tokio::test]
+    async fn fila_4_sin_poder_guardar_la_clave_nueva_no_se_borra_la_base() {
+        let f = Fixture::new("fila4-sin-guardar");
+        drop(Store::create(&f.paths("cuenta"), &fixed_key(b'a')).unwrap());
+        f.keys.state().reject_stores = true;
+
+        f.manager.accounts_listed(listing(&["cuenta"])).await;
+
+        assert_eq!(f.state("cuenta").await, StoreState::Unavailable);
+        assert!(
+            Store::open(&f.paths("cuenta"), &fixed_key(b'a')).is_ok(),
+            "la base buena se tenía que quedar"
+        );
+    }
+
+    /// Fila 4 con un vacío que no valía: la primera búsqueda no ve la clave y
+    /// la segunda sí. No se rehace nada, y en la próxima vuelta la base abre
+    /// con la clave de siempre.
+    #[tokio::test]
+    async fn fila_4_si_la_clave_aparece_al_volver_a_buscarla_no_se_rehace() {
+        let f = Fixture::new("fila4-reaparece");
+        drop(Store::create(&f.paths("cuenta"), &fixed_key(b'a')).unwrap());
+        {
+            let mut state = f.keys.state();
+            state
+                .keys
+                .insert("cuenta".into(), fixed_key(b'a').hex().into());
+            state.blind_finds = 1;
+        }
+
+        f.manager.accounts_listed(listing(&["cuenta"])).await;
+
+        assert_ne!(f.state("cuenta").await, StoreState::Rebuilt);
+        assert!(
+            f.keys.state().stored.is_empty(),
+            "no hacía falta otra clave"
+        );
+        assert!(Store::open(&f.paths("cuenta"), &fixed_key(b'a')).is_ok());
+
+        f.manager.refresh().await;
+        assert_eq!(f.state("cuenta").await, StoreState::Open);
+        assert!(log_lines(&f, "cuenta").is_empty());
     }
 
     /// Fila 5: la clave está y no abre. Lo mismo que la anterior, con la clave

@@ -550,6 +550,13 @@ pub(crate) mod fake {
         /// Que la colección se bloquee justo después de contestar
         /// `is_locked() == false`.
         pub lock_after_is_locked: bool,
+        /// Que `store` falle: `vasak-keyring` con la escritura bloqueada, o que
+        /// rechaza el `CreateItem`.
+        pub reject_stores: bool,
+        /// Cuántas veces `find` contesta vacío con la colección desbloqueada y
+        /// la clave ahí: `vasak-keyring` diciendo `Locked == false` antes de
+        /// haber descifrado nada.
+        pub blind_finds: usize,
     }
 
     #[derive(Clone, Default)]
@@ -588,6 +595,10 @@ pub(crate) mod fake {
             if state.locked {
                 return Err(KeyError::Locked);
             }
+            if state.blind_finds > 0 {
+                state.blind_finds -= 1;
+                return Ok(None);
+            }
             if state.lock_after_find {
                 state.locked = true;
             }
@@ -606,6 +617,9 @@ pub(crate) mod fake {
             if state.locked {
                 state.stored_while_locked += 1;
                 return Err(KeyError::Locked);
+            }
+            if state.reject_stores {
+                return Err(KeyError::Failed("el llavero no dejó guardar".into()));
             }
             state.stored.push(account_id.to_string());
             state.malformed.remove(account_id);
