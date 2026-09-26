@@ -1,0 +1,19 @@
+[package]
+name = "vasak-accounts-common"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Lo que comparten el servicio de cuentas y el sincronizador: identificar a un proceso y preguntarle al servicio de permisos por él"
+publish = false
+
+[dependencies]
+# Para hablar con `vasak-permissions`. El mismo zbus del espacio de trabajo: no
+# suma ninguna crate al candado.
+zbus.workspace = true
+
+[dev-dependencies]
+# Un servicio de permisos falso del otro lado de una conexión punto a punto,
+# sin `dbus-daemon`.
+tokio.workspace = true
+zbus = { workspace = true, features = ["p2p"] }

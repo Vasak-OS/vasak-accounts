@@ -2352,6 +2352,15 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "vasak-accounts-common",
+ "zbus",
+]
+
+[[package]]
+name = "vasak-accounts-common"
+version = "0.15.0"
+dependencies = [
+ "tokio",
  "zbus",
 ]
 

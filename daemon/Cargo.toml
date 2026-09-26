@@ -26,4 +26,7 @@ toml = "1"
 # un código de autorización. Parsear URLs a mano acá sería el lugar donde un
 # «http://127.0.0.1.ejemplo.com» pasa por local.
 url.workspace = true
+# El momento de arranque de un proceso y la pregunta a `vasak-permissions`,
+# compartidos con el sincronizador. Ver `common/`.
+vasak-accounts-common.workspace = true
 
