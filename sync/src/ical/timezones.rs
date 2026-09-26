@@ -646,7 +646,9 @@ fn parse_weekday(value: &str) -> Option<(i32, Weekday)> {
     } else {
         prefix.parse::<i32>().ok()?
     };
-    (ordinal != 0 && ordinal.abs() <= MAX_ORDINAL).then_some((ordinal, day))
+    // `unsigned_abs` y no `abs`: `-2147483648` se lee, y `i32::MIN.abs()`
+    // desborda —en debug, pánico; en release, sigue negativo y pasa el tope—.
+    (ordinal != 0 && ordinal.unsigned_abs() <= MAX_ORDINAL.unsigned_abs()).then_some((ordinal, day))
 }
 
 /// `MO` → lunes, … `SU` → domingo, sin mirar mayúsculas.
@@ -1156,5 +1158,23 @@ mod tests {
         }
         assert_eq!(last_day_of_month(i32::MAX, 12), None);
         assert_eq!(nth_weekday_of_month(262_143, 12, 5, Weekday::Sun), None);
+    }
+
+    /// Un `BYDAY` con el mínimo de `i32` no entra en pánico: se descarta. Y
+    /// tampoco dentro de un `VTIMEZONE`, que se lee fuera del `catch_unwind`.
+    #[test]
+    fn un_byday_con_el_minimo_de_i32_no_entra_en_panico() {
+        assert_eq!(parse_weekday("-2147483648SU"), None);
+        assert_eq!(parse_weekday("2147483647SU"), None);
+        assert_eq!(parse_weekday("-6SU"), None);
+        assert_eq!(parse_weekday("-5SU"), Some((-5, Weekday::Sun)));
+        assert_eq!(parse_weekday("-1SU"), Some((-1, Weekday::Sun)));
+        let ical = "BEGIN:VCALENDAR\r\nBEGIN:VTIMEZONE\r\nTZID:Rara\r\n\
+            BEGIN:STANDARD\r\nDTSTART:19701025T030000\r\nTZOFFSETFROM:+0200\r\n\
+            TZOFFSETTO:+0100\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-2147483648SU\r\n\
+            END:STANDARD\r\nEND:VTIMEZONE\r\nEND:VCALENDAR\r\n";
+        let document = super::super::parse_document(ical);
+        // Leer el documento es lo que entraba en pánico; la zona queda como quede.
+        let _ = document.zones.lookup("Rara");
     }
 }
