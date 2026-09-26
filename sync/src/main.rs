@@ -64,6 +64,9 @@ mod compose;
 mod contacts_sync;
 mod dav;
 mod html;
+// Lo usa el calendario del almacén, que llega en los commits que siguen.
+#[allow(dead_code)]
+mod ical;
 mod images;
 mod imap;
 mod mailboxes;

@@ -65,6 +65,16 @@ rustix = { version = "1", features = ["fs", "process"] }
 # lo que cierra las entidades externas y las expansiones en cadena. Es la misma
 # que usaba `vasak-contacts`, de donde viene el parser. Ver `dav/webdav.rs`.
 roxmltree = "0.21"
+# Las repeticiones de los eventos del calendario (`RRULE`, RFC 5545). Rust puro,
+# sin ninguna biblioteca compartida; se le da la hora de pared y la zona la
+# pone `ical/timezones.rs`, y sus topes no alcanzan solos: ver
+# `ical/recurrence.rs`. Trae `regex`, que ya estaba, y `thiserror` y `log`.
+rrule = "0.14"
+# La base de datos de zonas horarias de IANA, compilada adentro del binario: un
+# evento con `TZID=Europe/Madrid` cae a la hora de Madrid, horario de verano
+# incluido. La misma que usaba `vasak-calendar`, de donde viene `zonas.rs`. No
+# suma ninguna biblioteca compartida. Ver `ical/timezones.rs`.
+chrono-tz = "0.10"
 # El momento de arranque de un proceso y la pregunta a `vasak-permissions`,
 # compartidos con el servicio de cuentas. Ver `common/` y `access.rs`.
 vasak-accounts-common.workspace = true
