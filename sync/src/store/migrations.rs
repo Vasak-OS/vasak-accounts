@@ -211,6 +211,9 @@ END;
 /// La lista de un rango pagina por `(starts_at, object_id, recurrence_id)`,
 /// con un índice que además lleva el fin y el calendario, así que filtrar por
 /// superposición y por calendario no sale del índice (una prueba mira el plan).
+/// `occurrences_long` es el mismo índice con sólo las veces que duran más de
+/// 400 días (`calendar_read::LONG_OCCURRENCE_SECONDS`): la consulta por rango
+/// mira hacia atrás como mucho eso, y las que duran más las busca ahí.
 const V3: &str = "
 CREATE TABLE calendars (
     id           INTEGER PRIMARY KEY,
@@ -272,6 +275,10 @@ CREATE TABLE occurrences (
 
 CREATE INDEX occurrences_by_start
     ON occurrences (starts_at, object_id, recurrence_id, ends_at, calendar_id);
+
+CREATE INDEX occurrences_long
+    ON occurrences (starts_at, object_id, recurrence_id, ends_at, calendar_id)
+    WHERE ends_at - starts_at > 34560000;
 
 CREATE TABLE object_titles (
     object_id INTEGER NOT NULL REFERENCES calendar_objects (id) ON DELETE CASCADE,
@@ -372,12 +379,21 @@ mod tests {
             "calendar_objects_by_due",
             "occurrences",
             "occurrences_by_start",
+            "occurrences_long",
             "object_titles",
             "alarms",
             "alarms_by_time",
         ] {
             assert!(before.iter().any(|t| t == table), "falta {table}");
         }
+    }
+
+    /// El índice de las veces largas tiene en su condición el mismo tope que
+    /// la consulta por rango: si no, SQLite no lo puede usar.
+    #[test]
+    fn el_indice_de_las_veces_largas_usa_el_tope_de_la_lectura() {
+        let seconds = crate::store::calendar_read::LONG_OCCURRENCE_SECONDS;
+        assert!(V3.contains(&format!("WHERE ends_at - starts_at > {seconds};")));
     }
 
     /// Una base de una versión más nueva que este programa no se toca.

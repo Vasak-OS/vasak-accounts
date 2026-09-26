@@ -43,6 +43,14 @@ use crate::ical::{self, Component, DateValue, MAX_DESCRIPTION, MAX_TEXT};
 /// lo que muestra la vista más ancha de un calendario.
 pub const MAX_RANGE_SECONDS: i64 = 400 * 86_400;
 
+/// Desde cuánto una vez es **larga**: la consulta por rango mira hacia atrás
+/// lo que dura la vez más larga de la cuenta, pero no más que esto, y las que
+/// duran más las busca aparte, en `occurrences_long` (un índice con sólo
+/// ésas). Sin este tope, un solo evento del año 1 al 9999 llevaba el piso de
+/// **toda** consulta al año 1, y cada página recorría el índice entero. El
+/// número está también en la migración v3, en la condición del índice.
+pub const LONG_OCCURRENCE_SECONDS: i64 = 400 * 86_400;
+
 /// Cuántos calendarios se pueden nombrar en un filtro.
 pub const MAX_CALENDAR_IDS: usize = 100;
 
@@ -325,10 +333,25 @@ fn calendar_filter(column: &str, calendars: Option<&[i64]>) -> String {
     }
 }
 
+/// Qué parte de lo guardado se lee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoredPart {
+    /// Lo que empieza desde el piso ([`scan_floor`]): por
+    /// `occurrences_by_start`.
+    FromFloor,
+    /// Las veces largas que empiezan antes del piso: por `occurrences_long`.
+    Long,
+}
+
 /// La consulta de las ocurrencias guardadas de un rango: por el índice de
 /// comienzo, con la superposición, el calendario y el cursor adentro de él.
+/// Los parámetros: el piso, `to`, `from`, `from`, los del cursor y el límite.
 /// Aparte para que una prueba mire su plan.
-pub fn occurrences_sql(calendars: Option<&[i64]>, cursor: Option<&str>) -> String {
+pub fn occurrences_sql(
+    part: StoredPart,
+    calendars: Option<&[i64]>,
+    cursor: Option<&str>,
+) -> String {
     let cursor = cursor
         .map(|c| {
             format!(
@@ -339,20 +362,47 @@ pub fn occurrences_sql(calendars: Option<&[i64]>, cursor: Option<&str>) -> Strin
             )
         })
         .unwrap_or_default();
+    // La condición del índice parcial va escrita igual que en la migración,
+    // con el número y no con un parámetro: si no, SQLite no puede usarlo.
+    let (index, starts) = match part {
+        StoredPart::FromFloor => (
+            "occurrences_by_start",
+            "o.starts_at >= ? AND o.starts_at < ?",
+        ),
+        StoredPart::Long => (
+            "occurrences_long",
+            "o.starts_at < ? AND o.starts_at < ? AND o.ends_at - o.starts_at > 34560000",
+        ),
+    };
     format!(
         "SELECT o.starts_at, o.object_id, o.recurrence_id, o.ends_at, o.all_day,
                 coalesce(t.summary, c.summary), o.calendar_id, k.color, c.zone
-           FROM occurrences o
+           FROM occurrences o INDEXED BY {index}
            JOIN calendar_objects c ON c.id = o.object_id
            JOIN calendars k ON k.id = o.calendar_id
            LEFT JOIN object_titles t ON t.object_id = o.object_id AND t.position = o.title
-          WHERE o.starts_at >= ? AND o.starts_at < ?
+          WHERE {starts}
             AND (o.ends_at > ? OR (o.ends_at <= o.starts_at AND o.starts_at >= ?)){}{}
           ORDER BY o.starts_at, o.object_id, o.recurrence_id
           LIMIT ?",
         calendar_filter("o.calendar_id", calendars),
         cursor
     )
+}
+
+/// Desde dónde se leen las ocurrencias guardadas de un rango que empieza en
+/// `from`: lo que dura la vez más larga de la cuenta hacia atrás, pero no más
+/// que [`LONG_OCCURRENCE_SECONDS`]. Lo que dura más se lee aparte
+/// ([`StoredPart::Long`]).
+pub fn scan_floor(connection: &Connection, from: i64) -> Result<i64, StoreError> {
+    let max_span: i64 = connection
+        .query_row(
+            "SELECT coalesce(max(span), 0) FROM calendar_objects",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(classify)?;
+    Ok(from.saturating_sub(max_span.clamp(0, LONG_OCCURRENCE_SECONDS)))
 }
 
 fn floating(zone: &str) -> bool {
@@ -406,27 +456,17 @@ pub fn account_occurrences(
         color,
     };
 
-    // Lo guardado.
-    let max_span: i64 = connection
-        .query_row(
-            "SELECT coalesce(max(span), 0) FROM calendar_objects",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(classify)?;
+    // Lo guardado: lo que empieza desde el piso, y las veces largas que
+    // empiezan antes.
+    let floor = scan_floor(connection, range.from)?;
     let condition = after.map(|a| a.condition(account_id));
-    let sql = occurrences_sql(calendars, condition.as_ref().map(|(c, _)| *c));
-    let mut params: Vec<i64> = vec![
-        range.from.saturating_sub(max_span.max(0)),
-        range.to,
-        range.from,
-        range.from,
-    ];
-    if let Some((_, values)) = &condition {
-        params.extend(values);
-    }
-    params.push((limit + 1) as i64);
-    {
+    for part in [StoredPart::FromFloor, StoredPart::Long] {
+        let sql = occurrences_sql(part, calendars, condition.as_ref().map(|(c, _)| *c));
+        let mut params: Vec<i64> = vec![floor, range.to, range.from, range.from];
+        if let Some((_, values)) = &condition {
+            params.extend(values);
+        }
+        params.push((limit + 1) as i64);
         let mut statement = connection.prepare(&sql).map_err(classify)?;
         let mut rows = statement
             .query(rusqlite::params_from_iter(params))
@@ -1153,6 +1193,135 @@ mod tests {
         );
     }
 
+    /// Un suelto del año 1 al 9999 y diez mil veces guardadas, una por día
+    /// desde 1999: lo que un servidor puede mandar.
+    fn store_with_a_ten_thousand_year_event(temp: &TempDir) -> Store {
+        let long = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:largo\r\nSUMMARY:Largo\r\n\
+                    DTSTART:00010101T000000Z\r\nDTEND:99991231T000000Z\r\nEND:VEVENT\r\n\
+                    END:VCALENDAR\r\n";
+        let store = store_with(
+            temp,
+            &[
+                ("https://x/c/largo.ics", long),
+                ("https://x/c/v.ics", &single("v", "19990101T100000Z")),
+            ],
+        );
+        let (object, calendar): (i64, i64) = store
+            .connection()
+            .query_row(
+                "SELECT id, calendar_id FROM calendar_objects WHERE uid = 'v'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let first = at("1999-01-01T10:00:00Z");
+        store.connection().execute_batch("BEGIN").unwrap();
+        for day in 1..10_000i64 {
+            let start = first + day * 86_400;
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO occurrences
+                       (object_id, recurrence_id, calendar_id, starts_at, ends_at, all_day)
+                     VALUES (?1, ?2, ?3, ?2, ?2 + 3600, 0)",
+                    rusqlite::params![object, start, calendar],
+                )
+                .unwrap();
+        }
+        store.connection().execute_batch("COMMIT").unwrap();
+        store
+    }
+
+    /// **Un evento de diez mil años no saca la consulta del índice.** Con
+    /// uno así, `max(span)` llevaba el piso de toda consulta al año 1 y cada
+    /// página recorría las diez mil veces; ahora el piso mira hacia atrás
+    /// como mucho [`LONG_OCCURRENCE_SECONDS`], y lo que la consulta recorre
+    /// —medido en pasos de la máquina de SQLite— es lo de esos 400 días.
+    #[test]
+    fn un_evento_de_diez_mil_anios_no_saca_la_consulta_del_indice() {
+        use rusqlite::StatementStatus;
+        let temp = TempDir::new("leer-largo-costo");
+        let store = store_with_a_ten_thousand_year_event(&temp);
+        let r = range("2026-01-01T00:00:00Z", "2026-01-08T00:00:00Z");
+        let floor = scan_floor(store.connection(), r.from).unwrap();
+        assert_eq!(floor, r.from - LONG_OCCURRENCE_SECONDS);
+
+        let steps = |floor: i64| {
+            let sql = occurrences_sql(StoredPart::FromFloor, None, None);
+            let mut statement = store.connection().prepare(&sql).unwrap();
+            let mut rows = statement
+                .query(rusqlite::params![floor, r.to, r.from, r.from, 1001])
+                .unwrap();
+            let mut found = 0;
+            while rows.next().unwrap().is_some() {
+                found += 1;
+            }
+            drop(rows);
+            (found, statement.get_status(StatementStatus::VmStep))
+        };
+        let (found, capped) = steps(floor);
+        let (all, uncapped) = steps(at("0001-01-01T00:00:00Z"));
+        assert_eq!(found, 7, "una por día de la semana pedida");
+        assert_eq!(all, 8, "y el largo, desde el año 1");
+        // Unos 400 días de índice contra diez mil.
+        assert!(
+            capped * 10 < uncapped,
+            "con el piso acotado {capped} pasos, sin acotar {uncapped}"
+        );
+    }
+
+    /// Y el evento largo **se sigue viendo**, en cualquier año que cubra: lo
+    /// trae la consulta de las veces largas, por su índice.
+    #[test]
+    fn un_evento_de_diez_mil_anios_se_sigue_viendo() {
+        let temp = TempDir::new("leer-largo-visto");
+        let store = store_with_a_ten_thousand_year_event(&temp);
+        for (from, to, others) in [
+            ("2026-01-01T00:00:00Z", "2026-01-08T00:00:00Z", 7),
+            ("5000-06-01T00:00:00Z", "5000-06-08T00:00:00Z", 0),
+            ("0001-01-01T00:00:00Z", "0001-01-02T00:00:00Z", 0),
+        ] {
+            let rows = account_occurrences(
+                store.connection(),
+                "cuenta",
+                range(from, to),
+                None,
+                None,
+                100,
+                &ExpansionLimits::DEFAULT,
+            )
+            .unwrap();
+            let names: Vec<&str> = rows.rows.iter().map(|(_, i)| i.title.as_str()).collect();
+            assert_eq!(names.first(), Some(&"Largo"), "{from}");
+            assert_eq!(names.len(), others + 1, "{from}");
+        }
+        // Y con el cursor: después del largo siguen las otras, sin repetirlo.
+        let r = range("2026-01-01T00:00:00Z", "2026-01-08T00:00:00Z");
+        let first = account_occurrences(
+            store.connection(),
+            "cuenta",
+            r,
+            None,
+            None,
+            1,
+            &ExpansionLimits::DEFAULT,
+        )
+        .unwrap();
+        assert_eq!(first.rows[0].1.title, "Largo");
+        let rest = account_occurrences(
+            store.connection(),
+            "cuenta",
+            r,
+            None,
+            Some(&first.rows[0].0),
+            100,
+            &ExpansionLimits::DEFAULT,
+        )
+        .unwrap();
+        assert_eq!(rest.rows.len(), 7);
+        assert!(rest.rows.iter().all(|(_, i)| i.title == "Suelto v"));
+    }
+
     /// **La paginación no repite ni saltea** aunque entre algo entre páginas,
     /// y el cursor funciona también con lo expandido en el momento.
     #[test]
@@ -1289,25 +1458,38 @@ mod tests {
     fn la_consulta_de_un_rango_usa_el_indice() {
         let temp = TempDir::new("leer-plan");
         let store = open_store(&temp);
-        let sql = occurrences_sql(
-            Some(&[1, 2]),
-            Some("({key}, {id}, {occurrence}) > (?, ?, ?)"),
-        )
-        .replace("{key}", "o.starts_at")
-        .replace("{id}", "o.object_id")
-        .replace("{occurrence}", "o.recurrence_id");
-        let mut statement = store
-            .connection()
-            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-            .unwrap();
-        let plan: Vec<String> = statement
-            .query_map([1, 2, 3, 4, 5, 6, 7, 8], |row| row.get::<_, String>(3))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
-        let plan = plan.join(" | ");
-        assert!(plan.contains("occurrences_by_start"), "{plan}");
-        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        for (part, index) in [
+            (StoredPart::FromFloor, "occurrences_by_start"),
+            (StoredPart::Long, "occurrences_long"),
+        ] {
+            let sql = occurrences_sql(
+                part,
+                Some(&[1, 2]),
+                Some("({key}, {id}, {occurrence}) > (?, ?, ?)"),
+            )
+            .replace("{key}", "o.starts_at")
+            .replace("{id}", "o.object_id")
+            .replace("{occurrence}", "o.recurrence_id");
+            let mut statement = store
+                .connection()
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let plan: Vec<String> = statement
+                .query_map([1, 2, 3, 4, 5, 6, 7, 8], |row| row.get::<_, String>(3))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            let plan = plan.join(" | ");
+            assert!(plan.contains(&format!("INDEX {index} ")), "{plan}");
+            assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        }
+        // La condición del índice parcial es la de la consulta, con el mismo
+        // número.
+        assert!(
+            occurrences_sql(StoredPart::Long, None, None).contains(&format!(
+                "ends_at - o.starts_at > {LONG_OCCURRENCE_SECONDS}"
+            ))
+        );
     }
 
     /// Un evento entero, con la repetición en partes, los recordatorios, el
