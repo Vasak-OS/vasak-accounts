@@ -320,8 +320,9 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
         let mut report = SyncReport::default();
 
         let mut seen = BTreeSet::new();
-        let books: Vec<AddressBook> = carddav::list_address_books(&client)
-            .await?
+        let (books, foreign) = carddav::list_address_books(&client).await?;
+        report.foreign += foreign;
+        let books: Vec<AddressBook> = books
             .into_iter()
             // Una libreta que el servidor nombra dos veces es una.
             .filter(|b| seen.insert(b.href.to_string()))
@@ -332,10 +333,21 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
             .map(|b| (b.href.to_string(), b.display_name.clone()))
             .collect();
 
-        // Las libretas que ya no están, de a tandas.
+        // Las libretas que ya no están, de a tandas. **Salvo que el listado haya
+        // traído alguna de otro origen**: un servidor que pasa a contestar con
+        // URLs absolutas de otro nombre de máquina —un alias, `www.`, un proxy
+        // mal configurado— haría que todas «ya no estén», y se irían con sus
+        // contactos mientras dure el error. Esa vuelta no borra ninguna.
         let before = self.store(account_id, |s| s.address_books()).await?;
+        if foreign > 0 {
+            tracing::warn!(
+                "'{account_id}': el listado trajo {foreign} libretas de otro origen; no se borra \
+                 ninguna en esta vuelta"
+            );
+        }
         for gone in before
             .iter()
+            .filter(|_| foreign == 0)
             .filter(|b| !listed.iter().any(|(href, _)| href == &b.href))
         {
             let id = gone.id;

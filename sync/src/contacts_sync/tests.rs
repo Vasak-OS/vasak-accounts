@@ -601,6 +601,41 @@ async fn una_libreta_que_ya_no_esta_se_borra_con_lo_suyo() {
     assert_eq!(tokens, 0);
 }
 
+/// **Una libreta que vuelve con otro origen no se borra.** Un servidor que
+/// pasa a contestar con URLs absolutas de otro nombre de máquina —un alias,
+/// `www.`, un proxy mal configurado— no puede llevarse la libreta y sus
+/// contactos: mientras el listado traiga alguna de otro origen, esa vuelta no
+/// borra ninguna.
+#[tokio::test]
+async fn una_libreta_que_vuelve_con_otro_origen_no_se_borra() {
+    let f = Fixture::new("contactos-libreta-otro-origen").await;
+    let work = f.server.add_book("/dav/ana/trabajo/", "Trabajo");
+    f.server.put(0, "ana.vcf", &card("1", "Ana", "ana@x.com"));
+    f.server
+        .put(work, "jefe.vcf", &card("2", "La Jefa", "jefa@x.com"));
+    f.synced().await;
+    assert_eq!(f.names().await, vec!["Ana", "La Jefa"]);
+
+    {
+        let mut state = f.server.state();
+        state.books.remove(work);
+        state.extra_books_xml = "<d:response><d:href>https://alias.ejemplo.com/dav/ana/trabajo/\
+             </d:href><d:propstat><d:prop><d:resourcetype><d:collection/><c:addressbook/>\
+             </d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>\
+             </d:response>"
+            .into();
+    }
+    let report = f.synced().await;
+    assert_eq!(report.foreign, 1);
+    assert_eq!(f.names().await, vec!["Ana", "La Jefa"]);
+    assert_eq!(f.count("SELECT count(*) FROM address_books").await, 2);
+
+    // Cuando el listado vuelve a estar limpio, la que falta sí se borra.
+    f.server.state().extra_books_xml.clear();
+    f.synced().await;
+    assert_eq!(f.names().await, vec!["Ana"]);
+}
+
 // ── El llavero ──────────────────────────────────────────────────────────────
 
 /// **Con el llavero bloqueado no se pide nada a nadie**: ni la credencial al
@@ -788,7 +823,7 @@ async fn una_direccion_de_otro_origen_no_se_pide_ni_se_guarda() {
 
     let report = f.synced().await;
     assert_eq!(report.books, 1);
-    assert_eq!(report.foreign, 1);
+    assert_eq!(report.foreign, 2, "la libreta y la tarjeta");
     assert_eq!(f.names().await, vec!["Ana"]);
     assert!(
         other.requests().is_empty(),

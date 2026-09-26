@@ -253,8 +253,9 @@ fn expect_multistatus(reply: webdav::Reply) -> Result<String, DavError> {
     }
 }
 
-/// Las libretas que hay en la carpeta de la persona.
-pub async fn list_address_books(client: &DavClient) -> Result<Vec<AddressBook>, DavError> {
+/// Las libretas que hay en la carpeta de la persona, y cuántas se descartaron
+/// por venir con una dirección de otro origen.
+pub async fn list_address_books(client: &DavClient) -> Result<(Vec<AddressBook>, usize), DavError> {
     let home = client.home().clone();
     let reply = client
         // 1: la carpeta y lo que hay dentro. Con 0 sólo vendría la carpeta, que
@@ -271,7 +272,7 @@ pub async fn list_address_books(client: &DavClient) -> Result<Vec<AddressBook>, 
     if books.len() > cap {
         return Err(DavError::TooManyAddressBooks(cap));
     }
-    Ok(books)
+    Ok((books, foreign))
 }
 
 /// El ETag de cada tarjeta de una libreta.
