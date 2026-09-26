@@ -665,7 +665,15 @@ le pide que se desbloquee: con el llavero bloqueado no se hace nada y se espera.
 | desbloqueado | está | no está | la base, con esa clave |
 | desbloqueado | no está | está | se rehace vacía, se anota y el estado lo dice |
 | desbloqueado | está | no abre | igual |
-| se bloquea | — | abierta | se cierra |
+| se bloquea | — | abierta | se cierra, en la próxima revisión |
+
+El cierre al bloquear **no es inmediato**: `vasak-keyring` avisa al desbloquear
+pero no al bloquear, así que lo nota la revisión de cada cinco minutos. Hasta
+300 segundos después de bloquear, la base sigue abierta y SQLCipher tiene su
+clave en memoria. Por eso el proceso no deja volcados de memoria (`LimitCORE=0`
+en la unidad y `PR_SET_DUMPABLE` en cero al arrancar), y la clave llega a
+SQLCipher por `sqlite3_key_v2` desde memoria que se borra, sin pasar por el
+texto de un `PRAGMA`.
 
 **Lo que el cifrado protege, y lo que no.** Protege en reposo: el disco robado,
 la copia de seguridad, otra cuenta del equipo. No protege contra un proceso que
@@ -676,9 +684,23 @@ visibilidad, no una frontera.
 Encendido por omisión. Lo que la persona decide por cuenta vive en
 `$XDG_CONFIG_HOME/vasak-accounts-sync/stores.json`. Apagar o vaciar borra
 **primero la clave y después los archivos**; con el llavero bloqueado se borran
-los archivos y la clave en el primer desbloqueo. La base de una cuenta que ya no
-está en `ListAccounts` se borra, pero sólo si `ListAccounts` respondió bien: un
-servicio que no contesta no quiere decir que la persona no tenga cuentas.
+los archivos y la clave en el primer desbloqueo. Una base vaciada o apagada
+**nunca vuelve con la clave vieja**: aunque el llavero diga que la borró, la
+cuenta queda anotada hasta tener una clave nueva guardada. La base de una cuenta
+que ya no está en `ListAccounts` se borra, pero sólo si `ListAccounts` respondió
+bien: un servicio que no contesta no quiere decir que la persona no tenga
+cuentas.
+
+Borrar bajo `stores/` no sigue enlaces: `vasak-accounts-sync/` y `stores/` se
+abren con `O_NOFOLLOW` y todo se borra relativo a ese descriptor, sin
+recursión, y sólo carpetas que son una base (vacías, con un `store.db` regular o
+con restos `store.db*`). Una carpeta ajena con nombre de cuenta se queda donde
+está.
+
+La clave viaja del llavero al sync por una sesión `plain` de Secret Service: la
+ven `dbus-broker` y cualquier proceso de la persona que se ponga de monitor del
+bus. Contra el mismo usuario negociar Diffie-Hellman no ganaría nada —ese
+proceso le puede pedir la clave al llavero directamente—, así que queda así.
 
 Publica en `ar.net.vasak.os.AccountsStore`, en `/ar/net/vasak/os/AccountsStore`
 del mismo nombre de bus:
@@ -686,8 +708,8 @@ del mismo nombre de bus:
 | Método | Qué hace |
 |---|---|
 | `GetStatus` | El llavero y, por cuenta, `locked`, `open`, `rebuilt`, `disabled` o `unavailable`, con el motivo y `size_bytes`. |
-| `SetStoreEnabled(account_id, enabled)` | Enciende o apaga. Apagar borra. |
-| `ClearStore(account_id)` | Borra y, si está encendida, la vuelve a crear vacía con otra clave. |
+| `SetStoreEnabled(account_id, enabled)` | Enciende o apaga. Apagar borra. Sólo cuentas del último `ListAccounts` bueno. |
+| `ClearStore(account_id)` | Borra y, si está encendida, la vuelve a crear vacía con otra clave. Sólo cuentas del último `ListAccounts` bueno. |
 | `RequestSync(account_id)` | Deja lista la base de esa cuenta. |
 
 Y la señal `StatusChanged`, sin detalle. Nada de esto lee lo guardado, así que no

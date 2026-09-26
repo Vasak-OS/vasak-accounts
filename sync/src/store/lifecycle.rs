@@ -11,6 +11,11 @@
 //! | desbloqueado | está | no abre | igual que la anterior |
 //! | pasa a bloqueado | — | abierta | cerrar la base y soltar la clave |
 //!
+//! **La última fila no es inmediata.** `vasak-keyring` avisa al desbloquear y
+//! no al bloquear, así que el bloqueo lo nota la revisión por reloj del bucle
+//! principal: hasta 300 segundos después, y mientras tanto la base sigue
+//! abierta, con la clave de sus páginas en la memoria de SQLCipher.
+//!
 //! Y alrededor de la tabla:
 //!
 //! - **Encendido por omisión.** Lo que la persona decide por cuenta vive en
