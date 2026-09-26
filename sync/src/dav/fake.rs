@@ -90,6 +90,8 @@ pub struct FakeState {
     /// Cortar cada `sync-collection` a estas tarjetas, con un `507` sobre la
     /// libreta: la respuesta truncada de RFC 6578.
     pub truncate_sync: Option<usize>,
+    /// No contestar nunca: el pedido se lee, se anota y se queda esperando.
+    pub stall: bool,
 }
 
 #[derive(Clone)]
@@ -127,6 +129,7 @@ impl FakeDav {
             extra_sync_xml: String::new(),
             extra_multiget_xml: String::new(),
             truncate_sync: None,
+            stall: false,
         }));
 
         let shared = Arc::clone(&state);
@@ -268,7 +271,7 @@ async fn serve(mut socket: tokio::net::TcpStream, state: Arc<Mutex<FakeState>>) 
             body,
         };
 
-        let (status, reply, chunked) = {
+        let (status, reply, chunked, stall) = {
             let mut state = state.lock().unwrap();
             state.requests.push(request.clone());
             if let Some(hook) = state.on_request.as_mut() {
@@ -282,8 +285,11 @@ async fn serve(mut socket: tokio::net::TcpStream, state: Arc<Mutex<FakeState>>) 
                     1,
                 );
             }
-            (status, reply, state.chunked)
+            (status, reply, state.chunked, state.stall)
         };
+        if stall {
+            std::future::pending::<()>().await;
+        }
 
         let mut out =
             format!("HTTP/1.1 {status} X\r\nContent-Type: application/xml; charset=utf-8\r\n");

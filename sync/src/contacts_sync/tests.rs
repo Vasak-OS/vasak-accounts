@@ -17,6 +17,8 @@ const ACCOUNT: &str = "cuenta";
 
 struct CredentialState {
     result: Result<DavCredential, CredentialError>,
+    /// La de una cuenta en particular, antes que `result`.
+    per_account: HashMap<String, DavCredential>,
     calls: usize,
 }
 
@@ -36,11 +38,14 @@ impl FakeCredentials {
 impl CredentialSource for FakeCredentials {
     async fn contacts_credential(
         &self,
-        _account_id: &str,
+        account_id: &str,
     ) -> Result<DavCredential, CredentialError> {
         let mut state = self.0.lock().unwrap();
         state.calls += 1;
-        state.result.clone()
+        match state.per_account.get(account_id) {
+            Some(credential) => Ok(credential.clone()),
+            None => state.result.clone(),
+        }
     }
 }
 
@@ -93,6 +98,7 @@ impl Fixture {
         let server = FakeDav::start().await;
         let credentials = FakeCredentials(Arc::new(std::sync::Mutex::new(CredentialState {
             result: Ok(credential_for(&server)),
+            per_account: HashMap::new(),
             calls: 0,
         })));
         let notified = Arc::new(AtomicUsize::new(0));
@@ -1035,6 +1041,133 @@ async fn una_cuenta_que_pasa_el_tope_de_libretas_no_se_guarda() {
     };
     assert!(detail.contains("más de 2 libretas"), "{detail}");
     assert_eq!(f.count("SELECT count(*) FROM address_books").await, 0);
+}
+
+/// **Una cuenta que pasa el tope de bytes no sigue escribiendo.** Los topes
+/// por libreta y por tarjeta multiplicados dan un terabyte; el de la cuenta
+/// corta la vuelta como fallida antes de escribir el lote que lo pasaría, sin
+/// guardar el token, y lo que ya estaba queda.
+#[tokio::test]
+async fn una_cuenta_que_pasa_el_tope_de_bytes_no_sigue_escribiendo() {
+    let one = card("00000", "Persona 00000", "p0@x.com").len() as u64;
+    let limits = Limits {
+        max_account_vcard_bytes: 5 * one,
+        ..Limits::DEFAULT
+    };
+    let f = Fixture::with_limits("contactos-tope-cuenta", limits).await;
+    put_many(&f.server, 0, 0..3);
+    f.synced().await;
+    let old = f.token(0).await.unwrap();
+
+    put_many(&f.server, 0, 3..20);
+    let outcome = f.sync().await;
+    let SyncOutcome::Failed(detail) = outcome else {
+        panic!("tenía que fallar: {outcome:?}");
+    };
+    assert!(detail.contains(&format!("{} bytes", 5 * one)), "{detail}");
+    assert_eq!(f.count("SELECT count(*) FROM contacts").await, 3);
+    assert_eq!(f.token(0).await, Some(old), "el token no se movió");
+    assert_eq!(f.contacts_status().await["state"], "failed");
+}
+
+/// **Una cuenta lenta no frena a las otras.** Las cuentas van de a una: un
+/// servidor que no contesta dejaba a la siguiente esperando lo que tardara el
+/// plazo de cada pedido, por cada pedido. Con el plazo de la vuelta, la lenta
+/// se corta como fallida —sin guardar nada— y la otra se sincroniza.
+#[tokio::test]
+async fn una_cuenta_lenta_no_frena_a_las_otras() {
+    let temp = TempDir::new("contactos-lenta");
+    let keys = FakeKeys::default();
+    let manager = Arc::new(StoreManager::new(
+        keys.clone(),
+        Ok(Locations {
+            stores: temp.0.join("data/stores"),
+            settings: temp.0.join("config/stores.json"),
+        }),
+    ));
+    let listed = |id: &str| ListedAccount {
+        id: id.into(),
+        capabilities: vec!["contacts".into()],
+        needs_reauth: false,
+    };
+    manager
+        .accounts_listed(
+            AccountListing::Listed(vec![listed("lenta"), listed("rapida")]),
+            Instant::now(),
+        )
+        .await;
+    assert!(manager.activate_contacts("lenta").await.unwrap());
+    assert!(manager.activate_contacts("rapida").await.unwrap());
+
+    let slow = FakeDav::start().await;
+    slow.put(0, "ana.vcf", &card("1", "Ana", "ana@x.com"));
+    slow.state().stall = true;
+    let fast = FakeDav::start().await;
+    fast.put(0, "zoe.vcf", &card("2", "Zoe", "zoe@x.com"));
+    let credentials = FakeCredentials(Arc::new(std::sync::Mutex::new(CredentialState {
+        result: Err(CredentialError::Failed("no se esperaba".into())),
+        per_account: [
+            ("lenta".to_string(), credential_for(&slow)),
+            ("rapida".to_string(), credential_for(&fast)),
+        ]
+        .into(),
+        calls: 0,
+    })));
+    let limits = Limits {
+        max_round: Duration::from_millis(500),
+        ..Limits::DEFAULT
+    };
+    let scheduler = ContactsScheduler::new(ContactsSync::new(
+        Arc::clone(&manager),
+        credentials,
+        limits,
+        HttpPolicy::plain_loopback(),
+        Arc::new(|| {}),
+    ));
+
+    tokio::time::timeout(Duration::from_secs(10), scheduler.run_due(Instant::now()))
+        .await
+        .expect("la cuenta lenta frenó a la otra");
+
+    let status = serde_json::to_value(manager.status().await).unwrap();
+    let area = |id: &str| {
+        status["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["account_id"] == id)
+            .unwrap()["contacts"]
+            .clone()
+    };
+    assert_eq!(area("lenta")["state"], "failed");
+    assert!(
+        area("lenta")["detail"].as_str().unwrap().contains("tardó"),
+        "{}",
+        area("lenta")
+    );
+    assert_eq!(area("rapida")["state"], "synced");
+    let names = manager
+        .with_store("rapida", |store| {
+            Ok(store
+                .connection()
+                .query_row("SELECT display_name FROM contacts", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap())
+        })
+        .await
+        .unwrap();
+    assert_eq!(names, "Zoe");
+    let slow_rows = manager
+        .with_store("lenta", |store| {
+            Ok(store
+                .connection()
+                .query_row("SELECT count(*) FROM contacts", [], |r| r.get::<_, i64>(0))
+                .unwrap())
+        })
+        .await
+        .unwrap();
+    assert_eq!(slow_rows, 0);
 }
 
 // ── Los lotes ───────────────────────────────────────────────────────────────

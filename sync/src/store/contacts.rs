@@ -160,6 +160,21 @@ impl Store {
             .map_err(classify)
     }
 
+    /// Cuántos bytes ocupan las tarjetas crudas de toda la cuenta.
+    ///
+    /// Bytes y no caracteres (`octet_length`, no `length`): con acentos no es lo
+    /// mismo, y el tope es de disco.
+    pub fn contacts_raw_bytes(&self) -> Result<u64, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT coalesce(sum(octet_length(raw_vcard)), 0) FROM contacts",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|bytes| bytes.max(0) as u64)
+            .map_err(classify)
+    }
+
     /// El ETag de cada tarjeta guardada de una libreta, por dirección.
     pub fn contact_etags(
         &self,
@@ -413,6 +428,35 @@ pub(crate) mod tests {
             0,
             "el correo viejo no queda en el índice"
         );
+    }
+
+    /// Lo que ocupan las tarjetas crudas se cuenta en bytes, de todas las
+    /// libretas, y una tarjeta reescrita cuenta una vez.
+    #[test]
+    fn los_bytes_de_las_tarjetas_se_cuentan_en_bytes() {
+        let temp = TempDir::new("contactos-bytes");
+        let mut store = open_store(&temp);
+        assert_eq!(store.contacts_raw_bytes().unwrap(), 0);
+        let books = store
+            .upsert_address_books(&[
+                ("https://x/a/".into(), "A".into()),
+                ("https://x/b/".into(), "B".into()),
+            ])
+            .unwrap();
+        let ana = row("https://x/a/1.vcf", "Ñandú", "ana@x.com");
+        let juan = row("https://x/b/1.vcf", "Juan", "juan@x.com");
+        let expected = (ana.raw_vcard.len() + juan.raw_vcard.len()) as u64;
+        assert!(ana.raw_vcard.len() > ana.raw_vcard.chars().count());
+        store
+            .apply_contacts(&books[0], &[ContactOp::Upsert(ana.clone())], None)
+            .unwrap();
+        store
+            .apply_contacts(&books[0], &[ContactOp::Upsert(ana)], None)
+            .unwrap();
+        store
+            .apply_contacts(&books[1], &[ContactOp::Upsert(juan)], None)
+            .unwrap();
+        assert_eq!(store.contacts_raw_bytes().unwrap(), expected);
     }
 
     /// El token y el `getctag` van con el lote, y sin lote no cambian.

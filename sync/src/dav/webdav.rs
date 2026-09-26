@@ -89,6 +89,16 @@ pub struct Limits {
     pub multiget_batch: usize,
     /// Cuántas veces seguidas se sigue un `sync-collection` truncado (`507`).
     pub max_sync_rounds: usize,
+    /// Bytes de tarjetas crudas por cuenta. Los otros topes multiplicados dan
+    /// un terabyte —cien libretas de veinte mil tarjetas de medio mega—; una
+    /// agenda de verdad, con fotos, son decenas de megas. Pasarlo corta la
+    /// vuelta sin guardar el token.
+    pub max_account_vcard_bytes: u64,
+    /// Cuánto puede durar la vuelta de una cuenta. Las cuentas van de a una:
+    /// sin esto, un servidor lento —cuatrocientos `multiget` de treinta
+    /// segundos por libreta— dejaba esperando horas a las otras y a cada
+    /// `RequestSync`. Pasarlo corta la vuelta sin guardar el token.
+    pub max_round: Duration,
 }
 
 impl Limits {
@@ -102,6 +112,8 @@ impl Limits {
         max_vcard_bytes: 512 * 1024,
         multiget_batch: 50,
         max_sync_rounds: 50,
+        max_account_vcard_bytes: 1024 * 1024 * 1024,
+        max_round: Duration::from_secs(10 * 60),
     };
 }
 

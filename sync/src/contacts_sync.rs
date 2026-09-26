@@ -35,6 +35,12 @@
 //!
 //! Cada escritura vuelve a mirar el llavero: si se bloqueó a mitad de camino,
 //! no se escribe nada más y la vuelta se corta.
+//!
+//! Y cada vuelta tiene dos topes que la cortan entera, como fallida y sin
+//! guardar el token: un plazo ([`Limits::max_round`], diez minutos), para que
+//! un servidor lento no deje esperando a las otras cuentas, y los bytes de
+//! tarjetas crudas de la cuenta ([`Limits::max_account_vcard_bytes`], un
+//! gigabyte), mirados antes de escribir cada lote.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
@@ -180,6 +186,11 @@ pub enum SyncOutcome {
 enum SyncError {
     Dav(DavError),
     Store(StoreError),
+    /// La vuelta pasó [`Limits::max_round`]. Corta la vuelta entera.
+    Timeout,
+    /// Las tarjetas de la cuenta pasarían [`Limits::max_account_vcard_bytes`].
+    /// Corta la vuelta entera: las otras libretas suman al mismo tope.
+    AccountTooLarge,
 }
 
 impl From<DavError> for SyncError {
@@ -191,6 +202,45 @@ impl From<DavError> for SyncError {
 impl From<StoreError> for SyncError {
     fn from(error: StoreError) -> Self {
         SyncError::Store(error)
+    }
+}
+
+/// Lo que lleva una vuelta de una cuenta de libreta en libreta.
+struct Round {
+    report: SyncReport,
+    /// Hasta cuándo puede seguir: cada pedido a la red espera como mucho hasta
+    /// acá, y después de esto no se escribe nada más.
+    ///
+    /// Un plazo que se mira en cada paso y no un `timeout` sobre la vuelta
+    /// entera: cortar desde afuera suelta el futuro de `with_store` a mitad de
+    /// un lote, con la base prestada al hilo que escribe, y el lote —el último
+    /// lleva el token— se termina de escribir igual. Así, lo que se corta es
+    /// un pedido a la red o un lote que todavía no empezó.
+    deadline: tokio::time::Instant,
+    /// Los bytes de tarjetas crudas de la cuenta: los guardados al empezar,
+    /// más lo que escribió esta vuelta. Una tarjeta reescrita cuenta dos veces
+    /// hasta la vuelta siguiente, que vuelve a medir: se pasa por arriba y
+    /// nunca por abajo.
+    stored_bytes: u64,
+}
+
+impl Round {
+    fn check_deadline(&self) -> Result<(), SyncError> {
+        if tokio::time::Instant::now() >= self.deadline {
+            return Err(SyncError::Timeout);
+        }
+        Ok(())
+    }
+
+    /// Un pedido a la red, con lo que le queda de plazo a la vuelta.
+    async fn net<T>(
+        &self,
+        request: impl Future<Output = Result<T, DavError>>,
+    ) -> Result<T, SyncError> {
+        match tokio::time::timeout_at(self.deadline, request).await {
+            Ok(result) => Ok(result?),
+            Err(_) => Err(SyncError::Timeout),
+        }
     }
 }
 
@@ -287,6 +337,28 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
                 self.set_status(account_id, AreaState::Failed, shown).await;
                 SyncOutcome::Failed(shown.into())
             }
+            Err(SyncError::Timeout) => {
+                let minutes = self.limits.max_round.as_secs().div_ceil(60);
+                tracing::warn!("'{account_id}': la vuelta pasó los {minutes} minutos y se cortó");
+                let shown = format!(
+                    "la sincronización de los contactos tardó más de {minutes} minutos y se cortó; \
+                     sigue en la próxima vuelta"
+                );
+                self.set_status(account_id, AreaState::Failed, &shown).await;
+                SyncOutcome::Failed(shown)
+            }
+            Err(SyncError::AccountTooLarge) => {
+                let cap = self.limits.max_account_vcard_bytes;
+                tracing::warn!(
+                    "'{account_id}': las tarjetas de la cuenta pasarían los {cap} bytes"
+                );
+                let shown = format!(
+                    "los contactos de la cuenta pasan los {cap} bytes que se guardan; no se \
+                     guardaron los que faltaban"
+                );
+                self.set_status(account_id, AreaState::Failed, &shown).await;
+                SyncOutcome::Failed(shown)
+            }
             Err(SyncError::Dav(e)) => {
                 tracing::warn!(
                     "'{account_id}': no se pudieron sincronizar los contactos: {}",
@@ -317,17 +389,21 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
         credential: &DavCredential,
     ) -> Result<SyncReport, SyncError> {
         let client = DavClient::new(credential, self.limits, self.policy)?;
-        let mut report = SyncReport::default();
+        let mut round = Round {
+            report: SyncReport::default(),
+            deadline: tokio::time::Instant::now() + self.limits.max_round,
+            stored_bytes: self.store(account_id, |s| s.contacts_raw_bytes()).await?,
+        };
 
         let mut seen = BTreeSet::new();
-        let (books, foreign) = carddav::list_address_books(&client).await?;
-        report.foreign += foreign;
+        let (books, foreign) = round.net(carddav::list_address_books(&client)).await?;
+        round.report.foreign += foreign;
         let books: Vec<AddressBook> = books
             .into_iter()
             // Una libreta que el servidor nombra dos veces es una.
             .filter(|b| seen.insert(b.href.to_string()))
             .collect();
-        report.books = books.len();
+        round.report.books = books.len();
         let listed: Vec<(String, String)> = books
             .iter()
             .map(|b| (b.href.to_string(), b.display_name.clone()))
@@ -352,11 +428,12 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
         {
             let id = gone.id;
             loop {
+                round.check_deadline()?;
                 let removed = self
                     .store(account_id, move |s| s.remove_address_book_chunk(id))
                     .await?;
-                report.batches += 1;
-                report.removed += removed;
+                round.report.batches += 1;
+                round.report.removed += removed;
                 if removed == 0 {
                     break;
                 }
@@ -373,7 +450,7 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
         let mut first_error = None;
         for (book, stored) in books.iter().zip(stored) {
             match self
-                .sync_book(account_id, &client, book, &stored, &mut report)
+                .sync_book(account_id, &client, book, &stored, &mut round)
                 .await
             {
                 Ok(()) => {}
@@ -389,7 +466,7 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
         }
         match first_error {
             Some(e) => Err(SyncError::Dav(e)),
-            None => Ok(report),
+            None => Ok(round.report),
         }
     }
 
@@ -399,10 +476,10 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
         client: &DavClient,
         book: &AddressBook,
         stored: &StoredAddressBook,
-        report: &mut SyncReport,
+        round: &mut Round,
     ) -> Result<(), SyncError> {
         if book.ctag.is_some() && book.ctag == stored.ctag {
-            report.unchanged_books += 1;
+            round.report.unchanged_books += 1;
             return Ok(());
         }
 
@@ -417,19 +494,19 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
         let plan = match book.sync_collection {
             Some(false) => None,
             _ => {
-                self.plan_by_token(client, book, token, &local, report)
+                self.plan_by_token(client, book, token, &local, round)
                     .await?
             }
         };
         let plan = match plan {
             Some(plan) => plan,
             None => {
-                report.etag_books += 1;
-                self.plan_by_etag(client, book, &local).await?
+                round.report.etag_books += 1;
+                self.plan_by_etag(client, book, &local, round).await?
             }
         };
 
-        self.execute(account_id, client, book, stored, plan, report)
+        self.execute(account_id, client, book, stored, plan, round)
             .await
     }
 
@@ -440,7 +517,7 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
         book: &AddressBook,
         mut token: Option<String>,
         local: &HashMap<String, Option<String>>,
-        report: &mut SyncReport,
+        round: &mut Round,
     ) -> Result<Option<Plan>, SyncError> {
         let mut full = token.is_none();
         let mut changed: BTreeMap<String, (url::Url, Option<String>)> = BTreeMap::new();
@@ -452,7 +529,14 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
             if rounds > self.limits.max_sync_rounds {
                 return Err(DavError::Status(507).into());
             }
-            match webdav::sync_collection(client, &book.href, token.as_deref()).await? {
+            match round
+                .net(webdav::sync_collection(
+                    client,
+                    &book.href,
+                    token.as_deref(),
+                ))
+                .await?
+            {
                 webdav::SyncCollection::NotSupported => return Ok(None),
                 webdav::SyncCollection::InvalidToken => {
                     if token.is_none() {
@@ -461,14 +545,14 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
                         return Ok(None);
                     }
                     tracing::info!("el token de una libreta venció: sincronización completa");
-                    report.full_resyncs += 1;
+                    round.report.full_resyncs += 1;
                     token = None;
                     full = true;
                     changed.clear();
                     removed.clear();
                 }
                 webdav::SyncCollection::Delta(delta) => {
-                    report.foreign += delta.foreign;
+                    round.report.foreign += delta.foreign;
                     merge_delta(
                         &mut changed,
                         &mut removed,
@@ -528,8 +612,9 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
         client: &DavClient,
         book: &AddressBook,
         local: &HashMap<String, Option<String>>,
+        round: &Round,
     ) -> Result<Plan, SyncError> {
-        let listed = carddav::list_etags(client, &book.href).await?;
+        let listed = round.net(carddav::list_etags(client, &book.href)).await?;
         if listed.len() > self.limits.max_cards_per_book {
             return Err(DavError::TooManyCards(self.limits.max_cards_per_book).into());
         }
@@ -577,35 +662,35 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
         book: &AddressBook,
         stored: &StoredAddressBook,
         plan: Plan,
-        report: &mut SyncReport,
+        round: &mut Round,
     ) -> Result<(), SyncError> {
         let mut pending: Vec<ContactOp> = Vec::new();
         let mut pending_bytes = 0;
-        report.removed += plan.delete.len();
+        round.report.removed += plan.delete.len();
         for href in plan.delete {
             pending_bytes += href.len();
             pending.push(ContactOp::Delete(href));
             if pending.len() >= WRITE_BATCH_ROWS {
-                self.write(account_id, stored, &mut pending, None, report)
+                self.write(account_id, stored, &mut pending, None, round)
                     .await?;
                 pending_bytes = 0;
             }
         }
 
         for chunk in plan.fetch.chunks(self.limits.multiget_batch.max(1)) {
-            let cards = self.fetch_cards(client, book, chunk, report).await?;
+            let cards = self.fetch_cards(client, book, chunk, round).await?;
             // Desarmar las tarjetas es CPU, y una armada a propósito tarda: fuera
             // del bucle de eventos.
             let max_vcard_bytes = self.limits.max_vcard_bytes;
             let (rows, too_large) =
                 webdav::off_runtime(move || Ok(rows_from(cards, max_vcard_bytes))).await?;
-            report.too_large += too_large;
+            round.report.too_large += too_large;
             for row in rows {
-                report.fetched += 1;
+                round.report.fetched += 1;
                 pending_bytes += row.raw_vcard.len();
                 pending.push(ContactOp::Upsert(Box::new(row)));
                 if pending.len() >= WRITE_BATCH_ROWS || pending_bytes >= WRITE_BATCH_BYTES {
-                    self.write(account_id, stored, &mut pending, None, report)
+                    self.write(account_id, stored, &mut pending, None, round)
                         .await?;
                     pending_bytes = 0;
                 }
@@ -613,14 +698,8 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
         }
 
         // El último lote, aunque esté vacío: es el que guarda el token.
-        self.write(
-            account_id,
-            stored,
-            &mut pending,
-            Some(plan.progress),
-            report,
-        )
-        .await
+        self.write(account_id, stored, &mut pending, Some(plan.progress), round)
+            .await
     }
 
     async fn write(
@@ -629,15 +708,29 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
         stored: &StoredAddressBook,
         pending: &mut Vec<ContactOp>,
         finish: Option<BookProgress>,
-        report: &mut SyncReport,
+        round: &mut Round,
     ) -> Result<(), SyncError> {
+        round.check_deadline()?;
         let ops = std::mem::take(pending);
+        let added: u64 = ops
+            .iter()
+            .map(|op| match op {
+                ContactOp::Upsert(row) => row.raw_vcard.len() as u64,
+                ContactOp::Delete(_) => 0,
+            })
+            .sum();
+        // Antes de escribir: con el tope pasado no entra este lote, y el token
+        // —que va con el último— no se guarda.
+        if round.stored_bytes.saturating_add(added) > self.limits.max_account_vcard_bytes {
+            return Err(SyncError::AccountTooLarge);
+        }
         let book = stored.clone();
         self.store(account_id, move |s| {
             s.apply_contacts(&book, &ops, finish.as_ref())
         })
         .await?;
-        report.batches += 1;
+        round.stored_bytes += added;
+        round.report.batches += 1;
         Ok(())
     }
 
@@ -649,23 +742,26 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
         client: &DavClient,
         book: &AddressBook,
         hrefs: &[url::Url],
-        report: &mut SyncReport,
+        round: &mut Round,
     ) -> Result<Vec<CardResource>, SyncError> {
         let mut cards = Vec::new();
         let mut parts = vec![hrefs.to_vec()];
         while let Some(part) = parts.pop() {
-            match carddav::multiget(client, &book.href, &part).await {
+            match round
+                .net(carddav::multiget(client, &book.href, &part))
+                .await
+            {
                 Ok((fetched, unrequested)) => {
-                    report.unrequested += unrequested;
+                    round.report.unrequested += unrequested;
                     cards.extend(fetched);
                 }
-                Err(DavError::BodyTooLarge(_)) if part.len() > 1 => {
+                Err(SyncError::Dav(DavError::BodyTooLarge(_))) if part.len() > 1 => {
                     let (first, second) = part.split_at(part.len() / 2);
                     parts.push(second.to_vec());
                     parts.push(first.to_vec());
                 }
-                Err(DavError::BodyTooLarge(_)) => report.too_large += 1,
-                Err(e) => return Err(e.into()),
+                Err(SyncError::Dav(DavError::BodyTooLarge(_))) => round.report.too_large += 1,
+                Err(e) => return Err(e),
             }
         }
         Ok(cards)
