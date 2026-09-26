@@ -709,6 +709,59 @@ async fn si_el_llavero_se_bloquea_a_mitad_no_se_escribe_lo_que_llego() {
     assert_eq!(f.token(0).await, None);
 }
 
+/// **Un `ClearStore` a mitad de la vuelta no deja el token viejo en la base
+/// nueva.** La vuelta sigue con las libretas que leyó de la base de antes; la
+/// segunda libreta no cambió, así que su último lote va vacío y sólo lleva el
+/// token. Guardarlo en la base nueva —donde esa libreta todavía no existe—
+/// hacía que la vuelta siguiente pidiera sólo las diferencias desde él, y sus
+/// contactos no volvían nunca.
+#[tokio::test]
+async fn vaciar_a_mitad_de_la_vuelta_no_deja_el_token_viejo() {
+    let f = Fixture::new("contactos-vaciar-a-mitad").await;
+    let second = f.server.add_book("/dav/ana/trabajo/", "Trabajo");
+    put_many(&f.server, 0, 0..2);
+    put_many(&f.server, second, 10..13);
+    f.synced().await;
+    assert_eq!(f.count("SELECT count(*) FROM contacts").await, 5);
+
+    // En esta vuelta, el `sync-collection` de la segunda libreta vacía la base
+    // antes de contestarse. `clear` corre en otro hilo con su propio bucle, y
+    // el pedido espera a que termine: la vuelta sigue ya con la base nueva.
+    let manager = Arc::clone(&f.manager);
+    let book_path = f.server.state().books[second].path.clone();
+    let mut done = false;
+    f.server.state().on_request = Some(Box::new(move |request| {
+        if done || !request.is_sync_collection() || request.path != book_path {
+            return;
+        }
+        done = true;
+        let manager = Arc::clone(&manager);
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(manager.clear(ACCOUNT))
+        })
+        .join()
+        .unwrap()
+        .unwrap();
+    }));
+    let outcome = f.sync().await;
+    assert_eq!(
+        outcome_kind(&outcome),
+        "StoreClosed",
+        "la vuelta se corta al ver la base nueva"
+    );
+    f.server.state().on_request = None;
+    assert!(f.manager.prepare_for_sync(ACCOUNT).await);
+    assert_eq!(f.token(second).await, None, "el token viejo no quedó");
+
+    // La vuelta siguiente trae todo otra vez, las dos libretas.
+    f.synced().await;
+    assert_eq!(f.count("SELECT count(*) FROM contacts").await, 5);
+}
+
 // ── El permiso ──────────────────────────────────────────────────────────────
 
 /// **`AccessDenied` se ve `unavailable` y no se reintenta en bucle**: la

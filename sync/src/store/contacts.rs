@@ -196,6 +196,14 @@ impl Store {
     /// Una tarjeta que ya estaba se actualiza en su lugar —mismo `id`, así que
     /// la entrada del índice se reemplaza y no se duplica—, y sus correos y
     /// teléfonos se rehacen. Borrar lo que no está no es un error.
+    ///
+    /// **La libreta tiene que estar en esta base**, con el mismo `id` y la
+    /// misma dirección; si no, `Err(Missing)` sin escribir nada. Un
+    /// `ClearStore` a mitad de una vuelta rehace la base vacía, y la vuelta
+    /// sigue con las libretas que leyó de la vieja: sin esta comprobación, el
+    /// último lote —vacío si no había cambios— guardaba en la base nueva el
+    /// token de una libreta que ahí no existe, y la vuelta siguiente pedía
+    /// sólo las diferencias desde él. Lo de antes no volvía nunca.
     pub fn apply_contacts(
         &mut self,
         book: &StoredAddressBook,
@@ -209,6 +217,16 @@ impl Store {
             )));
         }
         let transaction = self.connection.transaction().map_err(classify)?;
+        let exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM address_books WHERE id = ?1 AND href = ?2)",
+                rusqlite::params![book.id, book.href],
+                |row| row.get(0),
+            )
+            .map_err(classify)?;
+        if !exists {
+            return Err(StoreError::Missing);
+        }
         let at = now();
         for op in ops {
             match op {
@@ -510,6 +528,56 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(store.contacts_sync_token(&book.href).unwrap(), None);
+    }
+
+    /// **Un lote de una libreta que no está en la base no escribe nada**, ni el
+    /// token. Es la base que rehízo un `ClearStore` a mitad de una vuelta: la
+    /// libreta leída de la vieja no existe en la nueva, o su `id` es ahora el
+    /// de otra.
+    #[test]
+    fn un_lote_de_una_libreta_que_no_esta_no_guarda_el_token() {
+        let old = TempDir::new("contactos-libreta-vieja");
+        let book = open_store(&old)
+            .upsert_address_books(&[("https://x/a/".into(), "A".into())])
+            .unwrap()
+            .remove(0);
+        let progress = BookProgress {
+            token: Some("t9".into()),
+            ctag: Some("c9".into()),
+        };
+
+        // La base nueva, vacía: el último lote de la libreta, sin cambios.
+        let fresh = TempDir::new("contactos-libreta-nueva");
+        let mut store = open_store(&fresh);
+        assert!(matches!(
+            store.apply_contacts(&book, &[], Some(&progress)),
+            Err(StoreError::Missing)
+        ));
+        assert_eq!(store.contacts_sync_token(&book.href).unwrap(), None);
+        assert_eq!(count(&store, "SELECT count(*) FROM sync_state"), 0);
+
+        // Y con el mismo `id` ocupado por otra libreta, tampoco: ni el token
+        // ni las tarjetas van a parar a ella.
+        let other = store
+            .upsert_address_books(&[("https://x/b/".into(), "B".into())])
+            .unwrap()
+            .remove(0);
+        assert_eq!(other.id, book.id);
+        assert!(matches!(
+            store.apply_contacts(
+                &book,
+                &[ContactOp::Upsert(row(
+                    "https://x/a/1.vcf",
+                    "Ana",
+                    "a@x.com"
+                ))],
+                Some(&progress),
+            ),
+            Err(StoreError::Missing)
+        ));
+        assert_eq!(count(&store, "SELECT count(*) FROM contacts"), 0);
+        assert_eq!(count(&store, "SELECT count(*) FROM sync_state"), 0);
+        assert_eq!(store.address_books().unwrap()[0].ctag, None);
     }
 
     /// Un lote de más de quinientos no entra: el tope lo pone el que escribe,
