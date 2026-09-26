@@ -1,6 +1,5 @@
 use std::os::fd::{FromRawFd, OwnedFd};
 
-
 // ---------------------------------------------------------------------------
 // Verification pública
 // ---------------------------------------------------------------------------
@@ -47,7 +46,11 @@ impl PinnedCaller {
         let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
             .map_err(|e| format!("Failed to resolve /proc/{pid}/exe: {e}"))?;
 
-        Ok(Self { pid, _pidfd: pidfd, exe })
+        Ok(Self {
+            pid,
+            _pidfd: pidfd,
+            exe,
+        })
     }
 }
 
@@ -63,7 +66,11 @@ mod tests {
     fn test_resolve_own_pid() {
         let path = resolve_binary_path(std::process::id()).unwrap();
         // Solo verificamos que se haya resuelto a algo (path absoluto)
-        assert!(path.starts_with('/'), "expected absolute path, got: {}", path);
+        assert!(
+            path.starts_with('/'),
+            "expected absolute path, got: {}",
+            path
+        );
     }
 
     #[test]
@@ -71,5 +78,4 @@ mod tests {
         let result = resolve_binary_path(999_999_999);
         assert!(result.is_err());
     }
-
 }

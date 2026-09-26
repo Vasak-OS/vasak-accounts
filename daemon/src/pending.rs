@@ -81,7 +81,11 @@ impl PendingAuth {
     /// de creación fuera un campo público, un flujo podría nacer ya vencido —o
     /// no vencer nunca— por un descuido en el lugar que lo construye.
     pub fn new(uid: u32, flow: Flow) -> Self {
-        Self { uid, flow, creado: Instant::now() }
+        Self {
+            uid,
+            flow,
+            creado: Instant::now(),
+        }
     }
 
     fn vencido(&self, ahora: Instant) -> bool {
@@ -270,7 +274,10 @@ pub fn is_loopback_redirect(uri: &str) -> bool {
     if url.scheme() != "http" {
         return false;
     }
-    matches!(url.host_str(), Some("127.0.0.1") | Some("localhost") | Some("[::1]") | Some("::1"))
+    matches!(
+        url.host_str(),
+        Some("127.0.0.1") | Some("localhost") | Some("[::1]") | Some("::1")
+    )
 }
 
 #[cfg(test)]
@@ -312,7 +319,10 @@ mod tests {
         assert_eq!(recuperado.verifier, "el-verifier");
 
         // La segunda vez ya no está: un código se canjea una sola vez.
-        assert_eq!(mapa.take_oauth(&id, 1000, "el-state").unwrap_err(), TakeError::Unknown);
+        assert_eq!(
+            mapa.take_oauth(&id, 1000, "el-state").unwrap_err(),
+            TakeError::Unknown
+        );
         assert_eq!(mapa.len(), 0);
     }
 
@@ -323,7 +333,10 @@ mod tests {
         let mut mapa = PendingAuths::default();
         let id = mapa.insert(pendiente(1000)).unwrap();
 
-        assert_eq!(mapa.take_oauth(&id, 1000, "otro-state").unwrap_err(), TakeError::StateMismatch);
+        assert_eq!(
+            mapa.take_oauth(&id, 1000, "otro-state").unwrap_err(),
+            TakeError::StateMismatch
+        );
         // Y el flujo sigue vivo: un intento fallido no puede servir para
         // cancelarle la autorización a quien la estaba haciendo bien.
         assert!(mapa.take_oauth(&id, 1000, "el-state").is_ok());
@@ -334,7 +347,10 @@ mod tests {
         let mut mapa = PendingAuths::default();
         let id = mapa.insert(pendiente(1000)).unwrap();
 
-        assert_eq!(mapa.take_oauth(&id, 1001, "el-state").unwrap_err(), TakeError::WrongUser);
+        assert_eq!(
+            mapa.take_oauth(&id, 1001, "el-state").unwrap_err(),
+            TakeError::WrongUser
+        );
     }
 
     #[test]
@@ -342,7 +358,10 @@ mod tests {
         let mut mapa = PendingAuths::default();
         mapa.insert(pendiente(1000)).unwrap();
 
-        assert_eq!(mapa.take_oauth("inventado", 1000, "el-state").unwrap_err(), TakeError::Unknown);
+        assert_eq!(
+            mapa.take_oauth("inventado", 1000, "el-state").unwrap_err(),
+            TakeError::Unknown
+        );
     }
 
     #[test]
@@ -352,7 +371,10 @@ mod tests {
         viejo.creado = Instant::now() - TTL - Duration::from_secs(1);
         let id = mapa.insert(viejo).unwrap();
 
-        assert_eq!(mapa.take_oauth(&id, 1000, "el-state").unwrap_err(), TakeError::Unknown);
+        assert_eq!(
+            mapa.take_oauth(&id, 1000, "el-state").unwrap_err(),
+            TakeError::Unknown
+        );
         assert_eq!(mapa.len(), 0, "tenía que purgarse, no sólo rechazarse");
     }
 
@@ -420,7 +442,10 @@ mod tests {
         let mut mapa = PendingAuths::default();
         let id = mapa.insert(pendiente_nextcloud(1000)).unwrap();
 
-        assert_eq!(mapa.peek_nextcloud(&id, 1001).unwrap_err(), TakeError::WrongUser);
+        assert_eq!(
+            mapa.peek_nextcloud(&id, 1001).unwrap_err(),
+            TakeError::WrongUser
+        );
     }
 
     /// Pedir un flujo por el camino del otro tipo se responde como «no existe»
@@ -432,7 +457,10 @@ mod tests {
         let oauth = mapa.insert(pendiente(1000)).unwrap();
         let nube = mapa.insert(pendiente_nextcloud(1000)).unwrap();
 
-        assert_eq!(mapa.peek_nextcloud(&oauth, 1000).unwrap_err(), TakeError::Unknown);
+        assert_eq!(
+            mapa.peek_nextcloud(&oauth, 1000).unwrap_err(),
+            TakeError::Unknown
+        );
         assert_eq!(
             mapa.take_oauth(&nube, 1000, "el-state").unwrap_err(),
             TakeError::Unknown
@@ -448,7 +476,11 @@ mod tests {
     fn los_dos_tipos_de_flujo_comparten_el_tope() {
         let mut mapa = PendingAuths::default();
         for i in 0..MAX_POR_USUARIO {
-            let p = if i % 2 == 0 { pendiente(1000) } else { pendiente_nextcloud(1000) };
+            let p = if i % 2 == 0 {
+                pendiente(1000)
+            } else {
+                pendiente_nextcloud(1000)
+            };
             mapa.insert(p).unwrap();
         }
         assert!(mapa.insert(pendiente_nextcloud(1000)).is_err());

@@ -19,7 +19,7 @@ resolver = "2"
 members = ["daemon", "sync"]
 
 [workspace.package]
-version = "0.13.1"
+version = "0.14.0"
 edition = "2021"
 authors = ["Vasak Group", "Joaquin (Pato) Decima"]
 license = "GPL-3.0-only"
@@ -33,10 +33,32 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 url = "2"
-# rustls y no native-tls: es Rust puro, así que no suma bibliotecas compartidas
-# al paquete.
+# rustls y no native-tls: es Rust puro, así que el TLS no suma bibliotecas
+# compartidas. El paquete sí enlaza una desde el almacén local del sync:
+# SQLCipher cifra con la `libcrypto.so.3` del sistema (paquete `openssl`), y
+# `readelf -d target/release/vasak-accounts-sync` la muestra en NEEDED. El
+# demonio sigue sin ninguna fuera de la libc.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rustls-native-certs = "0.8"
 
 [profile.release]
 opt-level = 2
+
+# Lo que no sube, y por qué. Una versión vieja explicada es una decisión; una sin
+# explicar es algo que nadie se anima a tocar. Cada una dice qué rompe y cuándo
+# deja de estar acá.
+[workspace.metadata.vasak.bibliotecasAtrasadas]
+zbus = """4 → 5. Salto mayor del andamiaje de D-Bus: cambian los tipos de las \
+señales (SignalContext → SignalEmitter), los proxies y las macros, en los dos \
+binarios a la vez. Condición de salida: un PR propio, sin otro trabajo mezclado, \
+que verifique a mano cada interfaz —AccountManager en el bus del sistema, con la \
+identidad del llamante por pidfd; AccountsSync y AccountsStore en el de sesión— \
+y el cliente del llavero de store/key.rs contra vasak-keyring."""
+reqwest = """0.12 → 0.13. Choca con oauth2 5.0.0, la última publicada, que pide \
+reqwest ^0.12: el demonio le pasa su propio reqwest::Client a request_async, y \
+con dos reqwest distintos ese tipo no coincide. El sync podría subir solo, pero \
+dejaría dos reqwest en el candado y en 0.13 el TLS de rustls trae aws-lc-rs \
+(C y cmake) salvo que se pida rustls-no-provider y se instale ring a mano. \
+Condición de salida: una versión de oauth2 que acepte reqwest 0.13 —o que el \
+demonio implemente AsyncHttpClient él mismo—, y entonces suben los dos binarios \
+juntos, con ring como proveedor."""

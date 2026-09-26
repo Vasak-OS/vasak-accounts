@@ -55,7 +55,13 @@ pub async fn authorize_removal(
             "/org/freedesktop/PolicyKit1/Authority",
             Some("org.freedesktop.PolicyKit1.Authority"),
             "CheckAuthorization",
-            &(subject, REMOVE_ACTION, detalles, banderas, id_de_cancelacion),
+            &(
+                subject,
+                REMOVE_ACTION,
+                detalles,
+                banderas,
+                id_de_cancelacion,
+            ),
         )
         .await
         .map_err(|e| FdoError::Failed(format!("no se pudo consultar a polkit: {e}")))?;

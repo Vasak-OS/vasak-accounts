@@ -56,7 +56,6 @@ pub async fn check(
         .map_err(|e| FdoError::Failed(format!("respuesta inválida del servicio de permisos: {e}")))
 }
 
-
 /// Follows the permission service onto the development bus when one is in use.
 /// Compiled out of release: see the note on the daemon's own bus selection.
 #[cfg(debug_assertions)]

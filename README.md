@@ -413,7 +413,13 @@ vasak-accounts/
     └── src/
         ├── main.rs          # el bucle y la interfaz de sesión
         ├── broker.rs        # le pide al servicio, como cualquier aplicación
-        └── imap.rs          # lo justo para contar el correo sin leer
+        ├── imap.rs          # lo justo para contar el correo sin leer
+        ├── store_api.rs     # ar.net.vasak.os.AccountsStore: estado y control
+        └── store/           # el almacén local cifrado, una base por cuenta
+            ├── key.rs        # la clave en el llavero (Secret Service)
+            ├── paths.rs      # dónde vive cada base, y con qué permisos
+            ├── migrations.rs # el esquema, versión por versión
+            └── lifecycle.rs  # cuándo se crea, se abre, se cierra y se borra
 ```
 
 ---
@@ -635,6 +641,80 @@ cuenta. Una conexión cortada, en cambio, se reconecta a los treinta segundos: q
 se caiga el wifi o se reinicie el servidor es lo normal en una conexión que dura
 horas, no un error.
 
+### El almacén local cifrado
+
+El sync prepara una base **SQLCipher** por cuenta, en
+`$XDG_DATA_HOME/vasak-accounts-sync/stores/<account_id>/store.db` (carpeta 0700,
+archivos 0600, reaplicados en cada apertura). **Hoy está vacía**: tiene su clave,
+su esquema v1 —dónde quedó la sincronización y una bitácora con tope de mil
+filas— y su ciclo de vida, y nada de nadie adentro. Los contactos, el calendario y
+el correo llegan después, de a uno (`vasak-accounts#23`). Mientras tanto la lista
+de mensajes sigue en memoria, como dice arriba.
+
+La clave son 32 bytes al azar guardados en el llavero de la sesión (Secret
+Service, esquema `ar.net.vasak.os.AccountsStore`), y se le pasan a SQLCipher
+crudos. **Nunca se genera una clave sin haber leído antes que el llavero está
+desbloqueado**: bloqueado, el llavero contesta vacío igual que si no hubiera
+nada, y tomar eso por «no hay clave» dejaría ilegible una base buena. Tampoco se
+le pide que se desbloquee: con el llavero bloqueado no se hace nada y se espera.
+
+| llavero | clave | base | qué se hace |
+|---|---|---|---|
+| bloqueado | — | — | nada |
+| desbloqueado | no está | no está | primero la clave, después la base |
+| desbloqueado | está | no está | la base, con esa clave |
+| desbloqueado | no está | está | se rehace vacía, se anota y el estado lo dice |
+| desbloqueado | está | no abre | igual |
+| se bloquea | — | abierta | se cierra, en la próxima revisión |
+
+El cierre al bloquear **no es inmediato**: `vasak-keyring` avisa al desbloquear
+pero no al bloquear, así que lo nota la revisión de cada cinco minutos. Hasta
+300 segundos después de bloquear, la base sigue abierta y SQLCipher tiene su
+clave en memoria. Por eso el proceso no deja volcados de memoria (`LimitCORE=0`
+en la unidad y `PR_SET_DUMPABLE` en cero al arrancar), y la clave llega a
+SQLCipher por `sqlite3_key_v2` desde memoria que se borra, sin pasar por el
+texto de un `PRAGMA`.
+
+**Lo que el cifrado protege, y lo que no.** Protege en reposo: el disco robado,
+la copia de seguridad, otra cuenta del equipo. No protege contra un proceso que
+corre como la misma persona: el llavero le entrega los secretos a cualquiera de
+sus procesos. El permiso que llegue para leer el almacén será consentimiento y
+visibilidad, no una frontera.
+
+Encendido por omisión. Lo que la persona decide por cuenta vive en
+`$XDG_CONFIG_HOME/vasak-accounts-sync/stores.json`. Apagar o vaciar borra
+**primero la clave y después los archivos**; con el llavero bloqueado se borran
+los archivos y la clave en el primer desbloqueo. Una base vaciada o apagada
+**nunca vuelve con la clave vieja**: aunque el llavero diga que la borró, la
+cuenta queda anotada hasta tener una clave nueva guardada. La base de una cuenta
+que ya no está en `ListAccounts` se borra, pero sólo si `ListAccounts` respondió
+bien: un servicio que no contesta no quiere decir que la persona no tenga
+cuentas.
+
+Borrar bajo `stores/` no sigue enlaces: `vasak-accounts-sync/` y `stores/` se
+abren con `O_NOFOLLOW` y todo se borra relativo a ese descriptor, sin
+recursión, y sólo carpetas que son una base (vacías, con un `store.db` regular o
+con restos `store.db*`). Una carpeta ajena con nombre de cuenta se queda donde
+está.
+
+La clave viaja del llavero al sync por una sesión `plain` de Secret Service: la
+ven `dbus-broker` y cualquier proceso de la persona que se ponga de monitor del
+bus. Contra el mismo usuario negociar Diffie-Hellman no ganaría nada —ese
+proceso le puede pedir la clave al llavero directamente—, así que queda así.
+
+Publica en `ar.net.vasak.os.AccountsStore`, en `/ar/net/vasak/os/AccountsStore`
+del mismo nombre de bus:
+
+| Método | Qué hace |
+|---|---|
+| `GetStatus` | El llavero y, por cuenta, `locked`, `open`, `rebuilt`, `disabled` o `unavailable`, con el motivo y `size_bytes`. |
+| `SetStoreEnabled(account_id, enabled)` | Enciende o apaga. Apagar borra. Sólo cuentas del último `ListAccounts` bueno. |
+| `ClearStore(account_id)` | Borra y, si está encendida, la vuelve a crear vacía con otra clave. Sólo cuentas del último `ListAccounts` bueno. |
+| `RequestSync(account_id)` | Deja lista la base de esa cuenta. |
+
+Y la señal `StatusChanged`, sin detalle. Nada de esto lee lo guardado, así que no
+pide permiso; el permiso llega con la primera lectura.
+
 ## Nextcloud: el único que no hay que configurar
 
 Nextcloud no usa OAuth2 sino su **Login Flow v2**, y la diferencia es la que
@@ -737,7 +817,11 @@ No caduca, no depende de ningún registro y no cuesta nada.
 
 ## Requisitos
 
-- Rust 1.75+ (edición 2021)
+- Rust 1.95+ (edición 2021; lo pide `rusqlite_migration`)
+- Para compilar, un compilador de C y las cabeceras de OpenSSL: SQLCipher se
+  compila con el programa y enlaza la `libcrypto.so.3` del sistema
+- Un llavero Secret Service en la sesión (`vasak-keyring`) para el almacén local;
+  sin él cada cuenta se ve «no disponible» y el correo sigue en memoria
 - D-Bus del sistema
 - `vasak-permissions` corriendo — **sin él no se autoriza nada**: el servicio
   rechaza toda petición que necesite permiso
