@@ -24,7 +24,7 @@
 //! Por eso el nombre se resuelve **acá**, antes de pedir nada, y se rechaza si
 //! apunta a cualquier dirección que no sea de internet: nada de `127.0.0.1`,
 //! nada de `192.168.*`, nada de enlaces locales ni de direcciones de máquina
-//! virtual. Ver [`direccion_permitida`].
+//! virtual. Ver [`is_allowed_ip`].
 //!
 //! Queda una rendija conocida: entre que se resuelve el nombre y que se abre la
 //! conexión, un servidor de nombres hostil puede contestar otra cosa (*DNS
@@ -62,12 +62,12 @@ const MAX_BYTES: usize = 5 * 1024 * 1024;
 /// Genérico a propósito: el `User-Agent` es uno de los datos que esta función
 /// existe para no entregar. No dice versión, ni sistema, ni que esto es un
 /// cliente de correo — que ya sería decir que el mensaje se abrió en uno.
-const AGENTE: &str = "VasakOS";
+const USER_AGENT: &str = "VasakOS";
 
 /// Los formatos que se aceptan.
 ///
 /// Mapas de bits y nada más. Ver la nota del módulo sobre el SVG.
-const TIPOS: &[&str] = &[
+const ACCEPTED_TYPES: &[&str] = &[
     "image/png",
     "image/jpeg",
     "image/gif",
@@ -79,9 +79,10 @@ const TIPOS: &[&str] = &[
 
 /// Una imagen traída, lista para que la ventana la ponga en el documento.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct Imagen {
+pub struct Image {
     /// El tipo tal como lo aceptamos, no como lo dijo el servidor.
-    pub tipo: String,
+    #[serde(rename = "tipo")]
+    pub content_type: String,
     /// El contenido en base64, para poder viajar por D-Bus y terminar en un
     /// `data:` del documento aislado.
     pub base64: String,
@@ -93,24 +94,26 @@ pub struct Imagen {
 /// «No se pudo» sobre una imagen que la persona pidió a propósito no le dice a
 /// nadie si el problema es el correo, la red o una decisión de seguridad.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Motivo {
+pub enum UrlRejection {
     /// No es `http` ni `https`.
-    EsquemaAjeno,
+    ForeignScheme,
     /// No tiene servidor al que pedirle.
-    SinServidor,
+    NoHost,
     /// Lleva usuario y contraseña adentro de la dirección.
-    ConCredenciales,
+    HasCredentials,
     /// Apunta a la propia máquina o a la red de al lado.
-    RedPrivada,
+    PrivateNetwork,
 }
 
-impl std::fmt::Display for Motivo {
+impl std::fmt::Display for UrlRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Motivo::EsquemaAjeno => write!(f, "la dirección no es http ni https"),
-            Motivo::SinServidor => write!(f, "la dirección no nombra ningún servidor"),
-            Motivo::ConCredenciales => write!(f, "la dirección lleva credenciales adentro"),
-            Motivo::RedPrivada => write!(f, "la dirección apunta a tu propia máquina o red"),
+            UrlRejection::ForeignScheme => write!(f, "la dirección no es http ni https"),
+            UrlRejection::NoHost => write!(f, "la dirección no nombra ningún servidor"),
+            UrlRejection::HasCredentials => write!(f, "la dirección lleva credenciales adentro"),
+            UrlRejection::PrivateNetwork => {
+                write!(f, "la dirección apunta a tu propia máquina o red")
+            }
         }
     }
 }
@@ -118,32 +121,32 @@ impl std::fmt::Display for Motivo {
 /// Mira la dirección antes de resolverla.
 ///
 /// Lo que se puede decidir sin tocar la red. Lo demás —a dónde apunta de
-/// verdad— hay que resolverlo, y eso pasa en [`traer`].
-pub fn revisar(direccion: &str) -> Result<url::Url, Motivo> {
-    let url = url::Url::parse(direccion.trim()).map_err(|_| Motivo::SinServidor)?;
+/// verdad— hay que resolverlo, y eso pasa en [`fetch`].
+pub fn check_url(address: &str) -> Result<url::Url, UrlRejection> {
+    let url = url::Url::parse(address.trim()).map_err(|_| UrlRejection::NoHost)?;
 
     if url.scheme() != "http" && url.scheme() != "https" {
-        return Err(Motivo::EsquemaAjeno);
+        return Err(UrlRejection::ForeignScheme);
     }
     // `http://usuario:clave@servidor/` manda esas credenciales en la petición.
     // En un correo eso no es un descuido de nadie: es alguien probando a ver si
     // algo las acepta.
     if !url.username().is_empty() || url.password().is_some() {
-        return Err(Motivo::ConCredenciales);
+        return Err(UrlRejection::HasCredentials);
     }
 
-    let Some(servidor) = url.host_str() else {
-        return Err(Motivo::SinServidor);
+    let Some(host) = url.host_str() else {
+        return Err(UrlRejection::NoHost);
     };
-    if servidor.is_empty() {
-        return Err(Motivo::SinServidor);
+    if host.is_empty() {
+        return Err(UrlRejection::NoHost);
     }
 
     // Si ya viene con la dirección numérica puesta, se decide acá y no hace
     // falta resolver nada.
-    if let Ok(ip) = servidor.trim_matches(['[', ']']).parse::<IpAddr>() {
-        if !direccion_permitida(ip) {
-            return Err(Motivo::RedPrivada);
+    if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
+        if !is_allowed_ip(ip) {
+            return Err(UrlRejection::PrivateNetwork);
         }
     }
 
@@ -160,7 +163,7 @@ pub fn revisar(direccion: &str) -> Result<url::Url, Motivo> {
 /// - los enlaces locales, que incluyen el `169.254.169.254` del que viven las
 ///   nubes para entregar credenciales de máquina virtual,
 /// - lo no especificado, lo de multidifusión y lo reservado para documentación.
-pub fn direccion_permitida(ip: IpAddr) -> bool {
+pub fn is_allowed_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             !(v4.is_loopback()
@@ -181,7 +184,7 @@ pub fn direccion_permitida(ip: IpAddr) -> bool {
             // Una IPv6 que envuelve una IPv4 se decide por la IPv4 que lleva
             // adentro: `::ffff:127.0.0.1` es la propia máquina con otro nombre.
             if let Some(v4) = v6.to_ipv4_mapped() {
-                return direccion_permitida(IpAddr::V4(v4));
+                return is_allowed_ip(IpAddr::V4(v4));
             }
             !(v6.is_loopback()
                 || v6.is_multicast()
@@ -199,48 +202,48 @@ pub fn direccion_permitida(ip: IpAddr) -> bool {
 /// Se compara contra la lista y se devuelve **el de la lista**, no el que llegó:
 /// lo que el servidor manda puede traer parámetros pegados, mayúsculas y
 /// espacios, y eso termina en un `data:` del documento de la ventana.
-pub fn tipo_aceptado(cabecera: &str) -> Option<&'static str> {
-    let declarado = cabecera
+pub fn accepted_type(header: &str) -> Option<&'static str> {
+    let declared = header
         .split(';')
         .next()
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
 
-    TIPOS.iter().find(|t| **t == declarado).copied()
+    ACCEPTED_TYPES.iter().find(|t| **t == declared).copied()
 }
 
 /// Trae la imagen.
-pub async fn traer(direccion: &str) -> Result<Imagen, String> {
-    let url = revisar(direccion).map_err(|m| m.to_string())?;
+pub async fn fetch(address: &str) -> Result<Image, String> {
+    let url = check_url(address).map_err(|m| m.to_string())?;
 
     // A dónde apunta de verdad. Se resuelve acá, antes de pedir nada: es lo que
     // impide que un correo haga que esta máquina se pida cosas a sí misma.
-    let servidor = url.host_str().unwrap_or_default().to_string();
-    let puerto = url.port_or_known_default().unwrap_or(443);
-    let resueltas = tokio::net::lookup_host((servidor.as_str(), puerto))
+    let host = url.host_str().unwrap_or_default().to_string();
+    let port = url.port_or_known_default().unwrap_or(443);
+    let resolved = tokio::net::lookup_host((host.as_str(), port))
         .await
         .map_err(|e| format!("no se pudo resolver el nombre: {e}"))?;
 
-    let mut alguna = false;
-    for socket in resueltas {
-        alguna = true;
-        if !direccion_permitida(socket.ip()) {
-            return Err(Motivo::RedPrivada.to_string());
+    let mut any_resolved = false;
+    for socket in resolved {
+        any_resolved = true;
+        if !is_allowed_ip(socket.ip()) {
+            return Err(UrlRejection::PrivateNetwork.to_string());
         }
     }
-    if !alguna {
-        return Err(Motivo::SinServidor.to_string());
+    if !any_resolved {
+        return Err(UrlRejection::NoHost.to_string());
     }
 
-    let cliente = reqwest::Client::builder()
+    let client = reqwest::Client::builder()
         // **Sin seguir redirecciones.** Una redirección es la forma de esquivar
         // la comprobación de arriba: la dirección que se revisó es de internet y
         // la siguiente puede ser `127.0.0.1`. Si el servidor quiere mandar a
         // otro lado, la imagen no se muestra.
         .redirect(reqwest::redirect::Policy::none())
         .timeout(TIMEOUT)
-        .user_agent(AGENTE)
+        .user_agent(USER_AGENT)
         // Sin galletas, y **no porque se apaguen acá**: el cliente se compila
         // sin esa función, así que no hay ningún almacén de galletas que
         // pudiera mandar la sesión de otro sitio a quien puso la dirección en
@@ -248,7 +251,7 @@ pub async fn traer(direccion: &str) -> Result<Imagen, String> {
         .build()
         .map_err(|e| format!("no se pudo preparar la petición: {e}"))?;
 
-    let respuesta = cliente
+    let response = client
         .get(url)
         // Sin decir de dónde viene. El `Referer` de un correo es la
         // confirmación de que se abrió.
@@ -257,26 +260,26 @@ pub async fn traer(direccion: &str) -> Result<Imagen, String> {
         .await
         .map_err(|e| format!("no se pudo traer la imagen: {e}"))?;
 
-    if !respuesta.status().is_success() {
-        return Err(format!("el servidor contestó {}", respuesta.status()));
+    if !response.status().is_success() {
+        return Err(format!("el servidor contestó {}", response.status()));
     }
 
-    let declarado = respuesta
+    let declared = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    let Some(tipo) = tipo_aceptado(&declarado) else {
+    let Some(content_type) = accepted_type(&declared) else {
         return Err(format!(
-            "eso no es una imagen que se pueda mostrar: {declarado}"
+            "eso no es una imagen que se pueda mostrar: {declared}"
         ));
     };
 
-    let bytes = leer_con_tope(respuesta).await?;
+    let bytes = read_capped(response).await?;
 
-    Ok(Imagen {
-        tipo: tipo.to_string(),
+    Ok(Image {
+        content_type: content_type.to_string(),
         base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
     })
 }
@@ -287,32 +290,32 @@ pub async fn traer(direccion: &str) -> Result<Imagen, String> {
 /// que va a mandar, no lo que va a mandar. Sin contar mientras llega, un
 /// servidor que promete un kilobyte y manda un gigabyte se lleva puesta la
 /// memoria del servicio.
-async fn leer_con_tope(respuesta: reqwest::Response) -> Result<Vec<u8>, String> {
+async fn read_capped(response: reqwest::Response) -> Result<Vec<u8>, String> {
     use futures_util::StreamExt;
 
-    let mut recibido: Vec<u8> = Vec::new();
-    let mut trozos = respuesta.bytes_stream();
+    let mut received: Vec<u8> = Vec::new();
+    let mut chunks = response.bytes_stream();
 
-    while let Some(trozo) = trozos.next().await {
-        let trozo = trozo.map_err(|e| format!("se cortó la descarga: {e}"))?;
-        if recibido.len() + trozo.len() > MAX_BYTES {
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(|e| format!("se cortó la descarga: {e}"))?;
+        if received.len() + chunk.len() > MAX_BYTES {
             return Err("la imagen es demasiado grande".to_string());
         }
-        recibido.extend_from_slice(&trozo);
+        received.extend_from_slice(&chunk);
     }
 
-    if recibido.is_empty() {
+    if received.is_empty() {
         return Err("el servidor no mandó nada".to_string());
     }
-    Ok(recibido)
+    Ok(received)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn ip(texto: &str) -> IpAddr {
-        texto.parse().expect("es una dirección válida")
+    fn ip(text: &str) -> IpAddr {
+        text.parse().expect("es una dirección válida")
     }
 
     /// **Lo que este módulo existe para impedir.** La dirección la puso quien
@@ -321,7 +324,7 @@ mod tests {
     /// sí misma.
     #[test]
     fn no_se_le_pide_nada_a_la_propia_maquina_ni_a_la_red_de_al_lado() {
-        for adentro in [
+        for inside in [
             "127.0.0.1",
             "127.1.2.3",
             "10.0.0.5",
@@ -345,8 +348,8 @@ mod tests {
             "::ffff:192.168.0.1",
         ] {
             assert!(
-                !direccion_permitida(ip(adentro)),
-                "{adentro} tendría que quedar afuera"
+                !is_allowed_ip(ip(inside)),
+                "{inside} tendría que quedar afuera"
             );
         }
     }
@@ -354,11 +357,8 @@ mod tests {
     /// Y lo que sí está en internet se puede pedir, o esto no serviría de nada.
     #[test]
     fn a_internet_si_se_le_pide() {
-        for afuera in ["1.1.1.1", "8.8.8.8", "93.184.216.34", "2606:4700::1111"] {
-            assert!(
-                direccion_permitida(ip(afuera)),
-                "{afuera} tendría que pasar"
-            );
+        for outside in ["1.1.1.1", "8.8.8.8", "93.184.216.34", "2606:4700::1111"] {
+            assert!(is_allowed_ip(ip(outside)), "{outside} tendría que pasar");
         }
     }
 
@@ -366,25 +366,29 @@ mod tests {
     /// escribe mal.
     #[test]
     fn el_borde_del_rango_privado_esta_donde_corresponde() {
-        assert!(!direccion_permitida(ip("172.16.0.0")));
-        assert!(!direccion_permitida(ip("172.31.255.255")));
-        assert!(direccion_permitida(ip("172.15.255.255")));
-        assert!(direccion_permitida(ip("172.32.0.0")));
+        assert!(!is_allowed_ip(ip("172.16.0.0")));
+        assert!(!is_allowed_ip(ip("172.31.255.255")));
+        assert!(is_allowed_ip(ip("172.15.255.255")));
+        assert!(is_allowed_ip(ip("172.32.0.0")));
     }
 
     #[test]
     fn solo_se_piden_direcciones_de_web() {
-        assert!(revisar("https://ejemplo.com/p.png").is_ok());
-        assert!(revisar("http://ejemplo.com/p.png").is_ok());
+        assert!(check_url("https://ejemplo.com/p.png").is_ok());
+        assert!(check_url("http://ejemplo.com/p.png").is_ok());
 
-        for ajena in [
+        for foreign in [
             "file:///etc/passwd",
             "ftp://ejemplo.com/p.png",
             "data:image/gif;base64,R0lGOD",
             "javascript:alert(1)",
             "cid:parte1@ejemplo",
         ] {
-            assert_eq!(revisar(ajena), Err(Motivo::EsquemaAjeno), "{ajena}");
+            assert_eq!(
+                check_url(foreign),
+                Err(UrlRejection::ForeignScheme),
+                "{foreign}"
+            );
         }
     }
 
@@ -393,12 +397,12 @@ mod tests {
     #[test]
     fn una_direccion_con_credenciales_no_se_pide() {
         assert_eq!(
-            revisar("http://usuario:clave@ejemplo.com/p.png"),
-            Err(Motivo::ConCredenciales)
+            check_url("http://usuario:clave@ejemplo.com/p.png"),
+            Err(UrlRejection::HasCredentials)
         );
         assert_eq!(
-            revisar("http://usuario@ejemplo.com/p.png"),
-            Err(Motivo::ConCredenciales)
+            check_url("http://usuario@ejemplo.com/p.png"),
+            Err(UrlRejection::HasCredentials)
         );
     }
 
@@ -406,24 +410,30 @@ mod tests {
     #[test]
     fn una_direccion_numerica_privada_se_rechaza_sin_tocar_la_red() {
         assert_eq!(
-            revisar("http://127.0.0.1:9000/x.png"),
-            Err(Motivo::RedPrivada)
+            check_url("http://127.0.0.1:9000/x.png"),
+            Err(UrlRejection::PrivateNetwork)
         );
-        assert_eq!(revisar("http://192.168.0.1/x.png"), Err(Motivo::RedPrivada));
+        assert_eq!(
+            check_url("http://192.168.0.1/x.png"),
+            Err(UrlRejection::PrivateNetwork)
+        );
         // Entre corchetes, que es como va una IPv6 en una dirección web.
-        assert_eq!(revisar("http://[::1]/x.png"), Err(Motivo::RedPrivada));
+        assert_eq!(
+            check_url("http://[::1]/x.png"),
+            Err(UrlRejection::PrivateNetwork)
+        );
     }
 
     #[test]
     fn lo_que_no_es_una_direccion_no_se_pide() {
-        for basura in [
+        for garbage in [
             "",
             "   ",
             "no es una dirección",
             "http://",
             "://ejemplo.com",
         ] {
-            assert!(revisar(basura).is_err(), "{basura:?}");
+            assert!(check_url(garbage).is_err(), "{garbage:?}");
         }
     }
 
@@ -432,10 +442,10 @@ mod tests {
     /// termina en un `data:` del documento de la ventana.
     #[test]
     fn el_tipo_sale_de_la_lista_y_no_del_servidor() {
-        assert_eq!(tipo_aceptado("image/png"), Some("image/png"));
-        assert_eq!(tipo_aceptado("IMAGE/PNG"), Some("image/png"));
+        assert_eq!(accepted_type("image/png"), Some("image/png"));
+        assert_eq!(accepted_type("IMAGE/PNG"), Some("image/png"));
         assert_eq!(
-            tipo_aceptado(" image/jpeg ; charset=binario"),
+            accepted_type(" image/jpeg ; charset=binario"),
             Some("image/jpeg")
         );
     }
@@ -445,19 +455,32 @@ mod tests {
     /// del motor, no de lo que se está devolviendo.
     #[test]
     fn un_svg_no_se_acepta() {
-        assert_eq!(tipo_aceptado("image/svg+xml"), None);
+        assert_eq!(accepted_type("image/svg+xml"), None);
     }
 
     #[test]
     fn lo_que_no_es_una_imagen_no_se_acepta() {
-        for otro in [
+        for other in [
             "text/html",
             "application/octet-stream",
             "",
             "image/",
             "imagen/png",
         ] {
-            assert_eq!(tipo_aceptado(otro), None, "{otro:?}");
+            assert_eq!(accepted_type(other), None, "{other:?}");
         }
+    }
+
+    /// `FetchImage`: el tipo y el contenido, con las claves que lee
+    /// `vasak-mail`.
+    #[test]
+    fn una_imagen_conserva_las_claves_del_bus() {
+        let image = Image {
+            content_type: "image/png".into(),
+            base64: "aG9sYQ==".into(),
+        };
+        let json = serde_json::to_value(&image).unwrap();
+        assert_eq!(crate::test_support::json_keys(&json), ["base64", "tipo"]);
+        assert_eq!(json["tipo"], "image/png");
     }
 }

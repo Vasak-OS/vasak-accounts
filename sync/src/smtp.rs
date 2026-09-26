@@ -30,7 +30,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 
-use crate::broker::{Credencial, Destino};
+use crate::broker::{Credential, Endpoint};
 
 /// Tope para conectarse y saludar.
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -40,13 +40,13 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 /// Vale lo mismo que en IMAP: un servidor que deja de escribir sin cerrar el
 /// socket no produce ningún error, la lectura no vuelve nunca, y sin tope el
 /// mensaje se queda «enviando» para siempre.
-const INTERCAMBIO: Duration = Duration::from_secs(120);
+const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Tope de una línea de respuesta.
-const MAX_LINEA: usize = 8 * 1024;
+const MAX_LINE: usize = 8 * 1024;
 
 /// El puerto que habla TLS desde el primer byte.
-const TLS_DIRECTO: u16 = 465;
+const IMPLICIT_TLS_PORT: u16 = 465;
 
 /// El nombre con el que este equipo se presenta.
 ///
@@ -54,29 +54,29 @@ const TLS_DIRECTO: u16 = 465;
 /// que se negocia el cifrado, y el nombre de la máquina de alguien no tiene por
 /// qué ir ahí. Los servidores que importan miran la dirección IP y el resultado
 /// de la autenticación, no esto.
-const NOS_LLAMAMOS: &str = "localhost";
+const EHLO_NAME: &str = "localhost";
 
 #[derive(Debug)]
 pub enum SmtpError {
     /// El servidor no aceptó las credenciales. No se reintenta: insistir con una
     /// contraseña rechazada es cómo se bloquea una cuenta.
-    Rechazado(String),
+    Rejected(String),
     /// El servidor dijo que no y no va a cambiar de opinión: un 5xx. Una
     /// dirección que no existe, un mensaje demasiado grande. Reintentarlo es
     /// quemar la reputación de la cuenta contra el servidor.
-    Permanente(String),
+    Permanent(String),
     /// Ahora no: un 4xx, o la red. Se vuelve a intentar más tarde.
-    Temporal(String),
+    Temporary(String),
 }
 
 impl std::fmt::Display for SmtpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SmtpError::Rechazado(d) => {
+            SmtpError::Rejected(d) => {
                 write!(f, "el servidor rechazó las credenciales: {d}")
             }
-            SmtpError::Permanente(d) => write!(f, "{d}"),
-            SmtpError::Temporal(d) => write!(f, "{d}"),
+            SmtpError::Permanent(d) => write!(f, "{d}"),
+            SmtpError::Temporary(d) => write!(f, "{d}"),
         }
     }
 }
@@ -85,8 +85,8 @@ impl std::error::Error for SmtpError {}
 
 impl SmtpError {
     /// Si tiene sentido volver a intentarlo.
-    pub fn se_reintenta(&self) -> bool {
-        matches!(self, SmtpError::Temporal(_))
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, SmtpError::Temporary(_))
     }
 }
 
@@ -100,29 +100,29 @@ impl SmtpError {
 /// guión contra el espacio es **toda** la diferencia, y confundirlos deja al
 /// cliente esperando una línea que ya llegó o leyendo la respuesta del comando
 /// siguiente como si fuera de éste.
-pub fn respuesta_de(linea: &str) -> Option<(u16, bool, String)> {
-    if linea.len() < 3 {
+pub fn parse_reply(line: &str) -> Option<(u16, bool, String)> {
+    if line.len() < 3 {
         return None;
     }
-    let codigo: u16 = linea.get(..3)?.parse().ok()?;
+    let code: u16 = line.get(..3)?.parse().ok()?;
 
-    match linea.as_bytes().get(3) {
-        Some(b'-') => Some((codigo, true, linea[4..].to_string())),
-        Some(b' ') => Some((codigo, false, linea[4..].to_string())),
+    match line.as_bytes().get(3) {
+        Some(b'-') => Some((code, true, line[4..].to_string())),
+        Some(b' ') => Some((code, false, line[4..].to_string())),
         // `250` pelado, sin texto: es válido y termina la respuesta.
-        None => Some((codigo, false, String::new())),
+        None => Some((code, false, String::new())),
         _ => None,
     }
 }
 
 /// Cómo clasificar el código que contestó el servidor.
-pub fn clasificar(codigo: u16, detalle: String) -> SmtpError {
-    match codigo {
+pub fn classify_reply(code: u16, detail: String) -> SmtpError {
+    match code {
         // Los de autenticación son su propio caso: no se arreglan reintentando
         // y hay que avisarle a la persona que reconecte la cuenta.
-        535 | 530 | 534 | 538 => SmtpError::Rechazado(detalle),
-        500..=599 => SmtpError::Permanente(detalle),
-        _ => SmtpError::Temporal(detalle),
+        535 | 530 | 534 | 538 => SmtpError::Rejected(detail),
+        500..=599 => SmtpError::Permanent(detail),
+        _ => SmtpError::Temporary(detail),
     }
 }
 
@@ -133,14 +133,14 @@ pub fn clasificar(codigo: u16, detalle: String) -> SmtpError {
 /// mensaje cuyo texto tenga una línea `.` se **corta ahí**: lo que sigue el
 /// servidor lo lee como comandos SMTP, y en el mejor de los casos la conexión
 /// muere. Es una de las cosas más viejas y más olvidadas del protocolo.
-pub fn puntos_protegidos(mensaje: &str) -> String {
-    mensaje
+pub fn dot_stuff(message: &str) -> String {
+    message
         .split("\r\n")
-        .map(|linea| {
-            if linea.starts_with('.') {
-                format!(".{linea}")
+        .map(|line| {
+            if line.starts_with('.') {
+                format!(".{line}")
             } else {
-                linea.to_string()
+                line.to_string()
             }
         })
         .collect::<Vec<_>>()
@@ -149,30 +149,28 @@ pub fn puntos_protegidos(mensaje: &str) -> String {
 
 /// Si una dirección se puede escribir dentro de un comando sin partirlo.
 ///
-/// No valida que sea una dirección —de eso se ocupa `redactar`— sino que **no
+/// No valida que sea una dirección —de eso se ocupa `compose`— sino que **no
 /// pueda salirse del comando**: un salto de línea la convierte en un comando
 /// SMTP más, y desde ahí se manda lo que sea en nombre de la persona.
-pub fn cabe_en_un_comando(direccion: &str) -> bool {
-    !direccion.is_empty()
-        && direccion.len() <= 320
-        && !direccion
-            .chars()
-            .any(|c| c.is_control() || c.is_whitespace())
-        && !direccion.contains(['<', '>'])
+pub fn fits_in_command(address: &str) -> bool {
+    !address.is_empty()
+        && address.len() <= 320
+        && !address.chars().any(|c| c.is_control() || c.is_whitespace())
+        && !address.contains(['<', '>'])
 }
 
 /// La carga de `AUTH PLAIN`: `\0usuario\0secreto`, en base64.
-pub fn carga_plain(usuario: &str, secreto: &str) -> String {
-    base64::engine::general_purpose::STANDARD.encode(format!("\0{usuario}\0{secreto}"))
+pub fn plain_payload(username: &str, secret: &str) -> String {
+    base64::engine::general_purpose::STANDARD.encode(format!("\0{username}\0{secret}"))
 }
 
 /// La carga de `AUTH XOAUTH2`, con el formato que fijan Google y Microsoft.
 ///
 /// El separador es `\x01` y no un espacio ni dos puntos, que es lo intuitivo.
 /// Escribirlo mal da un rechazo que parece de credenciales y no lo es.
-pub fn carga_xoauth2(usuario: &str, token: &str) -> String {
+pub fn xoauth2_payload(username: &str, token: &str) -> String {
     base64::engine::general_purpose::STANDARD
-        .encode(format!("user={usuario}\x01auth=Bearer {token}\x01\x01"))
+        .encode(format!("user={username}\x01auth=Bearer {token}\x01\x01"))
 }
 
 /// Qué mecanismo de autenticación usar.
@@ -181,18 +179,18 @@ pub fn carga_xoauth2(usuario: &str, token: &str) -> String {
 /// después: una cuenta con token no puede autenticarse con `PLAIN` aunque el
 /// servidor lo ofrezca —mandaría el token donde va una contraseña—, y una con
 /// contraseña no puede usar `XOAUTH2`.
-pub fn mecanismo(ofrecidos: &[String], credencial: &Credencial) -> Option<&'static str> {
-    let tiene = |nombre: &str| ofrecidos.iter().any(|m| m.eq_ignore_ascii_case(nombre));
+pub fn pick_mechanism(offered: &[String], credential: &Credential) -> Option<&'static str> {
+    let offers = |name: &str| offered.iter().any(|m| m.eq_ignore_ascii_case(name));
 
-    match credencial {
-        Credencial::Token { .. } => tiene("XOAUTH2").then_some("XOAUTH2"),
-        Credencial::Contrasena { .. } => {
+    match credential {
+        Credential::Token { .. } => offers("XOAUTH2").then_some("XOAUTH2"),
+        Credential::Password { .. } => {
             // `PLAIN` antes que `LOGIN`: es una sola vuelta en vez de tres, y
             // los dos mandan lo mismo. `LOGIN` está para los servidores que no
             // ofrecen el otro, que todavía hay.
-            if tiene("PLAIN") {
+            if offers("PLAIN") {
                 Some("PLAIN")
-            } else if tiene("LOGIN") {
+            } else if offers("LOGIN") {
                 Some("LOGIN")
             } else {
                 None
@@ -202,15 +200,15 @@ pub fn mecanismo(ofrecidos: &[String], credencial: &Credencial) -> Option<&'stat
 }
 
 /// Los mecanismos que anuncia una línea `250-AUTH ...`.
-pub fn mecanismos_de(linea: &str) -> Vec<String> {
-    let recortada = linea.trim();
-    if !recortada.to_ascii_uppercase().starts_with("AUTH") {
+pub fn mechanisms_from(line: &str) -> Vec<String> {
+    let trimmed = line.trim();
+    if !trimmed.to_ascii_uppercase().starts_with("AUTH") {
         return Vec::new();
     }
 
     // El separador es un espacio, pero hay servidores que ponen un `=` después
     // de AUTH: los dos aparecen en la naturaleza.
-    recortada["AUTH".len()..]
+    trimmed["AUTH".len()..]
         .trim_start_matches(['=', ' '])
         .split_whitespace()
         .map(str::to_string)
@@ -222,9 +220,9 @@ pub fn mecanismos_de(linea: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 /// Uno de los dos flujos posibles: en claro mientras se negocia, cifrado después.
-enum Flujo {
-    Claro(TcpStream),
-    Cifrado(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+enum Transport {
+    Plain(TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
     /// Ninguno, y **sólo mientras se cambia uno por el otro**.
     ///
     /// Envolver el socket en TLS pide moverlo, y moverlo de adentro de la
@@ -232,10 +230,10 @@ enum Flujo {
     /// líneas. Existe para no tener que inventar un socket de mentira para
     /// tapar el agujero, que era la otra salida y consistía en abrir una
     /// conexión que nadie usa y paniquear si fallaba.
-    Ninguno,
+    Closed,
 }
 
-impl Flujo {
+impl Transport {
     /// Escribe, **con plazo**.
     ///
     /// Sin él, un servidor que deja de leer sin cerrar el socket llena el búfer
@@ -244,184 +242,186 @@ impl Flujo {
     /// despachador manda de a un mensaje por vez, esa espera **frena la cola
     /// entera**: todo lo que la persona escriba después se queda sin salir, sin
     /// ningún error y sin nada en el diario.
-    async fn escribir(&mut self, datos: &[u8]) -> Result<(), SmtpError> {
-        let escritura = async {
+    async fn write(&mut self, data: &[u8]) -> Result<(), SmtpError> {
+        let writing = async {
             match self {
-                Flujo::Claro(f) => f.write_all(datos).await,
-                Flujo::Cifrado(f) => f.write_all(datos).await,
-                Flujo::Ninguno => Err(std::io::Error::other("no hay conexión")),
+                Transport::Plain(f) => f.write_all(data).await,
+                Transport::Tls(f) => f.write_all(data).await,
+                Transport::Closed => Err(std::io::Error::other("no hay conexión")),
             }
         };
 
-        tokio::time::timeout(INTERCAMBIO, escritura)
+        tokio::time::timeout(EXCHANGE_TIMEOUT, writing)
             .await
             .map_err(|_| {
-                SmtpError::Temporal(format!(
+                SmtpError::Temporary(format!(
                     "el servidor dejó de recibir (más de {} segundos)",
-                    INTERCAMBIO.as_secs()
+                    EXCHANGE_TIMEOUT.as_secs()
                 ))
             })?
-            .map_err(|e| SmtpError::Temporal(format!("no se pudo escribir: {e}")))
+            .map_err(|e| SmtpError::Temporary(format!("no se pudo escribir: {e}")))
     }
 
-    async fn leer(&mut self, destino: &mut Vec<u8>) -> Result<usize, SmtpError> {
-        let resultado = match self {
-            Flujo::Claro(f) => f.read_buf(destino).await,
-            Flujo::Cifrado(f) => f.read_buf(destino).await,
-            Flujo::Ninguno => return Err(SmtpError::Temporal("no hay conexión".into())),
+    async fn read(&mut self, destination: &mut Vec<u8>) -> Result<usize, SmtpError> {
+        let result = match self {
+            Transport::Plain(f) => f.read_buf(destination).await,
+            Transport::Tls(f) => f.read_buf(destination).await,
+            Transport::Closed => return Err(SmtpError::Temporary("no hay conexión".into())),
         };
-        resultado.map_err(|e| SmtpError::Temporal(format!("no se pudo leer: {e}")))
+        result.map_err(|e| SmtpError::Temporary(format!("no se pudo leer: {e}")))
     }
 
-    fn esta_cifrado(&self) -> bool {
-        matches!(self, Flujo::Cifrado(_))
+    fn is_encrypted(&self) -> bool {
+        matches!(self, Transport::Tls(_))
     }
 }
 
 /// Una sesión SMTP, de la conexión al `QUIT`.
-pub struct Sesion {
-    flujo: Flujo,
-    pendiente: Vec<u8>,
+pub struct Session {
+    transport: Transport,
+    pending: Vec<u8>,
     /// Lo que el servidor dijo saber hacer, del `EHLO`.
-    mecanismos: Vec<String>,
+    mechanisms: Vec<String>,
     starttls: bool,
 }
 
-impl Sesion {
+impl Session {
     /// Conecta, cifra y se autentica.
-    pub async fn abrir(destino: &Destino) -> Result<Self, SmtpError> {
+    pub async fn open(destination: &Endpoint) -> Result<Self, SmtpError> {
         let tcp = tokio::time::timeout(
             TIMEOUT,
-            TcpStream::connect((destino.host.as_str(), destino.puerto)),
+            TcpStream::connect((destination.host.as_str(), destination.port)),
         )
         .await
-        .map_err(|_| SmtpError::Temporal(format!("{} no contestó a tiempo", destino.host)))?
-        .map_err(|e| SmtpError::Temporal(format!("no se pudo conectar a {}: {e}", destino.host)))?;
+        .map_err(|_| SmtpError::Temporary(format!("{} no contestó a tiempo", destination.host)))?
+        .map_err(|e| {
+            SmtpError::Temporary(format!("no se pudo conectar a {}: {e}", destination.host))
+        })?;
 
-        let mut sesion = Sesion {
-            flujo: Flujo::Claro(tcp),
-            pendiente: Vec::new(),
-            mecanismos: Vec::new(),
+        let mut session = Session {
+            transport: Transport::Plain(tcp),
+            pending: Vec::new(),
+            mechanisms: Vec::new(),
             starttls: false,
         };
 
-        if destino.puerto == TLS_DIRECTO {
-            sesion.cifrar(&destino.host).await?;
+        if destination.port == IMPLICIT_TLS_PORT {
+            session.upgrade_to_tls(&destination.host).await?;
         }
 
         // El saludo del servidor va primero, antes de decir nada.
-        sesion.esperar(&["220"]).await?;
-        sesion.saludar().await?;
+        session.expect_reply(&["220"]).await?;
+        session.ehlo().await?;
 
-        if !sesion.flujo.esta_cifrado() {
-            if !sesion.starttls {
+        if !session.transport.is_encrypted() {
+            if !session.starttls {
                 // **Sin salida.** Seguir sería mandar la contraseña de la
                 // persona y el mensaje entero a la vista de cualquiera.
-                return Err(SmtpError::Permanente(format!(
+                return Err(SmtpError::Permanent(format!(
                     "{} no ofrece cifrado en el puerto {}, y sin cifrado no se manda nada",
-                    destino.host, destino.puerto
+                    destination.host, destination.port
                 )));
             }
-            sesion.mandar("STARTTLS", &["220"]).await?;
-            sesion.cifrar(&destino.host).await?;
+            session.command("STARTTLS", &["220"]).await?;
+            session.upgrade_to_tls(&destination.host).await?;
             // Y de nuevo el saludo: lo que el servidor anunció antes de cifrar
             // no vale, justamente porque cualquiera pudo haberlo cambiado en el
             // camino. Los mecanismos de autenticación son lo que más importa
             // acá: uno inyectado podría degradar a algo que manda la contraseña
             // en claro.
-            sesion.mecanismos.clear();
-            sesion.saludar().await?;
+            session.mechanisms.clear();
+            session.ehlo().await?;
         }
 
-        sesion.autenticar(&destino.credencial).await?;
-        Ok(sesion)
+        session.authenticate(&destination.credential).await?;
+        Ok(session)
     }
 
     /// Entrega el mensaje.
-    pub async fn entregar(
+    pub async fn deliver(
         &mut self,
-        remitente: &str,
-        destinatarios: &[String],
-        mensaje: &str,
+        sender: &str,
+        recipients: &[String],
+        message: &str,
     ) -> Result<(), SmtpError> {
         // **Las direcciones se revisan otra vez acá.** Ya pasaron por
-        // `redactar::revisar` antes de encolarse, así que esto no debería
-        // encontrar nada — y por eso mismo va: que `entregar` sea segura no
+        // `compose::validate` antes de encolarse, así que esto no debería
+        // encontrar nada — y por eso mismo va: que `deliver` sea segura no
         // puede depender de que quien la llame se haya acordado de validar
         // primero. Una dirección con un salto de línea es un comando SMTP
         // inyectado, y desde ahí se manda cualquier cosa en nombre de la
         // persona. El archivo de la cola además vive en el disco y se puede
         // haber tocado a mano.
-        for direccion in std::iter::once(remitente).chain(destinatarios.iter().map(String::as_str))
-        {
-            if !cabe_en_un_comando(direccion) {
-                return Err(SmtpError::Permanente(format!(
-                    "«{direccion}» no se puede usar como dirección"
+        for address in std::iter::once(sender).chain(recipients.iter().map(String::as_str)) {
+            if !fits_in_command(address) {
+                return Err(SmtpError::Permanent(format!(
+                    "«{address}» no se puede usar como dirección"
                 )));
             }
         }
 
-        self.mandar(&format!("MAIL FROM:<{remitente}>"), &["250"])
+        self.command(&format!("MAIL FROM:<{sender}>"), &["250"])
             .await?;
 
-        for destinatario in destinatarios {
+        for recipient in recipients {
             // 251 es «no está acá pero lo reenvío», que es una entrega buena.
-            self.mandar(&format!("RCPT TO:<{destinatario}>"), &["250", "251"])
+            self.command(&format!("RCPT TO:<{recipient}>"), &["250", "251"])
                 .await?;
         }
 
-        self.mandar("DATA", &["354"]).await?;
+        self.command("DATA", &["354"]).await?;
 
-        let cuerpo = puntos_protegidos(mensaje);
-        self.flujo.escribir(cuerpo.as_bytes()).await?;
+        let body = dot_stuff(message);
+        self.transport.write(body.as_bytes()).await?;
         // El punto solo cierra el bloque. El `\r\n` de antes va siempre, aunque
         // el mensaje ya termine en uno: un `.` pegado al final de la última
         // línea es parte del texto y no el cierre.
-        self.flujo.escribir(b"\r\n.\r\n").await?;
+        self.transport.write(b"\r\n.\r\n").await?;
 
         // **Éste es el momento en que el mensaje se mandó o no.** Un 250 acá
         // quiere decir que el servidor se hizo cargo; cualquier otra cosa, que
         // no. La respuesta puede tardar: hay servidores que revisan el mensaje
         // entero antes de contestar, y por eso el tope de intercambio es largo.
-        self.esperar(&["250"]).await?;
+        self.expect_reply(&["250"]).await?;
         Ok(())
     }
 
     /// Se despide. Un fallo acá no importa: el mensaje ya se entregó.
-    pub async fn cerrar(&mut self) {
-        let _ = self.flujo.escribir(b"QUIT\r\n").await;
+    pub async fn close(&mut self) {
+        let _ = self.transport.write(b"QUIT\r\n").await;
     }
 
-    async fn saludar(&mut self) -> Result<(), SmtpError> {
-        self.flujo
-            .escribir(format!("EHLO {NOS_LLAMAMOS}\r\n").as_bytes())
+    async fn ehlo(&mut self) -> Result<(), SmtpError> {
+        self.transport
+            .write(format!("EHLO {EHLO_NAME}\r\n").as_bytes())
             .await?;
 
-        let lineas = self.esperar(&["250"]).await?;
-        for linea in lineas {
-            let mayusculas = linea.to_ascii_uppercase();
-            if mayusculas.starts_with("STARTTLS") {
+        let lines = self.expect_reply(&["250"]).await?;
+        for line in lines {
+            let upper = line.to_ascii_uppercase();
+            if upper.starts_with("STARTTLS") {
                 self.starttls = true;
             }
-            if mayusculas.starts_with("AUTH") {
-                self.mecanismos.extend(mecanismos_de(&linea));
+            if upper.starts_with("AUTH") {
+                self.mechanisms.extend(mechanisms_from(&line));
             }
         }
         Ok(())
     }
 
-    async fn cifrar(&mut self, host: &str) -> Result<(), SmtpError> {
-        let conector = crate::tls::conector().map_err(SmtpError::Permanente)?;
-        let nombre = ServerName::try_from(host.to_string())
-            .map_err(|_| SmtpError::Permanente(format!("«{host}» no es un nombre válido")))?;
+    async fn upgrade_to_tls(&mut self, host: &str) -> Result<(), SmtpError> {
+        let connector = crate::tls::connector().map_err(SmtpError::Permanent)?;
+        let name = ServerName::try_from(host.to_string())
+            .map_err(|_| SmtpError::Permanent(format!("«{host}» no es un nombre válido")))?;
 
-        // Sacar el socket de adentro para envolverlo, dejando `Ninguno` en el
+        // Sacar el socket de adentro para envolverlo, dejando `Closed` en el
         // hueco mientras tanto. Si el cifrado falla, el hueco queda: cualquier
         // uso posterior da «no hay conexión», que es exactamente lo que pasó y
         // es mejor que dejar puesto un socket en claro por el que se podría
         // seguir hablando sin cifrar.
-        let Flujo::Claro(tcp) = std::mem::replace(&mut self.flujo, Flujo::Ninguno) else {
-            return Err(SmtpError::Permanente(
+        let Transport::Plain(tcp) = std::mem::replace(&mut self.transport, Transport::Closed)
+        else {
+            return Err(SmtpError::Permanent(
                 "no hay una conexión en claro que cifrar".into(),
             ));
         };
@@ -429,54 +429,55 @@ impl Sesion {
         // Con plazo, como todo lo demás: un servidor que acepta la conexión y no
         // completa el saludo de TLS deja el apretón de manos colgado, y con él
         // la cola entera.
-        let cifrado = tokio::time::timeout(TIMEOUT, conector.connect(nombre, tcp))
+        let encrypted = tokio::time::timeout(TIMEOUT, connector.connect(name, tcp))
             .await
-            .map_err(|_| SmtpError::Temporal(format!("{host} no completó el cifrado a tiempo")))?
-            .map_err(|e| SmtpError::Temporal(format!("no se pudo cifrar con {host}: {e}")))?;
-        self.flujo = Flujo::Cifrado(Box::new(cifrado));
+            .map_err(|_| SmtpError::Temporary(format!("{host} no completó el cifrado a tiempo")))?
+            .map_err(|e| SmtpError::Temporary(format!("no se pudo cifrar con {host}: {e}")))?;
+        self.transport = Transport::Tls(Box::new(encrypted));
         Ok(())
     }
 
-    async fn autenticar(&mut self, credencial: &Credencial) -> Result<(), SmtpError> {
-        let Some(como) = mecanismo(&self.mecanismos, credencial) else {
-            return Err(SmtpError::Permanente(
+    async fn authenticate(&mut self, credential: &Credential) -> Result<(), SmtpError> {
+        let Some(mechanism) = pick_mechanism(&self.mechanisms, credential) else {
+            return Err(SmtpError::Permanent(
                 "el servidor no acepta ninguna forma de autenticación que esta cuenta pueda usar"
                     .into(),
             ));
         };
 
-        match (como, credencial) {
-            ("XOAUTH2", Credencial::Token { usuario, token }) => {
-                let carga = carga_xoauth2(usuario, token);
-                self.mandar(&format!("AUTH XOAUTH2 {carga}"), &["235"])
+        match (mechanism, credential) {
+            ("XOAUTH2", Credential::Token { username, token }) => {
+                let payload = xoauth2_payload(username, token);
+                self.command(&format!("AUTH XOAUTH2 {payload}"), &["235"])
                     .await
             }
-            ("PLAIN", Credencial::Contrasena { usuario, secreto }) => {
-                let carga = carga_plain(usuario, secreto);
-                self.mandar(&format!("AUTH PLAIN {carga}"), &["235"]).await
+            ("PLAIN", Credential::Password { username, secret }) => {
+                let payload = plain_payload(username, secret);
+                self.command(&format!("AUTH PLAIN {payload}"), &["235"])
+                    .await
             }
-            ("LOGIN", Credencial::Contrasena { usuario, secreto }) => {
-                self.mandar("AUTH LOGIN", &["334"]).await?;
-                let u = base64::engine::general_purpose::STANDARD.encode(usuario);
-                self.mandar(&u, &["334"]).await?;
-                let s = base64::engine::general_purpose::STANDARD.encode(secreto);
-                self.mandar(&s, &["235"]).await
+            ("LOGIN", Credential::Password { username, secret }) => {
+                self.command("AUTH LOGIN", &["334"]).await?;
+                let u = base64::engine::general_purpose::STANDARD.encode(username);
+                self.command(&u, &["334"]).await?;
+                let s = base64::engine::general_purpose::STANDARD.encode(secret);
+                self.command(&s, &["235"]).await
             }
-            // `mecanismo` sólo devuelve combinaciones que existen, así que esto
+            // `pick_mechanism` sólo devuelve combinaciones que existen, así que esto
             // no pasa. Se contesta con un error en vez de con un pánico: un
             // pánico acá se lleva puesta la tarea que estaba mandando.
-            _ => Err(SmtpError::Permanente(
+            _ => Err(SmtpError::Permanent(
                 "la credencial no va con el mecanismo elegido".into(),
             )),
         }
     }
 
     /// Manda una línea y espera una respuesta con uno de los códigos esperados.
-    async fn mandar(&mut self, comando: &str, esperados: &[&str]) -> Result<(), SmtpError> {
-        self.flujo
-            .escribir(format!("{comando}\r\n").as_bytes())
+    async fn command(&mut self, command: &str, expected: &[&str]) -> Result<(), SmtpError> {
+        self.transport
+            .write(format!("{command}\r\n").as_bytes())
             .await?;
-        self.esperar(esperados).await?;
+        self.expect_reply(expected).await?;
         Ok(())
     }
 
@@ -484,53 +485,55 @@ impl Sesion {
     ///
     /// Devuelve las líneas sin el código, que es lo que hace falta para leer lo
     /// que anuncia el `EHLO`.
-    async fn esperar(&mut self, esperados: &[&str]) -> Result<Vec<String>, SmtpError> {
-        let leer = async {
-            let mut lineas = Vec::new();
+    async fn expect_reply(&mut self, expected: &[&str]) -> Result<Vec<String>, SmtpError> {
+        let reading = async {
+            let mut lines = Vec::new();
             loop {
-                let linea = self.leer_linea().await?;
-                let Some((codigo, sigue, texto)) = respuesta_de(&linea) else {
-                    return Err(SmtpError::Temporal(format!(
-                        "el servidor contestó algo que no se entiende: {linea}"
+                let line = self.read_line().await?;
+                let Some((code, more, text)) = parse_reply(&line) else {
+                    return Err(SmtpError::Temporary(format!(
+                        "el servidor contestó algo que no se entiende: {line}"
                     )));
                 };
 
-                let esperado = esperados.iter().any(|e| linea.starts_with(e));
-                if !esperado {
-                    return Err(clasificar(codigo, texto));
+                let is_expected = expected.iter().any(|e| line.starts_with(e));
+                if !is_expected {
+                    return Err(classify_reply(code, text));
                 }
-                lineas.push(texto);
-                if !sigue {
-                    return Ok(lineas);
+                lines.push(text);
+                if !more {
+                    return Ok(lines);
                 }
             }
         };
 
-        tokio::time::timeout(INTERCAMBIO, leer).await.map_err(|_| {
-            SmtpError::Temporal(format!(
-                "el servidor dejó de contestar (más de {} segundos)",
-                INTERCAMBIO.as_secs()
-            ))
-        })?
+        tokio::time::timeout(EXCHANGE_TIMEOUT, reading)
+            .await
+            .map_err(|_| {
+                SmtpError::Temporary(format!(
+                    "el servidor dejó de contestar (más de {} segundos)",
+                    EXCHANGE_TIMEOUT.as_secs()
+                ))
+            })?
     }
 
-    async fn leer_linea(&mut self) -> Result<String, SmtpError> {
+    async fn read_line(&mut self) -> Result<String, SmtpError> {
         loop {
-            if let Some(fin) = self.pendiente.iter().position(|b| *b == b'\n') {
-                let linea: Vec<u8> = self.pendiente.drain(..=fin).collect();
-                return Ok(String::from_utf8_lossy(&linea).trim_end().to_string());
+            if let Some(end) = self.pending.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = self.pending.drain(..=end).collect();
+                return Ok(String::from_utf8_lossy(&line).trim_end().to_string());
             }
-            if self.pendiente.len() > MAX_LINEA {
-                return Err(SmtpError::Temporal(
+            if self.pending.len() > MAX_LINE {
+                return Err(SmtpError::Temporary(
                     "el servidor mandó una línea sin fin".into(),
                 ));
             }
 
-            let mut destino = std::mem::take(&mut self.pendiente);
-            let leidos = self.flujo.leer(&mut destino).await;
-            self.pendiente = destino;
-            if leidos? == 0 {
-                return Err(SmtpError::Temporal("el servidor cortó la conexión".into()));
+            let mut destination = std::mem::take(&mut self.pending);
+            let read_count = self.transport.read(&mut destination).await;
+            self.pending = destination;
+            if read_count? == 0 {
+                return Err(SmtpError::Temporary("el servidor cortó la conexión".into()));
             }
         }
     }
@@ -546,21 +549,21 @@ mod tests {
     #[test]
     fn se_distingue_la_ultima_linea_de_las_del_medio() {
         assert_eq!(
-            respuesta_de("250-STARTTLS"),
+            parse_reply("250-STARTTLS"),
             Some((250, true, "STARTTLS".into()))
         );
         assert_eq!(
-            respuesta_de("250 AUTH PLAIN LOGIN"),
+            parse_reply("250 AUTH PLAIN LOGIN"),
             Some((250, false, "AUTH PLAIN LOGIN".into()))
         );
         // Un código pelado es válido y termina.
-        assert_eq!(respuesta_de("250"), Some((250, false, String::new())));
+        assert_eq!(parse_reply("250"), Some((250, false, String::new())));
     }
 
     #[test]
     fn una_respuesta_que_no_lo_es_no_se_interpreta() {
-        for basura in ["", "ok", "25", "2500 algo", "abc def"] {
-            assert_eq!(respuesta_de(basura), None, "{basura:?}");
+        for garbage in ["", "ok", "25", "2500 algo", "abc def"] {
+            assert_eq!(parse_reply(garbage), None, "{garbage:?}");
         }
     }
 
@@ -570,27 +573,27 @@ mod tests {
     #[test]
     fn los_codigos_se_separan_por_lo_que_hay_que_hacer() {
         // 4xx: ahora no.
-        assert!(clasificar(451, "x".into()).se_reintenta());
-        assert!(clasificar(421, "x".into()).se_reintenta());
+        assert!(classify_reply(451, "x".into()).is_retryable());
+        assert!(classify_reply(421, "x".into()).is_retryable());
         // 5xx: nunca. Reintentarlo quema la reputación de la cuenta.
-        assert!(!clasificar(550, "x".into()).se_reintenta());
-        assert!(!clasificar(552, "x".into()).se_reintenta());
+        assert!(!classify_reply(550, "x".into()).is_retryable());
+        assert!(!classify_reply(552, "x".into()).is_retryable());
         // Y el de credenciales es su propio caso, porque lo arregla la persona.
         assert!(matches!(
-            clasificar(535, "x".into()),
-            SmtpError::Rechazado(_)
+            classify_reply(535, "x".into()),
+            SmtpError::Rejected(_)
         ));
-        assert!(!clasificar(535, "x".into()).se_reintenta());
+        assert!(!classify_reply(535, "x".into()).is_retryable());
     }
 
     /// Un salto de línea en una dirección la convierte en un comando SMTP más,
     /// y desde ahí se manda lo que sea en nombre de la persona. La validación
-    /// de `redactar` ya lo impide antes de encolar; ésta está para que
-    /// `entregar` sea segura **sola**, porque el archivo de la cola vive en el
+    /// de `compose` ya lo impide antes de encolar; ésta está para que
+    /// `deliver` sea segura **sola**, porque el archivo de la cola vive en el
     /// disco y se puede haber tocado a mano.
     #[test]
     fn una_direccion_no_puede_partir_el_comando() {
-        for mala in [
+        for bad in [
             "juan@otro.com\r\nRCPT TO:<espia@ajeno.com>",
             "juan@otro.com\nDATA",
             "juan@otro.com>\r\n",
@@ -598,9 +601,9 @@ mod tests {
             "juan @otro.com",
             "",
         ] {
-            assert!(!cabe_en_un_comando(mala), "{mala:?} tendría que rechazarse");
+            assert!(!fits_in_command(bad), "{bad:?} tendría que rechazarse");
         }
-        assert!(cabe_en_un_comando("juan.perez+x@sub.otro.com"));
+        assert!(fits_in_command("juan.perez+x@sub.otro.com"));
     }
 
     /// **Una de las cosas más viejas y más olvidadas del protocolo.** Sin
@@ -608,15 +611,15 @@ mod tests {
     /// solo se corta ahí, y lo que sigue el servidor lo lee como comandos.
     #[test]
     fn un_punto_al_principio_de_linea_se_protege() {
-        let mensaje = "Hola\r\n.\r\nchau";
-        assert_eq!(puntos_protegidos(mensaje), "Hola\r\n..\r\nchau");
+        let message = "Hola\r\n.\r\nchau";
+        assert_eq!(dot_stuff(message), "Hola\r\n..\r\nchau");
     }
 
     #[test]
     fn un_punto_en_el_medio_no_se_toca() {
-        assert_eq!(puntos_protegidos("uno. dos"), "uno. dos");
-        assert_eq!(puntos_protegidos("uno\r\n. dos"), "uno\r\n.. dos");
-        assert_eq!(puntos_protegidos(".al principio"), "..al principio");
+        assert_eq!(dot_stuff("uno. dos"), "uno. dos");
+        assert_eq!(dot_stuff("uno\r\n. dos"), "uno\r\n.. dos");
+        assert_eq!(dot_stuff(".al principio"), "..al principio");
     }
 
     /// El formato del XOAUTH2 lo fijan Google y Microsoft. El separador es
@@ -624,23 +627,20 @@ mod tests {
     /// da un rechazo que parece de credenciales y no lo es.
     #[test]
     fn el_xoauth2_usa_el_separador_que_fija_el_proveedor() {
-        let carga = carga_xoauth2("ana@ejemplo.com", "el-token");
-        let crudo = base64::engine::general_purpose::STANDARD
-            .decode(&carga)
+        let payload = xoauth2_payload("ana@ejemplo.com", "el-token");
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(&payload)
             .unwrap();
-        assert_eq!(
-            crudo,
-            b"user=ana@ejemplo.com\x01auth=Bearer el-token\x01\x01"
-        );
+        assert_eq!(raw, b"user=ana@ejemplo.com\x01auth=Bearer el-token\x01\x01");
     }
 
     #[test]
     fn el_plain_lleva_los_nulos_que_lo_separan() {
-        let carga = carga_plain("ana", "clave");
-        let crudo = base64::engine::general_purpose::STANDARD
-            .decode(&carga)
+        let payload = plain_payload("ana", "clave");
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(&payload)
             .unwrap();
-        assert_eq!(crudo, b"\0ana\0clave");
+        assert_eq!(raw, b"\0ana\0clave");
     }
 
     /// **La credencial manda sobre lo que ofrece el servidor.** Una cuenta con
@@ -649,32 +649,32 @@ mod tests {
     /// el token quedaría escrito en el registro de alguien más.
     #[test]
     fn una_cuenta_con_token_no_usa_plain() {
-        let token = Credencial::Token {
-            usuario: "ana".into(),
+        let token = Credential::Token {
+            username: "ana".into(),
             token: "t".into(),
         };
-        let ofrece_todo = vec!["PLAIN".to_string(), "LOGIN".into(), "XOAUTH2".into()];
-        assert_eq!(mecanismo(&ofrece_todo, &token), Some("XOAUTH2"));
+        let offers_everything = vec!["PLAIN".to_string(), "LOGIN".into(), "XOAUTH2".into()];
+        assert_eq!(pick_mechanism(&offers_everything, &token), Some("XOAUTH2"));
 
         // Y si el servidor no lo ofrece, no hay con qué: mejor no mandar nada
         // que mandar el token de la persona por un mecanismo que no lo espera.
-        let sin_oauth = vec!["PLAIN".to_string(), "LOGIN".into()];
-        assert_eq!(mecanismo(&sin_oauth, &token), None);
+        let without_oauth = vec!["PLAIN".to_string(), "LOGIN".into()];
+        assert_eq!(pick_mechanism(&without_oauth, &token), None);
     }
 
     #[test]
     fn una_cuenta_con_contrasena_prefiere_plain_y_cae_a_login() {
-        let clave = Credencial::Contrasena {
-            usuario: "ana".into(),
-            secreto: "c".into(),
+        let key = Credential::Password {
+            username: "ana".into(),
+            secret: "c".into(),
         };
         assert_eq!(
-            mecanismo(&["PLAIN".to_string(), "LOGIN".into()], &clave),
+            pick_mechanism(&["PLAIN".to_string(), "LOGIN".into()], &key),
             Some("PLAIN")
         );
-        assert_eq!(mecanismo(&["LOGIN".to_string()], &clave), Some("LOGIN"));
-        assert_eq!(mecanismo(&["XOAUTH2".to_string()], &clave), None);
-        assert_eq!(mecanismo(&[], &clave), None);
+        assert_eq!(pick_mechanism(&["LOGIN".to_string()], &key), Some("LOGIN"));
+        assert_eq!(pick_mechanism(&["XOAUTH2".to_string()], &key), None);
+        assert_eq!(pick_mechanism(&[], &key), None);
     }
 
     /// Si el cifrado falla, la conexión **no puede volver a ser la de antes**:
@@ -682,20 +682,20 @@ mod tests {
     /// vista. El hueco que queda hace que cualquier uso posterior falle.
     #[tokio::test]
     async fn un_flujo_sin_conexion_no_deja_escribir() {
-        let mut flujo = Flujo::Ninguno;
-        assert!(flujo.escribir(b"AUTH PLAIN xxx\r\n").await.is_err());
-        assert!(!flujo.esta_cifrado());
+        let mut transport = Transport::Closed;
+        assert!(transport.write(b"AUTH PLAIN xxx\r\n").await.is_err());
+        assert!(!transport.is_encrypted());
     }
 
     /// Los dos formatos que aparecen en la naturaleza.
     #[test]
     fn se_leen_los_mecanismos_que_anuncia_el_servidor() {
         assert_eq!(
-            mecanismos_de("AUTH PLAIN LOGIN XOAUTH2"),
+            mechanisms_from("AUTH PLAIN LOGIN XOAUTH2"),
             vec!["PLAIN", "LOGIN", "XOAUTH2"]
         );
-        assert_eq!(mecanismos_de("AUTH=PLAIN LOGIN"), vec!["PLAIN", "LOGIN"]);
-        assert!(mecanismos_de("SIZE 35882577").is_empty());
-        assert!(mecanismos_de("").is_empty());
+        assert_eq!(mechanisms_from("AUTH=PLAIN LOGIN"), vec!["PLAIN", "LOGIN"]);
+        assert!(mechanisms_from("SIZE 35882577").is_empty());
+        assert!(mechanisms_from("").is_empty());
     }
 }

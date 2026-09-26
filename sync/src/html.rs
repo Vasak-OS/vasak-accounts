@@ -8,7 +8,7 @@
 //! es dibujar el documento de un desconocido adentro de la aplicación más
 //! expuesta del escritorio.
 //!
-//! Hasta ahora no se mostraba: `mensaje::sin_etiquetas` saca las etiquetas y
+//! Hasta ahora no se mostraba: `message::strip_tags` saca las etiquetas y
 //! deja el texto. Eso se queda como la vista segura de siempre; esto es lo otro.
 //!
 //! # Dos cosas distintas, y las dos hacen falta
@@ -36,7 +36,7 @@
 //! documento serializado de nuevo. Con lista blanca, además: lo que no está
 //! nombrado no pasa, así que una etiqueta nueva del estándar no es un agujero.
 //!
-//! `sin_etiquetas` se queda igual y no tiene este problema: su salida es texto,
+//! `strip_tags` se queda igual y no tiene este problema: su salida es texto,
 //! no se dibuja como documento.
 //!
 //! # Las imágenes no se cargan
@@ -64,19 +64,21 @@ const MAX_HTML: usize = 1024 * 1024;
 ///
 /// Se conserva en vez de tirarla para que mostrarla después no obligue a ir a
 /// buscar el mensaje de nuevo. Es un atributo cualquiera: nada la pide sola.
-pub const ATRIBUTO_REMOTO: &str = "data-vsk-src";
+pub const REMOTE_SRC_ATTRIBUTE: &str = "data-vsk-src";
 
 /// El HTML listo para mostrar, y qué se dejó afuera.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
-pub struct Saneado {
+pub struct Sanitized {
     pub html: String,
     /// Cuántas imágenes remotas se bloquearon.
     ///
     /// Se cuenta para poder **decirlo**: una imagen que no aparece y nadie
     /// explica se lee como un mensaje roto, no como una decisión.
-    pub imagenes_bloqueadas: usize,
+    #[serde(rename = "imagenes_bloqueadas")]
+    pub blocked_images: usize,
     /// Si hubo que cortar el HTML por largo.
-    pub recortado: bool,
+    #[serde(rename = "recortado")]
+    pub truncated: bool,
 }
 
 /// Las etiquetas que pasan.
@@ -90,7 +92,7 @@ pub struct Saneado {
 /// nada pero cargan o redirigen: un `<link rel=stylesheet>` es una petición al
 /// servidor de quien mandó el correo igual que un píxel, y un `<base>` cambia a
 /// dónde van todos los enlaces del documento de una sola vez.
-const ETIQUETAS: &[&str] = &[
+const ALLOWED_TAGS: &[&str] = &[
     "a",
     "abbr",
     "b",
@@ -146,17 +148,17 @@ const ETIQUETAS: &[&str] = &[
 /// `javascript:` y `data:` afuera, que es lo obvio. `cid:` también: apunta a una
 /// parte del propio mensaje, y mientras no haya de dónde sacarla es un enlace
 /// roto que además revela cómo está armado el correo.
-const ESQUEMAS: &[&str] = &["http", "https", "mailto"];
+const ALLOWED_SCHEMES: &[&str] = &["http", "https", "mailto"];
 
 /// Deja el HTML en condiciones de mostrarse.
-pub fn sanear(html: &str) -> Saneado {
-    let etiquetas: HashSet<&str> = ETIQUETAS.iter().copied().collect();
-    let esquemas: HashSet<&str> = ESQUEMAS.iter().copied().collect();
+pub fn sanitize(html: &str) -> Sanitized {
+    let tags: HashSet<&str> = ALLOWED_TAGS.iter().copied().collect();
+    let schemes: HashSet<&str> = ALLOWED_SCHEMES.iter().copied().collect();
 
-    let mut constructor = ammonia::Builder::default();
-    constructor
-        .tags(etiquetas)
-        .url_schemes(esquemas)
+    let mut builder = ammonia::Builder::default();
+    builder
+        .tags(tags)
+        .url_schemes(schemes)
         // Los atributos, también por lista blanca. Que `style` **no** esté es
         // deliberado: `background: url(...)` es una petición a un servidor ajeno
         // con otro nombre, y `position: fixed` deja al mensaje dibujarse encima
@@ -167,7 +169,7 @@ pub fn sanear(html: &str) -> Saneado {
                 ("a", ["href", "title"].into_iter().collect()),
                 (
                     "img",
-                    ["alt", "title", "width", "height", ATRIBUTO_REMOTO]
+                    ["alt", "title", "width", "height", REMOTE_SRC_ATTRIBUTE]
                         .into_iter()
                         .collect(),
                 ),
@@ -187,38 +189,38 @@ pub fn sanear(html: &str) -> Saneado {
         // Acá está la decisión: **ninguna imagen se pide**. El `src` se va
         // entero, venga de donde venga; la dirección de las remotas ya quedó
         // guardada con otro nombre, que nada carga solo.
-        .attribute_filter(|etiqueta, atributo, valor| {
-            if etiqueta == "img" && atributo == "src" {
+        .attribute_filter(|tag, attribute, value| {
+            if tag == "img" && attribute == "src" {
                 return None;
             }
-            Some(valor.into())
+            Some(value.into())
         });
 
     // En dos pasadas, y no con un contador adentro del filtro: el saneador exige
     // que su filtro se pueda compartir entre hilos, y además el filtro no puede
     // cambiarle el nombre a un atributo — que es justo lo que hay que hacer con
     // el `src`. La pasada de abajo guarda la dirección y cuenta; ésta borra.
-    let (con_la_direccion_guardada, bloqueadas) = guardar_direcciones(html);
-    let mut limpio = constructor.clean(&con_la_direccion_guardada).to_string();
+    let (stashed, blocked) = stash_remote_sources(html);
+    let mut cleaned = builder.clean(&stashed).to_string();
 
-    let recortado = limpio.len() > MAX_HTML;
-    if recortado {
+    let truncated = cleaned.len() > MAX_HTML;
+    if truncated {
         // Se corta y se vuelve a sanear: un corte a la mitad deja etiquetas sin
         // cerrar, y el saneador las cierra al serializar de nuevo. Cortar y
         // mostrar sin esto es entregar HTML roto al navegador, que lo va a
         // arreglar como se le ocurra.
-        limpio.truncate(corte_valido(&limpio, MAX_HTML));
-        limpio = constructor.clean(&limpio).to_string();
+        cleaned.truncate(floor_char_boundary(&cleaned, MAX_HTML));
+        cleaned = builder.clean(&cleaned).to_string();
     }
 
-    Saneado {
-        html: limpio,
-        imagenes_bloqueadas: bloqueadas,
-        recortado,
+    Sanitized {
+        html: cleaned,
+        blocked_images: blocked,
+        truncated,
     }
 }
 
-/// Copia cada `src` de imagen a [`ATRIBUTO_REMOTO`] antes de sanear, y cuenta
+/// Copia cada `src` de imagen a [`REMOTE_SRC_ATTRIBUTE`] antes de sanear, y cuenta
 /// cuántas eran remotas.
 ///
 /// Con una expresión regular y a propósito: no se está interpretando el
@@ -226,54 +228,54 @@ pub fn sanear(html: &str) -> Saneado {
 /// acá pasa entero por él—, sólo se está duplicando un atributo. Si esta pasada
 /// se equivoca, lo peor que produce es un atributo de más con una dirección que
 /// nadie carga.
-fn guardar_direcciones(html: &str) -> (String, usize) {
-    let patron =
+fn stash_remote_sources(html: &str) -> (String, usize) {
+    let pattern =
         regex::Regex::new(r#"(?is)(<img\b[^>]*?)\bsrc\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))"#)
             .expect("el patrón es válido");
 
-    let mut bloqueadas = 0usize;
-    let salida = patron
-        .replace_all(html, |captura: &regex::Captures| {
-            let direccion = captura
+    let mut blocked = 0usize;
+    let out = pattern
+        .replace_all(html, |caps: &regex::Captures| {
+            let address = caps
                 .get(3)
-                .or_else(|| captura.get(4))
-                .or_else(|| captura.get(5))
+                .or_else(|| caps.get(4))
+                .or_else(|| caps.get(5))
                 .map(|m| m.as_str())
                 .unwrap_or_default();
 
-            if !es_remota(direccion) {
+            if !is_remote(address) {
                 // Lo que no es remoto no se guarda ni se cuenta: un `cid:` o un
                 // `data:` no hay de dónde cargarlos, y ofrecerlos sería prometer
                 // un botón que no puede hacer nada.
-                return captura.get(0).map(|m| m.as_str()).unwrap_or("").to_string();
+                return caps.get(0).map(|m| m.as_str()).unwrap_or("").to_string();
             }
-            bloqueadas += 1;
+            blocked += 1;
             format!(
                 r#"{} {}="{}" src={}"#,
-                &captura[1],
-                ATRIBUTO_REMOTO,
-                direccion.replace('"', "&quot;"),
-                &captura[2]
+                &caps[1],
+                REMOTE_SRC_ATTRIBUTE,
+                address.replace('"', "&quot;"),
+                &caps[2]
             )
         })
         .into_owned();
 
-    (salida, bloqueadas)
+    (out, blocked)
 }
 
 /// Si una dirección va a buscar algo a otro servidor.
-fn es_remota(direccion: &str) -> bool {
-    let d = direccion.trim().to_ascii_lowercase();
+fn is_remote(address: &str) -> bool {
+    let d = address.trim().to_ascii_lowercase();
     d.starts_with("http://") || d.starts_with("https://") || d.starts_with("//")
 }
 
 /// El corte más cercano que no parte un carácter por la mitad.
-fn corte_valido(texto: &str, tope: usize) -> usize {
-    let mut corte = tope.min(texto.len());
-    while corte > 0 && !texto.is_char_boundary(corte) {
-        corte -= 1;
+fn floor_char_boundary(text: &str, limit: usize) -> usize {
+    let mut cut = limit.min(text.len());
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
     }
-    corte
+    cut
 }
 
 #[cfg(test)]
@@ -286,7 +288,7 @@ mod tests {
     /// que lee el correo de alguien.
     #[test]
     fn nada_que_ejecute_sobrevive() {
-        for hostil in [
+        for hostile in [
             r#"<script>alert(1)</script>"#,
             r#"<img src=x onerror="alert(1)">"#,
             r#"<div onclick="alert(1)">hola</div>"#,
@@ -300,15 +302,15 @@ mod tests {
             r#"<svg><style><img src=x onerror=alert(1)></style></svg>"#,
             r#"<math><mtext><script>alert(1)</script></mtext></math>"#,
         ] {
-            let salida = sanear(hostil).html.to_ascii_lowercase();
-            assert!(!salida.contains("<script"), "{hostil:?} → {salida:?}");
-            assert!(!salida.contains("onerror"), "{hostil:?} → {salida:?}");
-            assert!(!salida.contains("onclick"), "{hostil:?} → {salida:?}");
-            assert!(!salida.contains("javascript:"), "{hostil:?} → {salida:?}");
-            assert!(!salida.contains("<iframe"), "{hostil:?} → {salida:?}");
-            assert!(!salida.contains("<form"), "{hostil:?} → {salida:?}");
-            assert!(!salida.contains("<object"), "{hostil:?} → {salida:?}");
-            assert!(!salida.contains("<embed"), "{hostil:?} → {salida:?}");
+            let out = sanitize(hostile).html.to_ascii_lowercase();
+            assert!(!out.contains("<script"), "{hostile:?} → {out:?}");
+            assert!(!out.contains("onerror"), "{hostile:?} → {out:?}");
+            assert!(!out.contains("onclick"), "{hostile:?} → {out:?}");
+            assert!(!out.contains("javascript:"), "{hostile:?} → {out:?}");
+            assert!(!out.contains("<iframe"), "{hostile:?} → {out:?}");
+            assert!(!out.contains("<form"), "{hostile:?} → {out:?}");
+            assert!(!out.contains("<object"), "{hostile:?} → {out:?}");
+            assert!(!out.contains("<embed"), "{hostile:?} → {out:?}");
         }
     }
 
@@ -317,34 +319,34 @@ mod tests {
     fn nada_que_cargue_solo_sobrevive() {
         // Una hoja de estilos es una petición al servidor de quien escribió el
         // correo, igual que un píxel de seguimiento.
-        let con_hoja = sanear(r#"<link rel="stylesheet" href="https://ejemplo.com/x.css">"#);
-        assert!(!con_hoja.html.to_ascii_lowercase().contains("<link"));
+        let with_leaf = sanitize(r#"<link rel="stylesheet" href="https://ejemplo.com/x.css">"#);
+        assert!(!with_leaf.html.to_ascii_lowercase().contains("<link"));
 
         // Un `<base>` cambia a dónde van **todos** los enlaces del documento de
         // una sola vez.
-        let con_base = sanear(r#"<base href="https://ejemplo.com/"><a href="/x">ir</a>"#);
-        assert!(!con_base.html.to_ascii_lowercase().contains("<base"));
+        let with_base = sanitize(r#"<base href="https://ejemplo.com/"><a href="/x">ir</a>"#);
+        assert!(!with_base.html.to_ascii_lowercase().contains("<base"));
 
         // `style` no está en la lista blanca: `background: url(...)` es una
         // petición con otro nombre, y `position: fixed` deja al mensaje
         // dibujarse encima de la aplicación.
-        let con_estilo =
-            sanear(r#"<div style="background:url(https://ejemplo.com/p.gif)">x</div>"#);
-        assert!(!con_estilo.html.contains("background"));
-        assert!(!con_estilo.html.contains("ejemplo.com"));
+        let with_style =
+            sanitize(r#"<div style="background:url(https://ejemplo.com/p.gif)">x</div>"#);
+        assert!(!with_style.html.contains("background"));
+        assert!(!with_style.html.contains("ejemplo.com"));
     }
 
     /// El formato que sí se quiere ver sobrevive: si no, esto no sirve para
     /// nada y más vale seguir mostrando texto pelado.
     #[test]
     fn el_formato_de_un_correo_normal_sobrevive() {
-        let boletin = r#"<h1>Novedades</h1><p><strong>Hola</strong> <em>Ana</em>,</p>
+        let newsletter = r#"<h1>Novedades</h1><p><strong>Hola</strong> <em>Ana</em>,</p>
             <ul><li>Uno</li><li>Dos</li></ul>
             <table><tr><td>A</td><td>B</td></tr></table>
             <blockquote>lo que dijo</blockquote>"#;
-        let salida = sanear(boletin).html;
+        let out = sanitize(newsletter).html;
 
-        for etiqueta in [
+        for tag in [
             "<h1>",
             "<strong>",
             "<em>",
@@ -353,104 +355,101 @@ mod tests {
             "<table>",
             "<blockquote>",
         ] {
-            assert!(salida.contains(etiqueta), "se perdió {etiqueta}: {salida}");
+            assert!(out.contains(tag), "se perdió {tag}: {out}");
         }
     }
 
     /// Un enlace normal se queda, y sale con las protecciones puestas.
     #[test]
     fn un_enlace_normal_se_queda_y_no_filtra_de_donde_viene() {
-        let salida = sanear(r#"<a href="https://ejemplo.com/x">ir</a>"#).html;
-        assert!(
-            salida.contains(r#"href="https://ejemplo.com/x""#),
-            "{salida}"
-        );
+        let out = sanitize(r#"<a href="https://ejemplo.com/x">ir</a>"#).html;
+        assert!(out.contains(r#"href="https://ejemplo.com/x""#), "{out}");
         // `noreferrer` porque el `Referer` de un correo es la confirmación de
         // que se abrió.
-        assert!(salida.contains("noreferrer"), "{salida}");
-        assert!(salida.contains("noopener"), "{salida}");
+        assert!(out.contains("noreferrer"), "{out}");
+        assert!(out.contains("noopener"), "{out}");
     }
 
     /// **Ninguna imagen se pide sola.** Es lo que hace que mostrar el formato no
     /// se convierta en avisarle a quien escribió que abriste el mensaje.
     #[test]
     fn las_imagenes_remotas_no_se_cargan_pero_se_cuentan() {
-        let con_pixel = r#"<p>hola</p><img src="https://rastreo.ejemplo/p.gif?id=42" alt="">
+        let with_pixel = r#"<p>hola</p><img src="https://rastreo.ejemplo/p.gif?id=42" alt="">
             <img src='https://otro.ejemplo/b.png'>"#;
-        let salida = sanear(con_pixel);
+        let out = sanitize(with_pixel);
 
-        assert_eq!(salida.imagenes_bloqueadas, 2);
+        assert_eq!(out.blocked_images, 2);
         // No queda ningún `src` que el navegador vaya a pedir.
         //
         // Se busca **con el espacio adelante**, que no es quisquillosidad:
         // `data-vsk-src="https…` contiene `src="https`, así que la comprobación
         // sin el espacio pasa siempre y no comprueba nada. El espacio es lo que
         // distingue el atributo de verdad del que lo lleva adentro del nombre.
-        assert!(!salida.html.contains(" src=\""), "{}", salida.html);
-        assert!(!salida.html.contains(" src='"), "{}", salida.html);
+        assert!(!out.html.contains(" src=\""), "{}", out.html);
+        assert!(!out.html.contains(" src='"), "{}", out.html);
         // …pero la dirección se conserva, para poder mostrarla si la persona lo
         // pide sin volver a buscar el mensaje.
-        assert!(salida.html.contains(ATRIBUTO_REMOTO), "{}", salida.html);
-        assert!(salida.html.contains("rastreo.ejemplo"), "{}", salida.html);
+        assert!(out.html.contains(REMOTE_SRC_ATTRIBUTE), "{}", out.html);
+        assert!(out.html.contains("rastreo.ejemplo"), "{}", out.html);
     }
 
     /// Las que no son remotas no se cuentan ni se guardan: no hay de dónde
     /// cargarlas, y ofrecerlas sería prometer un botón que no puede hacer nada.
     #[test]
     fn lo_que_no_es_remoto_no_cuenta_como_imagen_bloqueada() {
-        let salida =
-            sanear(r#"<img src="cid:parte1@ejemplo"><img src="data:image/gif;base64,R0lGOD">"#);
-        assert_eq!(salida.imagenes_bloqueadas, 0);
-        assert!(!salida.html.contains(ATRIBUTO_REMOTO), "{}", salida.html);
+        let out =
+            sanitize(r#"<img src="cid:parte1@ejemplo"><img src="data:image/gif;base64,R0lGOD">"#);
+        assert_eq!(out.blocked_images, 0);
+        assert!(!out.html.contains(REMOTE_SRC_ATTRIBUTE), "{}", out.html);
         // Y el `src` se va igual: `data:` puede llevar un SVG con script adentro.
-        assert!(!salida.html.contains(" src="), "{}", salida.html);
+        assert!(!out.html.contains(" src="), "{}", out.html);
     }
 
     /// Una relativa tampoco: no hay contra qué resolverla, esto no es una página
     /// servida desde ningún lado.
     #[test]
     fn una_direccion_relativa_no_queda_a_medias() {
-        let salida = sanear(r#"<a href="/x">ir</a><img src="/p.gif">"#);
-        assert!(!salida.html.contains(r#"href="/x""#), "{}", salida.html);
-        assert_eq!(salida.imagenes_bloqueadas, 0);
+        let out = sanitize(r#"<a href="/x">ir</a><img src="/p.gif">"#);
+        assert!(!out.html.contains(r#"href="/x""#), "{}", out.html);
+        assert_eq!(out.blocked_images, 0);
     }
 
     /// Un mensaje enorme no hace crecer la memoria de la ventana sin freno, y lo
     /// que se devuelve sigue siendo HTML entero y no uno cortado a la mitad.
     #[test]
     fn un_html_enorme_se_recorta_y_sigue_cerrado() {
-        let gigante = format!("<p>{}</p>", "a".repeat(MAX_HTML * 2));
-        let salida = sanear(&gigante);
+        let huge = format!("<p>{}</p>", "a".repeat(MAX_HTML * 2));
+        let out = sanitize(&huge);
 
-        assert!(salida.recortado);
-        assert!(salida.html.len() <= MAX_HTML + 64, "{}", salida.html.len());
+        assert!(out.truncated);
+        assert!(out.html.len() <= MAX_HTML + 64, "{}", out.html.len());
         // Cortar y ya dejaría un `<p>` sin cerrar; el saneador lo cierra al
         // serializar de nuevo.
         assert_eq!(
-            salida.html.matches("<p").count(),
-            salida.html.matches("</p>").count()
+            out.html.matches("<p").count(),
+            out.html.matches("</p>").count()
         );
     }
 
     #[test]
     fn un_html_normal_no_se_marca_como_recortado() {
-        assert!(!sanear("<p>corto</p>").recortado);
+        assert!(!sanitize("<p>corto</p>").truncated);
     }
 
     /// El texto se escapa, no se pierde: un mensaje que habla de HTML se tiene
     /// que poder leer.
     #[test]
     fn el_texto_sobrevive_escapado() {
-        let salida = sanear("<p>usá &lt;script&gt; con cuidado</p>").html;
-        assert!(salida.contains("script"), "{salida}");
-        assert!(!salida.contains("<script"), "{salida}");
+        let out = sanitize("<p>usá &lt;script&gt; con cuidado</p>").html;
+        assert!(out.contains("script"), "{out}");
+        assert!(!out.contains("<script"), "{out}");
     }
 
     /// Entrada vacía o basura no rompe nada.
     #[test]
     fn lo_que_no_es_html_no_rompe() {
-        assert_eq!(sanear("").html, "");
-        assert_eq!(sanear("<<<>>>").imagenes_bloqueadas, 0);
-        assert!(!sanear("sólo texto").html.is_empty());
+        assert_eq!(sanitize("").html, "");
+        assert_eq!(sanitize("<<<>>>").blocked_images, 0);
+        assert!(!sanitize("sólo texto").html.is_empty());
     }
 }

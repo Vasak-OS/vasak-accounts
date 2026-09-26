@@ -27,7 +27,7 @@
 //!
 //! Empezó contando y nada más, a propósito, porque contar no necesita interpretar
 //! nada de lo que escribió un desconocido. Ese parser llegó con la aplicación de
-//! correo y vive en `mensaje.rs`, con su propia discusión escrita arriba.
+//! correo y vive en `message.rs`, con su propia discusión escrita arriba.
 //!
 //! Prepara además una base **cifrada** por cuenta —el almacén local de
 //! `store/`, publicado en `ar.net.vasak.os.AccountsStore`— y guarda ahí los
@@ -54,29 +54,30 @@
 //! tiene para perder.
 //!
 //! Y **envía**: `SendMessage` deja el mensaje en una cola en el disco
-//! (`cola.rs`) que sobrevive a que se apague el equipo, y un despachador lo
+//! (`outbox.rs`) que sobrevive a que se apague el equipo, y un despachador lo
 //! manda por SMTP (`smtp.rs`) en cuanto el servidor lo acepta.
 
 mod access;
-mod adjuntos;
-mod avisos;
+mod attachments;
 mod broker;
-mod casillas;
-mod cola;
-mod consulta;
+mod compose;
 mod contacts_sync;
 mod dav;
 mod html;
-mod imagenes;
+mod images;
 mod imap;
-mod mensaje;
-mod preferencias;
-mod redactar;
+mod mailboxes;
+mod message;
+mod notifications;
+mod outbox;
+mod preferences;
+mod query;
 mod smtp;
 mod store;
 mod store_api;
 mod tls;
 mod vcard;
+mod xdg;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -111,36 +112,36 @@ const POLL_INTERVAL: Duration = Duration::from_secs(300);
 /// renovación se le vuelve a pedir el token al servicio — que es lo que hace que
 /// lo refresque. Sin eso, una cuenta que anda bien podría quedarse con un
 /// refresh_token caducado por no usarse.
-const RENOVAR_IDLE: Duration = Duration::from_secs(24 * 60);
+const IDLE_RENEWAL: Duration = Duration::from_secs(24 * 60);
 
 /// Cuánto se espera antes de reconectar una cuenta que falló.
 ///
 /// Las conexiones largas se cortan: se cae el wifi, el servidor se reinicia, un
 /// NAT olvida la sesión. Es lo normal y no un error, así que se reconecta — pero
 /// no en el acto, o un servidor caído recibiría un intento por milisegundo.
-const REINTENTO_CUENTA: Duration = Duration::from_secs(30);
+const ACCOUNT_RETRY: Duration = Duration::from_secs(30);
 
 /// Cuánto se espera antes de volver a intentar cuando el servicio de cuentas no
 /// está.
 ///
 /// Corto, porque el caso normal es que todavía esté arrancando: este servicio
 /// puede levantar antes que el bus del sistema termine de activarlo.
-const REINTENTO: Duration = Duration::from_secs(15);
+const SERVICE_RETRY: Duration = Duration::from_secs(15);
 
 /// Cada cuánto se mira la cola de salida por las dudas.
 ///
 /// El caso normal es que se despierte en el momento, cuando alguien encola algo.
 /// Esto es para lo otro: un mensaje que quedó esperando porque el servidor
 /// estaba caído tiene que salir solo cuando vuelva, sin que nadie apriete nada.
-const REVISAR_COLA: Duration = Duration::from_secs(60);
+const OUTBOX_CHECK: Duration = Duration::from_secs(60);
 
 /// Lo que se sabe de una cuenta después de mirarla.
 #[derive(Debug, Clone, serde::Serialize)]
-struct Resumen {
+struct AccountSummary {
     account_id: String,
     display_name: String,
     #[serde(flatten)]
-    estado: imap::Estado,
+    status: imap::MailboxStatus,
     /// Vacío si la última vuelta anduvo. Si no, qué pasó — la aplicación que lo
     /// muestre necesita poder decir «no se pudo» y no un cero que parece «no
     /// tenés correo».
@@ -148,8 +149,8 @@ struct Resumen {
 }
 
 #[derive(Default)]
-struct Estado {
-    por_cuenta: HashMap<String, Resumen>,
+struct State {
+    by_account: HashMap<String, AccountSummary>,
     /// Los últimos mensajes de cada cuenta, para que la aplicación de correo los
     /// muestre sin abrir su propia conexión.
     ///
@@ -159,7 +160,7 @@ struct Estado {
     /// nadie recuerda que existe — y a cambio ahorraría los dos segundos que
     /// tarda la primera lista. La lista se rehace sola en cuanto la cuenta se
     /// conecta, que es de todos modos lo que pasa al arrancar la sesión.
-    mensajes: HashMap<String, Vec<mensaje::Resumen>>,
+    messages: HashMap<String, Vec<message::MessageSummary>>,
     /// Las cuentas cuyo servidor rechazó las credenciales.
     ///
     /// Sin esta lista, la tarea de una cuenta rechazada termina, deja de figurar
@@ -174,36 +175,38 @@ struct Estado {
     ///
     /// Se limpia sólo cuando el servicio avisa que las cuentas cambiaron — que
     /// es cuando la persona pudo haber arreglado algo.
-    rechazadas: std::collections::HashSet<String>,
+    rejected: std::collections::HashSet<String>,
 }
 
 #[derive(Clone, Default)]
-struct Servicio {
-    estado: Arc<Mutex<Estado>>,
+struct Service {
+    state: Arc<Mutex<State>>,
     /// La segunda conexión de cada cuenta, la que atiende lo que pide la
     /// ventana. Se crea cuando alguien abre un mensaje por primera vez.
-    lectores: Arc<Mutex<HashMap<String, Arc<Mutex<Lector>>>>>,
+    readers: Arc<Mutex<HashMap<String, Arc<Mutex<Reader>>>>>,
     /// Con qué se le avisa al despachador que hay algo nuevo para mandar.
     ///
     /// Sin esto habría que esperar a la revisión por reloj, y apretar «Enviar»
     /// tardaría hasta un minuto en hacer algo visible — que se siente como que
     /// el botón no anduvo.
-    hay_algo_que_mandar: Arc<tokio::sync::Notify>,
+    outbox_wakeup: Arc<tokio::sync::Notify>,
     /// Los carteles de correo nuevo que ya se mostraron, por cuenta.
     ///
     /// Sirven para reemplazar el anterior en vez de apilar: veinte mensajes que
     /// llegan juntos son un cartel que dice cuántos, no veinte carteles.
-    carteles: Arc<Mutex<avisos::Carteles>>,
+    shown_notifications: Arc<Mutex<notifications::ShownNotifications>>,
 }
 
 /// Un mensaje abierto, listo para mostrar.
 #[derive(Debug, Clone, serde::Serialize)]
-struct Abierto {
-    texto: String,
+struct OpenedMessage {
+    #[serde(rename = "texto")]
+    text: String,
     /// El mensaje era más largo de lo que se trae y hay más. La ventana tiene
     /// que poder decirlo en vez de dejar el texto terminado a la mitad sin
     /// explicación.
-    recortado: bool,
+    #[serde(rename = "recortado")]
+    truncated: bool,
     /// Los archivos pegados: cuáles hay, cómo se llaman y qué número de parte
     /// tienen.
     ///
@@ -216,7 +219,8 @@ struct Abierto {
     /// mirando lo que se trajo, y lo que se trae tiene tope; un adjunto que
     /// quedó más allá del corte no aparece. La ventana ya tiene que decir que el
     /// mensaje está recortado, y eso cubre también esto.
-    adjuntos: Vec<adjuntos::Adjunto>,
+    #[serde(rename = "adjuntos")]
+    attachments: Vec<attachments::Attachment>,
     /// El mismo mensaje con su formato, ya saneado, o nada si no traía HTML.
     ///
     /// Va **además** del texto y no en su lugar: el texto plano se queda como la
@@ -224,9 +228,10 @@ struct Abierto {
     /// sólo trae HTML seguía teniendo su versión sin etiquetas en `texto`, así
     /// que quitarle el formato a la vista es siempre posible.
     ///
-    /// Lo que hay acá ya pasó por `html::sanear`: sin `<script>`, sin `on*`, sin
+    /// Lo que hay acá ya pasó por `html::sanitize`: sin `<script>`, sin `on*`, sin
     /// `<iframe>` y sin ninguna imagen cargándose sola. Ver `html.rs`.
-    con_formato: Option<html::Saneado>,
+    #[serde(rename = "con_formato")]
+    formatted: Option<html::Sanitized>,
     /// Lo que hace falta para responderlo: a quién, y con qué cabeceras para que
     /// la respuesta quede enganchada a la conversación.
     ///
@@ -235,7 +240,7 @@ struct Abierto {
     /// las mismas cabeceras que ya se trajeron: pedirlo después sería volver al
     /// servidor por algo que ya está en memoria.
     #[serde(flatten)]
-    responder: mensaje::ParaResponder,
+    reply: message::ReplyInfo,
 }
 
 /// La conexión que atiende los pedidos de la aplicación de correo.
@@ -251,23 +256,25 @@ struct Abierto {
 /// cuando alguien abre un mensaje**: quien no usa la aplicación de correo sigue
 /// teniendo una sola conexión.
 #[derive(Default)]
-struct Lector {
-    sesion: Option<imap::Sesion>,
+struct Reader {
+    session: Option<imap::Session>,
 }
 
-impl Lector {
+impl Reader {
     /// Las casillas del servidor.
     ///
     /// Se piden en el momento y no se guardan: son unas pocas y cambian cuando
     /// la persona crea una carpeta desde otro lado. Un caché acá sería una
     /// lista que se queda vieja sin que nada la invalide.
-    async fn casillas(
+    async fn mailboxes(
         &mut self,
         broker: &Broker,
-        cuenta: &broker::Account,
-    ) -> Result<Vec<casillas::Casilla>, String> {
-        self.con_reintento(broker, cuenta, |sesion| Box::pin(sesion.listar_casillas()))
-            .await
+        account: &broker::Account,
+    ) -> Result<Vec<mailboxes::Mailbox>, String> {
+        self.with_retry(broker, account, |session| {
+            Box::pin(session.list_mailboxes())
+        })
+        .await
     }
 
     /// Busca en una casilla y devuelve los resúmenes que coinciden.
@@ -276,22 +283,22 @@ impl Lector {
     /// entero: en memoria están los últimos doscientos de la de entrada y nada
     /// más. Después hay que traer los encabezados de lo que encontró, porque
     /// `SEARCH` devuelve números y no mensajes.
-    async fn buscar_en(
+    async fn search_in(
         &mut self,
         broker: &Broker,
-        cuenta: &broker::Account,
-        casilla: &str,
-        terminos: Vec<consulta::Termino>,
-    ) -> Result<Vec<mensaje::Resumen>, String> {
-        let casilla = casilla.to_string();
-        self.con_reintento(broker, cuenta, move |sesion| {
-            let casilla = casilla.clone();
-            let terminos = terminos.clone();
+        account: &broker::Account,
+        mailbox: &str,
+        terms: Vec<query::Term>,
+    ) -> Result<Vec<message::MessageSummary>, String> {
+        let mailbox = mailbox.to_string();
+        self.with_retry(broker, account, move |session| {
+            let mailbox = mailbox.clone();
+            let terms = terms.clone();
             Box::pin(async move {
                 // `EXAMINE`: buscar no tiene por qué marcar nada como leído.
-                sesion.examinar(&casilla).await?;
-                let uids = sesion.buscar(&terminos).await?;
-                sesion.resumenes_de(&uids).await
+                session.examine(&mailbox).await?;
+                let uids = session.search(&terms).await?;
+                session.summaries_of(&uids).await
             })
         })
         .await
@@ -302,53 +309,50 @@ impl Lector {
     /// Se pide la parte sola y no el mensaje entero: es lo que hace que se pueda
     /// bajar un adjunto de veinte megas sin traer los otros tres que venían con
     /// él, y lo que el número de parte existe para permitir.
-    async fn adjunto(
+    async fn attachment(
         &mut self,
         broker: &Broker,
-        cuenta: &broker::Account,
-        casilla: &str,
+        account: &broker::Account,
+        mailbox: &str,
         uid: u32,
-        parte: &str,
+        part: &str,
     ) -> Result<(Vec<u8>, bool), String> {
-        let casilla = casilla.to_string();
-        let parte = parte.to_string();
-        let (cabeceras, contenido, recortado) = self
-            .con_reintento(broker, cuenta, move |sesion| {
-                let casilla = casilla.clone();
-                let parte = parte.clone();
+        let mailbox = mailbox.to_string();
+        let part = part.to_string();
+        let (headers, content, truncated) = self
+            .with_retry(broker, account, move |session| {
+                let mailbox = mailbox.clone();
+                let part = part.clone();
                 Box::pin(async move {
                     // `EXAMINE`: bajar un archivo no tiene por qué marcar el
                     // mensaje como leído.
-                    sesion.examinar(&casilla).await?;
-                    sesion.parte(uid, &parte, MAXIMO_ADJUNTO).await
+                    session.examine(&mailbox).await?;
+                    session.fetch_part(uid, &part, MAX_ATTACHMENT).await
                 })
             })
             .await?;
 
-        Ok((
-            adjuntos::destransportar_parte(&cabeceras, &contenido),
-            recortado,
-        ))
+        Ok((attachments::decode_part(&headers, &content), truncated))
     }
 
     /// Mueve un mensaje a otra casilla.
-    async fn mover(
+    async fn move_to(
         &mut self,
         broker: &Broker,
-        cuenta: &broker::Account,
-        casilla: &str,
+        account: &broker::Account,
+        mailbox: &str,
         uid: u32,
-        destino: &str,
-    ) -> Result<imap::Movido, String> {
-        let casilla = casilla.to_string();
-        let destino = destino.to_string();
-        self.con_reintento(broker, cuenta, move |sesion| {
-            let casilla = casilla.clone();
-            let destino = destino.clone();
+        destination: &str,
+    ) -> Result<imap::MoveOutcome, String> {
+        let mailbox = mailbox.to_string();
+        let destination = destination.to_string();
+        self.with_retry(broker, account, move |session| {
+            let mailbox = mailbox.clone();
+            let destination = destination.clone();
             Box::pin(async move {
                 // `SELECT` y no `EXAMINE`: mover escribe.
-                sesion.seleccionar(&casilla).await?;
-                sesion.mover(uid, &destino).await
+                session.select(&mailbox).await?;
+                session.move_to(uid, &destination).await
             })
         })
         .await
@@ -359,16 +363,16 @@ impl Lector {
     /// Se pregunta al servidor en vez de guardarla: la persona puede crearla,
     /// borrarla o renombrarla desde otro cliente, y una papelera guardada que ya
     /// no existe hace que borrar falle sin decir por qué.
-    async fn papelera(
+    async fn trash(
         &mut self,
         broker: &Broker,
-        cuenta: &broker::Account,
+        account: &broker::Account,
     ) -> Result<Option<String>, String> {
-        let casillas = self.casillas(broker, cuenta).await?;
-        Ok(casillas
+        let mailboxes = self.mailboxes(broker, account).await?;
+        Ok(mailboxes
             .into_iter()
-            .find(|c| c.uso == casillas::Uso::Papelera && c.seleccionable)
-            .map(|c| c.ruta))
+            .find(|c| c.role == mailboxes::MailboxRole::Trash && c.selectable)
+            .map(|c| c.path))
     }
 
     /// Los últimos mensajes de una casilla que no es la de entrada.
@@ -380,18 +384,18 @@ impl Lector {
     ///
     /// `EXAMINE` y no `SELECT`: abrir para mirar no tiene que marcar nada como
     /// leído.
-    async fn resumenes_de(
+    async fn summaries_of(
         &mut self,
         broker: &Broker,
-        cuenta: &broker::Account,
-        casilla: &str,
-    ) -> Result<Vec<mensaje::Resumen>, String> {
-        let casilla = casilla.to_string();
-        self.con_reintento(broker, cuenta, move |sesion| {
-            let casilla = casilla.clone();
+        account: &broker::Account,
+        mailbox: &str,
+    ) -> Result<Vec<message::MessageSummary>, String> {
+        let mailbox = mailbox.to_string();
+        self.with_retry(broker, account, move |session| {
+            let mailbox = mailbox.clone();
             Box::pin(async move {
-                let cuantos = sesion.examinar(&casilla).await?;
-                sesion.resumenes(cuantos).await
+                let count = session.examine(&mailbox).await?;
+                session.recent_summaries(count).await
             })
         })
         .await
@@ -399,23 +403,23 @@ impl Lector {
 
     /// Lo que hace falta para mostrar un mensaje abierto.
     ///
-    /// `casilla` importa y no es un adorno: **los UID son por casilla**. El 412
+    /// `mailbox` importa y no es un adorno: **los UID son por casilla**. El 412
     /// de la de entrada y el 412 de «Enviados» son mensajes distintos, así que
     /// pedir uno sin decir de dónde es pedir cualquiera.
-    async fn cuerpo(
+    async fn open_message(
         &mut self,
         broker: &Broker,
-        cuenta: &broker::Account,
-        casilla: &str,
+        account: &broker::Account,
+        mailbox: &str,
         uid: u32,
-    ) -> Result<Abierto, String> {
-        let casilla = casilla.to_string();
-        let (crudo, recortado) = self
-            .con_reintento(broker, cuenta, move |sesion| {
-                let casilla = casilla.clone();
+    ) -> Result<OpenedMessage, String> {
+        let mailbox = mailbox.to_string();
+        let (raw, truncated) = self
+            .with_retry(broker, account, move |session| {
+                let mailbox = mailbox.clone();
                 Box::pin(async move {
-                    sesion.seleccionar(&casilla).await?;
-                    sesion.cuerpo(uid).await
+                    session.select(&mailbox).await?;
+                    session.fetch_body(uid).await
                 })
             })
             .await?;
@@ -426,16 +430,16 @@ impl Lector {
         // perdería el `0xF3` de la «ó» antes de que se supiera que había que
         // leerlo como latin-1. En qué idioma está escrito lo dice el propio
         // mensaje, y eso se resuelve adentro.
-        Ok(Abierto {
-            texto: mensaje::texto_de(&crudo),
-            recortado,
-            adjuntos: adjuntos::listar(&crudo),
+        Ok(OpenedMessage {
+            text: message::plain_text(&raw),
+            truncated,
+            attachments: attachments::list(&raw),
             // El saneado pasa **acá**, en el servicio, y no en la ventana: es lo
             // que hace que la ventana no vea nunca el HTML crudo de un
             // desconocido, del mismo modo que no ve una contraseña ni abre una
             // conexión propia.
-            con_formato: mensaje::html_de(&crudo).map(|bruto| html::sanear(&bruto)),
-            responder: mensaje::para_responder(&crudo),
+            formatted: message::html_part(&raw).map(|raw_html| html::sanitize(&raw_html)),
+            reply: message::reply_info(&raw),
         })
     }
 
@@ -444,22 +448,22 @@ impl Lector {
     /// En el servidor y no sólo acá: la persona lee en el teléfono y en el
     /// escritorio, y un «leído» que no viaja deja el mismo mensaje sin leer del
     /// otro lado para siempre.
-    async fn marcar_leido(
+    async fn mark_read(
         &mut self,
         broker: &Broker,
-        cuenta: &broker::Account,
-        casilla: &str,
+        account: &broker::Account,
+        mailbox: &str,
         uid: u32,
     ) -> Result<(), String> {
-        let casilla = casilla.to_string();
-        self.con_reintento(broker, cuenta, move |sesion| {
-            let casilla = casilla.clone();
+        let mailbox = mailbox.to_string();
+        self.with_retry(broker, account, move |session| {
+            let mailbox = mailbox.clone();
             Box::pin(async move {
                 // La casilla correcta antes de tocar nada: los UID son por
                 // casilla, y marcar el 412 con «Enviados» abierta marcaría otro
                 // mensaje.
-                sesion.seleccionar(&casilla).await?;
-                sesion.marcar_leido(uid).await
+                session.select(&mailbox).await?;
+                session.mark_read(uid).await
             })
         })
         .await
@@ -472,34 +476,34 @@ impl Lector {
     /// al usarla. En cambio, una que acaba de abrirse y falla no se reintenta —
     /// si el servidor rechazó la credencial, insistir es cómo se bloquea una
     /// cuenta.
-    async fn con_reintento<T, F>(
+    async fn with_retry<T, F>(
         &mut self,
         broker: &Broker,
-        cuenta: &broker::Account,
-        mut trabajo: F,
+        account: &broker::Account,
+        mut work: F,
     ) -> Result<T, String>
     where
         F: for<'a> FnMut(
-            &'a mut imap::Sesion,
+            &'a mut imap::Session,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<T, imap::ImapError>> + Send + 'a>,
         >,
     {
-        let reusada = self.sesion.is_some();
+        let reused = self.session.is_some();
 
-        match self.intentar(broker, cuenta, &mut trabajo).await {
-            Ok(valor) => Ok(valor),
-            Err(primero) => {
+        match self.attempt(broker, account, &mut work).await {
+            Ok(value) => Ok(value),
+            Err(first_error) => {
                 // **La sesión se tira siempre**, se reintente o no. Un error de
                 // protocolo puede haberla dejado a mitad de camino de algo, y
                 // guardarla para el próximo pedido es guardar una conexión que
                 // va a leer el correo de alguien como si fueran líneas del
                 // protocolo. Abrir otra cuesta un login; usar una rota no se
                 // arregla nunca.
-                self.sesion = None;
+                self.session = None;
 
-                if !reusada {
-                    return Err(primero);
+                if !reused {
+                    return Err(first_error);
                 }
                 // Se reintenta sólo si la conexión venía de antes: una que
                 // estuvo quieta un rato la cierra el servidor sin avisar, y el
@@ -507,49 +511,49 @@ impl Lector {
                 // no se reintenta — si el servidor rechazó la credencial,
                 // insistir es cómo se bloquea una cuenta.
                 tracing::debug!(
-                    "'{}': la conexión de lectura estaba muerta: {primero}",
-                    cuenta.id
+                    "'{}': la conexión de lectura estaba muerta: {first_error}",
+                    account.id
                 );
-                self.intentar(broker, cuenta, &mut trabajo).await
+                self.attempt(broker, account, &mut work).await
             }
         }
     }
 
-    async fn intentar<T, F>(
+    async fn attempt<T, F>(
         &mut self,
         broker: &Broker,
-        cuenta: &broker::Account,
-        trabajo: &mut F,
+        account: &broker::Account,
+        work: &mut F,
     ) -> Result<T, String>
     where
         F: for<'a> FnMut(
-            &'a mut imap::Sesion,
+            &'a mut imap::Session,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<T, imap::ImapError>> + Send + 'a>,
         >,
     {
-        if self.sesion.is_none() {
-            let mut nueva = abrir(broker, cuenta).await?;
+        if self.session.is_none() {
+            let mut new_session = open_session(broker, account).await?;
             // `SELECT` y no `EXAMINE`: ésta es la conexión que actúa cuando la
             // persona pide algo, así que tiene que poder cambiar una bandera. La
             // que sólo cuenta sigue abriendo en modo lectura.
-            nueva
-                .seleccionar("INBOX")
+            new_session
+                .select("INBOX")
                 .await
                 .map_err(|e| e.to_string())?;
-            self.sesion = Some(nueva);
+            self.session = Some(new_session);
         }
 
-        let sesion = self
-            .sesion
+        let session = self
+            .session
             .as_mut()
             .ok_or_else(|| "no hay conexión con el servidor".to_string())?;
-        trabajo(sesion).await.map_err(|e| e.to_string())
+        work(session).await.map_err(|e| e.to_string())
     }
 }
 
 #[interface(name = "ar.net.vasak.os.AccountsSync")]
-impl Servicio {
+impl Service {
     /// Cuánto correo sin leer hay, por cuenta.
     ///
     /// Sin pedir permiso: son los mismos números que el servicio de cuentas ya
@@ -559,13 +563,13 @@ impl Servicio {
     /// Y esto vive en el bus **de sesión**: es un servicio del usuario y lo que
     /// publica es suyo, así que no hay otra sesión que pueda escucharlo.
     async fn mailbox_status(&self) -> zbus::fdo::Result<String> {
-        let estado = self.estado.lock().await;
-        let mut resumenes: Vec<&Resumen> = estado.por_cuenta.values().collect();
+        let state = self.state.lock().await;
+        let mut summaries: Vec<&AccountSummary> = state.by_account.values().collect();
         // Por identificador, para que la lista no cambie de orden entre lecturas
         // por el recorrido de un mapa.
-        resumenes.sort_by(|a, b| a.account_id.cmp(&b.account_id));
+        summaries.sort_by(|a, b| a.account_id.cmp(&b.account_id));
 
-        serde_json::to_string(&resumenes)
+        serde_json::to_string(&summaries)
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
     }
 
@@ -599,24 +603,20 @@ impl Servicio {
         account_id: String,
         mailbox: String,
     ) -> zbus::fdo::Result<String> {
-        let mensajes = if mailbox.is_empty() || mailbox.eq_ignore_ascii_case("INBOX") {
-            let estado = self.estado.lock().await;
-            estado
-                .mensajes
-                .get(&account_id)
-                .cloned()
-                .unwrap_or_default()
+        let messages = if mailbox.is_empty() || mailbox.eq_ignore_ascii_case("INBOX") {
+            let state = self.state.lock().await;
+            state.messages.get(&account_id).cloned().unwrap_or_default()
         } else {
-            let (broker, cuenta) = self.cuenta(&account_id).await?;
-            let lector = self.lector(&account_id).await;
-            let mut lector = lector.lock().await;
-            lector
-                .resumenes_de(&broker, &cuenta, &mailbox)
+            let (broker, account) = self.account(&account_id).await?;
+            let reader = self.reader(&account_id).await;
+            let mut reader = reader.lock().await;
+            reader
+                .summaries_of(&broker, &account, &mailbox)
                 .await
                 .map_err(zbus::fdo::Error::Failed)?
         };
 
-        serde_json::to_string(&mensajes)
+        serde_json::to_string(&messages)
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
     }
 
@@ -635,16 +635,16 @@ impl Servicio {
     /// **Sólo lee.** Mover y borrar no están todavía, a propósito: mueven correo
     /// ajeno de lugar y esta parte no se ejerció nunca contra un servidor real.
     async fn list_mailboxes(&self, account_id: String) -> zbus::fdo::Result<String> {
-        let (broker, cuenta) = self.cuenta(&account_id).await?;
-        let lector = self.lector(&account_id).await;
-        let mut lector = lector.lock().await;
+        let (broker, account) = self.account(&account_id).await?;
+        let reader = self.reader(&account_id).await;
+        let mut reader = reader.lock().await;
 
-        let casillas = lector
-            .casillas(&broker, &cuenta)
+        let mailboxes = reader
+            .mailboxes(&broker, &account)
             .await
             .map_err(zbus::fdo::Error::Failed)?;
 
-        serde_json::to_string(&casillas)
+        serde_json::to_string(&mailboxes)
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
     }
 
@@ -656,7 +656,7 @@ impl Servicio {
     /// como criterio crudo, un término con palabras clave del protocolo sería un
     /// comando distinto del que se quiso mandar — contra la casilla de la propia
     /// persona, pero igual: sería la ventana decidiendo qué comando IMAP se
-    /// ejecuta. Acá llega **qué** se busca y el criterio se arma en `consulta`.
+    /// ejecuta. Acá llega **qué** se busca y el criterio se arma en `query`.
     ///
     /// Un término que no se entiende hace fallar la llamada entera en vez de
     /// saltearse: buscar algo distinto de lo que se pidió y no decirlo es peor
@@ -667,19 +667,19 @@ impl Servicio {
         mailbox: String,
         query: String,
     ) -> zbus::fdo::Result<String> {
-        let terminos: Vec<consulta::Termino> = serde_json::from_str(&query)
+        let terms: Vec<query::Term> = serde_json::from_str(&query)
             .map_err(|e| zbus::fdo::Error::InvalidArgs(format!("consulta inválida: {e}")))?;
 
-        let (broker, cuenta) = self.cuenta(&account_id).await?;
-        let lector = self.lector(&account_id).await;
-        let mut lector = lector.lock().await;
+        let (broker, account) = self.account(&account_id).await?;
+        let reader = self.reader(&account_id).await;
+        let mut reader = reader.lock().await;
 
-        let encontrados = lector
-            .buscar_en(&broker, &cuenta, &casilla_o_entrada(&mailbox), terminos)
+        let found = reader
+            .search_in(&broker, &account, &mailbox_or_inbox(&mailbox), terms)
             .await
             .map_err(zbus::fdo::Error::Failed)?;
 
-        serde_json::to_string(&encontrados)
+        serde_json::to_string(&found)
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
     }
 
@@ -703,25 +703,17 @@ impl Servicio {
         uid: u32,
         part: String,
     ) -> zbus::fdo::Result<String> {
-        use base64::Engine;
+        let (broker, account) = self.account(&account_id).await?;
+        let reader = self.reader(&account_id).await;
+        let mut reader = reader.lock().await;
 
-        let (broker, cuenta) = self.cuenta(&account_id).await?;
-        let lector = self.lector(&account_id).await;
-        let mut lector = lector.lock().await;
-
-        let (bytes, recortado) = lector
-            .adjunto(&broker, &cuenta, &casilla_o_entrada(&mailbox), uid, &part)
+        let (bytes, truncated) = reader
+            .attachment(&broker, &account, &mailbox_or_inbox(&mailbox), uid, &part)
             .await
             .map_err(zbus::fdo::Error::Failed)?;
 
-        // Con el aviso adentro y no como un segundo método: quien guarda el
-        // archivo tiene que enterarse en el mismo momento en que lo recibe, o
-        // guarda uno cortado creyendo que está entero.
-        serde_json::to_string(&serde_json::json!({
-            "contenido": base64::engine::general_purpose::STANDARD.encode(&bytes),
-            "recortado": recortado,
-        }))
-        .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
+        serde_json::to_string(&attachment_reply(&bytes, truncated))
+            .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
     }
 
     /// Trae una imagen de un mensaje, cuando la persona la pidió.
@@ -733,15 +725,15 @@ impl Servicio {
     ///
     /// Que la pida este proceso trae un riesgo nuevo —la máquina pidiéndose
     /// cosas a sí misma— y por eso la dirección se revisa y se resuelve antes.
-    /// Ver `imagenes.rs`, que es donde está la decisión y sus pruebas.
+    /// Ver `images.rs`, que es donde está la decisión y sus pruebas.
     ///
     /// No se pide sola nunca: este método existe porque alguien apretó un botón.
     async fn fetch_image(&self, url: String) -> zbus::fdo::Result<String> {
-        let imagen = imagenes::traer(&url)
+        let image = images::fetch(&url)
             .await
             .map_err(zbus::fdo::Error::Failed)?;
 
-        serde_json::to_string(&imagen)
+        serde_json::to_string(&image)
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
     }
 
@@ -749,50 +741,50 @@ impl Servicio {
     ///
     /// Devuelve `entero` o `sin_borrar_el_viejo`. Lo segundo no es un fallo: el
     /// mensaje **está** en el destino, y la copia vieja quedó marcada para
-    /// borrar porque el servidor no sabe borrar una sola. Ver `imap::mover`.
+    /// borrar porque el servidor no sabe borrar una sola. Ver `imap::move_to`.
     async fn move_message(
         &self,
-        #[zbus(signal_context)] emisor: SignalContext<'_>,
+        #[zbus(signal_context)] emitter: SignalContext<'_>,
         account_id: String,
         mailbox: String,
         uid: u32,
-        destino: String,
+        destination: String,
     ) -> zbus::fdo::Result<String> {
-        let origen = casilla_o_entrada(&mailbox);
-        if destino.trim().is_empty() {
+        let origin = mailbox_or_inbox(&mailbox);
+        if destination.trim().is_empty() {
             return Err(zbus::fdo::Error::InvalidArgs(
                 "no se dijo a qué casilla".into(),
             ));
         }
-        if destino == origen {
+        if destination == origin {
             // Mover algo a donde ya está no es un error, pero tampoco es nada
             // que haya que pedirle al servidor.
             return Ok("entero".into());
         }
 
-        let (broker, cuenta) = self.cuenta(&account_id).await?;
-        let lector = self.lector(&account_id).await;
-        let mut lector = lector.lock().await;
+        let (broker, account) = self.account(&account_id).await?;
+        let reader = self.reader(&account_id).await;
+        let mut reader = reader.lock().await;
 
-        let como = lector
-            .mover(&broker, &cuenta, &origen, uid, &destino)
+        let outcome = reader
+            .move_to(&broker, &account, &origin, uid, &destination)
             .await
             .map_err(zbus::fdo::Error::Failed)?;
-        drop(lector);
+        drop(reader);
 
         // La lista en memoria es la de la de entrada. Si de ahí salió algo, se
         // saca ya en vez de esperar la próxima vuelta: la ventana lo acaba de
         // mover y verlo seguir ahí parece que no funcionó.
-        if origen.eq_ignore_ascii_case("INBOX") && matches!(como, imap::Movido::Entero) {
-            let mut estado = self.estado.lock().await;
-            if let Some(lista) = estado.mensajes.get_mut(&account_id) {
-                lista.retain(|m| m.uid != uid);
+        if origin.eq_ignore_ascii_case("INBOX") && matches!(outcome, imap::MoveOutcome::Complete) {
+            let mut state = self.state.lock().await;
+            if let Some(list) = state.messages.get_mut(&account_id) {
+                list.retain(|m| m.uid != uid);
             }
-            drop(estado);
-            let _ = Servicio::messages_changed(&emisor).await;
+            drop(state);
+            let _ = Service::messages_changed(&emitter).await;
         }
 
-        serde_json::to_string(&como)
+        serde_json::to_string(&outcome)
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
     }
 
@@ -807,28 +799,28 @@ impl Servicio {
     /// un botón que dice «borrar», y decirlo permite ofrecer otra cosa.
     async fn delete_message(
         &self,
-        #[zbus(signal_context)] emisor: SignalContext<'_>,
+        #[zbus(signal_context)] emitter: SignalContext<'_>,
         account_id: String,
         mailbox: String,
         uid: u32,
     ) -> zbus::fdo::Result<String> {
-        let (broker, cuenta) = self.cuenta(&account_id).await?;
-        let lector = self.lector(&account_id).await;
-        let papelera = {
-            let mut lector = lector.lock().await;
-            lector
-                .papelera(&broker, &cuenta)
+        let (broker, account) = self.account(&account_id).await?;
+        let reader = self.reader(&account_id).await;
+        let trash = {
+            let mut reader = reader.lock().await;
+            reader
+                .trash(&broker, &account)
                 .await
                 .map_err(zbus::fdo::Error::Failed)?
         };
 
-        let Some(papelera) = papelera else {
+        let Some(trash) = trash else {
             return Err(zbus::fdo::Error::Failed(
                 "esta cuenta no tiene papelera en el servidor".into(),
             ));
         };
 
-        self.move_message(emisor, account_id, mailbox, uid, papelera)
+        self.move_message(emitter, account_id, mailbox, uid, trash)
             .await
     }
 
@@ -849,16 +841,16 @@ impl Servicio {
         mailbox: String,
         uid: u32,
     ) -> zbus::fdo::Result<String> {
-        let (broker, cuenta) = self.cuenta(&account_id).await?;
-        let lector = self.lector(&account_id).await;
-        let mut lector = lector.lock().await;
+        let (broker, account) = self.account(&account_id).await?;
+        let reader = self.reader(&account_id).await;
+        let mut reader = reader.lock().await;
 
-        let abierto = lector
-            .cuerpo(&broker, &cuenta, &casilla_o_entrada(&mailbox), uid)
+        let opened = reader
+            .open_message(&broker, &account, &mailbox_or_inbox(&mailbox), uid)
             .await
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo traer el mensaje: {e}")))?;
 
-        serde_json::to_string(&abierto)
+        serde_json::to_string(&opened)
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
     }
 
@@ -870,18 +862,18 @@ impl Servicio {
     /// es de los errores más molestos que puede tener un cliente de correo.
     async fn mark_read(
         &self,
-        #[zbus(signal_context)] emisor: SignalContext<'_>,
+        #[zbus(signal_context)] emitter: SignalContext<'_>,
         account_id: String,
         mailbox: String,
         uid: u32,
     ) -> zbus::fdo::Result<()> {
-        let casilla = casilla_o_entrada(&mailbox);
-        let (broker, cuenta) = self.cuenta(&account_id).await?;
-        let lector = self.lector(&account_id).await;
-        let mut lector = lector.lock().await;
+        let mailbox = mailbox_or_inbox(&mailbox);
+        let (broker, account) = self.account(&account_id).await?;
+        let reader = self.reader(&account_id).await;
+        let mut reader = reader.lock().await;
 
-        lector
-            .marcar_leido(&broker, &cuenta, &casilla, uid)
+        reader
+            .mark_read(&broker, &account, &mailbox, uid)
             .await
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo marcar: {e}")))?;
 
@@ -892,24 +884,24 @@ impl Servicio {
         // UID de otra casilla en esa lista encontraría el de un mensaje
         // distinto —los UID son por casilla— y lo marcaría leído sin que nadie
         // lo haya leído.
-        if !casilla.eq_ignore_ascii_case("INBOX") {
+        if !mailbox.eq_ignore_ascii_case("INBOX") {
             return Ok(());
         }
 
-        let mut estado = self.estado.lock().await;
-        let cambio = estado
-            .mensajes
+        let mut state = self.state.lock().await;
+        let changed = state
+            .messages
             .get_mut(&account_id)
-            .and_then(|mensajes| mensajes.iter_mut().find(|m| m.uid == uid))
-            .is_some_and(|m| std::mem::replace(&mut m.sin_leer, false));
-        drop(estado);
+            .and_then(|messages| messages.iter_mut().find(|m| m.uid == uid))
+            .is_some_and(|m| std::mem::replace(&mut m.unread, false));
+        drop(state);
 
         // Con aviso: la ventana que pidió esto ya lo sabe, pero puede haber otra
         // abierta —o el escritorio mirando el contador— y sin la señal se
         // quedarían mostrando en negrita algo que ya se leyó hasta la próxima
         // vuelta del bucle, que puede tardar veinticuatro minutos.
-        if cambio {
-            let _ = Servicio::messages_changed(&emisor).await;
+        if changed {
+            let _ = Service::messages_changed(&emitter).await;
         }
         Ok(())
     }
@@ -938,92 +930,75 @@ impl Servicio {
     /// mensaje que sale ahora cuando se pidió para mañana no se puede deshacer.
     async fn send_message(
         &self,
-        #[zbus(signal_context)] emisor: SignalContext<'_>,
+        #[zbus(signal_context)] emitter: SignalContext<'_>,
         account_id: String,
-        borrador: String,
-        no_antes_de: String,
+        draft: String,
+        not_before: String,
     ) -> zbus::fdo::Result<String> {
-        if !no_antes_de.is_empty() && chrono::DateTime::parse_from_rfc3339(&no_antes_de).is_err() {
+        if !not_before.is_empty() && chrono::DateTime::parse_from_rfc3339(&not_before).is_err() {
             return Err(zbus::fdo::Error::InvalidArgs(format!(
-                "«{no_antes_de}» no es una hora válida"
+                "«{not_before}» no es una hora válida"
             )));
         }
-        let mut borrador: redactar::Borrador = serde_json::from_str(&borrador).map_err(|e| {
+        let mut draft: compose::Draft = serde_json::from_str(&draft).map_err(|e| {
             zbus::fdo::Error::InvalidArgs(format!("el borrador no se entiende: {e}"))
         })?;
 
-        let (broker, cuenta) = self.cuenta(&account_id).await?;
+        let (broker, account) = self.account(&account_id).await?;
         let config = broker
-            .account_data(&cuenta.id, "email")
+            .account_data(&account.id, "email")
             .await
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo leer la cuenta: {e}")))?;
         let config = config.get("config").cloned().unwrap_or(config);
 
-        borrador.de = config
+        draft.from = config
             .get("username")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
                 zbus::fdo::Error::Failed("la cuenta no tiene una dirección guardada".into())
             })?
             .to_string();
-        if borrador.nombre.trim().is_empty() {
-            borrador.nombre = cuenta.display_name.clone();
+        if draft.name.trim().is_empty() {
+            draft.name = account.display_name.clone();
         }
 
-        redactar::revisar(&borrador).map_err(zbus::fdo::Error::InvalidArgs)?;
+        compose::validate(&draft).map_err(zbus::fdo::Error::InvalidArgs)?;
 
-        let ahora = chrono::Utc::now();
-        let unico = siguiente_unico();
-        let salida = cola::Salida {
-            id: cola::nuevo_id(ahora, unico),
+        let now = chrono::Utc::now();
+        let unique = next_unique();
+        let outgoing = outbox::Outgoing {
+            id: outbox::new_id(now, unique),
             account_id,
-            identificador: redactar::identificador(&borrador.de, ahora, unico),
+            message_id: compose::message_id_for(&draft.from, now, unique),
             // La fecha de cuando se escribió y no de cuando sale: un mensaje
             // redactado anoche que sale a la mañana tiene que decir anoche.
-            fecha: redactar::fecha_de_cabecera(chrono::Local::now()),
-            borrador,
-            intentos: 0,
-            estado: cola::Estado::Pendiente,
-            ultimo_error: String::new(),
-            proximo_intento: String::new(),
-            programado_para: no_antes_de,
+            date: compose::header_date(chrono::Local::now()),
+            draft,
+            attempts: 0,
+            state: outbox::DeliveryState::Pending,
+            last_error: String::new(),
+            next_attempt: String::new(),
+            scheduled_for: not_before,
         };
 
-        cola::Cola::nueva(cola::directorio())
-            .and_then(|c| c.encolar(&salida))
+        outbox::Outbox::open(outbox::outbox_dir())
+            .and_then(|c| c.enqueue(&outgoing))
             .map_err(zbus::fdo::Error::Failed)?;
 
         // Recién ahora, con el mensaje ya en el disco: si el aviso se perdiera,
         // la revisión por reloj lo levanta igual.
-        self.hay_algo_que_mandar.notify_one();
-        let _ = Servicio::outbox_changed(&emisor).await;
-        Ok(salida.id)
+        self.outbox_wakeup.notify_one();
+        let _ = Service::outbox_changed(&emitter).await;
+        Ok(outgoing.id)
     }
 
     /// Lo que está esperando salir, y lo que se trabó.
     async fn list_outbox(&self) -> zbus::fdo::Result<String> {
-        let salidas = cola::Cola::nueva(cola::directorio())
-            .and_then(|c| c.todos())
+        let queued = outbox::Outbox::open(outbox::outbox_dir())
+            .and_then(|c| c.all())
             .map_err(zbus::fdo::Error::Failed)?;
 
-        // Se agrega si está esperando su hora, que no es un campo del archivo
-        // sino una pregunta sobre el reloj. Calcularlo acá y no en la ventana
-        // deja la regla —vacío, ilegible, o ya pasó— en un solo lugar; hacerlo
-        // en los dos es tener dos reglas que se pueden separar.
-        let ahora = chrono::Utc::now();
-        let vista: Vec<_> = salidas
-            .into_iter()
-            .map(|salida| {
-                let esperando = salida.esta_programado(ahora);
-                let mut json = serde_json::to_value(salida).unwrap_or_default();
-                if let Some(objeto) = json.as_object_mut() {
-                    objeto.insert("esperando_su_hora".into(), esperando.into());
-                }
-                json
-            })
-            .collect();
-
-        serde_json::to_string(&vista)
+        serde_json::to_string(&outbox::view(queued, chrono::Utc::now()))
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
     }
 
@@ -1035,7 +1010,7 @@ impl Servicio {
     /// preguntar antes; acá no hay forma de preguntar.
     async fn discard_outgoing(
         &self,
-        #[zbus(signal_context)] emisor: SignalContext<'_>,
+        #[zbus(signal_context)] emitter: SignalContext<'_>,
         id: String,
     ) -> zbus::fdo::Result<()> {
         // Sin barras ni puntos: el identificador viene de afuera y se convierte
@@ -1050,11 +1025,11 @@ impl Servicio {
             ));
         }
 
-        cola::Cola::nueva(cola::directorio())
-            .and_then(|c| c.quitar(&id))
+        outbox::Outbox::open(outbox::outbox_dir())
+            .and_then(|c| c.remove(&id))
             .map_err(zbus::fdo::Error::Failed)?;
 
-        let _ = Servicio::outbox_changed(&emisor).await;
+        let _ = Service::outbox_changed(&emitter).await;
         Ok(())
     }
 
@@ -1063,7 +1038,7 @@ impl Servicio {
     /// Sin detalle, como las otras: quien la recibe vuelve a leer y ve el
     /// estado completo.
     #[zbus(signal)]
-    async fn outbox_changed(emisor: &SignalContext<'_>) -> zbus::Result<()>;
+    async fn outbox_changed(emitter: &SignalContext<'_>) -> zbus::Result<()>;
 
     /// Señal `MessagesChanged` — cambió la lista de mensajes de alguna cuenta.
     ///
@@ -1071,7 +1046,7 @@ impl Servicio {
     /// leer y ve el estado completo, en vez de reconciliar señales que se pueden
     /// perder.
     #[zbus(signal)]
-    async fn messages_changed(emisor: &SignalContext<'_>) -> zbus::Result<()>;
+    async fn messages_changed(emitter: &SignalContext<'_>) -> zbus::Result<()>;
 
     /// Señal `MailboxChanged` — cambió el correo sin leer de alguna cuenta.
     ///
@@ -1079,23 +1054,23 @@ impl Servicio {
     /// la recibe vuelve a leer y ve el estado completo, en vez de reconciliar
     /// señales que se pueden perder.
     #[zbus(signal)]
-    async fn mailbox_changed(emisor: &SignalContext<'_>) -> zbus::Result<()>;
+    async fn mailbox_changed(emitter: &SignalContext<'_>) -> zbus::Result<()>;
 }
 
 /// Lo que necesita el servicio y no es un método de D-Bus.
-impl Servicio {
+impl Service {
     /// El lector de una cuenta, creándolo si es el primer pedido.
     ///
     /// Uno por cuenta y compartido: dos pedidos a la vez sobre la misma conexión
     /// mezclarían las respuestas —IMAP las devuelve en el orden que quiere—, así
     /// que el `Mutex` los pone en fila. Es también lo que hace que abrir dos
     /// mensajes seguidos no abra dos conexiones.
-    async fn lector(&self, account_id: &str) -> Arc<Mutex<Lector>> {
-        let mut lectores = self.lectores.lock().await;
+    async fn reader(&self, account_id: &str) -> Arc<Mutex<Reader>> {
+        let mut readers = self.readers.lock().await;
         Arc::clone(
-            lectores
+            readers
                 .entry(account_id.to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(Lector::default()))),
+                .or_insert_with(|| Arc::new(Mutex::new(Reader::default()))),
         )
     }
 
@@ -1105,16 +1080,16 @@ impl Servicio {
     /// haberla borrado desde Configuración mientras la aplicación de correo
     /// estaba abierta, y contestar con datos viejos sería intentar conectarse con
     /// una credencial que ya no existe.
-    async fn cuenta(&self, account_id: &str) -> zbus::fdo::Result<(Broker, broker::Account)> {
+    async fn account(&self, account_id: &str) -> zbus::fdo::Result<(Broker, broker::Account)> {
         let broker = Broker::connect().await.map_err(|e| {
             zbus::fdo::Error::Failed(format!("no se pudo hablar con el servicio de cuentas: {e}"))
         })?;
 
-        let cuentas = broker.accounts().await.map_err(|e| {
+        let accounts = broker.accounts().await.map_err(|e| {
             zbus::fdo::Error::Failed(format!("no se pudieron leer las cuentas: {e}"))
         })?;
 
-        cuentas
+        accounts
             .into_iter()
             .find(|c| c.id == account_id)
             .map(|c| (broker, c))
@@ -1130,10 +1105,10 @@ impl Servicio {
 /// microsegundo tendrían el mismo nombre de archivo y el mismo `Message-ID`, y
 /// el segundo pisaría al primero — o sea, se perdería un mensaje que alguien
 /// escribió.
-fn siguiente_unico() -> u64 {
+fn next_unique() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
-    static CONTADOR: AtomicU64 = AtomicU64::new(0);
-    CONTADOR.fetch_add(1, Ordering::Relaxed)
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 /// El bucle que vacía la cola de salida.
@@ -1146,57 +1121,49 @@ fn siguiente_unico() -> u64 {
 /// Se despierta cuando alguien encola algo y, si no, cada tanto: un mensaje
 /// que quedó esperando por un servidor caído tiene que salir solo cuando el
 /// servidor vuelva, sin que nadie apriete nada.
-async fn despachar(servicio: Servicio, emisor: SignalContext<'static>) {
+async fn dispatch_outbox(service: Service, emitter: SignalContext<'static>) {
     loop {
-        let hubo_cambios = vaciar_la_cola(&servicio).await;
-        if hubo_cambios {
-            let _ = Servicio::outbox_changed(&emisor).await;
+        let changed = flush_outbox(&service).await;
+        if changed {
+            let _ = Service::outbox_changed(&emitter).await;
         }
 
         // Lo que sea que pase primero: alguien escribió algo, o pasó el rato.
         tokio::select! {
-            _ = tokio::time::sleep(REVISAR_COLA) => {}
-            _ = servicio.hay_algo_que_mandar.notified() => {}
+            _ = tokio::time::sleep(OUTBOX_CHECK) => {}
+            _ = service.outbox_wakeup.notified() => {}
         }
     }
 }
 
 /// Intenta mandar lo que esté listo. Devuelve si cambió algo.
-async fn vaciar_la_cola(servicio: &Servicio) -> bool {
-    let Ok(cola) = cola::Cola::nueva(cola::directorio()) else {
+async fn flush_outbox(service: &Service) -> bool {
+    let Ok(outbox) = outbox::Outbox::open(outbox::outbox_dir()) else {
         return false;
     };
-    let Ok(pendientes) = cola.todos() else {
+    let Ok(queued) = outbox.all() else {
         return false;
     };
 
-    let ahora = chrono::Utc::now();
-    let mut cambio = false;
+    let now = chrono::Utc::now();
+    let mut changed = false;
 
-    for mut salida in pendientes {
-        if salida.estado == cola::Estado::Trabado {
-            continue;
-        }
-        // Todavía no le toca: la espera crece con cada intento fallido.
-        if !salida.le_toca(ahora) {
-            continue;
-        }
-
-        match mandar_uno(servicio, &salida).await {
+    for mut outgoing in outbox::ready_to_send(queued, now) {
+        match send_one(service, &outgoing).await {
             Ok(()) => {
-                tracing::info!("mensaje {} entregado", salida.id);
+                tracing::info!("mensaje {} entregado", outgoing.id);
                 // **El error de sacarlo importa.** Un mensaje entregado que
                 // sigue en la cola se vuelve a mandar en la vuelta siguiente, y
                 // quien lo recibe lo ve dos veces. Que quede en el diario es lo
                 // único que permite entender después por qué pasó.
-                if let Err(e) = cola.quitar(&salida.id) {
+                if let Err(e) = outbox.remove(&outgoing.id) {
                     tracing::error!(
                         "el mensaje {} se entregó pero no se pudo sacar de la cola: {e}. \
                          Se va a volver a mandar",
-                        salida.id
+                        outgoing.id
                     );
                 }
-                cambio = true;
+                changed = true;
             }
             Err(e) => {
                 // La hora **de ahora** y no la del principio de la vuelta:
@@ -1204,126 +1171,125 @@ async fn vaciar_la_cola(servicio: &Servicio) -> bool {
                 // tarda diez minutos, y con la hora vieja el último quedaría
                 // con su próximo intento ya cumplido. O sea, reintentos
                 // seguidos contra un servidor que justamente no está.
-                salida.fallo(e.to_string(), chrono::Utc::now());
+                outgoing.record_failure(e.to_string(), chrono::Utc::now());
                 // Se deja de intentar cuando el servidor dijo que no va a
                 // aceptarlo nunca, o cuando se acabaron los intentos. En los dos
                 // casos hace falta que la persona haga algo, y seguir golpeando
                 // el servidor de alguien no ayuda.
-                if !e.se_reintenta() || salida.intentos >= cola::MAX_INTENTOS {
-                    salida.estado = cola::Estado::Trabado;
-                    tracing::warn!("el mensaje {} no se pudo mandar: {e}", salida.id);
+                if !e.is_retryable() || outgoing.attempts >= outbox::MAX_ATTEMPTS {
+                    outgoing.state = outbox::DeliveryState::Stuck;
+                    tracing::warn!("el mensaje {} no se pudo mandar: {e}", outgoing.id);
                 } else {
-                    tracing::info!("el mensaje {} espera otro intento: {e}", salida.id);
+                    tracing::info!("el mensaje {} espera otro intento: {e}", outgoing.id);
                 }
-                let _ = cola.guardar(&salida);
-                cambio = true;
+                let _ = outbox.save(&outgoing);
+                changed = true;
             }
         }
     }
 
-    cambio
+    changed
 }
 
 /// Manda un mensaje, de principio a fin.
-async fn mandar_uno(servicio: &Servicio, salida: &cola::Salida) -> Result<(), smtp::SmtpError> {
-    let (broker, cuenta) = servicio
-        .cuenta(&salida.account_id)
+async fn send_one(service: &Service, outgoing: &outbox::Outgoing) -> Result<(), smtp::SmtpError> {
+    let (broker, account) = service
+        .account(&outgoing.account_id)
         .await
-        .map_err(|e| smtp::SmtpError::Permanente(e.to_string()))?;
+        .map_err(|e| smtp::SmtpError::Permanent(e.to_string()))?;
 
     let token = broker
-        .access_token(&cuenta.id, "email")
+        .access_token(&account.id, "email")
         .await
         .map_err(|e| match e {
             // Sin permiso no es un problema pasajero: hasta que la persona lo
             // dé, este mensaje no va a salir.
-            BrokerError::Denied(d) => smtp::SmtpError::Rechazado(d),
-            otro => smtp::SmtpError::Temporal(otro.to_string()),
+            BrokerError::Denied(d) => smtp::SmtpError::Rejected(d),
+            other => smtp::SmtpError::Temporary(other.to_string()),
         })?;
 
     let config = broker
-        .account_data(&cuenta.id, "email")
+        .account_data(&account.id, "email")
         .await
-        .map_err(|e| smtp::SmtpError::Temporal(e.to_string()))?;
+        .map_err(|e| smtp::SmtpError::Temporary(e.to_string()))?;
     let config = config.get("config").cloned().unwrap_or(config);
 
     // Una cuenta sin servidor de salida no se arregla esperando.
-    let destino =
-        broker::destino_smtp_de(&config, Some(token)).map_err(smtp::SmtpError::Permanente)?;
+    let destination =
+        broker::smtp_endpoint(&config, Some(token)).map_err(smtp::SmtpError::Permanent)?;
 
-    let mensaje = redactar::armar(&salida.borrador, &salida.identificador, &salida.fecha)
-        .map_err(smtp::SmtpError::Permanente)?;
+    let message = compose::build_message(&outgoing.draft, &outgoing.message_id, &outgoing.date)
+        .map_err(smtp::SmtpError::Permanent)?;
 
-    let mut sesion = smtp::Sesion::abrir(&destino).await?;
-    let resultado = sesion
-        .entregar(
-            &salida.borrador.de,
-            &salida.borrador.destinatarios(),
-            &mensaje,
-        )
+    let mut session = smtp::Session::open(&destination).await?;
+    let result = session
+        .deliver(&outgoing.draft.from, &outgoing.draft.recipients(), &message)
         .await;
-    sesion.cerrar().await;
-    resultado
+    session.close().await;
+    result
 }
 
 /// Abre la sesión de una cuenta: token, configuración y conexión.
-async fn abrir(broker: &Broker, cuenta: &broker::Account) -> Result<imap::Sesion, String> {
+async fn open_session(broker: &Broker, account: &broker::Account) -> Result<imap::Session, String> {
     let token = broker
-        .access_token(&cuenta.id, "email")
+        .access_token(&account.id, "email")
         .await
         .map_err(|e| e.to_string())?;
 
     let config = broker
-        .account_data(&cuenta.id, "email")
+        .account_data(&account.id, "email")
         .await
         .map_err(|e| e.to_string())?;
     // La configuración viene envuelta: el servicio devuelve la cuenta entera con
     // la capacidad adentro.
     let config = config.get("config").cloned().unwrap_or(config);
 
-    let destino = broker::destino_de(&config, Some(token))?;
-    imap::Sesion::abrir(&destino)
+    let destination = broker::imap_endpoint(&config, Some(token))?;
+    imap::Session::open(&destination)
         .await
         .map_err(|e| e.to_string())
 }
 
 /// Cuenta lo que hay en la casilla abierta.
-async fn contar(sesion: &mut imap::Sesion, mensajes: u32) -> Result<imap::Estado, String> {
-    let sin_leer = sesion.sin_leer().await.map_err(|e| e.to_string())?;
-    Ok(imap::Estado { mensajes, sin_leer })
+async fn read_mailbox_status(
+    session: &mut imap::Session,
+    messages: u32,
+) -> Result<imap::MailboxStatus, String> {
+    let unread = session.count_unread().await.map_err(|e| e.to_string())?;
+    Ok(imap::MailboxStatus { messages, unread })
 }
 
 /// Publica lo que se sabe de una cuenta y avisa si cambió.
-async fn publicar(
-    servicio: &Servicio,
-    emisor: &SignalContext<'_>,
-    cuenta: &broker::Account,
-    resultado: Result<imap::Estado, String>,
+async fn publish_status(
+    service: &Service,
+    emitter: &SignalContext<'_>,
+    account: &broker::Account,
+    result: Result<imap::MailboxStatus, String>,
 ) {
-    let nuevo = match resultado {
-        Ok(estado) => Resumen {
-            account_id: cuenta.id.clone(),
-            display_name: cuenta.display_name.clone(),
-            estado,
+    let summary = match result {
+        Ok(status) => AccountSummary {
+            account_id: account.id.clone(),
+            display_name: account.display_name.clone(),
+            status,
             error: String::new(),
         },
-        Err(detalle) => Resumen {
-            account_id: cuenta.id.clone(),
-            display_name: cuenta.display_name.clone(),
-            estado: imap::Estado::default(),
-            error: detalle,
+        Err(detail) => AccountSummary {
+            account_id: account.id.clone(),
+            display_name: account.display_name.clone(),
+            status: imap::MailboxStatus::default(),
+            error: detail,
         },
     };
 
-    let mut estado = servicio.estado.lock().await;
-    let anterior = estado.por_cuenta.get(&cuenta.id);
-    let cambio =
-        anterior.map(|a| (a.estado, a.error.clone())) != Some((nuevo.estado, nuevo.error.clone()));
-    estado.por_cuenta.insert(cuenta.id.clone(), nuevo);
-    drop(estado);
+    let mut state = service.state.lock().await;
+    let previous = state.by_account.get(&account.id);
+    let changed = previous.map(|a| (a.status, a.error.clone()))
+        != Some((summary.status, summary.error.clone()));
+    state.by_account.insert(account.id.clone(), summary);
+    drop(state);
 
-    if cambio {
-        let _ = Servicio::mailbox_changed(emisor).await;
+    if changed {
+        let _ = Service::mailbox_changed(emitter).await;
     }
 }
 
@@ -1332,32 +1298,32 @@ async fn publicar(
 /// Se compara con lo que había: sin eso, cada renovación de la espera —cada
 /// veinticuatro minutos, haya novedades o no— despertaría a la aplicación de
 /// correo a redibujar una lista idéntica.
-async fn publicar_mensajes(
-    servicio: &Servicio,
-    emisor: &SignalContext<'_>,
+async fn publish_messages(
+    service: &Service,
+    emitter: &SignalContext<'_>,
     account_id: &str,
-    mensajes: Vec<mensaje::Resumen>,
+    messages: Vec<message::MessageSummary>,
 ) {
-    let mut estado = servicio.estado.lock().await;
-    let anterior = estado.mensajes.get(account_id);
-    let cambio = anterior != Some(&mensajes);
+    let mut state = service.state.lock().await;
+    let previous = state.messages.get(account_id);
+    let changed = previous != Some(&messages);
     // Cuántos son nuevos se calcula **antes** de reemplazar la lista, que es la
     // única forma: después ya no hay con qué comparar. Y sale `0` la primera
     // vez, porque no había lista anterior — que es justo lo que evita veinte
     // carteles de correo de la semana pasada al conectarse.
-    let recien_llegados = avisos::recien_llegados(anterior.map(|v| v.as_slice()), &mensajes);
-    let nuevos = recien_llegados.len();
-    if cambio {
-        estado.mensajes.insert(account_id.to_string(), mensajes);
+    let just_arrived = notifications::just_arrived(previous.map(|v| v.as_slice()), &messages);
+    let new_count = just_arrived.len();
+    if changed {
+        state.messages.insert(account_id.to_string(), messages);
     }
-    drop(estado);
+    drop(state);
 
-    if !cambio {
+    if !changed {
         return;
     }
-    let _ = Servicio::messages_changed(emisor).await;
+    let _ = Service::messages_changed(emitter).await;
 
-    if nuevos == 0 {
+    if new_count == 0 {
         return;
     }
 
@@ -1365,22 +1331,22 @@ async fn publicar_mensajes(
     // normal— y ésta es la única forma de que alguien se entere.
     // Se releen acá y no al arrancar: un cambio vale en el próximo cartel y no
     // en la próxima sesión. Es una vez por aviso, o sea unas pocas por día.
-    let detalle = preferencias::leer().detalle_del_aviso;
-    let (titulo, cuerpo) = avisos::texto(&recien_llegados, account_id, detalle);
-    let mut carteles = servicio.carteles.lock().await;
-    if let Some(id) = avisos::mostrar(
-        emisor.connection(),
-        carteles.anterior(account_id),
-        &titulo,
-        &cuerpo,
+    let detail = preferences::read().notification_detail;
+    let (title, body) = notifications::notification_text(&just_arrived, account_id, detail);
+    let mut shown_notifications = service.shown_notifications.lock().await;
+    if let Some(id) = notifications::show(
+        emitter.connection(),
+        shown_notifications.previous(account_id),
+        &title,
+        &body,
         // Preguntado cada vez y no una: el servidor de notificaciones se puede
         // reiniciar —o cambiar por otro— sin que este servicio se entere, y la
         // respuesta viene de un método que ya está conectado.
-        avisos::soporta_botones(emisor.connection()).await,
+        notifications::supports_actions(emitter.connection()).await,
     )
     .await
     {
-        carteles.recordar(account_id, id);
+        shown_notifications.remember(account_id, id);
     }
 }
 
@@ -1389,38 +1355,38 @@ async fn publicar_mensajes(
 /// Vive toda la sesión, como el despachador: el cartel puede seguir en el centro
 /// de notificaciones mucho después de haberse mostrado, y alguien lo puede
 /// apretar en cualquier momento.
-fn atender_los_carteles(servicio: Servicio, conexion: zbus::Connection) {
+fn handle_notification_actions(service: Service, connection: zbus::Connection) {
     tokio::spawn(async move {
         // En bucle, igual que el resto de lo que escucha el bus: si la conexión
         // se corta, el botón dejaría de contestar hasta reiniciar la sesión.
         loop {
-            if let Err(e) = seguir_los_carteles(&servicio, &conexion).await {
+            if let Err(e) = follow_notification_actions(&service, &connection).await {
                 eprintln!("[avisos] no se puede atender el botón del cartel: {e}");
             }
-            tokio::time::sleep(REINTENTO).await;
+            tokio::time::sleep(SERVICE_RETRY).await;
         }
     });
 }
 
-async fn seguir_los_carteles(
-    servicio: &Servicio,
-    conexion: &zbus::Connection,
+async fn follow_notification_actions(
+    service: &Service,
+    connection: &zbus::Connection,
 ) -> Result<(), String> {
     use futures_util::StreamExt;
 
-    let regla = zbus::MatchRule::builder()
+    let rule = zbus::MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
         .interface("org.freedesktop.Notifications")
         .and_then(|r| r.member("ActionInvoked"))
         .map_err(|e| format!("no se pudo armar el filtro: {e}"))?
         .build();
 
-    let mut avisos_del_bus = zbus::MessageStream::for_match_rule(regla, conexion, None)
+    let mut bus_signals = zbus::MessageStream::for_match_rule(rule, connection, None)
         .await
         .map_err(|e| format!("no se pudo escuchar «ActionInvoked»: {e}"))?;
 
-    while let Some(Ok(mensaje)) = avisos_del_bus.next().await {
-        let Ok((id, accion)) = mensaje.body().deserialize::<(u32, String)>() else {
+    while let Some(Ok(message)) = bus_signals.next().await {
+        let Ok((id, action)) = message.body().deserialize::<(u32, String)>() else {
             continue;
         };
 
@@ -1428,10 +1394,10 @@ async fn seguir_los_carteles(
         // alguien apriete en cualquier cartel del escritorio, no sólo en los
         // propios: sin esto, un botón llamado «abrir» en el aviso de otro
         // programa abriría el correo.
-        if accion != "abrir" || !servicio.carteles.lock().await.es_nuestro(id) {
+        if action != "abrir" || !service.shown_notifications.lock().await.is_ours(id) {
             continue;
         }
-        avisos::abrir_el_correo();
+        notifications::open_mail_app();
     }
 
     Err("el bus de sesión cerró la conexión".into())
@@ -1443,50 +1409,68 @@ async fn seguir_los_carteles(
 /// queda esperando y el correo nuevo aparece en el momento; cuando no, vuelve a
 /// mirar cada cinco minutos sobre la misma conexión, que igual es mejor que
 /// reconectarse cada vez.
-async fn atender(cuenta: broker::Account, servicio: Servicio, emisor: SignalContext<'static>) {
+async fn serve_account(
+    account: broker::Account,
+    service: Service,
+    emitter: SignalContext<'static>,
+) {
     loop {
         let broker = match Broker::connect().await {
             Ok(b) => b,
             Err(e) => {
-                tracing::info!("'{}': esperando al servicio de cuentas: {e}", cuenta.id);
-                tokio::time::sleep(REINTENTO_CUENTA).await;
+                tracing::info!("'{}': esperando al servicio de cuentas: {e}", account.id);
+                tokio::time::sleep(ACCOUNT_RETRY).await;
                 continue;
             }
         };
 
-        match sesion_de_cuenta(&broker, &cuenta, &servicio, &emisor).await {
+        match account_session(&broker, &account, &service, &emitter).await {
             // Sólo se sale con un rechazo: insistir con una credencial que el
             // servidor no acepta es cómo se bloquea una cuenta, y en un bucle
             // serían cientos de intentos por día. La tarea termina y no vuelve
             // hasta que algo cambie en las cuentas.
-            Err(Salida::Rechazada(detalle)) => {
-                tracing::warn!("'{}' deja de mirarse: {detalle}", cuenta.id);
+            Err(SessionEnd::Rejected(detail)) => {
+                tracing::warn!("'{}' deja de mirarse: {detail}", account.id);
                 // Antes de publicar: quien revisa las tareas tiene que ver la
                 // marca aunque llegue justo ahora, o la vuelve a arrancar.
-                servicio
-                    .estado
+                service
+                    .state
                     .lock()
                     .await
-                    .rechazadas
-                    .insert(cuenta.id.clone());
-                publicar(&servicio, &emisor, &cuenta, Err(detalle)).await;
+                    .rejected
+                    .insert(account.id.clone());
+                publish_status(&service, &emitter, &account, Err(detail)).await;
                 return;
             }
-            Err(Salida::Cortada(detalle)) => {
-                tracing::info!("'{}' se cortó: {detalle}; reconectando", cuenta.id);
-                publicar(&servicio, &emisor, &cuenta, Err(detalle)).await;
-                tokio::time::sleep(REINTENTO_CUENTA).await;
+            Err(SessionEnd::Dropped(detail)) => {
+                tracing::info!("'{}' se cortó: {detail}; reconectando", account.id);
+                publish_status(&service, &emitter, &account, Err(detail)).await;
+                tokio::time::sleep(ACCOUNT_RETRY).await;
             }
         }
     }
 }
 
 /// Por qué terminó la sesión de una cuenta.
-enum Salida {
+enum SessionEnd {
     /// El servidor rechazó las credenciales, o el servicio negó el permiso.
-    Rechazada(String),
+    Rejected(String),
     /// Se cortó, se cayó la red, el servidor se reinició. Se reconecta.
-    Cortada(String),
+    Dropped(String),
+}
+
+/// Lo que contesta `GetAttachment`: el contenido en base64 y si se cortó.
+///
+/// Con el aviso adentro y no como un segundo método: quien guarda el archivo
+/// tiene que enterarse en el mismo momento en que lo recibe, o guarda uno
+/// cortado creyendo que está entero.
+fn attachment_reply(bytes: &[u8], truncated: bool) -> serde_json::Value {
+    use base64::Engine;
+
+    serde_json::json!({
+        "contenido": base64::engine::general_purpose::STANDARD.encode(bytes),
+        "recortado": truncated,
+    })
 }
 
 /// Lo más grande que se baja de un adjunto.
@@ -1495,14 +1479,14 @@ enum Salida {
 /// explícito en el comando de IMAP: un servidor puede anunciar el tamaño que
 /// quiera, y pedir «desde el byte cero, tantos» es lo que garantiza que no
 /// llegue más de lo que se está dispuesto a tener en memoria.
-const MAXIMO_ADJUNTO: usize = 20 * 1024 * 1024;
+const MAX_ATTACHMENT: usize = 20 * 1024 * 1024;
 
 /// La casilla que pidieron, o la de entrada si no dijeron ninguna.
 ///
 /// Las ventanas viejas no mandan el campo. Caer a `INBOX` es lo que hacían
 /// antes, así que una que no se actualizó sigue funcionando igual en vez de
 /// fallar con un nombre vacío.
-fn casilla_o_entrada(mailbox: &str) -> String {
+fn mailbox_or_inbox(mailbox: &str) -> String {
     if mailbox.is_empty() {
         "INBOX".to_string()
     } else {
@@ -1511,48 +1495,50 @@ fn casilla_o_entrada(mailbox: &str) -> String {
 }
 
 /// Una sesión, de principio a fin. Nunca vuelve bien: o se corta o la rechazan.
-async fn sesion_de_cuenta(
+async fn account_session(
     broker: &Broker,
-    cuenta: &broker::Account,
-    servicio: &Servicio,
-    emisor: &SignalContext<'_>,
-) -> Result<std::convert::Infallible, Salida> {
-    let mut sesion = abrir(broker, cuenta).await.map_err(clasificar_salida)?;
-
-    let mut mensajes = sesion
-        .examinar("INBOX")
+    account: &broker::Account,
+    service: &Service,
+    emitter: &SignalContext<'_>,
+) -> Result<std::convert::Infallible, SessionEnd> {
+    let mut session = open_session(broker, account)
         .await
-        .map_err(|e| Salida::Cortada(e.to_string()))?;
+        .map_err(classify_session_end)?;
+
+    let mut messages = session
+        .examine("INBOX")
+        .await
+        .map_err(|e| SessionEnd::Dropped(e.to_string()))?;
 
     // El `UIDVALIDITY` con el que se abrió. Si el servidor lo cambia a mitad de
     // la sesión, los UID que ya publicamos dejan de valer: el 412 de ayer no es
     // el 412 de hoy. Pasa cuando la casilla se recrea del otro lado —una
     // restauración, una migración de servidor— y es raro, pero el síntoma es
     // que abrir un mensaje trae otro.
-    let mut uidvalidity = sesion.uidvalidity();
+    let mut uidvalidity = session.uidvalidity();
 
-    let inicial = contar(&mut sesion, mensajes).await;
-    publicar(servicio, emisor, cuenta, inicial).await;
-    listar(&mut sesion, servicio, emisor, cuenta, mensajes).await?;
+    let initial = read_mailbox_status(&mut session, messages).await;
+    publish_status(service, emitter, account, initial).await;
+    list_inbox(&mut session, service, emitter, account, messages).await?;
 
-    let avisa = sesion.soporta_idle();
-    if !avisa {
+    let notifies = session.supports_idle();
+    if !notifies {
         tracing::info!(
             "'{}': el servidor no sabe avisar; se mira cada {} minutos",
-            cuenta.id,
+            account.id,
             POLL_INTERVAL.as_secs() / 60,
         );
     }
 
     loop {
-        if avisa {
+        if notifies {
             // Esperar a que el servidor diga algo. Vuelve por novedad o porque
             // hay que renovar; en los dos casos se vuelve a contar, que es
             // barato y evita depender de interpretar bien cada aviso.
-            sesion
-                .esperar(RENOVAR_IDLE)
+            session
+                .idle(IDLE_RENEWAL)
                 .await
-                .map_err(|e| Salida::Cortada(e.to_string()))?;
+                .map_err(|e| SessionEnd::Dropped(e.to_string()))?;
         } else {
             tokio::time::sleep(POLL_INTERVAL).await;
         }
@@ -1561,38 +1547,38 @@ async fn sesion_de_cuenta(
         // fresco: el servicio lo refresca si le queda poco. No se usa para nada
         // más — la sesión ya está autenticada— pero sin esto una cuenta que anda
         // podría quedarse con un refresh_token caducado por no usarse.
-        if let Err(e) = broker.access_token(&cuenta.id, "email").await {
+        if let Err(e) = broker.access_token(&account.id, "email").await {
             if matches!(e, BrokerError::Denied(_)) {
-                return Err(Salida::Rechazada(e.to_string()));
+                return Err(SessionEnd::Rejected(e.to_string()));
             }
-            tracing::debug!("'{}': no se pudo refrescar el token: {e}", cuenta.id);
+            tracing::debug!("'{}': no se pudo refrescar el token: {e}", account.id);
         }
 
         // `EXAMINE` otra vez para releer cuántos hay: el `EXISTS` que llegó
         // durante la espera puede haber quedado atrás si hubo varios.
-        mensajes = sesion
-            .examinar("INBOX")
+        messages = session
+            .examine("INBOX")
             .await
-            .map_err(|e| Salida::Cortada(e.to_string()))?;
+            .map_err(|e| SessionEnd::Dropped(e.to_string()))?;
 
         // Si cambió, lo guardado no sirve. Se tira y se vuelve a listar en vez
         // de intentar arreglarlo: la lista se rehace en un pedido, y quedarse
         // con UID que apuntan a otra cosa es peor que esperar dos segundos.
-        let ahora_vale = sesion.uidvalidity();
-        if ahora_vale != uidvalidity {
+        let current_validity = session.uidvalidity();
+        if current_validity != uidvalidity {
             tracing::info!(
                 "'{}': el servidor cambió el UIDVALIDITY de INBOX ({:?} -> {:?}); se rehace la lista",
-                cuenta.id,
+                account.id,
                 uidvalidity,
-                ahora_vale,
+                current_validity,
             );
-            uidvalidity = ahora_vale;
-            servicio.estado.lock().await.mensajes.remove(&cuenta.id);
+            uidvalidity = current_validity;
+            service.state.lock().await.messages.remove(&account.id);
         }
 
-        let ahora = contar(&mut sesion, mensajes).await;
-        publicar(servicio, emisor, cuenta, ahora).await;
-        listar(&mut sesion, servicio, emisor, cuenta, mensajes).await?;
+        let status = read_mailbox_status(&mut session, messages).await;
+        publish_status(service, emitter, account, status).await;
+        list_inbox(&mut session, service, emitter, account, messages).await?;
     }
 }
 
@@ -1608,32 +1594,32 @@ async fn sesion_de_cuenta(
 /// excepción y no admite otra: seguir usándola leería el correo de alguien como
 /// si fueran líneas del protocolo, y el contador que se quería salvar pasaría a
 /// decir cualquier cosa. Ahí se corta y se reconecta.
-async fn listar(
-    sesion: &mut imap::Sesion,
-    servicio: &Servicio,
-    emisor: &SignalContext<'_>,
-    cuenta: &broker::Account,
-    mensajes: u32,
-) -> Result<(), Salida> {
-    match sesion.resumenes(mensajes).await {
-        Ok(lista) => {
-            publicar_mensajes(servicio, emisor, &cuenta.id, lista).await;
+async fn list_inbox(
+    session: &mut imap::Session,
+    service: &Service,
+    emitter: &SignalContext<'_>,
+    account: &broker::Account,
+    messages: u32,
+) -> Result<(), SessionEnd> {
+    match session.recent_summaries(messages).await {
+        Ok(list) => {
+            publish_messages(service, emitter, &account.id, list).await;
             Ok(())
         }
-        Err(e @ imap::ImapError::Desincronizada(_)) => Err(Salida::Cortada(e.to_string())),
+        Err(e @ imap::ImapError::Desynced(_)) => Err(SessionEnd::Dropped(e.to_string())),
         Err(e) => {
-            tracing::warn!("'{}': no se pudo listar el correo: {e}", cuenta.id);
+            tracing::warn!("'{}': no se pudo listar el correo: {e}", account.id);
             Ok(())
         }
     }
 }
 
 /// Separa lo que hay que reintentar de lo que no.
-fn clasificar_salida(detalle: String) -> Salida {
-    if detalle.contains("rechazó las credenciales") || detalle.contains("sin permiso") {
-        Salida::Rechazada(detalle)
+fn classify_session_end(detail: String) -> SessionEnd {
+    if detail.contains("rechazó las credenciales") || detail.contains("sin permiso") {
+        SessionEnd::Rejected(detail)
     } else {
-        Salida::Cortada(detalle)
+        SessionEnd::Dropped(detail)
     }
 }
 
@@ -1643,15 +1629,13 @@ fn clasificar_salida(detalle: String) -> Salida {
 /// saber qué bases ya no son de nadie, y **sólo** cuando respondió bien.
 async fn reconcile_tasks(
     broker: &Broker,
-    service: &Servicio,
+    service: &Service,
     emitter: &SignalContext<'static>,
     tasks: &mut HashMap<String, tokio::task::JoinHandle<()>>,
 ) -> Result<Vec<broker::Account>, BrokerError> {
     let accounts = broker.accounts().await?;
-    let with_mail: Vec<&broker::Account> = accounts
-        .iter()
-        .filter(|a| a.hay_correo_que_sincronizar())
-        .collect();
+    let with_mail: Vec<&broker::Account> =
+        accounts.iter().filter(|a| a.has_mail_to_sync()).collect();
     let current: Vec<&str> = with_mail.iter().map(|a| a.id.as_str()).collect();
 
     // Las que ya no están, o que pasaron a necesitar reautenticación.
@@ -1663,9 +1647,9 @@ async fn reconcile_tasks(
         false
     });
 
-    let mut state = service.estado.lock().await;
+    let mut state = service.state.lock().await;
     state
-        .por_cuenta
+        .by_account
         .retain(|id, _| current.contains(&id.as_str()));
     // Los mensajes de una cuenta que ya no está **se van con ella**. Sin esto,
     // borrar una cuenta desde Configuración dejaba en memoria el remitente y el
@@ -1673,17 +1657,17 @@ async fn reconcile_tasks(
     // entregando a quien preguntara por ese identificador. Alguien que quita una
     // cuenta espera que se vaya el correo también.
     state
-        .mensajes
+        .messages
         .retain(|id, _| current.contains(&id.as_str()));
-    state.rechazadas.retain(|id| current.contains(&id.as_str()));
-    let rejected = state.rechazadas.clone();
+    state.rejected.retain(|id| current.contains(&id.as_str()));
+    let rejected = state.rejected.clone();
     drop(state);
 
     // Y su conexión de lectura, que está autenticada contra el servidor. Una
-    // cuenta borrada no puede dejar una sesión IMAP viva: al soltar el `Lector`
+    // cuenta borrada no puede dejar una sesión IMAP viva: al soltar el `Reader`
     // se cierra el socket.
     service
-        .lectores
+        .readers
         .lock()
         .await
         .retain(|id, _| current.contains(&id.as_str()));
@@ -1699,7 +1683,11 @@ async fn reconcile_tasks(
             continue;
         }
         tracing::info!("'{}' pasa a atenderse", account.id);
-        let task = tokio::spawn(atender(account.clone(), service.clone(), emitter.clone()));
+        let task = tokio::spawn(serve_account(
+            account.clone(),
+            service.clone(),
+            emitter.clone(),
+        ));
         tasks.insert(account.id.clone(), task);
     }
 
@@ -1745,7 +1733,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("no se pudo apagar el volcado de memoria del proceso: {e}");
     }
 
-    let service = Servicio::default();
+    // Antes que nada que pueda tocar la cola: hasta la 0.16.0 vivía en
+    // `salientes/`, y lo que quedó ahí sin salir tiene que salir igual. Un error
+    // no frena el servicio —el correo que llega no depende de esto— y lo que no
+    // se pudo mudar sigue en `salientes/`, sin borrar.
+    migrate_outbox();
+
+    let service = Service::default();
 
     // El bus de **sesión**: es un servicio del usuario y lo que publica es suyo.
     //
@@ -1774,19 +1768,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(()) => tracing::warn!("se cortó la escucha del servicio de cuentas"),
                 Err(e) => tracing::warn!("no se pudo escuchar al servicio de cuentas: {e}"),
             }
-            tokio::time::sleep(REINTENTO).await;
+            tokio::time::sleep(SERVICE_RETRY).await;
         }
     });
 
     // El despachador de la cola de salida: una sola tarea para todas las
     // cuentas. Arranca antes que nada porque lo primero que hace es intentar
     // mandar lo que haya quedado de la sesión anterior.
-    tokio::spawn(despachar(service.clone(), emitter.clone()));
+    tokio::spawn(dispatch_outbox(service.clone(), emitter.clone()));
 
     // Y quien atiende el botón «Abrir» de los carteles de correo nuevo. También
     // una sola tarea: la señal es del servidor de notificaciones y no de una
     // cuenta.
-    atender_los_carteles(service.clone(), emitter.connection().clone());
+    handle_notification_actions(service.clone(), emitter.connection().clone());
 
     // El hilo principal ya no mira casillas: sólo se asegura de que haya una
     // tarea por cuenta. Cada tarea se queda conectada y avisa por su cuenta.
@@ -1823,9 +1817,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // corregido una contraseña o reconectado una cuenta. En la
                 // revisión por reloj no, o el olvido devolvería los 288
                 // intentos diarios que la marca evita.
-                service.estado.lock().await.rechazadas.clear();
+                service.state.lock().await.rejected.clear();
             }
         }
+    }
+}
+
+/// Muda la cola de salida vieja y deja en el diario qué pasó.
+///
+/// Ver `outbox::migrate_legacy_outbox`.
+fn migrate_outbox() {
+    let app_dir = outbox::app_data_dir();
+    match outbox::migrate_legacy_outbox(&app_dir) {
+        Ok(outbox::Migration::NothingToMove) => {}
+        Ok(outbox::Migration::Renamed) => {
+            tracing::info!(
+                "la cola de salida pasó de {0}/salientes a {0}/outbox",
+                app_dir.display()
+            );
+        }
+        Ok(outbox::Migration::Merged { moved, kept }) => {
+            tracing::info!(
+                "{moved} mensajes de la cola de salida pasaron de {0}/salientes a {0}/outbox",
+                app_dir.display()
+            );
+            if !kept.is_empty() {
+                tracing::warn!(
+                    "{} archivos se quedaron en {}/salientes porque ya estaban en outbox o no \
+                     se pudieron mover: {kept:?}. No salen desde ahí; hay que resolverlos a mano",
+                    kept.len(),
+                    app_dir.display()
+                );
+            }
+        }
+        Err(e) => tracing::warn!(
+            "no se pudo mudar la cola de salida vieja: {e}. Lo que haya en \
+             {}/salientes se queda ahí y no sale hasta que se resuelva",
+            app_dir.display()
+        ),
     }
 }
 
@@ -1886,6 +1915,26 @@ fn sent_by(
     matches!((sender, owner), (Some(sender), Some(owner)) if sender == owner)
 }
 
+/// Lo que comparten las pruebas de la forma del JSON.
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// Las claves de un objeto JSON, ordenadas.
+    ///
+    /// Lo que va por el bus y lo que queda en el disco se lee desde afuera de
+    /// este proceso —`vasak-mail`, o una versión anterior de este servicio—,
+    /// así que un campo renombrado en Rust tiene que seguir saliendo con el
+    /// nombre de antes. Estas pruebas comparan la lista entera: una clave que
+    /// cambia, sobra o falta rompe acá y no en la ventana de alguien.
+    pub(crate) fn json_keys(value: &serde_json::Value) -> Vec<String> {
+        let mut keys: Vec<String> = value
+            .as_object()
+            .map(|object| object.keys().cloned().collect())
+            .unwrap_or_default();
+        keys.sort();
+        keys
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1914,7 +1963,7 @@ mod tests {
         );
     }
 
-    fn cuenta(id: &str) -> broker::Account {
+    fn account(id: &str) -> broker::Account {
         broker::Account {
             id: id.into(),
             display_name: id.into(),
@@ -1938,19 +1987,19 @@ mod tests {
     /// de aplicación no la toca.
     #[tokio::test]
     async fn una_cuenta_rechazada_no_se_vuelve_a_arrancar() {
-        let servicio = Servicio::default();
-        let cuentas = [cuenta("a"), cuenta("b")];
+        let service = Service::default();
+        let accounts = [account("a"), account("b")];
 
-        servicio.estado.lock().await.rechazadas.insert("a".into());
-        let rechazadas = servicio.estado.lock().await.rechazadas.clone();
+        service.state.lock().await.rejected.insert("a".into());
+        let rejected = service.state.lock().await.rejected.clone();
 
-        let arrancarian: Vec<&str> = cuentas
+        let would_start: Vec<&str> = accounts
             .iter()
-            .filter(|c| !rechazadas.contains(&c.id))
+            .filter(|c| !rejected.contains(&c.id))
             .map(|c| c.id.as_str())
             .collect();
 
-        assert_eq!(arrancarian, vec!["b"], "la rechazada no tenía que arrancar");
+        assert_eq!(would_start, vec!["b"], "la rechazada no tenía que arrancar");
     }
 
     /// Y el olvido pasa **sólo** cuando el servicio avisa que algo cambió, que
@@ -1958,37 +2007,37 @@ mod tests {
     /// revisión por reloj devolvería los 288 intentos diarios.
     #[tokio::test]
     async fn el_rechazo_se_olvida_cuando_cambian_las_cuentas() {
-        let servicio = Servicio::default();
-        servicio.estado.lock().await.rechazadas.insert("a".into());
+        let service = Service::default();
+        service.state.lock().await.rejected.insert("a".into());
 
         // Lo que hace el bucle al recibir la señal.
-        servicio.estado.lock().await.rechazadas.clear();
+        service.state.lock().await.rejected.clear();
 
-        assert!(servicio.estado.lock().await.rechazadas.is_empty());
+        assert!(service.state.lock().await.rejected.is_empty());
     }
 
     /// Una cuenta que se borró no puede dejar su marca colgada: si se vuelve a
     /// conectar con el mismo identificador, merece un intento limpio.
     #[tokio::test]
     async fn el_rechazo_de_una_cuenta_que_ya_no_esta_se_descarta() {
-        let servicio = Servicio::default();
+        let service = Service::default();
         {
-            let mut estado = servicio.estado.lock().await;
-            estado.rechazadas.insert("borrada".into());
-            estado.rechazadas.insert("sigue".into());
+            let mut state = service.state.lock().await;
+            state.rejected.insert("borrada".into());
+            state.rejected.insert("sigue".into());
         }
 
-        let vigentes = ["sigue"];
-        servicio
-            .estado
+        let current = ["sigue"];
+        service
+            .state
             .lock()
             .await
-            .rechazadas
-            .retain(|id| vigentes.contains(&id.as_str()));
+            .rejected
+            .retain(|id| current.contains(&id.as_str()));
 
-        let quedan = servicio.estado.lock().await.rechazadas.clone();
-        assert!(quedan.contains("sigue"));
-        assert!(!quedan.contains("borrada"));
+        let remaining = service.state.lock().await.rejected.clone();
+        assert!(remaining.contains("sigue"));
+        assert!(!remaining.contains("borrada"));
     }
 
     /// El tope de un intercambio tiene que ser más corto que la renovación de la
@@ -1998,10 +2047,10 @@ mod tests {
     #[test]
     fn los_tiempos_tienen_el_orden_que_corresponde() {
         assert!(
-            RENOVAR_IDLE < Duration::from_secs(29 * 60),
+            IDLE_RENEWAL < Duration::from_secs(29 * 60),
             "el estándar pide renovar antes de los 29 minutos"
         );
-        assert!(REINTENTO_CUENTA < POLL_INTERVAL);
+        assert!(ACCOUNT_RETRY < POLL_INTERVAL);
     }
 
     /// Las ventanas viejas no mandan el campo. Caer a la de entrada es lo que
@@ -2009,11 +2058,104 @@ mod tests {
     /// de fallar con un nombre vacío.
     #[test]
     fn sin_casilla_se_usa_la_de_entrada() {
-        assert_eq!(casilla_o_entrada(""), "INBOX");
-        assert_eq!(casilla_o_entrada("INBOX"), "INBOX");
-        assert_eq!(casilla_o_entrada("Sent"), "Sent");
+        assert_eq!(mailbox_or_inbox(""), "INBOX");
+        assert_eq!(mailbox_or_inbox("INBOX"), "INBOX");
+        assert_eq!(mailbox_or_inbox("Sent"), "Sent");
         // No se normaliza: el servidor distingue mayúsculas en todo lo que no
         // sea `INBOX`, y «sent» puede ser otra carpeta distinta de «Sent».
-        assert_eq!(casilla_o_entrada("[Gmail]/Sent Mail"), "[Gmail]/Sent Mail");
+        assert_eq!(mailbox_or_inbox("[Gmail]/Sent Mail"), "[Gmail]/Sent Mail");
+    }
+
+    /// `MailboxStatus` por cuenta, con las claves que lee `vasak-mail`.
+    #[test]
+    fn el_estado_de_una_cuenta_conserva_las_claves_del_bus() {
+        let summary = AccountSummary {
+            account_id: "a".into(),
+            display_name: "Trabajo".into(),
+            status: imap::MailboxStatus {
+                messages: 120,
+                unread: 3,
+            },
+            error: String::new(),
+        };
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(
+            test_support::json_keys(&json),
+            [
+                "account_id",
+                "display_name",
+                "error",
+                "mensajes",
+                "sin_leer"
+            ]
+        );
+        assert_eq!(json["mensajes"], 120);
+        assert_eq!(json["sin_leer"], 3);
+    }
+
+    /// `GetMessage`: el mensaje abierto, con el adjunto, el formato y lo que
+    /// hace falta para responder —aplanado— con las claves de siempre.
+    #[test]
+    fn un_mensaje_abierto_conserva_las_claves_del_bus() {
+        let opened = OpenedMessage {
+            text: "Hola".into(),
+            truncated: true,
+            attachments: vec![attachments::Attachment {
+                part: "2".into(),
+                name: "x.pdf".into(),
+                content_type: "application/pdf".into(),
+            }],
+            formatted: Some(html::Sanitized {
+                html: "<p>Hola</p>".into(),
+                blocked_images: 1,
+                truncated: false,
+            }),
+            reply: message::ReplyInfo {
+                message_id: "<a@b>".into(),
+                references: vec!["<a@b>".into()],
+                reply_to: "ana@x.com".into(),
+                name: "Ana".into(),
+            },
+        };
+        let json = serde_json::to_value(&opened).unwrap();
+        assert_eq!(
+            test_support::json_keys(&json),
+            [
+                "adjuntos",
+                "con_formato",
+                "message_id",
+                "nombre",
+                "recortado",
+                "referencias",
+                "responder_a",
+                "texto"
+            ]
+        );
+        assert_eq!(
+            test_support::json_keys(&json["adjuntos"][0]),
+            ["nombre", "parte", "tipo"]
+        );
+        assert_eq!(
+            test_support::json_keys(&json["con_formato"]),
+            ["html", "imagenes_bloqueadas", "recortado"]
+        );
+
+        // Sin HTML, `con_formato` va igual, en `null`: la ventana lo mira.
+        let plain = OpenedMessage {
+            formatted: None,
+            ..opened
+        };
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json["con_formato"].is_null());
+    }
+
+    /// `GetAttachment`: el contenido y si se cortó, en las dos claves que lee
+    /// `vasak-mail` para guardar el archivo.
+    #[test]
+    fn un_adjunto_bajado_conserva_las_claves_del_bus() {
+        let json = attachment_reply(b"hola", true);
+        assert_eq!(test_support::json_keys(&json), ["contenido", "recortado"]);
+        assert_eq!(json["contenido"], "aG9sYQ==");
+        assert_eq!(json["recortado"], true);
     }
 }

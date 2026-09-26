@@ -35,7 +35,7 @@ futures-util = "0.3"
 # cliente que ya usa el servicio de cuentas del mismo espacio de trabajo, con
 # rustls: es Rust puro y no suma bibliotecas compartidas al paquete.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
-# Para mirar la dirección de una imagen antes de pedirla. Ver `imagenes.rs`.
+# Para mirar la dirección de una imagen antes de pedirla. Ver `images.rs`.
 url.workspace = true
 # Los juegos de caracteres del correo. Medio correo viejo viene en latin-1, y sin
 # convertirlo un mensaje en español de hace quince años se ve con un rombo en

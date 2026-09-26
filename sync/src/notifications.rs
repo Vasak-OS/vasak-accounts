@@ -27,18 +27,18 @@
 
 use std::collections::HashMap;
 
-use crate::mensaje::Resumen;
-use crate::preferencias::Detalle;
+use crate::message::MessageSummary;
+use crate::preferences::NotificationDetail;
 
 /// El identificador del botón, con el que vuelve la señal.
 ///
 /// No se ve: lo que se lee en pantalla es la etiqueta que va al lado.
-const ACCION_ABRIR: &str = "abrir";
+const OPEN_ACTION: &str = "abrir";
 
 /// La entrada del menú de la aplicación de correo, sin el `.desktop`.
 ///
 /// La declara el cartel para que el escritorio sepa de qué aplicación es.
-const ENTRADA_DE_ESCRITORIO: &str = "vasak-mail";
+const DESKTOP_ENTRY: &str = "vasak-mail";
 
 /// El programa que abre el botón.
 ///
@@ -49,36 +49,38 @@ const ENTRADA_DE_ESCRITORIO: &str = "vasak-mail";
 ///
 /// Abrirla dos veces no deja dos ventanas: `vasak-mail` es de instancia única y
 /// la segunda le pide a la primera que se muestre.
-const PROGRAMA_DE_CORREO: &str = "vasak-mail";
+const MAIL_PROGRAM: &str = "vasak-mail";
 
 /// El servicio de notificaciones del escritorio.
-const SERVICIO: &str = "org.freedesktop.Notifications";
-const RUTA: &str = "/org/freedesktop/Notifications";
+const SERVICE: &str = "org.freedesktop.Notifications";
+const PATH: &str = "/org/freedesktop/Notifications";
 
-/// Cuántos mensajes hay en `ahora` que no estaban en `antes`.
+/// Cuántos mensajes hay en `now` que no estaban en `before`.
 ///
-/// `antes` en `None` es la primera lista de la cuenta: no hay con qué comparar,
+/// `before` en `None` es la primera lista de la cuenta: no hay con qué comparar,
 /// así que no hay novedad. Es lo que evita el aluvión de carteles al arrancar.
 ///
 /// Se comparan por UID y no por posición: un mensaje borrado desde el teléfono
 /// corre la lista entera, y por posición todo parecería nuevo.
-pub fn recien_llegados(antes: Option<&[Resumen]>, ahora: &[Resumen]) -> Vec<Resumen> {
-    let Some(antes) = antes else {
+pub fn just_arrived(
+    before: Option<&[MessageSummary]>,
+    now: &[MessageSummary],
+) -> Vec<MessageSummary> {
+    let Some(before) = before else {
         return Vec::new();
     };
 
-    let conocidos: std::collections::HashSet<u32> = antes.iter().map(|m| m.uid).collect();
-    ahora
-        .iter()
-        .filter(|m| !conocidos.contains(&m.uid))
+    let known: std::collections::HashSet<u32> = before.iter().map(|m| m.uid).collect();
+    now.iter()
+        .filter(|m| !known.contains(&m.uid))
         .cloned()
         .collect()
 }
 
 /// Cuántos son nuevos. Lo mismo de arriba cuando sólo hace falta el número.
 #[cfg(test)]
-pub fn cuantos_nuevos(antes: Option<&[Resumen]>, ahora: &[Resumen]) -> usize {
-    recien_llegados(antes, ahora).len()
+pub fn count_new(before: Option<&[MessageSummary]>, now: &[MessageSummary]) -> usize {
+    just_arrived(before, now).len()
 }
 
 /// Lo que dice el cartel.
@@ -88,39 +90,49 @@ pub fn cuantos_nuevos(antes: Option<&[Resumen]>, ahora: &[Resumen]) -> usize {
 /// personal como lo que te escribió. El issue pide que esto se pueda
 /// configurar; mientras no haya dónde guardar esa preferencia, el valor por
 /// omisión es el que no muestra nada de nadie.
-pub fn texto(nuevos: &[Resumen], cuenta: &str, detalle: Detalle) -> (String, String) {
-    let cuantos = nuevos.len();
-    let titulo = if cuantos == 1 {
+pub fn notification_text(
+    new_messages: &[MessageSummary],
+    account: &str,
+    detail: NotificationDetail,
+) -> (String, String) {
+    let count = new_messages.len();
+    let title = if count == 1 {
         "Llegó 1 mensaje".to_string()
     } else {
-        format!("Llegaron {cuantos} mensajes")
+        format!("Llegaron {count} mensajes")
     };
 
     // Con uno solo se puede decir de quién y de qué. Con varios no: el cartel
     // diría el de uno y callaría los otros, que es peor que no decir ninguno.
-    let uno = (cuantos == 1).then(|| nuevos.first()).flatten();
+    let single = (count == 1).then(|| new_messages.first()).flatten();
 
-    let cuerpo = match (detalle, uno) {
-        (Detalle::Remitente, Some(m)) => con_cuenta(&para_el_cartel(&quien(m)), cuenta),
-        (Detalle::RemitenteYAsunto, Some(m)) => {
-            let asunto = m.asunto.trim();
-            if asunto.is_empty() {
-                con_cuenta(&para_el_cartel(&quien(m)), cuenta)
+    let body = match (detail, single) {
+        (NotificationDetail::Sender, Some(m)) => {
+            with_account(&for_notification(&sender_name(m)), account)
+        }
+        (NotificationDetail::SenderAndSubject, Some(m)) => {
+            let subject = m.subject.trim();
+            if subject.is_empty() {
+                with_account(&for_notification(&sender_name(m)), account)
             } else {
                 // Cada uno por su lado y no el texto ya junto: así el tope de
                 // largo vale para cada cosa, y un asunto enorme no se come el
                 // nombre de quien lo mandó.
-                con_cuenta(
-                    &format!("{}: {}", para_el_cartel(&quien(m)), para_el_cartel(asunto)),
-                    cuenta,
+                with_account(
+                    &format!(
+                        "{}: {}",
+                        for_notification(&sender_name(m)),
+                        for_notification(subject)
+                    ),
+                    account,
                 )
             }
         }
         // Lo callado: cuántos y a qué casilla llegaron, nada de quién ni de qué.
-        _ => escapar(cuenta),
+        _ => escape_markup(account),
     };
 
-    (titulo, cuerpo)
+    (title, body)
 }
 
 /// Cómo se nombra a quien lo mandó.
@@ -129,12 +141,12 @@ pub fn texto(nuevos: &[Resumen], cuenta: &str, detalle: Detalle) -> (String, Str
 /// en la lista van juntos porque ahí el engaño de firmarse «soporte@banco.com»
 /// desde otra dirección se ve, y en un cartel de dos renglones no entra el
 /// contraste que lo hace visible.
-fn quien(mensaje: &Resumen) -> String {
-    let nombre = mensaje.de.trim();
-    if nombre.is_empty() {
-        mensaje.direccion.trim().to_string()
+fn sender_name(message: &MessageSummary) -> String {
+    let name = message.from.trim();
+    if name.is_empty() {
+        message.address.trim().to_string()
     } else {
-        nombre.to_string()
+        name.to_string()
     }
 }
 
@@ -143,7 +155,7 @@ fn quien(mensaje: &Resumen) -> String {
 /// Ochenta caracteres entran en dos renglones de cartel. Un asunto de cinco mil
 /// —que no es raro en una lista de correo, y que en uno hostil es deliberado—
 /// estira el cartel hasta tapar la pantalla: nadie lo corta por nosotros.
-const MAX_TEXTO: usize = 80;
+const MAX_TEXT: usize = 80;
 
 /// Deja un texto del mensaje en condiciones de ir a un cartel.
 ///
@@ -161,32 +173,31 @@ const MAX_TEXTO: usize = 80;
 ///
 /// **Se acorta primero y se escapa después.** Al revés, el corte puede caer en
 /// medio de un `&amp;` y el cartel muestra `&am`.
-fn para_el_cartel(texto: &str) -> String {
-    let mut corte = MAX_TEXTO.min(texto.len());
-    while corte > 0 && !texto.is_char_boundary(corte) {
-        corte -= 1;
+fn for_notification(text: &str) -> String {
+    let mut cut = MAX_TEXT.min(text.len());
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
     }
 
-    if corte < texto.len() {
-        format!("{}…", escapar(&texto[..corte]))
+    if cut < text.len() {
+        format!("{}…", escape_markup(&text[..cut]))
     } else {
-        escapar(texto)
+        escape_markup(text)
     }
 }
 
 /// Lo que el cuerpo de una notificación interpreta como marcado.
-fn escapar(texto: &str) -> String {
-    texto
-        .replace('&', "&amp;")
+fn escape_markup(text: &str) -> String {
+    text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
 
 /// La cuenta va siempre, porque dice a cuál de las casillas de alguien llegó.
-fn con_cuenta(que: &str, cuenta: &str) -> String {
+fn with_account(what: &str, account: &str) -> String {
     // La cuenta también se escapa: la da el servicio de cuentas, pero el nombre
     // para mostrar lo puso alguien al conectarla.
-    format!("{que} — {}", escapar(cuenta))
+    format!("{what} — {}", escape_markup(account))
 }
 
 /// Los identificadores de los carteles que ya se mostraron, por cuenta.
@@ -195,13 +206,13 @@ fn con_cuenta(que: &str, cuenta: &str) -> String {
 /// servidor de notificaciones devuelve un número al mostrar uno, y pasárselo
 /// como `replaces_id` la próxima vez le dice cuál pisar.
 #[derive(Default)]
-pub struct Carteles(HashMap<String, u32>);
+pub struct ShownNotifications(HashMap<String, u32>);
 
-impl Carteles {
+impl ShownNotifications {
     /// El cartel que hay que reemplazar para esta cuenta. `0` es «ninguno», que
     /// es lo que el estándar define como «mostrá uno nuevo».
-    pub fn anterior(&self, cuenta: &str) -> u32 {
-        self.0.get(cuenta).copied().unwrap_or(0)
+    pub fn previous(&self, account: &str) -> u32 {
+        self.0.get(account).copied().unwrap_or(0)
     }
 
     /// Si ese cartel es uno de los nuestros.
@@ -210,16 +221,16 @@ impl Carteles {
     /// botón que alguien apriete en cualquier cartel del escritorio**, no sólo
     /// en los propios. Sin comprobar el número, un botón llamado «abrir» en el
     /// aviso de otro programa abriría el correo.
-    pub fn es_nuestro(&self, id: u32) -> bool {
-        self.0.values().any(|guardado| *guardado == id)
+    pub fn is_ours(&self, id: u32) -> bool {
+        self.0.values().any(|stored| *stored == id)
     }
 
-    pub fn recordar(&mut self, cuenta: &str, id: u32) {
+    pub fn remember(&mut self, account: &str, id: u32) {
         // El servidor devuelve `0` cuando no quiere que lo reemplacen. Guardarlo
-        // no rompe nada —`anterior` devolvería `0` igual— pero llenaría el mapa
+        // no rompe nada —`previous` devolvería `0` igual— pero llenaría el mapa
         // de entradas que no sirven.
         if id != 0 {
-            self.0.insert(cuenta.to_string(), id);
+            self.0.insert(account.to_string(), id);
         }
     }
 }
@@ -230,18 +241,18 @@ impl Carteles {
 /// especificación lo contempla— y ahí declarar uno es pedir algo que nadie va a
 /// ver. Ante la duda, `false`: un cartel sin botón sirve igual; uno con un botón
 /// que no se dibuja no le suma nada a nadie.
-pub async fn soporta_botones(conexion: &zbus::Connection) -> bool {
-    let respuesta = conexion
-        .call_method(Some(SERVICIO), RUTA, Some(SERVICIO), "GetCapabilities", &())
+pub async fn supports_actions(connection: &zbus::Connection) -> bool {
+    let reply = connection
+        .call_method(Some(SERVICE), PATH, Some(SERVICE), "GetCapabilities", &())
         .await;
 
-    let Ok(respuesta) = respuesta else {
+    let Ok(reply) = reply else {
         return false;
     };
-    respuesta
+    reply
         .body()
         .deserialize::<Vec<String>>()
-        .map(|capacidades| capacidades.iter().any(|c| c == "actions"))
+        .map(|capabilities| capabilities.iter().any(|c| c == "actions"))
         .unwrap_or(false)
 }
 
@@ -250,17 +261,17 @@ pub async fn soporta_botones(conexion: &zbus::Connection) -> bool {
 /// **Se espera al hijo en una tarea aparte.** Un proceso que termina y que nadie
 /// recoge queda de zombi hasta que muera su padre, y el padre acá es un servicio
 /// que vive toda la sesión: un zombi por cada vez que alguien apretara el botón.
-pub fn abrir_el_correo() {
-    match tokio::process::Command::new(PROGRAMA_DE_CORREO).spawn() {
-        Ok(mut hijo) => {
+pub fn open_mail_app() {
+    match tokio::process::Command::new(MAIL_PROGRAM).spawn() {
+        Ok(mut child) => {
             tokio::spawn(async move {
-                let _ = hijo.wait().await;
+                let _ = child.wait().await;
             });
         }
         // Que no esté instalado, o que no se pueda ejecutar. No hay a quién
         // decírselo —el cartel ya se fue— así que queda en el diario.
         Err(error) => {
-            eprintln!("[avisos] no se pudo abrir {PROGRAMA_DE_CORREO}: {error}");
+            eprintln!("[avisos] no se pudo abrir {MAIL_PROGRAM}: {error}");
         }
     }
 }
@@ -275,46 +286,43 @@ pub fn abrir_el_correo() {
 /// cartel la próxima vez. Si algo falla devuelve `None` y no pasa nada más: no
 /// poder avisar no puede tumbar la sincronización del correo, que es lo que la
 /// persona sí necesita.
-pub async fn mostrar(
-    conexion: &zbus::Connection,
-    reemplaza: u32,
-    titulo: &str,
-    cuerpo: &str,
-    con_boton: bool,
+pub async fn show(
+    connection: &zbus::Connection,
+    replaces: u32,
+    title: &str,
+    body: &str,
+    with_action: bool,
 ) -> Option<u32> {
     // Los botones van de a pares: primero el identificador con el que vuelve la
     // señal, después lo que se lee en pantalla.
-    let acciones: Vec<&str> = if con_boton {
-        vec![ACCION_ABRIR, "Abrir"]
+    let actions: Vec<&str> = if with_action {
+        vec![OPEN_ACTION, "Abrir"]
     } else {
         Vec::new()
     };
 
-    let mut pistas: HashMap<&str, zbus::zvariant::Value> = HashMap::new();
+    let mut hints: HashMap<&str, zbus::zvariant::Value> = HashMap::new();
     // Con qué aplicación es este cartel. Sirve para que el escritorio lo agrupe
     // con la ventana de correo, y para que la configuración de notificaciones
     // por aplicación lo encuentre.
-    pistas.insert(
-        "desktop-entry",
-        zbus::zvariant::Value::from(ENTRADA_DE_ESCRITORIO),
-    );
+    hints.insert("desktop-entry", zbus::zvariant::Value::from(DESKTOP_ENTRY));
 
-    let respuesta = conexion
+    let reply = connection
         .call_method(
-            Some(SERVICIO),
-            RUTA,
-            Some(SERVICIO),
+            Some(SERVICE),
+            PATH,
+            Some(SERVICE),
             "Notify",
             &(
                 "VasakOS Correo",
-                reemplaza,
+                replaces,
                 // El icono por nombre y no por ruta: lo resuelve el tema, así
                 // que sigue al escritorio en vez de quedar fijo.
                 "internet-mail",
-                titulo,
-                cuerpo,
-                acciones,
-                pistas,
+                title,
+                body,
+                actions,
+                hints,
                 // Que lo decida el servidor de notificaciones, que es quien
                 // sabe si hay un «no molestar» puesto.
                 -1i32,
@@ -323,15 +331,15 @@ pub async fn mostrar(
         .await
         .ok()?;
 
-    respuesta.body().deserialize::<u32>().ok()
+    reply.body().deserialize::<u32>().ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn resumen(uid: u32) -> Resumen {
-        Resumen {
+    fn summary(uid: u32) -> MessageSummary {
+        MessageSummary {
             uid,
             ..Default::default()
         }
@@ -341,46 +349,46 @@ mod tests {
     /// novedad, es lo que ya estaba.
     #[test]
     fn la_primera_lista_no_avisa_nada() {
-        let ahora = vec![resumen(1), resumen(2), resumen(3)];
-        assert_eq!(cuantos_nuevos(None, &ahora), 0);
+        let now = vec![summary(1), summary(2), summary(3)];
+        assert_eq!(count_new(None, &now), 0);
     }
 
     #[test]
     fn lo_que_no_estaba_antes_es_nuevo() {
-        let antes = vec![resumen(1), resumen(2)];
-        let ahora = vec![resumen(3), resumen(1), resumen(2)];
-        assert_eq!(cuantos_nuevos(Some(&antes), &ahora), 1);
+        let before = vec![summary(1), summary(2)];
+        let now = vec![summary(3), summary(1), summary(2)];
+        assert_eq!(count_new(Some(&before), &now), 1);
     }
 
     /// Se compara por UID y no por posición. Un mensaje borrado desde el
     /// teléfono corre la lista entera: por posición, todo parecería nuevo.
     #[test]
     fn borrar_uno_no_hace_parecer_nuevos_a_los_demas() {
-        let antes = vec![resumen(1), resumen(2), resumen(3)];
-        let ahora = vec![resumen(2), resumen(3)];
-        assert_eq!(cuantos_nuevos(Some(&antes), &ahora), 0);
+        let before = vec![summary(1), summary(2), summary(3)];
+        let now = vec![summary(2), summary(3)];
+        assert_eq!(count_new(Some(&before), &now), 0);
     }
 
     #[test]
     fn sin_cambios_no_hay_novedad() {
-        let lista = vec![resumen(1), resumen(2)];
-        assert_eq!(cuantos_nuevos(Some(&lista), &lista), 0);
-        assert_eq!(cuantos_nuevos(Some(&[]), &[]), 0);
+        let list = vec![summary(1), summary(2)];
+        assert_eq!(count_new(Some(&list), &list), 0);
+        assert_eq!(count_new(Some(&[]), &[]), 0);
     }
 
     #[test]
     fn varios_juntos_se_cuentan_juntos() {
-        let antes = vec![resumen(1)];
-        let ahora: Vec<Resumen> = (1..=21).map(resumen).collect();
-        assert_eq!(cuantos_nuevos(Some(&antes), &ahora), 20);
+        let before = vec![summary(1)];
+        let now: Vec<MessageSummary> = (1..=21).map(summary).collect();
+        assert_eq!(count_new(Some(&before), &now), 20);
     }
 
-    fn de(quien: &str, direccion: &str, asunto: &str) -> Resumen {
-        Resumen {
+    fn from(who: &str, address: &str, subject: &str) -> MessageSummary {
+        MessageSummary {
             uid: 1,
-            de: quien.into(),
-            direccion: direccion.into(),
-            asunto: asunto.into(),
+            from: who.into(),
+            address: address.into(),
+            subject: subject.into(),
             ..Default::default()
         }
     }
@@ -389,69 +397,93 @@ mod tests {
     /// proyectada, y quién te escribe es tan personal como lo que te escribió.
     #[test]
     fn por_omision_el_texto_no_nombra_a_nadie() {
-        let tres = vec![de("Ana", "ana@x.com", "Hola"); 3];
-        let (titulo, cuerpo) = texto(&tres, "mia@ejemplo.com", Detalle::Cuenta);
+        let three = vec![from("Ana", "ana@x.com", "Hola"); 3];
+        let (title, body) =
+            notification_text(&three, "mia@ejemplo.com", NotificationDetail::Account);
 
-        assert!(titulo.contains('3'));
-        assert_eq!(cuerpo, "mia@ejemplo.com");
-        assert!(!cuerpo.contains("Ana"));
-        assert!(!cuerpo.contains("Hola"));
+        assert!(title.contains('3'));
+        assert_eq!(body, "mia@ejemplo.com");
+        assert!(!body.contains("Ana"));
+        assert!(!body.contains("Hola"));
     }
 
     #[test]
     fn con_uno_solo_se_puede_decir_de_quien() {
-        let uno = vec![de("Ana", "ana@x.com", "La factura")];
-        let (_, cuerpo) = texto(&uno, "mia@ejemplo.com", Detalle::Remitente);
-        assert!(cuerpo.contains("Ana"));
+        let single = vec![from("Ana", "ana@x.com", "La factura")];
+        let (_, body) = notification_text(&single, "mia@ejemplo.com", NotificationDetail::Sender);
+        assert!(body.contains("Ana"));
         // El asunto no, que es el escalón siguiente.
-        assert!(!cuerpo.contains("factura"));
+        assert!(!body.contains("factura"));
 
-        let (_, cuerpo) = texto(&uno, "mia@ejemplo.com", Detalle::RemitenteYAsunto);
-        assert!(cuerpo.contains("Ana") && cuerpo.contains("La factura"));
+        let (_, body) = notification_text(
+            &single,
+            "mia@ejemplo.com",
+            NotificationDetail::SenderAndSubject,
+        );
+        assert!(body.contains("Ana") && body.contains("La factura"));
     }
 
     /// Con varios, el cartel diría el de uno y callaría los otros, que es peor
     /// que no decir ninguno.
     #[test]
     fn con_varios_no_se_nombra_a_ninguno() {
-        let dos = vec![
-            de("Ana", "ana@x.com", "Uno"),
-            de("Juan", "juan@y.com", "Dos"),
+        let two = vec![
+            from("Ana", "ana@x.com", "Uno"),
+            from("Juan", "juan@y.com", "Dos"),
         ];
-        for detalle in [Detalle::Remitente, Detalle::RemitenteYAsunto] {
-            let (_, cuerpo) = texto(&dos, "mia@ejemplo.com", detalle);
-            assert!(!cuerpo.contains("Ana"), "{cuerpo}");
-            assert!(!cuerpo.contains("Juan"), "{cuerpo}");
+        for detail in [
+            NotificationDetail::Sender,
+            NotificationDetail::SenderAndSubject,
+        ] {
+            let (_, body) = notification_text(&two, "mia@ejemplo.com", detail);
+            assert!(
+                !body.contains("Ana"),
+                "con varios mensajes, el cuerpo nombra al primer remitente"
+            );
+            assert!(
+                !body.contains("Juan"),
+                "con varios mensajes, el cuerpo nombra al segundo remitente"
+            );
         }
     }
 
     #[test]
     fn sin_nombre_se_usa_la_direccion() {
-        let uno = vec![de("", "ana@x.com", "Hola")];
-        let (_, cuerpo) = texto(&uno, "mia@ejemplo.com", Detalle::Remitente);
-        assert!(cuerpo.contains("ana@x.com"));
+        let single = vec![from("", "ana@x.com", "Hola")];
+        let (_, body) = notification_text(&single, "mia@ejemplo.com", NotificationDetail::Sender);
+        assert!(body.contains("ana@x.com"));
     }
 
     /// Un asunto vacío no deja un cartel que termina en dos puntos y nada.
     #[test]
     fn sin_asunto_se_dice_sólo_quien() {
-        let uno = vec![de("Ana", "ana@x.com", "   ")];
-        let (_, cuerpo) = texto(&uno, "mia@ejemplo.com", Detalle::RemitenteYAsunto);
-        assert!(cuerpo.contains("Ana"));
-        assert!(!cuerpo.contains(':'), "{cuerpo}");
+        let single = vec![from("Ana", "ana@x.com", "   ")];
+        let (_, body) = notification_text(
+            &single,
+            "mia@ejemplo.com",
+            NotificationDetail::SenderAndSubject,
+        );
+        assert!(body.contains("Ana"));
+        assert!(
+            !body.contains(':'),
+            "el cuerpo deja los dos puntos de un asunto vacío"
+        );
     }
 
     /// La cuenta va siempre: dice a cuál de las casillas de alguien llegó.
     #[test]
     fn la_cuenta_va_en_los_tres_escalones() {
-        let uno = vec![de("Ana", "ana@x.com", "Hola")];
-        for detalle in [
-            Detalle::Cuenta,
-            Detalle::Remitente,
-            Detalle::RemitenteYAsunto,
+        let single = vec![from("Ana", "ana@x.com", "Hola")];
+        for detail in [
+            NotificationDetail::Account,
+            NotificationDetail::Sender,
+            NotificationDetail::SenderAndSubject,
         ] {
-            let (_, cuerpo) = texto(&uno, "mia@ejemplo.com", detalle);
-            assert!(cuerpo.contains("mia@ejemplo.com"), "{cuerpo}");
+            let (_, body) = notification_text(&single, "mia@ejemplo.com", detail);
+            assert!(
+                body.contains("mia@ejemplo.com"),
+                "el cuerpo no dice a qué cuenta llegó"
+            );
         }
     }
 
@@ -463,32 +495,32 @@ mod tests {
     /// el aviso de otro programa abriría el correo.
     #[test]
     fn solo_se_atienden_los_carteles_propios() {
-        let mut carteles = Carteles::default();
+        let mut shown_notifications = ShownNotifications::default();
         assert!(
-            !carteles.es_nuestro(42),
+            !shown_notifications.is_ours(42),
             "sin nada mostrado, ninguno es nuestro"
         );
 
-        carteles.recordar("una", 42);
-        assert!(carteles.es_nuestro(42));
-        assert!(!carteles.es_nuestro(43));
+        shown_notifications.remember("una", 42);
+        assert!(shown_notifications.is_ours(42));
+        assert!(!shown_notifications.is_ours(43));
 
         // Con dos cuentas, los dos.
-        carteles.recordar("otra", 43);
-        assert!(carteles.es_nuestro(42));
-        assert!(carteles.es_nuestro(43));
+        shown_notifications.remember("otra", 43);
+        assert!(shown_notifications.is_ours(42));
+        assert!(shown_notifications.is_ours(43));
     }
 
     /// Un cartel reemplazado deja de ser el vigente de esa cuenta.
     #[test]
     fn el_cartel_viejo_de_una_cuenta_deja_de_ser_nuestro() {
-        let mut carteles = Carteles::default();
-        carteles.recordar("una", 42);
-        carteles.recordar("una", 55);
+        let mut shown_notifications = ShownNotifications::default();
+        shown_notifications.remember("una", 42);
+        shown_notifications.remember("una", 55);
 
-        assert!(carteles.es_nuestro(55));
+        assert!(shown_notifications.is_ours(55));
         // El 42 ya no existe: lo pisó el 55 al reemplazarlo.
-        assert!(!carteles.es_nuestro(42));
+        assert!(!shown_notifications.is_ours(42));
     }
 
     /// El cero no cuenta.
@@ -498,26 +530,26 @@ mod tests {
     /// nuestro, cualquier señal con id cero abriría el correo.
     #[test]
     fn el_cero_no_es_el_cartel_de_nadie() {
-        let mut carteles = Carteles::default();
-        carteles.recordar("una", 0);
-        assert!(!carteles.es_nuestro(0));
+        let mut shown_notifications = ShownNotifications::default();
+        shown_notifications.remember("una", 0);
+        assert!(!shown_notifications.is_ours(0));
     }
 
     #[test]
     fn el_cartel_anterior_se_reemplaza() {
-        let mut carteles = Carteles::default();
+        let mut shown_notifications = ShownNotifications::default();
         // Sin nada guardado, `0`: el estándar lo define como «mostrá uno nuevo».
-        assert_eq!(carteles.anterior("uno"), 0);
+        assert_eq!(shown_notifications.previous("uno"), 0);
 
-        carteles.recordar("uno", 42);
-        assert_eq!(carteles.anterior("uno"), 42);
+        shown_notifications.remember("uno", 42);
+        assert_eq!(shown_notifications.previous("uno"), 42);
         // Y cada cuenta tiene el suyo: dos cuentas no se pisan el cartel.
-        assert_eq!(carteles.anterior("otra"), 0);
+        assert_eq!(shown_notifications.previous("otra"), 0);
 
         // Un `0` del servidor quiere decir «no me lo reemplaces»; guardarlo
         // llenaría el mapa de entradas que no sirven.
-        carteles.recordar("dos", 0);
-        assert_eq!(carteles.anterior("dos"), 0);
+        shown_notifications.remember("dos", 0);
+        assert_eq!(shown_notifications.previous("dos"), 0);
     }
 
     /// **Lo que llega al cartel lo escribió un desconocido.**
@@ -528,76 +560,100 @@ mod tests {
     /// que el escritorio presenta como propio.
     #[test]
     fn el_marcado_de_un_desconocido_no_se_interpreta() {
-        let m = Resumen {
-            de: "<b>Banco</b>".to_string(),
-            asunto: "<a href='x'>clic</a> & más".to_string(),
+        let m = MessageSummary {
+            from: "<b>Banco</b>".to_string(),
+            subject: "<a href='x'>clic</a> & más".to_string(),
             ..Default::default()
         };
 
-        let (_, cuerpo) = texto(&[m], "casa", Detalle::RemitenteYAsunto);
-        assert!(!cuerpo.contains("<b>"), "{cuerpo}");
-        assert!(!cuerpo.contains("<a "), "{cuerpo}");
-        assert!(cuerpo.contains("&lt;b&gt;"), "{cuerpo}");
-        assert!(cuerpo.contains("&amp;"), "{cuerpo}");
+        let (_, body) = notification_text(&[m], "casa", NotificationDetail::SenderAndSubject);
+        assert!(
+            !body.contains("<b>"),
+            "el cuerpo interpreta el marcado del remitente"
+        );
+        assert!(
+            !body.contains("<a "),
+            "el cuerpo interpreta el enlace del asunto"
+        );
+        assert!(
+            body.contains("&lt;b&gt;"),
+            "falta el marcado del remitente escapado"
+        );
+        assert!(body.contains("&amp;"), "falta el «&» del asunto escapado");
     }
 
     /// La cuenta también: la da el servicio de cuentas, pero el nombre para
     /// mostrar lo puso alguien al conectarla.
     #[test]
     fn la_cuenta_tambien_se_escapa() {
-        let m = Resumen::default();
-        let (_, cuerpo) = texto(&[m], "<i>casa</i>", Detalle::Cuenta);
-        assert!(!cuerpo.contains("<i>"), "{cuerpo}");
-        assert!(cuerpo.contains("&lt;i&gt;"), "{cuerpo}");
+        let m = MessageSummary::default();
+        let (_, body) = notification_text(&[m], "<i>casa</i>", NotificationDetail::Account);
+        assert!(
+            !body.contains("<i>"),
+            "el cuerpo interpreta el marcado del nombre de la cuenta"
+        );
+        assert!(
+            body.contains("&lt;i&gt;"),
+            "falta el marcado de la cuenta escapado"
+        );
     }
 
     /// Un asunto enorme estira el cartel hasta tapar la pantalla: nadie lo corta
     /// por nosotros.
     #[test]
     fn un_asunto_enorme_se_corta() {
-        let m = Resumen {
-            de: "Ana".to_string(),
-            asunto: "a".repeat(5000),
+        let m = MessageSummary {
+            from: "Ana".to_string(),
+            subject: "a".repeat(5000),
             ..Default::default()
         };
 
-        let (_, cuerpo) = texto(&[m], "casa", Detalle::RemitenteYAsunto);
-        assert!(cuerpo.len() < 200, "quedó de {}", cuerpo.len());
-        assert!(cuerpo.contains('…'), "{cuerpo}");
+        let (_, body) = notification_text(&[m], "casa", NotificationDetail::SenderAndSubject);
+        assert!(body.len() < 200, "quedó de {}", body.len());
+        assert!(
+            body.contains('…'),
+            "el asunto cortado no lleva el «…» del corte"
+        );
         // Y el nombre sigue estando: cada cosa se acorta por su lado, así que un
         // asunto enorme no se come a quien lo mandó.
-        assert!(cuerpo.contains("Ana"), "{cuerpo}");
+        assert!(
+            body.contains("Ana"),
+            "el corte del asunto se comió el nombre del remitente"
+        );
     }
 
     /// Cortar no puede partir un carácter por la mitad.
     #[test]
     fn el_corte_respeta_los_acentos() {
         // Dos bytes por carácter: el corte cae justo en el medio de uno.
-        let m = Resumen {
-            de: "Ana".to_string(),
-            asunto: "ñ".repeat(200),
+        let m = MessageSummary {
+            from: "Ana".to_string(),
+            subject: "ñ".repeat(200),
             ..Default::default()
         };
 
-        let (_, cuerpo) = texto(&[m], "casa", Detalle::RemitenteYAsunto);
-        assert!(cuerpo.contains('ñ'), "{cuerpo}");
+        let (_, body) = notification_text(&[m], "casa", NotificationDetail::SenderAndSubject);
+        assert!(body.contains('ñ'), "el asunto cortado perdió las eñes");
     }
 
     /// Y lo normal no se toca: si esto escapara de más, un asunto con un «&»
     /// aparecería como «&amp;» en pantalla.
     #[test]
     fn un_asunto_normal_sale_tal_cual() {
-        let m = Resumen {
-            de: "Ana Pérez".to_string(),
-            asunto: "Factura de septiembre".to_string(),
+        let m = MessageSummary {
+            from: "Ana Pérez".to_string(),
+            subject: "Factura de septiembre".to_string(),
             ..Default::default()
         };
 
-        let (_, cuerpo) = texto(&[m], "casa", Detalle::RemitenteYAsunto);
+        let (_, body) = notification_text(&[m], "casa", NotificationDetail::SenderAndSubject);
         assert!(
-            cuerpo.contains("Ana Pérez: Factura de septiembre"),
-            "{cuerpo}"
+            body.contains("Ana Pérez: Factura de septiembre"),
+            "el cuerpo no trae el nombre y el asunto tal cual"
         );
-        assert!(!cuerpo.contains("&amp;"), "{cuerpo}");
+        assert!(
+            !body.contains("&amp;"),
+            "el cuerpo escapa un texto que no llevaba marcado"
+        );
     }
 }

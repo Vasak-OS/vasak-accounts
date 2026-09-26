@@ -32,7 +32,7 @@ impl Account {
     /// Una cuenta marcada para reautenticar se salta: pedirle el token daría
     /// error, y hacerlo en cada vuelta del bucle llenaría el diario con el mismo
     /// fallo mientras la persona no la reconecte.
-    pub fn hay_correo_que_sincronizar(&self) -> bool {
+    pub fn has_mail_to_sync(&self) -> bool {
         !self.needs_reauth && self.capabilities.iter().any(|c| c == "email")
     }
 }
@@ -152,19 +152,19 @@ fn classify(method: &str, error: zbus::Error) -> BrokerError {
 /// aplicación por IMAP y una conectada por OAuth2 se ven igual desde afuera y se
 /// autentican distinto.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Credencial {
+pub enum Credential {
     /// Usuario y contraseña, con `LOGIN`.
-    Contrasena { usuario: String, secreto: String },
+    Password { username: String, secret: String },
     /// Token de OAuth2, con `AUTHENTICATE XOAUTH2`.
-    Token { usuario: String, token: String },
+    Token { username: String, token: String },
 }
 
 /// Dónde y cómo conectarse al correo de una cuenta.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Destino {
+pub struct Endpoint {
     pub host: String,
-    pub puerto: u16,
-    pub credencial: Credencial,
+    pub port: u16,
+    pub credential: Credential,
 }
 
 /// Lee el servidor, el usuario y **cómo autenticarse** de la configuración.
@@ -184,48 +184,51 @@ pub struct Destino {
 /// La marca es el `client_id`: sólo lo tienen las cuentas que pasaron por un
 /// flujo OAuth2, porque lo escribe `CompleteAuth` junto con las URLs para
 /// renovar el token.
-pub fn destino_de(config: &serde_json::Value, secreto: Option<String>) -> Result<Destino, String> {
-    let campo = |nombre: &str| config.get(nombre).and_then(|v| v.as_str());
+pub fn imap_endpoint(
+    config: &serde_json::Value,
+    secret: Option<String>,
+) -> Result<Endpoint, String> {
+    let field = |name: &str| config.get(name).and_then(|v| v.as_str());
 
-    let usuario = campo("username")
+    let username = field("username")
         .ok_or("la cuenta no tiene usuario guardado")?
         .to_string();
-    let host = campo("imap_server")
+    let host = field("imap_server")
         .ok_or("la cuenta no tiene servidor IMAP guardado")?
         .to_string();
 
     // 993 por omisión: es el puerto de IMAP sobre TLS y el que pone el
     // formulario. Una cuenta guardada sin puerto es de una versión anterior, y
     // suponer el correcto es mejor que negarse a sincronizarla.
-    let puerto = config
+    let port = config
         .get("imap_port")
         .and_then(|v| v.as_u64())
         .and_then(|p| u16::try_from(p).ok())
         .unwrap_or(993);
 
-    let Some(secreto) = secreto else {
+    let Some(secret) = secret else {
         return Err("no se obtuvo ninguna credencial para la cuenta".into());
     };
 
-    let credencial = if campo("client_id").is_some() {
-        Credencial::Token {
-            usuario,
-            token: secreto,
+    let credential = if field("client_id").is_some() {
+        Credential::Token {
+            username,
+            token: secret,
         }
     } else {
-        Credencial::Contrasena { usuario, secreto }
+        Credential::Password { username, secret }
     };
 
-    Ok(Destino {
+    Ok(Endpoint {
         host,
-        puerto,
-        credencial,
+        port,
+        credential,
     })
 }
 
 /// Lo mismo, pero para el servidor por el que se manda.
 ///
-/// Aparte de `destino_de` y no un parámetro suyo, porque lo que falta cuando
+/// Aparte de `imap_endpoint` y no un parámetro suyo, porque lo que falta cuando
 /// falta es distinto: una cuenta puede leer correo sin poder mandarlo —el
 /// formulario deja el servidor de salida vacío, o la cuenta viene de una
 /// versión anterior a que se guardara—, y el mensaje tiene que decir eso y no
@@ -233,19 +236,19 @@ pub fn destino_de(config: &serde_json::Value, secreto: Option<String>) -> Result
 ///
 /// 587 por omisión: es el puerto de envío con `STARTTLS` y el que pone el
 /// formulario. El otro que existe es el 465, que habla TLS desde el primer byte.
-pub fn destino_smtp_de(
+pub fn smtp_endpoint(
     config: &serde_json::Value,
-    secreto: Option<String>,
-) -> Result<Destino, String> {
-    let campo = |nombre: &str| config.get(nombre).and_then(|v| v.as_str());
+    secret: Option<String>,
+) -> Result<Endpoint, String> {
+    let field = |name: &str| config.get(name).and_then(|v| v.as_str());
 
-    let usuario = campo("username")
+    let username = field("username")
         .ok_or("la cuenta no tiene usuario guardado")?
         .to_string();
     // Recortado: se comprobaba con `trim` y se guardaba igual, así que un
     // « smtp.ejemplo.com » con espacios pasaba el control y después fallaba al
     // resolver el nombre, con un error que no dice nada del espacio.
-    let host = campo("smtp_server")
+    let host = field("smtp_server")
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or(
@@ -253,33 +256,33 @@ pub fn destino_smtp_de(
         )?
         .to_string();
 
-    let puerto = config
+    let port = config
         .get("smtp_port")
         .and_then(|v| v.as_u64())
         .and_then(|p| u16::try_from(p).ok())
         .filter(|p| *p != 0)
         .unwrap_or(587);
 
-    let Some(secreto) = secreto else {
+    let Some(secret) = secret else {
         return Err("no se obtuvo ninguna credencial para la cuenta".into());
     };
 
     // La misma regla que para leer: la marca es el `client_id`, que sólo lo
     // tienen las cuentas que pasaron por un flujo OAuth2. Confundirlas manda una
     // contraseña donde va un token.
-    let credencial = if campo("client_id").is_some() {
-        Credencial::Token {
-            usuario,
-            token: secreto,
+    let credential = if field("client_id").is_some() {
+        Credential::Token {
+            username,
+            token: secret,
         }
     } else {
-        Credencial::Contrasena { usuario, secreto }
+        Credential::Password { username, secret }
     };
 
-    Ok(Destino {
+    Ok(Endpoint {
         host,
-        puerto,
-        credencial,
+        port,
+        credential,
     })
 }
 
@@ -297,21 +300,21 @@ mod tests {
             "username": "ana@ejemplo.com",
             "imap_server": "imap.ejemplo.com",
         });
-        let error = destino_smtp_de(&config, Some("c".into())).unwrap_err();
+        let error = smtp_endpoint(&config, Some("c".into())).unwrap_err();
         assert!(error.contains("servidor de salida"), "{error}");
 
         // Y uno en blanco es lo mismo que no tenerlo: conectarse a "" da un
         // error de resolución de nombres que no explica nada.
-        let vacio = serde_json::json!({ "username": "ana", "smtp_server": "  " });
-        assert!(destino_smtp_de(&vacio, Some("c".into())).is_err());
+        let empty = serde_json::json!({ "username": "ana", "smtp_server": "  " });
+        assert!(smtp_endpoint(&empty, Some("c".into())).is_err());
 
         // Y uno con espacios alrededor se guarda recortado: si no, pasa el
         // control y falla después al resolver el nombre.
-        let con_espacios = serde_json::json!({
+        let with_spaces = serde_json::json!({
             "username": "ana", "smtp_server": " smtp.ejemplo.com ",
         });
-        let destino = destino_smtp_de(&con_espacios, Some("c".into())).unwrap();
-        assert_eq!(destino.host, "smtp.ejemplo.com");
+        let destination = smtp_endpoint(&with_spaces, Some("c".into())).unwrap();
+        assert_eq!(destination.host, "smtp.ejemplo.com");
     }
 
     /// 587 es el puerto de envío con `STARTTLS`, y es el que pone el formulario.
@@ -322,9 +325,9 @@ mod tests {
             "username": "ana@ejemplo.com",
             "smtp_server": "smtp.ejemplo.com",
         });
-        let destino = destino_smtp_de(&config, Some("c".into())).unwrap();
-        assert_eq!(destino.puerto, 587);
-        assert_eq!(destino.host, "smtp.ejemplo.com");
+        let destination = smtp_endpoint(&config, Some("c".into())).unwrap();
+        assert_eq!(destination.port, 587);
+        assert_eq!(destination.host, "smtp.ejemplo.com");
     }
 
     /// El puerto guardado manda, incluido el 465, que habla TLS desde el primer
@@ -334,10 +337,7 @@ mod tests {
         let config = serde_json::json!({
             "username": "ana", "smtp_server": "smtp.x.com", "smtp_port": 465,
         });
-        assert_eq!(
-            destino_smtp_de(&config, Some("c".into())).unwrap().puerto,
-            465
-        );
+        assert_eq!(smtp_endpoint(&config, Some("c".into())).unwrap().port, 465);
     }
 
     /// La misma regla que para leer: el `client_id` es lo que distingue una
@@ -346,50 +346,50 @@ mod tests {
     /// credenciales sin serlo.
     #[test]
     fn el_client_id_decide_como_autenticarse_tambien_al_mandar() {
-        let con_token = serde_json::json!({
+        let with_token = serde_json::json!({
             "username": "ana", "smtp_server": "smtp.x.com", "client_id": "abc",
         });
         assert!(matches!(
-            destino_smtp_de(&con_token, Some("t".into()))
+            smtp_endpoint(&with_token, Some("t".into()))
                 .unwrap()
-                .credencial,
-            Credencial::Token { .. }
+                .credential,
+            Credential::Token { .. }
         ));
 
-        let con_clave = serde_json::json!({ "username": "ana", "smtp_server": "smtp.x.com" });
+        let with_key = serde_json::json!({ "username": "ana", "smtp_server": "smtp.x.com" });
         assert!(matches!(
-            destino_smtp_de(&con_clave, Some("c".into()))
+            smtp_endpoint(&with_key, Some("c".into()))
                 .unwrap()
-                .credencial,
-            Credencial::Contrasena { .. }
+                .credential,
+            Credential::Password { .. }
         ));
     }
     use serde_json::json;
 
     #[test]
     fn una_cuenta_con_correo_se_sincroniza() {
-        let cuenta = Account {
+        let account = Account {
             id: "a".into(),
             display_name: "Ana".into(),
             provider_type: "custom".into(),
             capabilities: vec!["email".into(), "calendar".into()],
             needs_reauth: false,
         };
-        assert!(cuenta.hay_correo_que_sincronizar());
+        assert!(account.has_mail_to_sync());
     }
 
     /// Una cuenta sin correo no es un error: es una de Nextcloud con archivos y
     /// calendario, por ejemplo. Se saltea en silencio.
     #[test]
     fn una_cuenta_sin_correo_se_saltea() {
-        let cuenta = Account {
+        let account = Account {
             id: "a".into(),
             display_name: "Nube".into(),
             provider_type: "nextcloud".into(),
             capabilities: vec!["drive".into(), "calendar".into()],
             needs_reauth: false,
         };
-        assert!(!cuenta.hay_correo_que_sincronizar());
+        assert!(!account.has_mail_to_sync());
     }
 
     /// Y una que hay que reconectar tampoco: pedirle el token daría error, y
@@ -397,14 +397,14 @@ mod tests {
     /// persona no la reconecte.
     #[test]
     fn una_cuenta_que_pide_reautenticacion_se_saltea() {
-        let cuenta = Account {
+        let account = Account {
             id: "a".into(),
             display_name: "Vieja".into(),
             provider_type: "google".into(),
             capabilities: vec!["email".into()],
             needs_reauth: true,
         };
-        assert!(!cuenta.hay_correo_que_sincronizar());
+        assert!(!account.has_mail_to_sync());
     }
 
     /// El resumen que devuelve el servicio se lee tal como viene, incluida una
@@ -415,12 +415,12 @@ mod tests {
                         "capabilities":["email"],"needs_reauth":false},
                        {"id":"b","display_name":"Vieja","provider_type":"custom",
                         "capabilities":[]}]"#;
-        let cuentas: Vec<Account> = serde_json::from_str(json).unwrap();
+        let accounts: Vec<Account> = serde_json::from_str(json).unwrap();
 
-        assert_eq!(cuentas.len(), 2);
-        assert!(cuentas[0].hay_correo_que_sincronizar());
+        assert_eq!(accounts.len(), 2);
+        assert!(accounts[0].has_mail_to_sync());
         assert!(
-            !cuentas[1].needs_reauth,
+            !accounts[1].needs_reauth,
             "sin la marca es una cuenta que anda"
         );
     }
@@ -433,9 +433,9 @@ mod tests {
             "imap_port": 993,
         });
 
-        let destino = destino_de(&config, Some("el-secreto".into())).unwrap();
-        assert_eq!(destino.host, "imap.ejemplo.com");
-        assert_eq!(destino.puerto, 993);
+        let destination = imap_endpoint(&config, Some("el-secreto".into())).unwrap();
+        assert_eq!(destination.host, "imap.ejemplo.com");
+        assert_eq!(destination.port, 993);
     }
 
     /// **El caso que se rompe callado si se elige mal.** Una cuenta conectada
@@ -448,33 +448,33 @@ mod tests {
     /// un rechazo que parece de credenciales.
     #[test]
     fn una_cuenta_con_contrasena_no_se_autentica_con_token() {
-        let con_contrasena = json!({
+        let with_password = json!({
             "username": "ana@gmail.com",
             "imap_server": "imap.gmail.com",
             "imap_port": 993,
         });
         assert_eq!(
-            destino_de(&con_contrasena, Some("la-contrasena".into()))
+            imap_endpoint(&with_password, Some("la-contrasena".into()))
                 .unwrap()
-                .credencial,
-            Credencial::Contrasena {
-                usuario: "ana@gmail.com".into(),
-                secreto: "la-contrasena".into(),
+                .credential,
+            Credential::Password {
+                username: "ana@gmail.com".into(),
+                secret: "la-contrasena".into(),
             }
         );
 
-        let con_oauth = json!({
+        let with_oauth = json!({
             "username": "ana@gmail.com",
             "imap_server": "imap.gmail.com",
             "client_id": "el-mio.apps.googleusercontent.com",
             "token_url": "https://oauth2.googleapis.com/token",
         });
         assert_eq!(
-            destino_de(&con_oauth, Some("el-token".into()))
+            imap_endpoint(&with_oauth, Some("el-token".into()))
                 .unwrap()
-                .credencial,
-            Credencial::Token {
-                usuario: "ana@gmail.com".into(),
+                .credential,
+            Credential::Token {
+                username: "ana@gmail.com".into(),
                 token: "el-token".into()
             }
         );
@@ -485,7 +485,7 @@ mod tests {
     #[test]
     fn sin_credencial_no_se_arma_un_destino() {
         let config = json!({ "username": "ana", "imap_server": "imap.ejemplo.com" });
-        assert!(destino_de(&config, None).is_err());
+        assert!(imap_endpoint(&config, None).is_err());
     }
 
     /// Una cuenta guardada antes de que el formulario pidiera el puerto no tiene
@@ -494,7 +494,7 @@ mod tests {
     #[test]
     fn sin_puerto_se_supone_el_de_imap_sobre_tls() {
         let config = json!({ "username": "ana", "imap_server": "imap.ejemplo.com" });
-        assert_eq!(destino_de(&config, Some("t".into())).unwrap().puerto, 993);
+        assert_eq!(imap_endpoint(&config, Some("t".into())).unwrap().port, 993);
     }
 
     /// El mensaje tiene que decir qué falta. Sin esto, una cuenta a la que le
@@ -502,12 +502,12 @@ mod tests {
     /// ""», que no señala a ninguna parte.
     #[test]
     fn una_configuracion_incompleta_dice_que_le_falta() {
-        let sin_servidor = json!({ "username": "ana" });
-        let error = destino_de(&sin_servidor, Some("t".into())).unwrap_err();
+        let without_server = json!({ "username": "ana" });
+        let error = imap_endpoint(&without_server, Some("t".into())).unwrap_err();
         assert!(error.contains("servidor"), "{error}");
 
-        let sin_usuario = json!({ "imap_server": "imap.ejemplo.com" });
-        let error = destino_de(&sin_usuario, Some("t".into())).unwrap_err();
+        let without_user = json!({ "imap_server": "imap.ejemplo.com" });
+        let error = imap_endpoint(&without_user, Some("t".into())).unwrap_err();
         assert!(error.contains("usuario"), "{error}");
     }
 
@@ -520,6 +520,6 @@ mod tests {
             "imap_server": "imap.ejemplo.com",
             "imap_port": 999_999,
         });
-        assert_eq!(destino_de(&config, Some("t".into())).unwrap().puerto, 993);
+        assert_eq!(imap_endpoint(&config, Some("t".into())).unwrap().port, 993);
     }
 }
