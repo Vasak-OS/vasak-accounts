@@ -107,6 +107,11 @@ pub const STORE_AREAS: [&str; 3] = ["email", "calendar", "contacts"];
 /// `active_areas` de `stores.json`.
 pub const CONTACTS_AREA: &str = "contacts";
 
+/// El nombre del área de calendario, en la capacidad de la cuenta y en
+/// `active_areas` de `stores.json`. Lleva los eventos y las tareas de CalDAV
+/// (supuesto 8 de `vasak-accounts#23`).
+pub const CALENDAR_AREA: &str = "calendar";
+
 /// Cuánto tiene que haber entre el primer listado bueno en que falta una
 /// cuenta y el que confirma que se fue, antes de borrar nada suyo.
 ///
