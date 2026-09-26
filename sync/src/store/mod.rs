@@ -472,7 +472,7 @@ mod tests {
             .connection()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
     }
 
     /// 0700 la carpeta y 0600 los tres archivos, y otra vez en cada apertura si
