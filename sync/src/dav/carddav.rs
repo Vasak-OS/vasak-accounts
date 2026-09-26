@@ -18,14 +18,14 @@
 //! No crea, no edita y no borra nada en el servidor.
 
 use super::webdav::{
-    self, href_for_request, href_key, off_runtime, parse_multistatus, resolve_href,
-    same_collection, xml_escape, DavClient, DavError, Limits, Method, NS_DAV,
+    self, expect_multistatus, href_for_request, off_runtime, parse_multistatus, resolve_href,
+    storable, xml_escape, DavClient, DavError, Limits, Method, NS_CALENDARSERVER, NS_DAV,
 };
+// El ETag de cada tarjeta es lo mismo que el de cada evento: vive en
+// `webdav.rs`, y se sigue llamando desde acá como antes.
+pub use super::webdav::list_etags;
 
 pub const NS_CARDDAV: &str = "urn:ietf:params:xml:ns:carddav";
-/// El de `getctag`, una extensión de Apple que casi todos los servidores
-/// hablan: cambia cada vez que cambia algo de la libreta.
-pub const NS_CALENDARSERVER: &str = "http://calendarserver.org/ns/";
 
 /// Hasta cuánto del nombre de una libreta se guarda.
 const MAX_BOOK_NAME: usize = 256;
@@ -41,9 +41,6 @@ pub struct AddressBook {
     /// lo dijo: se prueba, y si contesta que no, se va por ETag.
     pub sync_collection: Option<bool>,
 }
-
-/// La dirección y el ETag de cada tarjeta de una libreta.
-pub type Etags = Vec<(url::Url, Option<String>)>;
 
 /// Una tarjeta tal como vino del servidor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,12 +64,6 @@ fn short(text: &str, cap: usize) -> String {
         cut -= 1;
     }
     text[..cut].to_string()
-}
-
-/// Un token o un `getctag` que se puede guardar.
-fn storable(text: Option<&str>) -> Option<String> {
-    text.filter(|t| t.len() <= webdav::MAX_TOKEN_BYTES)
-        .map(str::to_string)
 }
 
 /// Lee las libretas de una respuesta `PROPFIND`. Devuelve también cuántas
@@ -177,38 +168,6 @@ pub fn cards_from(
     Ok((cards, foreign))
 }
 
-/// Saca el ETag de cada tarjeta de un `PROPFIND` sobre una libreta, para los
-/// servidores que no saben `sync-collection`. Sin la libreta misma ni las
-/// subcarpetas.
-pub fn etags_from(xml: &str, book: &url::Url, limits: &Limits) -> Result<(Etags, usize), DavError> {
-    let document = webdav::parse_xml(xml, limits)?;
-    let multistatus = parse_multistatus(&document)?;
-    let mut foreign = 0;
-
-    let etags = multistatus
-        .responses
-        .iter()
-        .filter(|response| response.status.is_none_or(|s| (200..300).contains(&s)))
-        .filter(|response| {
-            !response
-                .prop(NS_DAV, "resourcetype")
-                .is_some_and(|p| p.contains(NS_DAV, "collection"))
-        })
-        .filter_map(|response| {
-            let Ok(href) = resolve_href(book, &response.href) else {
-                foreign += 1;
-                return None;
-            };
-            if same_collection(&href, book) {
-                return None;
-            }
-            Some((href, storable(response.text(NS_DAV, "getetag"))))
-        })
-        .collect();
-
-    Ok((etags, foreign))
-}
-
 /// El cuerpo del `PROPFIND` que pide las libretas.
 pub fn address_books_query() -> String {
     format!(
@@ -217,15 +176,6 @@ pub fn address_books_query() -> String {
   <d:prop><d:resourcetype/><d:displayname/><cs:getctag/><d:supported-report-set/></d:prop>
 </d:propfind>"#
     )
-}
-
-/// El cuerpo del `PROPFIND` que pide el ETag de cada tarjeta de una libreta.
-pub fn etags_query() -> String {
-    r#"<?xml version="1.0" encoding="utf-8"?>
-<d:propfind xmlns:d="DAV:">
-  <d:prop><d:resourcetype/><d:getetag/></d:prop>
-</d:propfind>"#
-        .to_string()
 }
 
 /// El cuerpo del `REPORT` que pide unas tarjetas por su dirección.
@@ -245,13 +195,6 @@ pub fn multiget_body(hrefs: &[url::Url]) -> String {
 // ---------------------------------------------------------------------------
 // La parte que habla por la red
 // ---------------------------------------------------------------------------
-
-fn expect_multistatus(reply: webdav::Reply) -> Result<String, DavError> {
-    match reply.status {
-        207 => Ok(reply.body),
-        other => Err(DavError::Status(other)),
-    }
-}
 
 /// Las libretas que hay en la carpeta de la persona, y cuántas se descartaron
 /// por venir con una dirección de otro origen.
@@ -275,21 +218,6 @@ pub async fn list_address_books(client: &DavClient) -> Result<(Vec<AddressBook>,
     Ok((books, foreign))
 }
 
-/// El ETag de cada tarjeta de una libreta.
-pub async fn list_etags(client: &DavClient, book: &url::Url) -> Result<Etags, DavError> {
-    let reply = client
-        .request(Method::Propfind, book, "1", etags_query())
-        .await?;
-    let xml = expect_multistatus(reply)?;
-    let limits = *client.limits();
-    let book = book.clone();
-    let (etags, foreign) = off_runtime(move || etags_from(&xml, &book, &limits)).await?;
-    if foreign > 0 {
-        tracing::warn!("se descartaron {foreign} tarjetas con dirección de otro servidor");
-    }
-    Ok(etags)
-}
-
 /// Se queda con las tarjetas que se pidieron, **una vez cada una**, y cuenta
 /// las que no.
 ///
@@ -299,23 +227,11 @@ pub async fn list_etags(client: &DavClient, book: &url::Url) -> Result<Etags, Da
 /// contactos que el servidor nunca listó. Una repetida es lo mismo: la
 /// primera que llega es la que vale.
 ///
-/// Pedida y contestada se comparan por [`href_key`]: `a%2db.vcf` pedida y
+/// Pedida y contestada se comparan por [`webdav::href_key`]: `a%2db.vcf` pedida y
 /// `a%2Db.vcf` contestada son la misma tarjeta, y descartarla la dejaba
 /// afuera hasta que cambiara.
 pub fn keep_requested(cards: Vec<CardResource>, hrefs: &[url::Url]) -> (Vec<CardResource>, usize) {
-    let mut pending: std::collections::HashSet<String> = hrefs.iter().map(href_key).collect();
-    let mut unrequested = 0;
-    let kept = cards
-        .into_iter()
-        .filter(|card| {
-            let requested = pending.remove(&href_key(&card.href));
-            if !requested {
-                unrequested += 1;
-            }
-            requested
-        })
-        .collect();
-    (kept, unrequested)
+    webdav::keep_requested_by(cards, hrefs, |card| &card.href)
 }
 
 /// Unas tarjetas de una libreta, por su dirección. Sólo las pedidas, una vez
@@ -351,6 +267,7 @@ pub async fn multiget(
 
 #[cfg(test)]
 mod tests {
+    use super::super::webdav::{etags_from, etags_query};
     use super::*;
 
     const NODES: &Limits = &Limits {

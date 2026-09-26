@@ -1,9 +1,11 @@
-//! Un servidor CardDAV de mentira en `127.0.0.1`, para las pruebas.
+//! Un servidor CardDAV o CalDAV de mentira en `127.0.0.1`, para las pruebas.
 //!
 //! Habla HTTP/1.1 de verdad —el cliente es `reqwest`, sin atajos— y contesta
-//! lo mínimo de CardDAV que usa el sincronizador: `PROPFIND` de la carpeta y
-//! de cada libreta, `sync-collection` con tokens `t<versión>` y
-//! `addressbook-multiget`. Anota cada pedido que le llega, para que una prueba
+//! lo mínimo de CardDAV ([`FakeDav::start`]) o de CalDAV
+//! ([`FakeDav::start_caldav`]) que usa el sincronizador: `PROPFIND` de la
+//! carpeta y de cada colección —una libreta o un calendario—,
+//! `sync-collection` con tokens `t<versión>` y `addressbook-multiget` o
+//! `calendar-multiget`. Anota cada pedido que le llega, para que una prueba
 //! pueda decir «no se pidió nada».
 //!
 //! Cada cambio sube la versión del servidor entero, como un contador de
@@ -29,7 +31,9 @@ pub struct RecordedRequest {
 
 impl RecordedRequest {
     pub fn is_multiget(&self) -> bool {
-        self.method == "REPORT" && self.body.contains("addressbook-multiget")
+        self.method == "REPORT"
+            && (self.body.contains("addressbook-multiget")
+                || self.body.contains("calendar-multiget"))
     }
 
     pub fn is_sync_collection(&self) -> bool {
@@ -38,21 +42,26 @@ impl RecordedRequest {
 }
 
 #[derive(Debug, Clone)]
-pub struct FakeCard {
+pub struct FakeResource {
     pub etag: String,
     pub data: String,
     pub version: u64,
 }
 
+/// Una libreta, o un calendario.
 #[derive(Debug, Clone)]
-pub struct FakeBook {
+pub struct FakeCollection {
     /// La ruta, con barra al final: `/dav/ana/personal/`.
     pub path: String,
     pub name: String,
+    /// Los componentes que dice guardar un calendario. Vacío: no lo dice.
+    pub components: Vec<String>,
+    /// El `calendar-color`, si alguno.
+    pub color: Option<String>,
     pub supports_sync: bool,
     /// El `getctag` que se anuncia, si alguno.
     pub ctag: Option<String>,
-    pub cards: BTreeMap<String, FakeCard>,
+    pub resources: BTreeMap<String, FakeResource>,
     /// Lo borrado, con la versión en que se borró.
     pub removed: BTreeMap<String, u64>,
 }
@@ -62,8 +71,10 @@ type Hook = Box<dyn FnMut(&RecordedRequest) + Send>;
 /// Lo que sabe y lo que hace el servidor. Todo público: cada prueba lo toca a
 /// mano.
 pub struct FakeState {
+    /// Si habla CalDAV en vez de CardDAV.
+    pub caldav: bool,
     pub home: String,
-    pub books: Vec<FakeBook>,
+    pub collections: Vec<FakeCollection>,
     pub version: u64,
     pub requests: Vec<RecordedRequest>,
     /// Un token de antes de esta versión se contesta como vencido.
@@ -82,7 +93,7 @@ pub struct FakeState {
     /// No decir qué informes sabe cada libreta: el cliente tiene que probar.
     pub hide_reports: bool,
     /// `<d:response>` de más que se suman al listado de libretas.
-    pub extra_books_xml: String,
+    pub extra_listing_xml: String,
     /// `<d:response>` de más que se suman a cada `sync-collection`.
     pub extra_sync_xml: String,
     /// `<d:response>` de más que se suman a cada `addressbook-multiget`.
@@ -104,19 +115,38 @@ pub struct FakeDav {
 }
 
 impl FakeDav {
-    /// Levanta el servidor con una libreta vacía, `personal`, que sabe
+    /// Levanta el servidor CardDAV con una libreta vacía, `personal`, que sabe
     /// `sync-collection`.
     pub async fn start() -> Self {
+        Self::start_as(false).await
+    }
+
+    /// Levanta el servidor CalDAV con un calendario vacío de eventos y tareas,
+    /// `personal`, que sabe `sync-collection`.
+    pub async fn start_caldav() -> Self {
+        let server = Self::start_as(true).await;
+        {
+            let mut state = server.state();
+            state.collections[0].components = vec!["VEVENT".into(), "VTODO".into()];
+            state.collections[0].color = Some("#FF5733".into());
+        }
+        server
+    }
+
+    async fn start_as(caldav: bool) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let state = Arc::new(Mutex::new(FakeState {
+            caldav,
             home: "/dav/ana/".into(),
-            books: vec![FakeBook {
+            collections: vec![FakeCollection {
                 path: "/dav/ana/personal/".into(),
                 name: "Personal".into(),
+                components: Vec::new(),
+                color: None,
                 supports_sync: true,
                 ctag: None,
-                cards: BTreeMap::new(),
+                resources: BTreeMap::new(),
                 removed: BTreeMap::new(),
             }],
             version: 1,
@@ -128,7 +158,7 @@ impl FakeDav {
             padding: 0,
             chunked: false,
             hide_reports: false,
-            extra_books_xml: String::new(),
+            extra_listing_xml: String::new(),
             extra_sync_xml: String::new(),
             extra_multiget_xml: String::new(),
             multiget_href: None,
@@ -160,21 +190,21 @@ impl FakeDav {
         url::Url::parse(&format!("{}{home}", self.origin())).unwrap()
     }
 
-    pub fn book_url(&self, index: usize) -> url::Url {
-        let path = self.state().books[index].path.clone();
+    pub fn collection_url(&self, index: usize) -> url::Url {
+        let path = self.state().collections[index].path.clone();
         url::Url::parse(&format!("{}{path}", self.origin())).unwrap()
     }
 
-    /// Agrega o cambia una tarjeta de una libreta.
+    /// Agrega o cambia un recurso —una tarjeta, un evento— de una colección.
     pub fn put(&self, book: usize, name: &str, data: &str) {
         let mut state = self.state();
         state.version += 1;
         let version = state.version;
-        let book = &mut state.books[book];
+        let book = &mut state.collections[book];
         book.removed.remove(name);
-        book.cards.insert(
+        book.resources.insert(
             name.to_string(),
-            FakeCard {
+            FakeResource {
                 etag: format!("\"v{version}\""),
                 data: data.to_string(),
                 version,
@@ -186,8 +216,8 @@ impl FakeDav {
         let mut state = self.state();
         state.version += 1;
         let version = state.version;
-        let book = &mut state.books[book];
-        if book.cards.remove(name).is_some() {
+        let book = &mut state.collections[book];
+        if book.resources.remove(name).is_some() {
             book.removed.insert(name.to_string(), version);
         }
     }
@@ -196,19 +226,44 @@ impl FakeDav {
         self.state().requests.clone()
     }
 
-    /// Suma una libreta vacía que sabe `sync-collection`.
-    pub fn add_book(&self, path: &str, name: &str) -> usize {
+    /// Suma una colección vacía que sabe `sync-collection`: una libreta, o un
+    /// calendario de eventos y tareas.
+    pub fn add_collection(&self, path: &str, name: &str) -> usize {
         let mut state = self.state();
-        state.books.push(FakeBook {
+        let components = if state.caldav {
+            vec!["VEVENT".into(), "VTODO".into()]
+        } else {
+            Vec::new()
+        };
+        state.collections.push(FakeCollection {
             path: path.into(),
             name: name.into(),
+            components,
+            color: None,
             supports_sync: true,
             ctag: None,
-            cards: BTreeMap::new(),
+            resources: BTreeMap::new(),
             removed: BTreeMap::new(),
         });
-        state.books.len() - 1
+        state.collections.len() - 1
     }
+}
+
+/// Un evento mínimo, con su `UID`, su título y su comienzo en UTC
+/// (`20260915T140000Z`), de una hora.
+pub fn event(uid: &str, summary: &str, start: &str) -> String {
+    format!(
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:{uid}\r\nSUMMARY:{summary}\r\n\
+         DTSTART:{start}\r\nDURATION:PT1H\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+    )
+}
+
+/// Una tarea mínima.
+pub fn task(uid: &str, summary: &str, due: &str) -> String {
+    format!(
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTODO\r\nUID:{uid}\r\nSUMMARY:{summary}\r\n\
+         DUE:{due}\r\nSTATUS:NEEDS-ACTION\r\nEND:VTODO\r\nEND:VCALENDAR\r\n"
+    )
 }
 
 /// Una tarjeta mínima.
@@ -325,6 +380,8 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 const HEAD: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav" xmlns:cs="http://calendarserver.org/ns/">"#;
+const CALDAV_HEAD: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:cs="http://calendarserver.org/ns/" xmlns:a="http://apple.com/ns/ical/">"#;
 const TAIL: &str = "</d:multistatus>";
 
 fn ok(prop: &str) -> String {
@@ -332,17 +389,27 @@ fn ok(prop: &str) -> String {
 }
 
 fn answer(state: &mut FakeState, request: &RecordedRequest) -> (u16, String) {
-    let book = state.books.iter().position(|b| b.path == request.path);
+    let book = state
+        .collections
+        .iter()
+        .position(|b| b.path == request.path);
+    let head = if state.caldav { CALDAV_HEAD } else { HEAD };
+    // Qué es una colección, y cómo se llama lo que trae cada recurso.
+    let (kind, data) = if state.caldav {
+        ("<c:calendar/>", "c:calendar-data")
+    } else {
+        ("<c:addressbook/>", "c:address-data")
+    };
 
     match (request.method.as_str(), book) {
         ("PROPFIND", None) if request.path == state.home => {
-            let mut xml = String::from(HEAD);
+            let mut xml = String::from(head);
             xml.push_str(&format!(
                 "<d:response><d:href>{}</d:href>{}</d:response>",
                 state.home,
                 ok("<d:resourcetype><d:collection/></d:resourcetype>")
             ));
-            for book in &state.books {
+            for book in &state.collections {
                 let reports = match (state.hide_reports, book.supports_sync) {
                     (true, _) => String::new(),
                     (false, true) => "<d:supported-report-set><d:supported-report><d:report>\
@@ -352,6 +419,22 @@ fn answer(state: &mut FakeState, request: &RecordedRequest) -> (u16, String) {
                         <c:addressbook-multiget/></d:report></d:supported-report></d:supported-report-set>"
                         .into(),
                 };
+                let components = if book.components.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "<c:supported-calendar-component-set>{}</c:supported-calendar-component-set>",
+                        book.components
+                            .iter()
+                            .map(|c| format!("<c:comp name=\"{c}\"/>"))
+                            .collect::<String>()
+                    )
+                };
+                let color = book
+                    .color
+                    .as_ref()
+                    .map(|c| format!("<a:calendar-color>{}</a:calendar-color>", xml_escape(c)))
+                    .unwrap_or_default();
                 let ctag = book
                     .ctag
                     .as_ref()
@@ -361,25 +444,27 @@ fn answer(state: &mut FakeState, request: &RecordedRequest) -> (u16, String) {
                     "<d:response><d:href>{}</d:href>{}</d:response>",
                     book.path,
                     ok(&format!(
-                        "<d:resourcetype><d:collection/><c:addressbook/></d:resourcetype>\
-                         <d:displayname>{}</d:displayname>{ctag}{reports}",
+                        "<d:resourcetype><d:collection/>{kind}</d:resourcetype>\
+                         <d:displayname>{}</d:displayname>{ctag}{reports}{components}{color}",
                         xml_escape(&book.name)
                     ))
                 ));
             }
-            xml.push_str(&state.extra_books_xml);
+            xml.push_str(&state.extra_listing_xml);
             xml.push_str(TAIL);
             (207, xml)
         }
         ("PROPFIND", Some(index)) => {
-            let book = &state.books[index];
-            let mut xml = String::from(HEAD);
+            let book = &state.collections[index];
+            let mut xml = String::from(head);
             xml.push_str(&format!(
                 "<d:response><d:href>{}</d:href>{}</d:response>",
                 book.path,
-                ok("<d:resourcetype><d:collection/><c:addressbook/></d:resourcetype>")
+                ok(&format!(
+                    "<d:resourcetype><d:collection/>{kind}</d:resourcetype>"
+                ))
             ));
-            for (name, card) in &book.cards {
+            for (name, card) in &book.resources {
                 xml.push_str(&format!(
                     "<d:response><d:href>{}{name}</d:href>{}</d:response>",
                     book.path,
@@ -393,7 +478,7 @@ fn answer(state: &mut FakeState, request: &RecordedRequest) -> (u16, String) {
             (207, xml)
         }
         ("REPORT", Some(index)) if request.is_sync_collection() => {
-            let book = &state.books[index];
+            let book = &state.collections[index];
             if !book.supports_sync {
                 return (501, String::new());
             }
@@ -419,9 +504,9 @@ fn answer(state: &mut FakeState, request: &RecordedRequest) -> (u16, String) {
                     }
                 }
             };
-            let mut xml = String::from(HEAD);
+            let mut xml = String::from(head);
             let changed = book
-                .cards
+                .resources
                 .iter()
                 .filter(|(_, card)| since.is_none_or(|n| card.version > n))
                 .take(state.truncate_sync.unwrap_or(usize::MAX));
@@ -467,7 +552,7 @@ fn answer(state: &mut FakeState, request: &RecordedRequest) -> (u16, String) {
                 return (500, String::new());
             }
             let shown = state.multiget_href;
-            let book = &state.books[index];
+            let book = &state.collections[index];
             let hrefs: Vec<String> = roxmltree::Document::parse(&request.body)
                 .map(|d| {
                     d.descendants()
@@ -476,15 +561,15 @@ fn answer(state: &mut FakeState, request: &RecordedRequest) -> (u16, String) {
                         .collect()
                 })
                 .unwrap_or_default();
-            let mut xml = String::from(HEAD);
+            let mut xml = String::from(head);
             for href in hrefs {
                 let name = href.strip_prefix(&book.path).unwrap_or("");
                 let answered = shown.map_or_else(|| href.clone(), |f| f(&href));
-                match book.cards.get(name) {
+                match book.resources.get(name) {
                     Some(card) => xml.push_str(&format!(
                         "<d:response><d:href>{answered}</d:href>{}</d:response>",
                         ok(&format!(
-                            "<d:getetag>{}</d:getetag><c:address-data>{}</c:address-data>",
+                            "<d:getetag>{}</d:getetag><{data}>{}</{data}>",
                             xml_escape(&card.etag),
                             xml_escape(&card.data)
                         ))

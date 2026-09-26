@@ -1,8 +1,10 @@
 //! Lo genérico de WebDAV: la credencial, el cliente HTTP, el `multistatus`, las
 //! direcciones que manda el servidor y `sync-collection` (RFC 6578).
 //!
-//! Aparte de `carddav.rs` porque el calendario va a hablar lo mismo: CalDAV y
-//! CardDAV son WebDAV con otro espacio de nombres para los datos.
+//! Aparte de `carddav.rs` y `caldav.rs` porque los dos hablan lo mismo: CalDAV
+//! y CardDAV son WebDAV con otro espacio de nombres para los datos. Lo que es de
+//! los dos —el ETag de cada recurso de una colección, quedarse con lo que se
+//! pidió de un `multiget`— vive acá.
 //!
 //! ── Qué se le cree al servidor, y qué no ────────────────────────────────────
 //!
@@ -41,6 +43,10 @@ use base64::Engine;
 use zeroize::Zeroizing;
 
 pub const NS_DAV: &str = "DAV:";
+/// El de `getctag`, una extensión de Apple que casi todos los servidores
+/// hablan, de contactos y de calendario: cambia cada vez que cambia algo de la
+/// colección.
+pub const NS_CALENDARSERVER: &str = "http://calendarserver.org/ns/";
 
 /// Cuánto se espera una respuesta.
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -104,6 +110,19 @@ pub struct Limits {
     /// agenda de verdad, con fotos, son decenas de megas. Pasarlo corta la
     /// vuelta sin guardar el token.
     pub max_account_vcard_bytes: u64,
+    /// Calendarios por cuenta.
+    pub max_calendars: usize,
+    /// Objetos —eventos y tareas— por calendario. Una agenda de diez años con
+    /// dos mil eventos por año son veinte mil.
+    pub max_objects_per_calendar: usize,
+    /// El tamaño de un objeto de calendario. Uno con adjuntos en línea puede
+    /// pesar; uno de más no se guarda, y queda contado.
+    pub max_ical_bytes: usize,
+    /// Bytes de iCalendar crudo por cuenta, como el de las tarjetas.
+    pub max_account_ical_bytes: u64,
+    /// Ocurrencias guardadas por cuenta: lo que deja la expansión de todas las
+    /// series en la ventana, con cada vez de cada evento que no se repite.
+    pub max_account_occurrences: u64,
     /// Cuánto puede durar la vuelta de una cuenta. Las cuentas van de a una:
     /// sin esto, un servidor lento —cuatrocientos `multiget` de treinta
     /// segundos por libreta— dejaba esperando horas a las otras y a cada
@@ -124,6 +143,11 @@ impl Limits {
         multiget_batch: 50,
         max_sync_rounds: 50,
         max_account_vcard_bytes: 1024 * 1024 * 1024,
+        max_calendars: 100,
+        max_objects_per_calendar: 50_000,
+        max_ical_bytes: 512 * 1024,
+        max_account_ical_bytes: 1024 * 1024 * 1024,
+        max_account_occurrences: 1_000_000,
         max_round: Duration::from_secs(10 * 60),
     };
 }
@@ -166,6 +190,10 @@ pub enum DavError {
     BadXml(String),
     TooManyAddressBooks(usize),
     TooManyCards(usize),
+    TooManyCalendars(usize),
+    // La construye la sincronización del calendario, unos commits después.
+    #[allow(dead_code)]
+    TooManyObjects(usize),
 }
 
 impl std::fmt::Display for DavError {
@@ -198,6 +226,12 @@ impl std::fmt::Display for DavError {
                 write!(f, "la cuenta tiene más de {cap} libretas")
             }
             DavError::TooManyCards(cap) => write!(f, "una libreta tiene más de {cap} tarjetas"),
+            DavError::TooManyCalendars(cap) => {
+                write!(f, "la cuenta tiene más de {cap} calendarios")
+            }
+            DavError::TooManyObjects(cap) => {
+                write!(f, "un calendario tiene más de {cap} eventos y tareas")
+            }
         }
     }
 }
@@ -960,6 +994,10 @@ pub struct Prop {
     /// `addressbook` en un `resourcetype`, `sync-collection` en un
     /// `supported-report-set`.
     pub descendants: Vec<(String, String)>,
+    /// El atributo `name` de los elementos de adentro que lo tienen, en orden:
+    /// `VEVENT` y `VTODO` en un `supported-calendar-component-set`, que dice
+    /// sus componentes como `<c:comp name="VEVENT"/>`.
+    pub name_attributes: Vec<String>,
 }
 
 impl Prop {
@@ -1086,6 +1124,13 @@ pub fn parse_multistatus(document: &roxmltree::Document<'_>) -> Result<Multistat
                             )
                         })
                         .collect(),
+                    name_attributes: prop
+                        .descendants()
+                        .skip(1)
+                        .filter(|n| n.is_element())
+                        .filter_map(|n| n.attribute("name"))
+                        .map(str::to_string)
+                        .collect(),
                 });
             }
         }
@@ -1098,6 +1143,118 @@ pub fn parse_multistatus(document: &roxmltree::Document<'_>) -> Result<Multistat
     }
 
     Ok(multistatus)
+}
+
+// ---------------------------------------------------------------------------
+// Lo que comparten CardDAV y CalDAV
+// ---------------------------------------------------------------------------
+
+/// La dirección y el ETag de cada recurso de una colección.
+pub type Etags = Vec<(url::Url, Option<String>)>;
+
+/// Un token o un ETag que se puede guardar.
+pub fn storable(text: Option<&str>) -> Option<String> {
+    text.filter(|t| t.len() <= MAX_TOKEN_BYTES)
+        .map(str::to_string)
+}
+
+/// Saca el ETag de cada recurso de un `PROPFIND` sobre una colección, para los
+/// servidores que no saben `sync-collection`. Sin la colección misma ni las
+/// subcarpetas. Devuelve también cuántas direcciones de otro origen se
+/// descartaron.
+pub fn etags_from(
+    xml: &str,
+    collection: &url::Url,
+    limits: &Limits,
+) -> Result<(Etags, usize), DavError> {
+    let document = parse_xml(xml, limits)?;
+    let multistatus = parse_multistatus(&document)?;
+    let mut foreign = 0;
+
+    let etags = multistatus
+        .responses
+        .iter()
+        .filter(|response| response.status.is_none_or(|s| (200..300).contains(&s)))
+        .filter(|response| {
+            !response
+                .prop(NS_DAV, "resourcetype")
+                .is_some_and(|p| p.contains(NS_DAV, "collection"))
+        })
+        .filter_map(|response| {
+            let Ok(href) = resolve_href(collection, &response.href) else {
+                foreign += 1;
+                return None;
+            };
+            if same_collection(&href, collection) {
+                return None;
+            }
+            Some((href, storable(response.text(NS_DAV, "getetag"))))
+        })
+        .collect();
+
+    Ok((etags, foreign))
+}
+
+/// El cuerpo del `PROPFIND` que pide el ETag de cada recurso de una colección.
+pub fn etags_query() -> String {
+    r#"<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop><d:resourcetype/><d:getetag/></d:prop>
+</d:propfind>"#
+        .to_string()
+}
+
+/// El ETag de cada recurso de una colección.
+pub async fn list_etags(client: &DavClient, collection: &url::Url) -> Result<Etags, DavError> {
+    let reply = client
+        .request(Method::Propfind, collection, "1", etags_query())
+        .await?;
+    let xml = expect_multistatus(reply)?;
+    let limits = *client.limits();
+    let collection = collection.clone();
+    let (etags, foreign) = off_runtime(move || etags_from(&xml, &collection, &limits)).await?;
+    if foreign > 0 {
+        tracing::warn!("se descartaron {foreign} recursos con dirección de otro servidor");
+    }
+    Ok(etags)
+}
+
+/// El cuerpo de un `207`, o el estado como error.
+pub fn expect_multistatus(reply: Reply) -> Result<String, DavError> {
+    match reply.status {
+        207 => Ok(reply.body),
+        other => Err(DavError::Status(other)),
+    }
+}
+
+/// Se queda con los recursos que se pidieron en un `multiget`, **una vez cada
+/// uno**, y cuenta los que no.
+///
+/// Un servidor puede contestar un `multiget` de un recurso con dieciséis megas
+/// de recursos que nadie pidió: guardarlos saltaría el tope por colección, que
+/// se mira sobre lo que se pide, y llenaría la base con lo que el servidor
+/// nunca listó. Uno repetido es lo mismo: el primero que llega es el que vale.
+///
+/// Pedido y contestado se comparan por [`href_key`]: `a%2db` pedido y `a%2Db`
+/// contestado son el mismo recurso.
+pub fn keep_requested_by<T>(
+    items: Vec<T>,
+    hrefs: &[url::Url],
+    href_of: impl Fn(&T) -> &url::Url,
+) -> (Vec<T>, usize) {
+    let mut pending: std::collections::HashSet<String> = hrefs.iter().map(href_key).collect();
+    let mut unrequested = 0;
+    let kept = items
+        .into_iter()
+        .filter(|item| {
+            let requested = pending.remove(&href_key(href_of(item)));
+            if !requested {
+                unrequested += 1;
+            }
+            requested
+        })
+        .collect();
+    (kept, unrequested)
 }
 
 // ---------------------------------------------------------------------------
@@ -1417,6 +1574,8 @@ mod tests {
             DavError::bad_xml(server_text),
             DavError::TooManyAddressBooks(100),
             DavError::TooManyCards(20_000),
+            DavError::TooManyCalendars(100),
+            DavError::TooManyObjects(50_000),
         ];
         for error in &all {
             match error {
@@ -1429,7 +1588,9 @@ mod tests {
                 | DavError::Network(_)
                 | DavError::BadXml(_)
                 | DavError::TooManyAddressBooks(_)
-                | DavError::TooManyCards(_) => {}
+                | DavError::TooManyCards(_)
+                | DavError::TooManyCalendars(_)
+                | DavError::TooManyObjects(_) => {}
             }
         }
         all
