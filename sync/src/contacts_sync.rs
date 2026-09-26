@@ -40,7 +40,8 @@
 //! guardar el token: un plazo ([`Limits::max_round`], diez minutos), para que
 //! un servidor lento no deje esperando a las otras cuentas, y los bytes de
 //! tarjetas crudas de la cuenta ([`Limits::max_account_vcard_bytes`], un
-//! gigabyte), mirados antes de escribir cada lote.
+//! gigabyte), con el cambio neto de cada lote medido antes de guardarlo: una
+//! tarjeta reescrita cuenta la diferencia y una borrada resta.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
@@ -54,7 +55,8 @@ use crate::broker::{Broker, BrokerError};
 use crate::dav::carddav::{self, AddressBook, CardResource};
 use crate::dav::webdav::{self, DavClient, DavCredential, DavError, HttpPolicy, Limits};
 use crate::store::contacts::{
-    BookProgress, ContactOp, ContactRow, StoredAddressBook, WRITE_BATCH_BYTES, WRITE_BATCH_ROWS,
+    Applied, BookProgress, ContactOp, ContactRow, StoredAddressBook, WRITE_BATCH_BYTES,
+    WRITE_BATCH_ROWS,
 };
 use crate::store::key::{KeyError, KeySource};
 use crate::store::lifecycle::{AreaState, StoreManager, CONTACTS_AREA};
@@ -217,10 +219,12 @@ struct Round {
     /// lleva el token— se termina de escribir igual. Así, lo que se corta es
     /// un pedido a la red o un lote que todavía no empezó.
     deadline: tokio::time::Instant,
-    /// Los bytes de tarjetas crudas de la cuenta: los guardados al empezar,
-    /// más lo que escribió esta vuelta. Una tarjeta reescrita cuenta dos veces
-    /// hasta la vuelta siguiente, que vuelve a medir: se pasa por arriba y
-    /// nunca por abajo.
+    /// Los bytes de tarjetas crudas de la cuenta: los guardados después de
+    /// borrar las libretas que ya no están, más el cambio neto de cada lote de
+    /// esta vuelta, que mide el almacén dentro de la misma transacción (ver
+    /// `Store::apply_contacts`). Una tarjeta reescrita cuenta la diferencia y
+    /// una borrada resta: contarla dos veces hacía que la carga completa de una
+    /// cuenta por encima de la mitad del tope fallara siempre.
     stored_bytes: u64,
 }
 
@@ -392,7 +396,7 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
         let mut round = Round {
             report: SyncReport::default(),
             deadline: tokio::time::Instant::now() + self.limits.max_round,
-            stored_bytes: self.store(account_id, |s| s.contacts_raw_bytes()).await?,
+            stored_bytes: 0,
         };
 
         let mut seen = BTreeSet::new();
@@ -443,6 +447,8 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
         let stored = self
             .store(account_id, move |s| s.upsert_address_books(&listed))
             .await?;
+        // Después de borrar las libretas que se fueron: lo suyo ya no ocupa.
+        round.stored_bytes = self.store(account_id, |s| s.contacts_raw_bytes()).await?;
 
         // Una libreta que falla no frena a las otras; la vuelta se da por
         // fallida con el primer error del servidor. Uno del almacén sí corta:
@@ -712,24 +718,25 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
     ) -> Result<(), SyncError> {
         round.check_deadline()?;
         let ops = std::mem::take(pending);
-        let added: u64 = ops
-            .iter()
-            .map(|op| match op {
-                ContactOp::Upsert(row) => row.raw_vcard.len() as u64,
-                ContactOp::Delete(_) => 0,
-            })
-            .sum();
-        // Antes de escribir: con el tope pasado no entra este lote, y el token
-        // —que va con el último— no se guarda.
-        if round.stored_bytes.saturating_add(added) > self.limits.max_account_vcard_bytes {
-            return Err(SyncError::AccountTooLarge);
-        }
+        // El almacén mide el cambio neto del lote en la misma transacción: si
+        // pasa el tope, no escribe nada, y el token —que va con el último— no
+        // se guarda.
+        let room = self
+            .limits
+            .max_account_vcard_bytes
+            .saturating_sub(round.stored_bytes);
         let book = stored.clone();
-        self.store(account_id, move |s| {
-            s.apply_contacts(&book, &ops, finish.as_ref())
-        })
-        .await?;
-        round.stored_bytes += added;
+        let applied = self
+            .store(account_id, move |s| {
+                s.apply_contacts(&book, &ops, finish.as_ref(), room)
+            })
+            .await?;
+        match applied {
+            Applied::Written { net_bytes } => {
+                round.stored_bytes = round.stored_bytes.saturating_add_signed(net_bytes);
+            }
+            Applied::OverCap => return Err(SyncError::AccountTooLarge),
+        }
         round.report.batches += 1;
         Ok(())
     }

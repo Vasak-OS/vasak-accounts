@@ -1159,6 +1159,71 @@ async fn una_cuenta_que_pasa_el_tope_de_bytes_no_sigue_escribiendo() {
     assert_eq!(f.contacts_status().await["state"], "failed");
 }
 
+/// Los bytes de las tarjetas que arma `put_many`.
+fn bytes_of(range: std::ops::Range<usize>) -> u64 {
+    range
+        .map(|i| {
+            card(
+                &format!("{i:05}"),
+                &format!("Persona {i:05}"),
+                &format!("p{i}@x.com"),
+            )
+            .len() as u64
+        })
+        .sum()
+}
+
+/// **La carga completa de una cuenta por encima de la mitad del tope no falla
+/// para siempre.** Con el token vencido y todas las tarjetas cambiadas, se traen
+/// todas otra vez: contarlas enteras sobre lo que ya estaba las contaba dos
+/// veces, la vuelta fallaba antes del último lote, el token nuevo no se
+/// guardaba, y la siguiente repetía lo mismo. Lo que cuenta es el cambio neto.
+#[tokio::test]
+async fn una_carga_completa_no_cuenta_dos_veces_lo_que_reemplaza() {
+    let stored = bytes_of(0..4);
+    let limits = Limits {
+        max_account_vcard_bytes: stored + stored / 2,
+        ..Limits::DEFAULT
+    };
+    let f = Fixture::with_limits("contactos-tope-neto", limits).await;
+    put_many(&f.server, 0, 0..4);
+    f.synced().await;
+
+    // Las mismas tarjetas con otro ETag, y el token vencido.
+    put_many(&f.server, 0, 0..4);
+    let version = f.server.state().version;
+    f.server.state().min_valid_token = version;
+
+    let report = f.synced().await;
+    assert_eq!(report.full_resyncs, 1);
+    assert_eq!(report.fetched, 4);
+    assert_eq!(f.token(0).await, Some(f.server_token()));
+    assert_eq!(f.count("SELECT count(*) FROM contacts").await, 4);
+}
+
+/// **Lo que se borra hace lugar.** Una cuenta en el tope que pierde tres
+/// tarjetas y gana otras tres del mismo tamaño queda igual: contar los borrados
+/// como cero la daba por pasada.
+#[tokio::test]
+async fn lo_que_se_borra_hace_lugar_en_el_tope_de_la_cuenta() {
+    let limits = Limits {
+        max_account_vcard_bytes: bytes_of(0..5),
+        ..Limits::DEFAULT
+    };
+    let f = Fixture::with_limits("contactos-tope-borrados", limits).await;
+    put_many(&f.server, 0, 0..5);
+    f.synced().await;
+
+    for i in 0..3 {
+        f.server.remove(0, &format!("{i:05}.vcf"));
+    }
+    put_many(&f.server, 0, 5..8);
+    let report = f.synced().await;
+    assert_eq!((report.removed, report.fetched), (3, 3));
+    assert_eq!(f.count("SELECT count(*) FROM contacts").await, 5);
+    assert_eq!(f.token(0).await, Some(f.server_token()));
+}
+
 /// **Una cuenta lenta no frena a las otras.** Las cuentas van de a una: un
 /// servidor que no contesta dejaba a la siguiente esperando lo que tardara el
 /// plazo de cada pedido, por cada pedido. Con el plazo de la vuelta, la lenta

@@ -62,6 +62,16 @@ pub struct BookProgress {
     pub ctag: Option<String>,
 }
 
+/// Cómo quedó un lote de [`Store::apply_contacts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Applied {
+    /// Escrito. Cuántos bytes de tarjetas crudas sumó a la cuenta —negativo si
+    /// borró o achicó más de lo que agregó—.
+    Written { net_bytes: i64 },
+    /// No se escribió nada: la cuenta crecería más de lo que había lugar.
+    OverCap,
+}
+
 fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
@@ -204,12 +214,21 @@ impl Store {
     /// último lote —vacío si no había cambios— guardaba en la base nueva el
     /// token de una libreta que ahí no existe, y la vuelta siguiente pedía
     /// sólo las diferencias desde él. Lo de antes no volvía nunca.
+    ///
+    /// **`room` es cuánto puede crecer la cuenta con este lote**, en bytes de
+    /// tarjetas crudas, y lo que se mide es el cambio neto: una tarjeta que
+    /// reemplaza a otra cuenta la diferencia, y una que se borra resta. Si el
+    /// lote pasaría de `room`, [`Applied::OverCap`] y no queda nada escrito
+    /// —tampoco el token—. Contar cada tarjeta traída entera hacía que la
+    /// carga completa de una cuenta por encima de la mitad del tope contara
+    /// todo dos veces y fallara en cada vuelta, sin guardar nunca el token.
     pub fn apply_contacts(
         &mut self,
         book: &StoredAddressBook,
         ops: &[ContactOp],
         finish: Option<&BookProgress>,
-    ) -> Result<(), StoreError> {
+        room: u64,
+    ) -> Result<Applied, StoreError> {
         if ops.len() > WRITE_BATCH_ROWS {
             return Err(StoreError::Sqlite(format!(
                 "un lote de {} contactos pasa el tope de {WRITE_BATCH_ROWS}",
@@ -228,18 +247,44 @@ impl Store {
             return Err(StoreError::Missing);
         }
         let at = now();
+        // Lo que ocupaba cada tarjeta se lee en el momento de tocarla, dentro de
+        // la transacción: una dirección que aparece dos veces en el lote se
+        // cuenta contra lo que dejó la anterior.
+        let mut net: i64 = 0;
         for op in ops {
             match op {
                 ContactOp::Delete(href) => {
-                    transaction
+                    let freed: Option<i64> = transaction
                         .prepare_cached(
-                            "DELETE FROM contacts WHERE address_book_id = ?1 AND href = ?2",
+                            "DELETE FROM contacts WHERE address_book_id = ?1 AND href = ?2
+                             RETURNING octet_length(raw_vcard)",
                         )
-                        .and_then(|mut s| s.execute(rusqlite::params![book.id, href]))
+                        .and_then(|mut s| {
+                            s.query_row(rusqlite::params![book.id, href], |r| r.get(0))
+                                .optional()
+                        })
                         .map_err(classify)?;
+                    net -= freed.unwrap_or(0);
                 }
-                ContactOp::Upsert(row) => upsert_contact(&transaction, book.id, row, &at)?,
+                ContactOp::Upsert(row) => {
+                    let replaced: Option<i64> = transaction
+                        .prepare_cached(
+                            "SELECT octet_length(raw_vcard) FROM contacts
+                             WHERE address_book_id = ?1 AND href = ?2",
+                        )
+                        .and_then(|mut s| {
+                            s.query_row(rusqlite::params![book.id, row.href], |r| r.get(0))
+                                .optional()
+                        })
+                        .map_err(classify)?;
+                    net += row.raw_vcard.len() as i64 - replaced.unwrap_or(0);
+                    upsert_contact(&transaction, book.id, row, &at)?;
+                }
             }
+        }
+        if net > 0 && net as u64 > room {
+            // Sin `commit`: al soltarse, la transacción se deshace entera.
+            return Ok(Applied::OverCap);
         }
 
         if let Some(finish) = finish {
@@ -265,7 +310,8 @@ impl Store {
                 .map_err(classify)?;
         }
 
-        transaction.commit().map_err(classify)
+        transaction.commit().map_err(classify)?;
+        Ok(Applied::Written { net_bytes: net })
     }
 }
 
@@ -410,6 +456,7 @@ pub(crate) mod tests {
                     "ana@x.com",
                 ))],
                 None,
+                u64::MAX,
             )
             .unwrap();
         store
@@ -421,6 +468,7 @@ pub(crate) mod tests {
                     "am@x.com",
                 ))],
                 None,
+                u64::MAX,
             )
             .unwrap();
 
@@ -466,13 +514,13 @@ pub(crate) mod tests {
         let expected = (ana.raw_vcard.len() + juan.raw_vcard.len()) as u64;
         assert!(ana.raw_vcard.len() > ana.raw_vcard.chars().count());
         store
-            .apply_contacts(&books[0], &[ContactOp::Upsert(ana.clone())], None)
+            .apply_contacts(&books[0], &[ContactOp::Upsert(ana.clone())], None, u64::MAX)
             .unwrap();
         store
-            .apply_contacts(&books[0], &[ContactOp::Upsert(ana)], None)
+            .apply_contacts(&books[0], &[ContactOp::Upsert(ana)], None, u64::MAX)
             .unwrap();
         store
-            .apply_contacts(&books[1], &[ContactOp::Upsert(juan)], None)
+            .apply_contacts(&books[1], &[ContactOp::Upsert(juan)], None, u64::MAX)
             .unwrap();
         assert_eq!(store.contacts_raw_bytes().unwrap(), expected);
     }
@@ -496,6 +544,7 @@ pub(crate) mod tests {
                     token: Some("t1".into()),
                     ctag: Some("c1".into()),
                 }),
+                u64::MAX,
             )
             .unwrap();
         assert_eq!(
@@ -525,9 +574,82 @@ pub(crate) mod tests {
                     token: None,
                     ctag: None,
                 }),
+                u64::MAX,
             )
             .unwrap();
         assert_eq!(store.contacts_sync_token(&book.href).unwrap(), None);
+    }
+
+    /// **El lugar que pide un lote es su cambio neto.** Reescribir una tarjeta
+    /// cuenta la diferencia, borrar resta, y un lote que crece más que `room`
+    /// no escribe nada, ni el token.
+    #[test]
+    fn el_lote_cuenta_el_cambio_neto_contra_el_lugar() {
+        let temp = TempDir::new("contactos-neto");
+        let mut store = open_store(&temp);
+        let book = store
+            .upsert_address_books(&[("https://x/a/".into(), "A".into())])
+            .unwrap()
+            .remove(0);
+        let ana = row("https://x/a/1.vcf", "Ana María López", "ana@x.com");
+        let juan = row("https://x/a/2.vcf", "Juan", "j@x.com");
+        let (ana_len, juan_len) = (ana.raw_vcard.len() as i64, juan.raw_vcard.len() as i64);
+        assert!(juan_len < ana_len);
+
+        assert_eq!(
+            store
+                .apply_contacts(&book, &[ContactOp::Upsert(ana.clone())], None, u64::MAX)
+                .unwrap(),
+            Applied::Written { net_bytes: ana_len }
+        );
+        // La misma tarjeta otra vez no crece: entra sin lugar.
+        assert_eq!(
+            store
+                .apply_contacts(&book, &[ContactOp::Upsert(ana.clone())], None, 0)
+                .unwrap(),
+            Applied::Written { net_bytes: 0 }
+        );
+
+        // Una nueva que no entra: nada escrito, tampoco el token.
+        let progress = BookProgress {
+            token: Some("t2".into()),
+            ctag: None,
+        };
+        assert_eq!(
+            store
+                .apply_contacts(
+                    &book,
+                    &[ContactOp::Upsert(juan.clone())],
+                    Some(&progress),
+                    juan_len as u64 - 1,
+                )
+                .unwrap(),
+            Applied::OverCap
+        );
+        assert_eq!(count(&store, "SELECT count(*) FROM contacts"), 1);
+        assert_eq!(store.contacts_sync_token(&book.href).unwrap(), None);
+        assert_eq!(store.contacts_raw_bytes().unwrap(), ana_len as u64);
+
+        // Borrar una y traer otra más chica en el mismo lote achica la cuenta,
+        // y entra sin lugar.
+        assert_eq!(
+            store
+                .apply_contacts(
+                    &book,
+                    &[ContactOp::Delete(ana.href.clone()), ContactOp::Upsert(juan),],
+                    Some(&progress),
+                    0,
+                )
+                .unwrap(),
+            Applied::Written {
+                net_bytes: juan_len - ana_len
+            }
+        );
+        assert_eq!(store.contacts_raw_bytes().unwrap(), juan_len as u64);
+        assert_eq!(
+            store.contacts_sync_token(&book.href).unwrap().as_deref(),
+            Some("t2")
+        );
     }
 
     /// **Un lote de una libreta que no está en la base no escribe nada**, ni el
@@ -550,7 +672,7 @@ pub(crate) mod tests {
         let fresh = TempDir::new("contactos-libreta-nueva");
         let mut store = open_store(&fresh);
         assert!(matches!(
-            store.apply_contacts(&book, &[], Some(&progress)),
+            store.apply_contacts(&book, &[], Some(&progress), u64::MAX),
             Err(StoreError::Missing)
         ));
         assert_eq!(store.contacts_sync_token(&book.href).unwrap(), None);
@@ -572,6 +694,7 @@ pub(crate) mod tests {
                     "a@x.com"
                 ))],
                 Some(&progress),
+                u64::MAX,
             ),
             Err(StoreError::Missing)
         ));
@@ -593,7 +716,7 @@ pub(crate) mod tests {
         let ops: Vec<ContactOp> = (0..=WRITE_BATCH_ROWS)
             .map(|i| ContactOp::Delete(format!("https://x/a/{i}.vcf")))
             .collect();
-        assert!(store.apply_contacts(&book, &ops, None).is_err());
+        assert!(store.apply_contacts(&book, &ops, None, u64::MAX).is_err());
     }
 
     /// Una libreta que se va se borra de a tandas, y con la última se va ella.
@@ -609,7 +732,7 @@ pub(crate) mod tests {
             let ops: Vec<ContactOp> = (start..start + WRITE_BATCH_ROWS)
                 .map(|i| ContactOp::Upsert(row(&format!("https://x/a/{i}.vcf"), "Ana", "a@x.com")))
                 .collect();
-            store.apply_contacts(&book, &ops, None).unwrap();
+            store.apply_contacts(&book, &ops, None, u64::MAX).unwrap();
         }
         store
             .apply_contacts(
@@ -619,6 +742,7 @@ pub(crate) mod tests {
                     token: Some("t".into()),
                     ctag: None,
                 }),
+                u64::MAX,
             )
             .unwrap();
 
