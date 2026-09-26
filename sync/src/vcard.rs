@@ -405,21 +405,18 @@ pub fn decoded(property: &Property) -> String {
     let declared = declared_charset(property);
     let printable = has("encoding=quoted-printable") || has("quoted-printable");
 
-    // Sin nada declarado y sin codificar, el valor ya es texto: es el caso de
-    // la 3.0 y la 4.0, que es casi todo.
-    if !printable && declared.is_none() {
+    // Sin codificar, el valor ya es texto, y declare lo que declare: la tarjeta
+    // llegó como `String` —el cuerpo de la respuesta pasó a UTF-8 antes de
+    // leer el XML—, así que sus bytes son UTF-8 y no los del juego declarado.
+    // Volver a decodificarlos con él rompía lo que ya estaba bien:
+    // `FN;CHARSET=ISO-8859-2:Łukasz` salía «Ĺ», un control invisible y «ukasz».
+    // El juego declarado sólo describe los bytes que salen de deshacer el
+    // `quoted-printable`.
+    if !printable {
         return property.value.clone();
     }
 
-    let bytes = if printable {
-        decode_quoted_printable(&property.value)
-    } else {
-        // Ya vino como texto, pero declarando otro juego: los bytes originales
-        // se recuperan del texto tal como llegó.
-        property.value.as_bytes().to_vec()
-    };
-
-    to_text(&bytes, declared)
+    to_text(&decode_quoted_printable(&property.value), declared)
 }
 
 /// Pasa bytes a texto según el juego que declaró la tarjeta.
@@ -953,6 +950,29 @@ mod tests {
 
         // Y el que no se conoce cae al respaldo en vez de romper.
         assert_eq!(to_text(b"caf\xe9", Some("juego-inventado")), "café");
+    }
+
+    /// **Un valor sin `quoted-printable` ya es texto, declare el juego que
+    /// declare.** La tarjeta llega como `String`: sus bytes son UTF-8, y
+    /// decodificarlos otra vez con `ISO-8859-2`, `KOI8-R` o `Shift_JIS` rompía lo
+    /// que estaba bien. El juego declarado sí vale para los bytes de un
+    /// `quoted-printable`.
+    #[test]
+    fn el_juego_declarado_no_redecodifica_un_valor_que_ya_es_texto() {
+        let card = "BEGIN:VCARD\r\nVERSION:3.0\r\n\
+            FN;CHARSET=ISO-8859-2:Łukasz Żółć\r\n\
+            N;CHARSET=KOI8-R:Иванов;Иван;;;\r\n\
+            ORG;CHARSET=Shift_JIS:東京\r\nEND:VCARD";
+        let c = contact_from(card, "").unwrap();
+        assert_eq!(c.display_name, "Łukasz Żółć");
+        assert_eq!(c.sort_name, "Иванов, Иван");
+        assert_eq!(c.organization, "東京");
+
+        // Con `quoted-printable`, los bytes son los del juego declarado: 0xA3 es
+        // «Ł» en ISO-8859-2 (y «£» en latin-1).
+        let old = "BEGIN:VCARD\r\nVERSION:2.1\r\n\
+            FN;CHARSET=ISO-8859-2;ENCODING=QUOTED-PRINTABLE:=A3ukasz\r\nEND:VCARD";
+        assert_eq!(contact_from(old, "").unwrap().display_name, "Łukasz");
     }
 
     /// Los esquemas de una URI no distinguen mayúsculas, y los exportadores de
