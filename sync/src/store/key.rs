@@ -185,6 +185,17 @@ impl std::error::Error for KeyError {}
 /// Un rasgo y no el cliente de Secret Service a secas para que el ciclo de vida
 /// se pueda probar entero —fila por fila de su tabla— sin un llavero de verdad.
 pub trait KeySource: Send + Sync + 'static {
+    /// Resuelve la colección donde viven las claves —el alias `default`— y la
+    /// **fija** para todo lo que siga, hasta la próxima vez que se llame.
+    /// Devuelve su identidad: la ruta y su momento de creación (`Created`).
+    ///
+    /// Se llama una vez por vuelta de la tabla del ciclo de vida. Sin fijarla,
+    /// un `SetAlias` —que puede mandar cualquier proceso de la sesión— a mitad
+    /// de una vuelta partiría las claves entre dos colecciones; y comparando la
+    /// identidad con la que creó cada clave, un alias que cambió o un llavero
+    /// que se reemplazó no se confunden con «se perdieron todas las claves».
+    fn pin_collection(&self) -> impl Future<Output = Result<String, KeyError>> + Send;
+
     /// Si la colección donde viven las claves está bloqueada.
     ///
     /// Es **la** pregunta: ninguna clave se genera sin haber leído `false` acá.
@@ -248,6 +259,9 @@ pub struct SecretServiceKeys {
     /// El nombre único del dueño de `destination` la última vez que se
     /// preguntó, para saber de quién es una señal.
     owner: Arc<std::sync::Mutex<Option<OwnedUniqueName>>>,
+    /// La colección fijada por [`KeySource::pin_collection`]. Mientras no se
+    /// fije ninguna, cada operación lee el alias.
+    pinned: Arc<std::sync::Mutex<Option<OwnedObjectPath>>>,
 }
 
 impl SecretServiceKeys {
@@ -258,6 +272,7 @@ impl SecretServiceKeys {
             connection,
             destination: Some(SERVICE_NAME),
             owner: Arc::default(),
+            pinned: Arc::default(),
         }
     }
 
@@ -268,6 +283,7 @@ impl SecretServiceKeys {
             connection,
             destination: None,
             owner: Arc::default(),
+            pinned: Arc::default(),
         }
     }
 
@@ -305,9 +321,23 @@ impl SecretServiceKeys {
             .map_err(|e| KeyError::Failed(format!("la propiedad {name} no se entiende: {e}")))
     }
 
+    /// La colección de las claves: la fijada, o si no hay ninguna, la del
+    /// alias `default`.
+    async fn default_collection(&self) -> Result<OwnedObjectPath, KeyError> {
+        let pinned = self
+            .pinned
+            .lock()
+            .map(|pinned| pinned.clone())
+            .unwrap_or(None);
+        match pinned {
+            Some(path) => Ok(path),
+            None => self.read_default_alias().await,
+        }
+    }
+
     /// La colección por omisión. Sin ella no hay dónde guardar, y crear una
     /// abriría un diálogo.
-    async fn default_collection(&self) -> Result<OwnedObjectPath, KeyError> {
+    async fn read_default_alias(&self) -> Result<OwnedObjectPath, KeyError> {
         let path: OwnedObjectPath = self
             .call(SERVICE_PATH, SERVICE_IFACE, "ReadAlias", &("default",))
             .await?;
@@ -468,6 +498,22 @@ pub fn is_lock_change(message: &zbus::Message) -> bool {
 }
 
 impl KeySource for SecretServiceKeys {
+    async fn pin_collection(&self) -> Result<String, KeyError> {
+        let path = self.read_default_alias().await?;
+        // `Created` es del estándar y `vasak-keyring` lo tiene. Un llavero que
+        // no lo contesta da siempre la misma identidad —la ruta y `?`—, que es
+        // lo que importa: que no cambie sola.
+        let created = self
+            .property::<u64>(path.as_str(), COLLECTION_IFACE, "Created")
+            .await
+            .map_or_else(|_| "?".to_string(), |c| c.to_string());
+        let identity = format!("{}#{created}", path.as_str());
+        if let Ok(mut pinned) = self.pinned.lock() {
+            *pinned = Some(path);
+        }
+        Ok(identity)
+    }
+
     async fn is_locked(&self) -> Result<bool, KeyError> {
         let collection = self.default_collection().await?;
         self.collection_locked(&collection).await
@@ -651,6 +697,11 @@ pub(crate) mod fake {
         /// la clave ahí: `vasak-keyring` diciendo `Locked == false` antes de
         /// haber descifrado nada.
         pub blind_finds: usize,
+        /// La identidad de la colección, como la da `pin_collection`. Vacía es
+        /// `coleccion-a`.
+        pub collection: String,
+        /// Cuántas veces se fijó la colección.
+        pub pins: usize,
     }
 
     #[derive(Clone, Default)]
@@ -663,6 +714,19 @@ pub(crate) mod fake {
     }
 
     impl KeySource for FakeKeys {
+        async fn pin_collection(&self) -> Result<String, KeyError> {
+            let mut state = self.state();
+            if state.unavailable {
+                return Err(KeyError::Unavailable("sin llavero".into()));
+            }
+            state.pins += 1;
+            Ok(if state.collection.is_empty() {
+                "coleccion-a".to_string()
+            } else {
+                state.collection.clone()
+            })
+        }
+
         async fn is_locked(&self) -> Result<bool, KeyError> {
             let mut state = self.state();
             if state.unavailable {
@@ -838,6 +902,10 @@ mod tests {
         items: BTreeMap<String, (HashMap<String, String>, Vec<u8>)>,
         sessions: u32,
         closed_sessions: u32,
+        /// `Created` de la colección.
+        created: u64,
+        /// Cuántas veces se leyó el alias.
+        alias_reads: u32,
     }
 
     type Shared = Arc<Mutex<FakeKeyring>>;
@@ -871,6 +939,7 @@ mod tests {
         }
 
         async fn read_alias(&self, alias: &str) -> OwnedObjectPath {
+            self.0.lock().unwrap().alias_reads += 1;
             let path = if alias == "default" {
                 COLLECTION_PATH
             } else {
@@ -960,6 +1029,11 @@ mod tests {
         async fn locked(&self) -> bool {
             self.0.lock().unwrap().locked
         }
+
+        #[zbus(property)]
+        async fn created(&self) -> u64 {
+            self.0.lock().unwrap().created
+        }
     }
 
     struct FakeItem(Shared, String);
@@ -1025,6 +1099,36 @@ mod tests {
             server.unwrap(),
             shared,
         )
+    }
+
+    /// La identidad de la colección es su ruta y su `Created`, y una vez
+    /// fijada las operaciones no vuelven a leer el alias: un `SetAlias` a mitad
+    /// de una vuelta no parte las claves entre dos colecciones.
+    #[tokio::test]
+    async fn la_coleccion_se_fija_una_vez_por_vuelta() {
+        let (keys, _server, shared) = fake_keyring().await;
+        shared.lock().unwrap().created = 1700;
+
+        let identity = keys.pin_collection().await.unwrap();
+        assert_eq!(identity, format!("{COLLECTION_PATH}#1700"));
+        let reads = shared.lock().unwrap().alias_reads;
+
+        let key = StoreKey::generate().unwrap();
+        keys.store("cuenta", &key).await.unwrap();
+        assert_eq!(keys.find("cuenta").await.unwrap(), Some(key));
+        assert!(!keys.is_locked().await.unwrap());
+        assert_eq!(
+            shared.lock().unwrap().alias_reads,
+            reads,
+            "con la colección fijada no se vuelve a leer el alias"
+        );
+
+        // La misma ruta, recreada: otra identidad.
+        shared.lock().unwrap().created = 1800;
+        assert_eq!(
+            keys.pin_collection().await.unwrap(),
+            format!("{COLLECTION_PATH}#1800")
+        );
     }
 
     #[tokio::test]

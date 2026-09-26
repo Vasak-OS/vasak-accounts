@@ -42,9 +42,19 @@
 //!   cuentas: una que pide reautenticarse sigue siendo de la persona y conserva
 //!   su base. Ver [`Listings`].
 //!
+//! - **La colección del llavero se fija una vez por vuelta** y se anota cuál
+//!   guarda la clave de cada base (`key_collections` en `stores.json`). Si en
+//!   una vuelta la colección no es la anotada —el alias `default` apunta a otra,
+//!   que `SetAlias` lo puede cambiar cualquier proceso de la sesión, o el
+//!   llavero es otro—, que la clave «no esté» no quiere decir que se perdió: la
+//!   base **no se rehace**, queda no disponible con el motivo, y abre como
+//!   estaba en cuanto vuelve la colección. Vaciarla es la salida si el cambio
+//!   fue a propósito.
+//!
 //! Lo que **nunca** lleva a borrar: un error del disco, un error del llavero, un
-//! esquema más nuevo que este programa. Sólo una clave que no está —leída con el
-//! llavero desbloqueado— o una que no abre.
+//! esquema más nuevo que este programa, una colección que cambió. Sólo una clave
+//! que no está —leída con el llavero desbloqueado, en la colección donde se
+//! guardó— o una que no abre.
 //!
 //! ── Las áreas, y quién escribe ──────────────────────────────────────────────
 //!
@@ -313,6 +323,17 @@ pub struct StoreSettings {
     /// releer, «la clave no está» no se sabe.
     #[serde(default)]
     pub pending_key_deletions: BTreeSet<String>,
+    /// En qué colección del llavero está la clave de cada base: la identidad
+    /// que dio [`KeySource::pin_collection`] cuando se guardó, o cuando se la
+    /// encontró y abrió la base por primera vez.
+    ///
+    /// Es lo que separa «se perdió la clave» de «el llavero es otro». Si la
+    /// colección de ahora no es la anotada —el alias `default` apunta a otra, o
+    /// el llavero se reemplazó—, la clave no «falta»: está en otra parte, y la
+    /// base **no se rehace**. Queda no disponible y el estado lo dice, hasta
+    /// que vuelva la colección o la persona la vacíe.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub key_collections: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -938,7 +959,16 @@ impl<K: KeySource> StoreManager<K> {
             }
         };
 
-        let locked = match self.keys.is_locked().await {
+        // La colección, una vez por vuelta: lo que sigue la usa fijada.
+        let mut collection = String::new();
+        let locked = match self.keys.pin_collection().await {
+            Ok(identity) => {
+                collection = identity;
+                self.keys.is_locked().await
+            }
+            Err(e) => Err(e),
+        };
+        let locked = match locked {
             Ok(locked) => locked,
             Err(e) => {
                 // Sin saber si el llavero está abierto, la clave no se usa: se
@@ -998,7 +1028,7 @@ impl<K: KeySource> StoreManager<K> {
         }
 
         for id in targets {
-            self.bring_account(inner, locations, &mut settings, &cleared, &id)
+            self.bring_account(inner, locations, &mut settings, &cleared, &collection, &id)
                 .await;
         }
     }
@@ -1010,6 +1040,7 @@ impl<K: KeySource> StoreManager<K> {
         locations: &Locations,
         settings: &mut StoreSettings,
         cleared: &BTreeSet<String>,
+        collection: &str,
         account_id: &str,
     ) {
         if !settings.is_enabled(account_id) {
@@ -1042,7 +1073,25 @@ impl<K: KeySource> StoreManager<K> {
             return;
         }
 
-        let result = self.bring_up(&locations.stores, account_id, pending).await;
+        let moved = settings
+            .key_collections
+            .get(account_id)
+            .is_some_and(|recorded| recorded != collection);
+        let result = self
+            .bring_up(&locations.stores, account_id, pending, moved)
+            .await;
+        if result.is_ok()
+            && settings.key_collections.get(account_id).map(String::as_str) != Some(collection)
+        {
+            // La clave con la que abrió está en esta colección: la guardó
+            // recién, o la encontró ahí.
+            settings
+                .key_collections
+                .insert(account_id.to_string(), collection.to_string());
+            if let Err(e) = settings.save(&locations.settings) {
+                tracing::warn!("{e}");
+            }
+        }
         if pending && result.is_ok() {
             // Recién ahora: hay una clave nueva guardada y releída, que
             // reemplazó a la vieja en el llavero.
@@ -1081,13 +1130,22 @@ impl<K: KeySource> StoreManager<K> {
     /// usa: es una cuenta vaciada o apagada, y una clave que aparece ahí es la
     /// vieja —un `Delete` que contestó bien y no borró—. Se sigue como si no
     /// hubiera clave, y la nueva la reemplaza.
+    ///
+    /// Con `collection_moved`, la clave de esta cuenta se guardó en otra
+    /// colección que la de esta vuelta. Si hay base, **no se toca**: ni se
+    /// busca la clave —lo que haya en esta colección no es la suya—, ni se
+    /// rehace. Sin base no hay nada que perder, y se sigue como siempre.
     async fn bring_up(
         &self,
         root: &Path,
         account_id: &str,
         discard_found_key: bool,
+        collection_moved: bool,
     ) -> Result<(Store, bool), StoreError> {
         let paths = StorePaths::new(root, account_id)?;
+        if collection_moved && paths.db_exists()? {
+            return Err(StoreError::CollectionChanged);
+        }
 
         let key = if discard_found_key {
             None
@@ -1249,9 +1307,13 @@ impl<K: KeySource> StoreManager<K> {
                 tracing::warn!("'{account_id}': la clave se borra después: {e}");
             }
         }
+        // La colección anotada se olvida: la base que venga después se hace
+        // con una clave nueva, en la colección de ese momento.
+        let forgot = settings.key_collections.remove(account_id).is_some();
         if settings
             .pending_key_deletions
             .insert(account_id.to_string())
+            || forgot
         {
             if let Err(e) = settings.save(&locations.settings) {
                 tracing::warn!("{e}");
@@ -1329,6 +1391,7 @@ impl<K: KeySource> StoreManager<K> {
             }
             settings.pending_key_deletions.remove(&account_id);
             settings.accounts.remove(&account_id);
+            settings.key_collections.remove(&account_id);
             changed = true;
             tracing::info!(
                 "se olvidó la clave pendiente de «{account_id}», que ya no es una cuenta"
@@ -1396,11 +1459,14 @@ impl<K: KeySource> StoreManager<K> {
         // Y lo decidido para cuentas que ya no existen. `pending_key_deletions`
         // no: ésa necesita el llavero, y la vacía `forget_gone_accounts`.
         if let Ok(mut settings) = StoreSettings::load(&locations.settings) {
-            let before = settings.accounts.len();
+            let before = (settings.accounts.len(), settings.key_collections.len());
             settings
                 .accounts
                 .retain(|id, _| !listings.is_confirmed_gone(id));
-            if settings.accounts.len() != before {
+            settings
+                .key_collections
+                .retain(|id, _| !listings.is_confirmed_gone(id));
+            if (settings.accounts.len(), settings.key_collections.len()) != before {
                 if let Err(e) = settings.save(&locations.settings) {
                     tracing::warn!("{e}");
                 }
@@ -1788,6 +1854,117 @@ mod tests {
         assert_eq!(f.state("cuenta").await, StoreState::Open);
         // La misma clave: no se generó otra.
         assert_eq!(f.keys.state().stored.len(), 1);
+    }
+
+    // ── La colección del llavero ────────────────────────────────────────────
+
+    /// El alias `default` que pasa a otra colección —o un llavero que se
+    /// reemplazó— hace que ninguna clave «esté». Eso no es una clave perdida:
+    /// **no se rehace ninguna base**, el estado lo dice, y al volver la
+    /// colección todo abre como estaba.
+    #[tokio::test]
+    async fn la_coleccion_del_llavero_que_cambia_no_rehace_ninguna_base() {
+        let f = Fixture::new("coleccion");
+        f.list(listing(&["a", "b"])).await;
+        assert_eq!(
+            f.settings().key_collections.get("a").map(String::as_str),
+            Some("coleccion-a")
+        );
+        assert_eq!(f.keys.state().pins, 1, "una vez por vuelta, no por cuenta");
+        let keys_before = f.keys.state().keys.clone();
+        let stored_before = f.keys.state().stored.len();
+
+        // Se bloquea —se cierran— y vuelve con otra colección, vacía.
+        f.keys.state().locked = true;
+        f.manager.refresh().await;
+        {
+            let mut state = f.keys.state();
+            state.locked = false;
+            state.collection = "coleccion-b".into();
+            state.keys.clear();
+        }
+        f.manager.refresh().await;
+
+        for id in ["a", "b"] {
+            assert_eq!(f.state(id).await, StoreState::Unavailable);
+            assert!(!f.manager.is_open(id).await);
+        }
+        let status = f.manager.status().await;
+        assert_eq!(
+            status.accounts[0].detail,
+            StoreError::CollectionChanged.to_string()
+        );
+        assert_eq!(
+            f.keys.state().stored.len(),
+            stored_before,
+            "no se tenía que generar ninguna clave"
+        );
+        assert!(f.keys.state().deleted.is_empty(), "ni borrar ninguna");
+
+        // Vuelve la colección de antes: abren las mismas, sin rehacer nada.
+        {
+            let mut state = f.keys.state();
+            state.collection = "coleccion-a".into();
+            state.keys = keys_before;
+        }
+        f.manager.refresh().await;
+        for id in ["a", "b"] {
+            assert_eq!(f.state(id).await, StoreState::Open);
+            assert!(log_lines(&f, id).is_empty(), "no se rehízo");
+        }
+    }
+
+    /// Vaciar es la salida cuando la colección cambió a propósito: la base
+    /// vuelve, vacía, con una clave en la colección nueva.
+    #[tokio::test]
+    async fn vaciar_con_la_coleccion_cambiada_la_rehace_en_la_nueva() {
+        let f = Fixture::new("coleccion-vaciar");
+        f.list(listing(&["cuenta"])).await;
+        f.keys.state().locked = true;
+        f.manager.refresh().await;
+        {
+            let mut state = f.keys.state();
+            state.locked = false;
+            state.collection = "coleccion-b".into();
+            state.keys.clear();
+        }
+        f.manager.refresh().await;
+        assert_eq!(f.state("cuenta").await, StoreState::Unavailable);
+
+        f.manager.clear("cuenta").await.unwrap();
+        assert_eq!(f.state("cuenta").await, StoreState::Open);
+        assert_eq!(
+            f.settings()
+                .key_collections
+                .get("cuenta")
+                .map(String::as_str),
+            Some("coleccion-b")
+        );
+    }
+
+    /// Una base de antes de anotar colecciones adopta la de la vuelta en que
+    /// su clave la abre, y desde ahí queda protegida.
+    #[tokio::test]
+    async fn una_base_sin_coleccion_anotada_adopta_la_de_la_vuelta() {
+        let f = Fixture::new("coleccion-adopta");
+        f.list(listing(&["cuenta"])).await;
+        let mut settings = f.settings();
+        settings.key_collections.clear();
+        settings.save(&f.locations().settings).unwrap();
+
+        f.keys.state().locked = true;
+        f.manager.refresh().await;
+        f.keys.state().locked = false;
+        f.manager.refresh().await;
+
+        assert_eq!(f.state("cuenta").await, StoreState::Open);
+        assert_eq!(
+            f.settings()
+                .key_collections
+                .get("cuenta")
+                .map(String::as_str),
+            Some("coleccion-a")
+        );
     }
 
     /// Si el llavero se bloquea entre la búsqueda y la creación, el vacío de la

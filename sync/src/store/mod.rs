@@ -71,6 +71,10 @@ pub enum StoreError {
     Settings(String),
     /// La cuenta no tiene almacén: no existe, o no tiene nada que guardar.
     UnknownAccount(String),
+    /// La colección del llavero no es en la que se guardó la clave de esta
+    /// base: el alias `default` cambió, o el llavero es otro. La base no se
+    /// rehace.
+    CollectionChanged,
 }
 
 impl std::fmt::Display for StoreError {
@@ -92,6 +96,10 @@ impl std::fmt::Display for StoreError {
             StoreError::Key(e) => write!(f, "{e}"),
             StoreError::Settings(d) => write!(f, "stores.json: {d}"),
             StoreError::UnknownAccount(id) => write!(f, "la cuenta «{id}» no tiene almacén"),
+            StoreError::CollectionChanged => f.write_str(
+                "la colección del llavero no es en la que se guardó la clave de esta base; \
+                 no se rehace hasta que vuelva, o hasta vaciarla",
+            ),
         }
     }
 }
