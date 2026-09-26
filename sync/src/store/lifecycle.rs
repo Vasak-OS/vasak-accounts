@@ -2038,6 +2038,26 @@ mod tests {
 
     // ── La colección del llavero ────────────────────────────────────────────
 
+    /// Si la identidad de la colección no se pudo leer, la vuelta no crea ni
+    /// adopta nada y no anota ninguna colección: la siguiente lo hace con la
+    /// identidad de verdad, y la base no queda atada a una que no existe.
+    #[tokio::test]
+    async fn sin_la_identidad_de_la_coleccion_no_se_anota_nada() {
+        let f = Fixture::new("coleccion-sin-identidad");
+        f.keys.state().fail_pins = 1;
+        f.list(listing(&["a"])).await;
+        assert!(f.settings().key_collections.is_empty());
+        assert!(f.keys.state().stored.is_empty(), "no se creó ninguna clave");
+        assert!(!f.manager.is_open("a").await);
+
+        f.manager.refresh().await;
+        assert_eq!(
+            f.settings().key_collections.get("a").map(String::as_str),
+            Some("coleccion-a")
+        );
+        assert!(f.manager.is_open("a").await);
+    }
+
     /// El alias `default` que pasa a otra colección —o un llavero que se
     /// reemplazó— hace que ninguna clave «esté». Eso no es una clave perdida:
     /// **no se rehace ninguna base**, el estado lo dice, y al volver la

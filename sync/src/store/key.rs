@@ -349,6 +349,48 @@ impl SecretServiceKeys {
         Ok(path)
     }
 
+    /// `Created` de una colección, como texto para su identidad.
+    ///
+    /// `Created` es del estándar y `vasak-keyring` lo tiene. Un llavero que
+    /// **no lo tiene** lo dice siempre igual —`UnknownProperty`, o
+    /// `InvalidArgs` en GDBus, o que no tiene la interfaz o el método—, y da
+    /// siempre la misma identidad: la ruta y `?`, que es lo que importa, que no
+    /// cambie sola.
+    ///
+    /// **Cualquier otro error no es «no lo tiene»**: un llavero que se
+    /// reinicia, uno que no contestó a tiempo, uno que dijo `Failed`. Tomarlo
+    /// como `?` anotaba `ruta#?` en la vuelta en que se crea o se adopta una
+    /// base, y en la siguiente, con `Created` contestando, la identidad pasaba
+    /// a ser otra y la base quedaba `unavailable` para siempre. Así que es
+    /// `Err`, y la vuelta se corta sin anotar nada: la próxima lo vuelve a
+    /// intentar.
+    async fn collection_created(&self, path: &OwnedObjectPath) -> Result<String, KeyError> {
+        let reply = self
+            .connection
+            .call_method(
+                self.destination,
+                path.as_str(),
+                Some(PROPERTIES_IFACE),
+                "Get",
+                &(COLLECTION_IFACE, "Created"),
+            )
+            .await;
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(zbus::Error::MethodError(name, _, _)) if lacks_property(name.as_str()) => {
+                return Ok("?".to_string());
+            }
+            Err(e) => return Err(classify("Get(Created)", e)),
+        };
+        let value: OwnedValue = reply
+            .body()
+            .deserialize()
+            .map_err(|e| KeyError::Failed(format!("respuesta inválida de Get(Created): {e}")))?;
+        // Un `Created` de otro tipo tampoco cambia solo: es siempre el mismo
+        // llavero contestando lo mismo.
+        Ok(u64::try_from(value).map_or_else(|_| "?".to_string(), |c| c.to_string()))
+    }
+
     /// `Locked` de una colección.
     async fn collection_locked(&self, collection: &OwnedObjectPath) -> Result<bool, KeyError> {
         self.property(collection.as_str(), COLLECTION_IFACE, "Locked")
@@ -500,13 +542,7 @@ pub fn is_lock_change(message: &zbus::Message) -> bool {
 impl KeySource for SecretServiceKeys {
     async fn pin_collection(&self) -> Result<String, KeyError> {
         let path = self.read_default_alias().await?;
-        // `Created` es del estándar y `vasak-keyring` lo tiene. Un llavero que
-        // no lo contesta da siempre la misma identidad —la ruta y `?`—, que es
-        // lo que importa: que no cambie sola.
-        let created = self
-            .property::<u64>(path.as_str(), COLLECTION_IFACE, "Created")
-            .await
-            .map_or_else(|_| "?".to_string(), |c| c.to_string());
+        let created = self.collection_created(&path).await?;
         let identity = format!("{}#{created}", path.as_str());
         if let Ok(mut pinned) = self.pinned.lock() {
             *pinned = Some(path);
@@ -623,6 +659,22 @@ fn account_attributes(account_id: &str) -> HashMap<&str, &str> {
 ///
 /// Importa por lo que se hace después: ninguno de los tres es «no hay clave»,
 /// y ninguno lleva a borrar ni a generar nada.
+/// Si un error de `Properties.Get` quiere decir «esa propiedad no existe acá»:
+/// una respuesta que el llavero da siempre igual, y no una falla pasajera.
+fn lacks_property(error_name: &str) -> bool {
+    [
+        ".UnknownProperty",
+        ".InvalidArgs",
+        ".UnknownInterface",
+        ".UnknownMethod",
+        ".NotSupported",
+    ]
+    .iter()
+    .any(|suffix| {
+        error_name.starts_with("org.freedesktop.DBus.Error") && error_name.ends_with(suffix)
+    })
+}
+
 fn classify(method: &str, error: zbus::Error) -> KeyError {
     if let zbus::Error::MethodError(name, detail, _) = &error {
         let name = name.as_str();
@@ -702,6 +754,9 @@ pub(crate) mod fake {
         pub collection: String,
         /// Cuántas veces se fijó la colección.
         pub pins: usize,
+        /// Cuántas veces `pin_collection` falla antes de contestar: un
+        /// `Created` que no llegó.
+        pub fail_pins: usize,
     }
 
     #[derive(Clone, Default)]
@@ -718,6 +773,10 @@ pub(crate) mod fake {
             let mut state = self.state();
             if state.unavailable {
                 return Err(KeyError::Unavailable("sin llavero".into()));
+            }
+            if state.fail_pins > 0 {
+                state.fail_pins -= 1;
+                return Err(KeyError::Failed("Get(Created): no contestó".into()));
             }
             state.pins += 1;
             Ok(if state.collection.is_empty() {
@@ -904,6 +963,12 @@ mod tests {
         closed_sessions: u32,
         /// `Created` de la colección.
         created: u64,
+        /// Cuántas veces `Created` contesta `Failed` antes de contestar bien:
+        /// un llavero que se está reiniciando.
+        created_failures: u32,
+        /// Que la colección no tenga `Created`: un llavero que no lo
+        /// implementa.
+        without_created: bool,
         /// Cuántas veces se leyó el alias.
         alias_reads: u32,
     }
@@ -1031,8 +1096,16 @@ mod tests {
         }
 
         #[zbus(property)]
-        async fn created(&self) -> u64 {
-            self.0.lock().unwrap().created
+        async fn created(&self) -> zbus::fdo::Result<u64> {
+            let mut state = self.0.lock().unwrap();
+            if state.without_created {
+                return Err(zbus::fdo::Error::UnknownProperty("Created".into()));
+            }
+            if state.created_failures > 0 {
+                state.created_failures -= 1;
+                return Err(zbus::fdo::Error::Failed("reiniciando".into()));
+            }
+            Ok(state.created)
         }
     }
 
@@ -1129,6 +1202,68 @@ mod tests {
             keys.pin_collection().await.unwrap(),
             format!("{COLLECTION_PATH}#1800")
         );
+    }
+
+    /// Un error pasajero al leer `Created` no es «este llavero no tiene
+    /// `Created`»: la vuelta no fija nada y la siguiente lee la identidad de
+    /// verdad. Anotado como `ruta#?`, la base quedaba `unavailable` en cuanto
+    /// `Created` volvía a contestar.
+    #[tokio::test]
+    async fn un_error_al_leer_created_no_se_anota_como_coleccion() {
+        let (keys, _server, shared) = fake_keyring().await;
+        {
+            let mut state = shared.lock().unwrap();
+            state.created = 1700;
+            state.created_failures = 1;
+        }
+        let first = keys.pin_collection().await;
+        assert!(
+            matches!(first, Err(KeyError::Failed(_))),
+            "un Failed de Created tenía que cortar la vuelta"
+        );
+        assert!(
+            keys.pinned.lock().unwrap().is_none(),
+            "sin identidad no se fija ninguna colección"
+        );
+        assert_eq!(
+            keys.pin_collection().await.unwrap(),
+            format!("{COLLECTION_PATH}#1700"),
+            "la vuelta siguiente lee la identidad de verdad"
+        );
+    }
+
+    /// Un llavero que no tiene `Created` da siempre la misma identidad, la
+    /// ruta y `?`: eso no cambia solo, y no es un error.
+    #[tokio::test]
+    async fn un_llavero_sin_created_da_siempre_la_misma_identidad() {
+        let (keys, _server, shared) = fake_keyring().await;
+        shared.lock().unwrap().without_created = true;
+        for _ in 0..2 {
+            assert_eq!(
+                keys.pin_collection().await.unwrap(),
+                format!("{COLLECTION_PATH}#?")
+            );
+        }
+    }
+
+    #[test]
+    fn solo_lo_que_dice_que_no_hay_propiedad_es_no_tener_created() {
+        for name in [
+            "org.freedesktop.DBus.Error.UnknownProperty",
+            "org.freedesktop.DBus.Error.InvalidArgs",
+            "org.freedesktop.DBus.Error.UnknownInterface",
+        ] {
+            assert!(lacks_property(name), "{name}");
+        }
+        for name in [
+            "org.freedesktop.DBus.Error.Failed",
+            "org.freedesktop.DBus.Error.NoReply",
+            "org.freedesktop.DBus.Error.ServiceUnknown",
+            "org.freedesktop.DBus.Error.UnknownObject",
+            "ar.net.vasak.Keyring.Error.InvalidArgs",
+        ] {
+            assert!(!lacks_property(name), "{name}");
+        }
     }
 
     #[tokio::test]
