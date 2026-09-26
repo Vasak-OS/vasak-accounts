@@ -1,7 +1,11 @@
 //! La sincronización de contactos contra un servidor CardDAV de mentira en
 //! `127.0.0.1`, sin red, sin bus y con el llavero falso.
 
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
+
+use zeroize::Zeroizing;
 
 use base64::Engine;
 use rusqlite::OptionalExtension;
@@ -9,6 +13,7 @@ use rusqlite::OptionalExtension;
 use super::*;
 use crate::dav::fake::{card, FakeDav, RecordedRequest};
 use crate::dav::webdav::AuthKind;
+use crate::dav_sync::{merge_delta, REQUEST_COOLDOWN};
 use crate::store::key::fake::FakeKeys;
 use crate::store::lifecycle::{AccountListing, Consent, ListedAccount, Locations};
 use crate::store::paths::tests::TempDir;
@@ -20,6 +25,8 @@ struct CredentialState {
     /// La de una cuenta en particular, antes que `result`.
     per_account: HashMap<String, DavCredential>,
     calls: usize,
+    /// Las capacidades que se pidieron, en orden.
+    asked: Vec<&'static str>,
 }
 
 #[derive(Clone)]
@@ -36,12 +43,14 @@ impl FakeCredentials {
 }
 
 impl CredentialSource for FakeCredentials {
-    async fn contacts_credential(
+    async fn credential(
         &self,
         account_id: &str,
+        capability: &'static str,
     ) -> Result<DavCredential, CredentialError> {
         let mut state = self.0.lock().unwrap();
         state.calls += 1;
+        state.asked.push(capability);
         match state.per_account.get(account_id) {
             Some(credential) => Ok(credential.clone()),
             None => state.result.clone(),
@@ -108,7 +117,7 @@ impl Fixture {
             )
             .await;
         assert!(manager
-            .activate_contacts(ACCOUNT, Consent::Granted)
+            .activate_area(CONTACTS_AREA, ACCOUNT, Consent::Granted)
             .await
             .unwrap());
 
@@ -117,6 +126,7 @@ impl Fixture {
             result: Ok(credential_for(&server)),
             per_account: HashMap::new(),
             calls: 0,
+            asked: Vec::new(),
         })));
         let notified = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&notified);
@@ -200,7 +210,7 @@ impl Fixture {
     }
 
     async fn token(&self, book: usize) -> Option<String> {
-        let href = self.server.book_url(book).to_string();
+        let href = self.server.collection_url(book).to_string();
         self.query(move |c| {
             c.query_row(
                 "SELECT token FROM sync_state WHERE area = 'contacts' AND collection = ?1",
@@ -311,6 +321,8 @@ async fn la_carga_inicial_trae_todas_las_tarjetas_y_guarda_el_token() {
     }
     assert_eq!(f.contacts_status().await["state"], "synced");
     assert!(f.notified.load(Ordering::SeqCst) > 0);
+    // Y a la credencial se le pidió `contacts`, y nada más.
+    assert_eq!(f.credentials.0.lock().unwrap().asked, vec!["contacts"]);
 }
 
 // ── Las diferencias ─────────────────────────────────────────────────────────
@@ -523,7 +535,7 @@ async fn un_507_que_no_avanza_el_token_no_borra_ni_guarda_nada() {
 #[tokio::test]
 async fn sin_sync_collection_se_compara_por_etag() {
     let f = Fixture::new("contactos-etag").await;
-    f.server.state().books[0].supports_sync = false;
+    f.server.state().collections[0].supports_sync = false;
     f.server.put(0, "ana.vcf", &card("1", "Ana", "ana@x.com"));
     f.server
         .put(0, "juan.vcf", &card("2", "Juan", "juan@x.com"));
@@ -558,7 +570,7 @@ async fn un_servidor_que_no_dice_nada_se_prueba_y_se_va_por_etag() {
     let f = Fixture::new("contactos-etag-probado").await;
     {
         let mut state = f.server.state();
-        state.books[0].supports_sync = false;
+        state.collections[0].supports_sync = false;
         state.hide_reports = true;
     }
     f.server.put(0, "ana.vcf", &card("1", "Ana", "ana@x.com"));
@@ -574,7 +586,7 @@ async fn un_servidor_que_no_dice_nada_se_prueba_y_se_va_por_etag() {
 #[tokio::test]
 async fn con_el_getctag_igual_la_libreta_no_se_pide() {
     let f = Fixture::new("contactos-ctag").await;
-    f.server.state().books[0].ctag = Some("c1".into());
+    f.server.state().collections[0].ctag = Some("c1".into());
     f.server.put(0, "ana.vcf", &card("1", "Ana", "ana@x.com"));
     f.synced().await;
 
@@ -589,7 +601,7 @@ async fn con_el_getctag_igual_la_libreta_no_se_pide() {
     );
 
     f.server.put(0, "zoe.vcf", &card("2", "Zoe", "zoe@x.com"));
-    f.server.state().books[0].ctag = Some("c2".into());
+    f.server.state().collections[0].ctag = Some("c2".into());
     let report = f.synced().await;
     assert_eq!(report.fetched, 1);
     assert_eq!(f.names().await, vec!["Ana", "Zoe"]);
@@ -600,16 +612,16 @@ async fn con_el_getctag_igual_la_libreta_no_se_pide() {
 #[tokio::test]
 async fn una_libreta_que_ya_no_esta_se_borra_con_lo_suyo() {
     let f = Fixture::new("contactos-libreta-ida").await;
-    let work = f.server.add_book("/dav/ana/trabajo/", "Trabajo");
+    let work = f.server.add_collection("/dav/ana/trabajo/", "Trabajo");
     f.server.put(0, "ana.vcf", &card("1", "Ana", "ana@x.com"));
     f.server
         .put(work, "jefe.vcf", &card("2", "La Jefa", "jefa@x.com"));
     f.synced().await;
     assert_eq!(f.names().await, vec!["Ana", "La Jefa"]);
     assert!(f.token(work).await.is_some());
-    let work_url = f.server.book_url(work).to_string();
+    let work_url = f.server.collection_url(work).to_string();
 
-    f.server.state().books.remove(work);
+    f.server.state().collections.remove(work);
     let report = f.synced().await;
     assert_eq!(report.books, 1);
     assert_eq!(f.names().await, vec!["Ana"]);
@@ -636,7 +648,7 @@ async fn una_libreta_que_ya_no_esta_se_borra_con_lo_suyo() {
 #[tokio::test]
 async fn una_libreta_que_vuelve_con_otro_origen_no_se_borra() {
     let f = Fixture::new("contactos-libreta-otro-origen").await;
-    let work = f.server.add_book("/dav/ana/trabajo/", "Trabajo");
+    let work = f.server.add_collection("/dav/ana/trabajo/", "Trabajo");
     f.server.put(0, "ana.vcf", &card("1", "Ana", "ana@x.com"));
     f.server
         .put(work, "jefe.vcf", &card("2", "La Jefa", "jefa@x.com"));
@@ -645,8 +657,8 @@ async fn una_libreta_que_vuelve_con_otro_origen_no_se_borra() {
 
     {
         let mut state = f.server.state();
-        state.books.remove(work);
-        state.extra_books_xml = "<d:response><d:href>https://alias.ejemplo.com/dav/ana/trabajo/\
+        state.collections.remove(work);
+        state.extra_listing_xml = "<d:response><d:href>https://alias.ejemplo.com/dav/ana/trabajo/\
              </d:href><d:propstat><d:prop><d:resourcetype><d:collection/><c:addressbook/>\
              </d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>\
              </d:response>"
@@ -658,9 +670,65 @@ async fn una_libreta_que_vuelve_con_otro_origen_no_se_borra() {
     assert_eq!(f.count("SELECT count(*) FROM address_books").await, 2);
 
     // Cuando el listado vuelve a estar limpio, la que falta sí se borra.
-    f.server.state().extra_books_xml.clear();
+    f.server.state().extra_listing_xml.clear();
     f.synced().await;
     assert_eq!(f.names().await, vec!["Ana"]);
+}
+
+/// **N6** (la nota 1 de integridad del #52): **una tarjeta que vuelve con otro
+/// origen no se borra.** El N2 cubrió las libretas; esto es un nivel más
+/// abajo. Con el token vencido, la carga completa trae las mismas tres con la
+/// dirección entera de otro servidor: se descartan —no se piden— y lo guardado
+/// que «no vino» se borraba (3 → 0). Ahora la vuelta no borra nada de la
+/// libreta y no guarda el token nuevo; tampoco por ETag. Cuando el servidor
+/// vuelve a contestar bien, la libreta queda al día.
+#[tokio::test]
+async fn una_tarjeta_que_vuelve_con_otro_origen_no_se_borra() {
+    let f = Fixture::new("contactos-tarjeta-otro-origen").await;
+    f.server.put(0, "ana.vcf", &card("1", "Ana", "ana@x.com"));
+    f.server
+        .put(0, "juan.vcf", &card("2", "Juan", "juan@x.com"));
+    f.server.put(0, "zoe.vcf", &card("3", "Zoe", "zoe@x.com"));
+    f.synced().await;
+    let old = f.token(0).await.unwrap();
+
+    {
+        let mut state = f.server.state();
+        state.min_valid_token = state.version + 1;
+        state.resource_origin = Some("https://alias.ejemplo.com".into());
+    }
+    // Una nueva mientras tanto: el token del servidor avanza, y la nueva
+    // también viene de otro origen.
+    f.server.put(0, "eva.vcf", &card("4", "Eva", "eva@x.com"));
+    let before = f.server.requests().len();
+    let report = f.synced().await;
+    assert_eq!((report.full_resyncs, report.foreign), (1, 4));
+    assert_eq!(report.removed, 0);
+    assert_eq!(f.names().await, vec!["Ana", "Juan", "Zoe"]);
+    assert_ne!(f.server_token(), old);
+    assert_eq!(f.token(0).await, Some(old.clone()), "se guardó el token");
+    assert!(!f.requests_since(before).iter().any(|r| r.is_multiget()));
+
+    // Por ETag, igual.
+    f.server.state().collections[0].supports_sync = false;
+    let report = f.synced().await;
+    assert_eq!(
+        (report.etag_books, report.foreign, report.removed),
+        (1, 4, 0)
+    );
+    assert_eq!(f.names().await, vec!["Ana", "Juan", "Zoe"]);
+
+    // Y cuando vuelve a contestar bien, lo que de verdad se fue se borra.
+    {
+        let mut state = f.server.state();
+        state.collections[0].supports_sync = true;
+        state.resource_origin = None;
+    }
+    f.server.remove(0, "zoe.vcf");
+    let report = f.synced().await;
+    assert_eq!((report.foreign, report.removed, report.fetched), (0, 1, 1));
+    assert_eq!(f.names().await, vec!["Ana", "Eva", "Juan"]);
+    assert_eq!(f.token(0).await, Some(f.server_token()));
 }
 
 // ── El llavero ──────────────────────────────────────────────────────────────
@@ -680,7 +748,7 @@ async fn con_el_llavero_bloqueado_no_se_pide_ni_se_escribe_nada() {
 
     // Al desbloquear, la base se abre y no tiene nada.
     f.keys.state().locked = false;
-    assert!(f.manager.prepare_for_sync(ACCOUNT).await);
+    assert!(f.manager.prepare_for_sync(CONTACTS_AREA, ACCOUNT).await);
     assert_eq!(f.count("SELECT count(*) FROM contacts").await, 0);
 }
 
@@ -708,7 +776,7 @@ async fn si_el_llavero_se_bloquea_a_mitad_no_se_escribe_lo_que_llego() {
 
     f.server.state().on_request = None;
     f.keys.state().locked = false;
-    assert!(f.manager.prepare_for_sync(ACCOUNT).await);
+    assert!(f.manager.prepare_for_sync(CONTACTS_AREA, ACCOUNT).await);
     assert_eq!(f.count("SELECT count(*) FROM contacts").await, 0);
     assert_eq!(f.token(0).await, None);
 }
@@ -722,7 +790,7 @@ async fn si_el_llavero_se_bloquea_a_mitad_no_se_escribe_lo_que_llego() {
 #[tokio::test]
 async fn vaciar_a_mitad_de_la_vuelta_no_deja_el_token_viejo() {
     let f = Fixture::new("contactos-vaciar-a-mitad").await;
-    let second = f.server.add_book("/dav/ana/trabajo/", "Trabajo");
+    let second = f.server.add_collection("/dav/ana/trabajo/", "Trabajo");
     put_many(&f.server, 0, 0..2);
     put_many(&f.server, second, 10..13);
     f.synced().await;
@@ -732,7 +800,7 @@ async fn vaciar_a_mitad_de_la_vuelta_no_deja_el_token_viejo() {
     // antes de contestarse. `clear` corre en otro hilo con su propio bucle, y
     // el pedido espera a que termine: la vuelta sigue ya con la base nueva.
     let manager = Arc::clone(&f.manager);
-    let book_path = f.server.state().books[second].path.clone();
+    let book_path = f.server.state().collections[second].path.clone();
     let mut done = false;
     f.server.state().on_request = Some(Box::new(move |request| {
         if done || !request.is_sync_collection() || request.path != book_path {
@@ -758,7 +826,7 @@ async fn vaciar_a_mitad_de_la_vuelta_no_deja_el_token_viejo() {
         "la vuelta se corta al ver la base nueva"
     );
     f.server.state().on_request = None;
-    assert!(f.manager.prepare_for_sync(ACCOUNT).await);
+    assert!(f.manager.prepare_for_sync(CONTACTS_AREA, ACCOUNT).await);
     assert_eq!(f.token(second).await, None, "el token viejo no quedó");
 
     // La vuelta siguiente trae todo otra vez, las dos libretas.
@@ -887,7 +955,7 @@ async fn una_direccion_de_otro_origen_no_se_pide_ni_se_guarda() {
     f.server.put(0, "ana.vcf", &card("1", "Ana", "ana@x.com"));
     {
         let mut state = f.server.state();
-        state.extra_books_xml = format!(
+        state.extra_listing_xml = format!(
             "<d:response><d:href>{}/dav/ana/personal/</d:href><d:propstat><d:prop>\
              <d:resourcetype><d:collection/><c:addressbook/></d:resourcetype>\
              </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>",
@@ -996,7 +1064,7 @@ async fn una_tarjeta_contestada_con_otros_escapes_se_guarda_y_se_reconoce() {
     assert_eq!(f.names().await, vec!["Ana María"]);
 
     // Y por ETag, sin cambios: ni se trae ni se borra.
-    f.server.state().books[0].supports_sync = false;
+    f.server.state().collections[0].supports_sync = false;
     let before = f.server.requests().len();
     let report = f.synced().await;
     assert_eq!(
@@ -1015,7 +1083,7 @@ async fn una_tarjeta_contestada_con_otros_escapes_se_guarda_y_se_reconoce() {
 #[tokio::test]
 async fn un_xml_roto_no_lleva_texto_del_servidor_al_estado() {
     let f = Fixture::new("contactos-xml-roto").await;
-    f.server.state().extra_books_xml = "<Entrá-a-otro-sitio></x>".into();
+    f.server.state().extra_listing_xml = "<Entrá-a-otro-sitio></x>".into();
 
     let outcome = f.sync().await;
     let SyncOutcome::Failed(shown) = outcome else {
@@ -1043,7 +1111,7 @@ async fn un_xml_roto_no_lleva_texto_del_servidor_al_estado() {
 async fn una_respuesta_anidada_no_tumba_el_sincronizador() {
     let f = Fixture::new("contactos-anidada").await;
     f.server.put(0, "ana.vcf", &card("1", "Ana", "ana@x.com"));
-    f.server.state().extra_books_xml = format!(
+    f.server.state().extra_listing_xml = format!(
         "<d:response><d:href>/x/</d:href>{}{}</d:response>",
         "<d:x>".repeat(10_000),
         "</d:x>".repeat(10_000)
@@ -1163,8 +1231,8 @@ async fn una_cuenta_que_pasa_el_tope_de_libretas_no_se_guarda() {
         ..Limits::DEFAULT
     };
     let f = Fixture::with_limits("contactos-tope-libretas", limits).await;
-    f.server.add_book("/dav/ana/b/", "B");
-    f.server.add_book("/dav/ana/c/", "C");
+    f.server.add_collection("/dav/ana/b/", "B");
+    f.server.add_collection("/dav/ana/c/", "C");
 
     let SyncOutcome::Failed(detail) = f.sync().await else {
         panic!("tenía que fallar");
@@ -1299,11 +1367,11 @@ async fn una_cuenta_lenta_no_frena_a_las_otras() {
         )
         .await;
     assert!(manager
-        .activate_contacts("lenta", Consent::Granted)
+        .activate_area(CONTACTS_AREA, "lenta", Consent::Granted)
         .await
         .unwrap());
     assert!(manager
-        .activate_contacts("rapida", Consent::Granted)
+        .activate_area(CONTACTS_AREA, "rapida", Consent::Granted)
         .await
         .unwrap());
 
@@ -1320,6 +1388,7 @@ async fn una_cuenta_lenta_no_frena_a_las_otras() {
         ]
         .into(),
         calls: 0,
+        asked: Vec::new(),
     })));
     let limits = Limits {
         max_round: Duration::from_millis(500),
@@ -1493,4 +1562,112 @@ async fn el_estado_del_area_no_lleva_datos_ni_direcciones() {
     let json: serde_json::Value = serde_json::from_str(&status).unwrap();
     assert_eq!(json["accounts"][0]["contacts"]["state"], "failed");
     assert!(json["accounts"][0]["contacts"]["last_synced_at"].is_string());
+}
+
+/// **N8**, en los contactos: `fetch_cards` no devuelve —ni retiene hasta el
+/// final de la tanda— ninguna tarjeta que pase el tope de tamaño: se descarta
+/// al leer cada respuesta y queda contada en `too_large`. Antes se miraba en
+/// `rows_from`, después de juntar la tanda entera.
+#[tokio::test]
+async fn una_tarjeta_de_mas_no_se_retiene_en_la_tanda() {
+    let limits = Limits {
+        max_vcard_bytes: 1024,
+        ..Limits::DEFAULT
+    };
+    let f = Fixture::with_limits("contactos-tanda-de-mas", limits).await;
+    let big = format!(
+        "BEGIN:VCARD\r\nFN:Grande\r\nNOTE:{}\r\nEND:VCARD\r\n",
+        "n".repeat(4096)
+    );
+    for i in 0..20 {
+        f.server.put(0, &format!("grande{i}.vcf"), &big);
+    }
+    f.server.put(0, "ana.vcf", &card("1", "Ana", "ana@x.com"));
+
+    let client = DavClient::new(
+        &credential_for(&f.server),
+        limits,
+        HttpPolicy::plain_loopback(),
+    )
+    .unwrap();
+    let (books, _) = carddav::list_address_books(&client).await.unwrap();
+    let base = &books[0].href;
+    let mut hrefs: Vec<url::Url> = (0..20)
+        .map(|i| base.join(&format!("grande{i}.vcf")).unwrap())
+        .collect();
+    hrefs.push(base.join("ana.vcf").unwrap());
+    let mut round = Round {
+        report: SyncReport::default(),
+        deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+        stored_bytes: 0,
+    };
+    let (cards, missing) = f
+        .sync
+        .fetch_cards(&client, &books[0], &hrefs, &mut round)
+        .await
+        .unwrap();
+    assert_eq!(missing, 0, "una de más no falta: volvió");
+    assert_eq!(cards.len(), 1, "se retuvieron las de más");
+    assert!(cards.iter().all(|c| c.data.len() <= 1024));
+    assert_eq!(round.report.too_large, 20);
+
+    let report = f.synced().await;
+    assert_eq!((report.fetched, report.too_large), (1, 20));
+    assert_eq!(f.names().await, vec!["Ana"]);
+    assert_eq!(f.token(0).await, Some(f.server_token()));
+}
+
+/// **N7** (la nota 2 de integridad del #52): **una tarjeta pedida que no
+/// vuelve no deja guardar el token.** El servidor lista `a%40b.vcf` y el
+/// `multiget` la contesta como `a@b.vcf`, que a propósito no se iguala: se
+/// descartaba como no pedida y el token se guardaba igual. Ahora lo traído se
+/// escribe, la libreta falla sin guardar el token y la vuelta siguiente la
+/// vuelve a pedir; si sigue faltando [`MISSING_ROUNDS`] vueltas seguidas, la
+/// libreta se da por al día igual y queda en la bitácora.
+#[tokio::test]
+async fn una_tarjeta_pedida_que_no_vuelve_no_deja_guardar_el_token() {
+    let f = Fixture::new("contactos-pedida-que-no-vuelve").await;
+    f.server.put(0, "ana.vcf", &card("1", "Ana", "ana@x.com"));
+    f.synced().await;
+    let old = f.token(0).await.unwrap();
+
+    f.server
+        .put(0, "juan.vcf", &card("2", "Juan", "juan@x.com"));
+    f.server
+        .put(0, "a%40b.vcf", &card("3", "Arroba", "a@x.com"));
+    f.server.state().multiget_href = Some(|href| href.replace("%40", "@"));
+
+    for round in 1..MISSING_ROUNDS {
+        let before = f.server.requests().len();
+        let outcome = f.sync().await;
+        assert_eq!(outcome_kind(&outcome), "Failed", "vuelta {round}");
+        assert_eq!(f.token(0).await, Some(old.clone()), "vuelta {round}");
+        assert_eq!(f.names().await, vec!["Ana", "Juan"]);
+        assert_eq!(f.contacts_status().await["state"], "failed");
+        assert!(f
+            .requests_since(before)
+            .iter()
+            .any(|r| r.is_multiget() && r.body.contains("a%40b.vcf")));
+    }
+    let report = f.synced().await;
+    assert_eq!(report.missing, 1);
+    assert_eq!(f.token(0).await, Some(f.server_token()));
+    let logged: i64 = f
+        .query(|c| {
+            c.query_row(
+                "SELECT count(*) FROM sync_log WHERE message LIKE '%no volvieron%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        })
+        .await;
+    assert_eq!(logged, 1);
+
+    f.server.state().multiget_href = None;
+    f.server
+        .put(0, "a%40b.vcf", &card("3", "Arroba Pérez", "a@x.com"));
+    let report = f.synced().await;
+    assert_eq!((report.fetched, report.missing), (1, 0));
+    assert_eq!(f.names().await, vec!["Ana", "Arroba Pérez", "Juan"]);
 }

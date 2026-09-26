@@ -1,9 +1,12 @@
-//! Hablar con servidores DAV: lo genérico de WebDAV y lo de CardDAV.
+//! Hablar con servidores DAV: lo genérico de WebDAV, lo de CardDAV y lo de
+//! CalDAV.
 //!
-//! Traído de `vasak-contacts` al sincronizador para que los contactos se
-//! guarden en el almacén local (`vasak-accounts#23`). Sólo lee: no hay ningún
-//! método de escritura en el cliente (ver [`webdav::Method`]).
+//! Traído de `vasak-contacts` y `vasak-calendar` al sincronizador para que los
+//! contactos y el calendario se guarden en el almacén local
+//! (`vasak-accounts#23`). Sólo lee: no hay ningún método de escritura en el
+//! cliente (ver [`webdav::Method`]).
 
+pub mod caldav;
 pub mod carddav;
 #[cfg(test)]
 pub mod fake;

@@ -3,11 +3,11 @@
 //! ── Qué hay acá, y qué todavía no ───────────────────────────────────────────
 //!
 //! La base: su clave en el llavero, su archivo cifrado, el esquema —dónde quedó
-//! la sincronización, una bitácora y, desde la v2, **los contactos** (ver
-//! `migrations.rs` y `contacts.rs`)— y el ciclo de vida entero (crear, abrir,
-//! cerrar al bloquear, rehacer si se perdió la clave, apagar, vaciar, borrar al
-//! quitar la cuenta). El calendario y el correo llegan después, de a uno, con
-//! su propia migración. Ver `vasak-accounts#23`.
+//! la sincronización, una bitácora, desde la v2 **los contactos** y desde la v3
+//! **el calendario** (ver `migrations.rs`, `contacts.rs` y `calendar.rs`)— y el
+//! ciclo de vida entero (crear, abrir, cerrar al bloquear, rehacer si se perdió
+//! la clave, apagar, vaciar, borrar al quitar la cuenta). El correo llega
+//! después, con su propia migración. Ver `vasak-accounts#23`.
 //!
 //! ── Qué protege el cifrado, y qué no ────────────────────────────────────────
 //!
@@ -17,7 +17,7 @@
 //! **No** protege contra un proceso que corre como la misma persona. La clave
 //! vive en el llavero de la sesión, y el llavero es un Secret Service estándar:
 //! cualquier proceso de la persona puede pedirle todos los secretos. El permiso
-//! por D-Bus para leer el almacén (`store.contacts`, ver `access.rs`) es
+//! por D-Bus para leer el almacén (`store.contacts`, `store.calendar`, ver `access.rs`) es
 //! consentimiento y visibilidad, no una frontera. La frontera de verdad —control por ítem en el llavero— es
 //! otro trabajo, y hasta que exista hay que decirlo así.
 //!
@@ -34,6 +34,8 @@
 //! —la clave vive en el llavero de la sesión, y parsear lo que llega de la red
 //! tiene que pasar como la persona— y con un solo escritor no hay carreras.
 
+pub mod calendar;
+pub mod calendar_read;
 pub mod contacts;
 pub mod contacts_read;
 pub mod key;
@@ -376,6 +378,15 @@ impl Store {
         })
     }
 
+    /// Si `key` abre la base de `paths`, sin tocarla: una conexión de sólo
+    /// lectura, la clave y la misma comprobación que al abrir.
+    pub fn key_opens(paths: &StorePaths, key: &StoreKey) -> bool {
+        paths
+            .db_to_open()
+            .and_then(|db| readers::open_reader(&db, key))
+            .is_ok()
+    }
+
     /// Las conexiones de lectura de esta base.
     pub fn readers(&self) -> Arc<ReadPool> {
         Arc::clone(&self.readers)
@@ -609,7 +620,7 @@ mod tests {
             .connection()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
     }
 
     /// 0700 la carpeta y 0600 los tres archivos, y otra vez en cada apertura si

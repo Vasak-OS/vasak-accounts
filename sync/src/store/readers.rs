@@ -14,10 +14,18 @@
 //! conexión que está en medio de una lectura en ese momento se cierra al
 //! terminarla, y ninguna lectura nueva empieza. SQLCipher borra su copia de la
 //! clave al cerrar cada conexión.
+//!
+//! **Una lectura larga no tiene tomada una conexión mientras hace CPU.** Lo
+//! que el calendario expande en el momento se lee de a partes ([`Reader`]): la
+//! conexión se toma para leer una tanda, se suelta, y la expansión corre sin
+//! ella. Y hay un turno por base para eso ([`ExpansionGate`]): una sola
+//! expansión en el momento a la vez, así que dos aplicaciones que piden años
+//! lejanos no se llevan la CPU entre las dos ni dejan sin lector a las demás.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::sync::{Condvar, Mutex, MutexGuard, TryLockError};
+use std::time::Instant;
 
 use rusqlite::{Connection, OpenFlags};
 
@@ -27,11 +35,81 @@ use super::{classify, StoreError};
 /// Cuántas conexiones de lectura tiene cada base.
 pub const READERS: usize = 2;
 
+/// Por dónde lee una consulta que se hace de a partes: una conexión que se
+/// toma para cada parte y se suelta entre una y otra.
+pub trait Reader {
+    /// Una parte: con una conexión, dentro de una transacción de lectura.
+    fn read<T>(
+        &self,
+        work: impl FnOnce(&Connection) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError>;
+
+    /// El turno de la base para expandir en el momento, si tiene.
+    fn expansion_gate(&self) -> Option<&ExpansionGate> {
+        None
+    }
+}
+
+/// Una conexión sola —la de las pruebas, o una ya tomada— es un lector de a
+/// partes sin turno: cada parte usa la misma.
+impl Reader for Connection {
+    fn read<T>(
+        &self,
+        work: impl FnOnce(&Connection) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        work(self)
+    }
+}
+
+/// Un turno: de a uno por vez. El que llega mientras está ocupado espera, pero
+/// no más que su plazo.
+#[derive(Debug, Default)]
+pub struct ExpansionGate {
+    busy: Mutex<bool>,
+    freed: Condvar,
+}
+
+/// Tener el turno; se devuelve al soltarse.
+#[derive(Debug)]
+pub struct Turn<'a> {
+    gate: &'a ExpansionGate,
+}
+
+impl ExpansionGate {
+    /// Toma el turno, esperando hasta `deadline` si está ocupado. `None` si no
+    /// se liberó a tiempo.
+    pub fn enter_until(&self, deadline: Instant) -> Option<Turn<'_>> {
+        let mut busy = self.busy.lock().unwrap_or_else(|p| p.into_inner());
+        while *busy {
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            busy = self
+                .freed
+                .wait_timeout(busy, deadline - now)
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
+        *busy = true;
+        Some(Turn { gate: self })
+    }
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        *self.gate.busy.lock().unwrap_or_else(|p| p.into_inner()) = false;
+        self.gate.freed.notify_one();
+    }
+}
+
 /// Las conexiones de lectura de una base abierta.
 pub struct ReadPool {
     slots: [Mutex<Option<Connection>>; READERS],
     closed: AtomicBool,
     next: AtomicUsize,
+    /// El turno para expandir en el momento.
+    expansion: ExpansionGate,
 }
 
 impl ReadPool {
@@ -44,6 +122,7 @@ impl ReadPool {
             slots: [Mutex::new(Some(first)), Mutex::new(Some(second))],
             closed: AtomicBool::new(false),
             next: AtomicUsize::new(0),
+            expansion: ExpansionGate::default(),
         })
     }
 
@@ -116,9 +195,22 @@ impl ReadPool {
     }
 }
 
+impl Reader for ReadPool {
+    fn read<T>(
+        &self,
+        work: impl FnOnce(&Connection) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        ReadPool::read(self, work)
+    }
+
+    fn expansion_gate(&self) -> Option<&ExpansionGate> {
+        Some(&self.expansion)
+    }
+}
+
 /// Una conexión de sólo lectura, con la clave y la misma comprobación que la
 /// de escritura.
-fn open_reader(db: &Path, key: &StoreKey) -> Result<Connection, StoreError> {
+pub(super) fn open_reader(db: &Path, key: &StoreKey) -> Result<Connection, StoreError> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_NOFOLLOW;
@@ -144,4 +236,41 @@ fn open_reader(db: &Path, key: &StoreKey) -> Result<Connection, StoreError> {
         .execute_batch("PRAGMA query_only = 1; PRAGMA busy_timeout = 5000;")
         .map_err(classify)?;
     Ok(connection)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::*;
+
+    /// **Una sola expansión a la vez.** El segundo que pide el turno espera a
+    /// que el primero lo suelte; y si no lo suelta dentro de su plazo, se va
+    /// sin él.
+    #[test]
+    fn el_turno_es_de_a_uno() {
+        let gate = Arc::new(ExpansionGate::default());
+        let first = gate.enter_until(Instant::now()).expect("libre");
+        assert!(
+            gate.enter_until(Instant::now() + Duration::from_millis(50))
+                .is_none(),
+            "ocupado: no hay turno"
+        );
+        let waiting = {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let turn = gate.enter_until(Instant::now() + Duration::from_secs(10));
+                (turn.is_some(), started.elapsed())
+            })
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        drop(first);
+        let (got, waited) = waiting.join().unwrap();
+        assert!(got, "al soltarlo, el que esperaba lo toma");
+        assert!(waited >= Duration::from_millis(150), "esperó {waited:?}");
+        // Y se devolvió al terminar el hilo.
+        assert!(gate.enter_until(Instant::now()).is_some());
+    }
 }

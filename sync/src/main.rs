@@ -31,8 +31,9 @@
 //!
 //! Prepara además una base **cifrada** por cuenta —el almacén local de
 //! `store/`, publicado en `ar.net.vasak.os.AccountsStore`— y guarda ahí los
-//! **contactos** de las cuentas que los piden (`contacts_sync.rs`), que las
-//! aplicaciones leen por esa interfaz con el permiso `store.contacts`
+//! **contactos** y el **calendario** —eventos y tareas— de las cuentas que los
+//! piden (`contacts_sync.rs`, `calendar_sync.rs`), que las aplicaciones leen
+//! por esa interfaz con el permiso `store.contacts` o `store.calendar`
 //! (`access.rs`). El correo todavía no pasa por ahí: lo que dicen los dos
 //! párrafos que siguen sigue siendo cierto hasta que pase.
 //!
@@ -60,10 +61,13 @@
 mod access;
 mod attachments;
 mod broker;
+mod calendar_sync;
 mod compose;
 mod contacts_sync;
 mod dav;
+mod dav_sync;
 mod html;
+mod ical;
 mod images;
 mod imap;
 mod mailboxes;

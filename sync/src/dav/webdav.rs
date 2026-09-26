@@ -1,8 +1,10 @@
 //! Lo genérico de WebDAV: la credencial, el cliente HTTP, el `multistatus`, las
 //! direcciones que manda el servidor y `sync-collection` (RFC 6578).
 //!
-//! Aparte de `carddav.rs` porque el calendario va a hablar lo mismo: CalDAV y
-//! CardDAV son WebDAV con otro espacio de nombres para los datos.
+//! Aparte de `carddav.rs` y `caldav.rs` porque los dos hablan lo mismo: CalDAV
+//! y CardDAV son WebDAV con otro espacio de nombres para los datos. Lo que es de
+//! los dos —el ETag de cada recurso de una colección, quedarse con lo que se
+//! pidió de un `multiget`— vive acá.
 //!
 //! ── Qué se le cree al servidor, y qué no ────────────────────────────────────
 //!
@@ -41,6 +43,10 @@ use base64::Engine;
 use zeroize::Zeroizing;
 
 pub const NS_DAV: &str = "DAV:";
+/// El de `getctag`, una extensión de Apple que casi todos los servidores
+/// hablan, de contactos y de calendario: cambia cada vez que cambia algo de la
+/// colección.
+pub const NS_CALENDARSERVER: &str = "http://calendarserver.org/ns/";
 
 /// Cuánto se espera una respuesta.
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -104,6 +110,22 @@ pub struct Limits {
     /// agenda de verdad, con fotos, son decenas de megas. Pasarlo corta la
     /// vuelta sin guardar el token.
     pub max_account_vcard_bytes: u64,
+    /// Calendarios por cuenta.
+    pub max_calendars: usize,
+    /// Objetos —eventos y tareas— por calendario. Una agenda de diez años con
+    /// dos mil eventos por año son veinte mil.
+    pub max_objects_per_calendar: usize,
+    /// El tamaño de un objeto de calendario. Uno con adjuntos en línea puede
+    /// pesar; uno de más no se guarda, y queda contado.
+    pub max_ical_bytes: usize,
+    /// Bytes de iCalendar crudo por cuenta, como el de las tarjetas.
+    pub max_account_ical_bytes: u64,
+    /// Ocurrencias guardadas por cuenta: lo que deja la expansión de todas las
+    /// series en la ventana, con cada vez de cada evento que no se repite.
+    pub max_account_occurrences: u64,
+    /// Recordatorios guardados por cuenta: hasta diez por ocurrencia, así que
+    /// sin un tope propio el de ocurrencias dejaba pasar diez millones.
+    pub max_account_alarms: u64,
     /// Cuánto puede durar la vuelta de una cuenta. Las cuentas van de a una:
     /// sin esto, un servidor lento —cuatrocientos `multiget` de treinta
     /// segundos por libreta— dejaba esperando horas a las otras y a cada
@@ -124,6 +146,12 @@ impl Limits {
         multiget_batch: 50,
         max_sync_rounds: 50,
         max_account_vcard_bytes: 1024 * 1024 * 1024,
+        max_calendars: 100,
+        max_objects_per_calendar: 50_000,
+        max_ical_bytes: 512 * 1024,
+        max_account_ical_bytes: 1024 * 1024 * 1024,
+        max_account_occurrences: 1_000_000,
+        max_account_alarms: 1_000_000,
         max_round: Duration::from_secs(10 * 60),
     };
 }
@@ -166,6 +194,11 @@ pub enum DavError {
     BadXml(String),
     TooManyAddressBooks(usize),
     TooManyCards(usize),
+    TooManyCalendars(usize),
+    TooManyObjects(usize),
+    /// Lo pedido en un `multiget` que no volvió, cuántos: la colección no se
+    /// da por al día y se vuelve a pedir en la vuelta siguiente.
+    MissingResources(usize),
 }
 
 impl std::fmt::Display for DavError {
@@ -198,6 +231,17 @@ impl std::fmt::Display for DavError {
                 write!(f, "la cuenta tiene más de {cap} libretas")
             }
             DavError::TooManyCards(cap) => write!(f, "una libreta tiene más de {cap} tarjetas"),
+            DavError::TooManyCalendars(cap) => {
+                write!(f, "la cuenta tiene más de {cap} calendarios")
+            }
+            DavError::TooManyObjects(cap) => {
+                write!(f, "un calendario tiene más de {cap} eventos y tareas")
+            }
+            DavError::MissingResources(count) => write!(
+                f,
+                "el servidor no devolvió {count} de los elementos que se le pidieron; se vuelven \
+                 a pedir en la próxima vuelta"
+            ),
         }
     }
 }
@@ -294,27 +338,42 @@ impl std::fmt::Debug for DavCredential {
 /// Arma la credencial a partir de lo que guardó el servicio al conectar.
 ///
 /// Viene de `credencial_desde` de `vasak-contacts`. `config` es lo que
-/// contesta `GetAccountData` para la capacidad, ya sacado del envoltorio.
+/// contesta `GetAccountData` para la capacidad, ya sacado del envoltorio;
+/// `capability` es esa capacidad —`contacts`, `calendar`—, y sólo cambia qué
+/// nombran los textos de error: la libreta o el calendario.
 pub fn credential_from(
     config: &serde_json::Value,
     secret: Zeroizing<String>,
+    capability: &str,
 ) -> Result<DavCredential, String> {
     let field = |name: &str| config.get(name).and_then(|v| v.as_str());
+    // Textos fijos, por área: ninguno lleva nada de lo guardado.
+    let (missing, not_an_address, with_userinfo) = match capability {
+        "calendar" => (
+            "la cuenta no guardó la dirección de su calendario; volvé a conectarla desde \
+             Configuración",
+            "la dirección guardada del calendario no es una dirección",
+            "la dirección guardada del calendario trae usuario y contraseña adentro",
+        ),
+        _ => (
+            "la cuenta no guardó la dirección de su libreta; volvé a conectarla desde \
+             Configuración",
+            "la dirección guardada de la libreta no es una dirección",
+            "la dirección guardada de la libreta trae usuario y contraseña adentro",
+        ),
+    };
 
-    let home = field("url").ok_or(
-        "la cuenta no guardó la dirección de su libreta; volvé a conectarla desde Configuración",
-    )?;
+    let home = field("url").ok_or(missing)?;
     let username = field("username")
         .ok_or("la cuenta no guardó el usuario")?
         .to_string();
 
-    let home = url::Url::parse(home.trim())
-        .map_err(|_| "la dirección guardada de la libreta no es una dirección".to_string())?;
+    let home = url::Url::parse(home.trim()).map_err(|_| not_an_address.to_string())?;
     if home.scheme() != "https" {
         return Err(DavError::InsecureUrl.to_string());
     }
     if !home.username().is_empty() || home.password().is_some() {
-        return Err("la dirección guardada de la libreta trae usuario y contraseña adentro".into());
+        return Err(with_userinfo.into());
     }
 
     // El `client_id` es la marca de que la cuenta pasó por un flujo OAuth2, así
@@ -960,6 +1019,10 @@ pub struct Prop {
     /// `addressbook` en un `resourcetype`, `sync-collection` en un
     /// `supported-report-set`.
     pub descendants: Vec<(String, String)>,
+    /// El atributo `name` de los elementos de adentro que lo tienen, en orden:
+    /// `VEVENT` y `VTODO` en un `supported-calendar-component-set`, que dice
+    /// sus componentes como `<c:comp name="VEVENT"/>`.
+    pub name_attributes: Vec<String>,
 }
 
 impl Prop {
@@ -1086,6 +1149,13 @@ pub fn parse_multistatus(document: &roxmltree::Document<'_>) -> Result<Multistat
                             )
                         })
                         .collect(),
+                    name_attributes: prop
+                        .descendants()
+                        .skip(1)
+                        .filter(|n| n.is_element())
+                        .filter_map(|n| n.attribute("name"))
+                        .map(str::to_string)
+                        .collect(),
                 });
             }
         }
@@ -1098,6 +1168,224 @@ pub fn parse_multistatus(document: &roxmltree::Document<'_>) -> Result<Multistat
     }
 
     Ok(multistatus)
+}
+
+// ---------------------------------------------------------------------------
+// Lo que comparten CardDAV y CalDAV
+// ---------------------------------------------------------------------------
+
+/// La dirección y el ETag de cada recurso de una colección.
+pub type Etags = Vec<(url::Url, Option<String>)>;
+
+/// Un token o un ETag que se puede guardar.
+pub fn storable(text: Option<&str>) -> Option<String> {
+    text.filter(|t| t.len() <= MAX_TOKEN_BYTES)
+        .map(str::to_string)
+}
+
+/// Saca el ETag de cada recurso de un `PROPFIND` sobre una colección, para los
+/// servidores que no saben `sync-collection`. Sin la colección misma ni las
+/// subcarpetas. Devuelve también cuántas direcciones de otro origen se
+/// descartaron.
+pub fn etags_from(
+    xml: &str,
+    collection: &url::Url,
+    limits: &Limits,
+) -> Result<(Etags, usize), DavError> {
+    let document = parse_xml(xml, limits)?;
+    let multistatus = parse_multistatus(&document)?;
+    let mut foreign = 0;
+
+    let etags = multistatus
+        .responses
+        .iter()
+        .filter(|response| response.status.is_none_or(|s| (200..300).contains(&s)))
+        .filter(|response| {
+            !response
+                .prop(NS_DAV, "resourcetype")
+                .is_some_and(|p| p.contains(NS_DAV, "collection"))
+        })
+        .filter_map(|response| {
+            let Ok(href) = resolve_href(collection, &response.href) else {
+                foreign += 1;
+                return None;
+            };
+            if same_collection(&href, collection) {
+                return None;
+            }
+            Some((href, storable(response.text(NS_DAV, "getetag"))))
+        })
+        .collect();
+
+    Ok((etags, foreign))
+}
+
+/// El cuerpo del `PROPFIND` que pide el ETag de cada recurso de una colección.
+pub fn etags_query() -> String {
+    r#"<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop><d:resourcetype/><d:getetag/></d:prop>
+</d:propfind>"#
+        .to_string()
+}
+
+/// El ETag de cada recurso de una colección, y cuántos se descartaron por
+/// venir con una dirección de otro origen: con alguno, el listado no dice
+/// qué falta.
+pub async fn list_etags(
+    client: &DavClient,
+    collection: &url::Url,
+) -> Result<(Etags, usize), DavError> {
+    let reply = client
+        .request(Method::Propfind, collection, "1", etags_query())
+        .await?;
+    let xml = expect_multistatus(reply)?;
+    let limits = *client.limits();
+    let collection = collection.clone();
+    let (etags, foreign) = off_runtime(move || etags_from(&xml, &collection, &limits)).await?;
+    if foreign > 0 {
+        tracing::warn!("se descartaron {foreign} recursos con dirección de otro servidor");
+    }
+    Ok((etags, foreign))
+}
+
+/// El cuerpo de un `207`, o el estado como error.
+pub fn expect_multistatus(reply: Reply) -> Result<String, DavError> {
+    match reply.status {
+        207 => Ok(reply.body),
+        other => Err(DavError::Status(other)),
+    }
+}
+
+/// Los recursos que trajo un `multiget`, tal como se leyeron: antes de
+/// quedarse con lo pedido.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadResources<T> {
+    pub items: Vec<T>,
+    /// Direcciones de otro origen que se descartaron.
+    pub foreign: usize,
+    /// Los que pasaban el tope de tamaño, por su dirección. **Se descartan al
+    /// leerlos**, sin retenerlos: una tanda de cincuenta objetos de casi
+    /// dieciséis megas —uno por respuesta, partida hasta aislarlos— eran unos
+    /// 1,5 GB en memoria antes de mirar el tope (N8 del #55).
+    pub oversized: Vec<url::Url>,
+}
+
+/// Saca los recursos de un `multiget` —su dirección, su ETag y el texto de la
+/// propiedad `namespace:name`— con su tope de tamaño, `max_bytes`: el que lo
+/// pasa no se copia ni se devuelve, sólo su dirección en
+/// [`ReadResources::oversized`]. Uno sin datos, o con un estado de error, no
+/// vino.
+pub fn resources_from<T>(
+    xml: &str,
+    base: &url::Url,
+    limits: &Limits,
+    (namespace, name): (&str, &str),
+    max_bytes: usize,
+    make: impl Fn(url::Url, Option<String>, String) -> T,
+) -> Result<ReadResources<T>, DavError> {
+    let document = parse_xml(xml, limits)?;
+    let multistatus = parse_multistatus(&document)?;
+    drop(document);
+    let mut read = ReadResources {
+        items: Vec::new(),
+        foreign: 0,
+        oversized: Vec::new(),
+    };
+    for mut response in multistatus.responses {
+        let Some(position) = response
+            .props
+            .iter()
+            .position(|p| p.namespace == namespace && p.name == name)
+        else {
+            continue;
+        };
+        if response.props[position].text.trim().is_empty() {
+            continue;
+        }
+        let Ok(href) = resolve_href(base, &response.href) else {
+            read.foreign += 1;
+            continue;
+        };
+        if response.props[position].text.len() > max_bytes {
+            read.oversized.push(href);
+            continue;
+        }
+        let etag = storable(response.text(NS_DAV, "getetag"));
+        // Se mueve y no se copia: el texto de un recurso puede ser el tope
+        // entero.
+        let data = std::mem::take(&mut response.props[position].text);
+        read.items.push(make(href, etag, data));
+    }
+    Ok(read)
+}
+
+/// Lo que queda de un `multiget` después de quedarse con lo pedido.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Multiget<T> {
+    /// Lo pedido, una vez cada uno.
+    pub items: Vec<T>,
+    /// Lo que vino sin pedirlo, o repetido.
+    pub unrequested: usize,
+    /// Lo pedido que vino y pasaba el tope de tamaño: no se guarda, y queda
+    /// contado.
+    pub too_large: usize,
+    /// Lo pedido que **no volvió**, por su clave ([`href_key`]): el servidor
+    /// lo omitió, lo contestó con un estado de error o sin datos, o con la
+    /// dirección escrita de otra forma (un reservado escapado distinto, que a
+    /// propósito no se iguala).
+    pub missing: Vec<String>,
+}
+
+/// Se queda con los recursos que se pidieron en un `multiget`, **una vez cada
+/// uno**, cuenta los que no y dice cuáles de los pedidos no volvieron.
+///
+/// Un servidor puede contestar un `multiget` de un recurso con dieciséis megas
+/// de recursos que nadie pidió: guardarlos saltaría el tope por colección, que
+/// se mira sobre lo que se pide, y llenaría la base con lo que el servidor
+/// nunca listó. Uno repetido es lo mismo: el primero que llega es el que vale.
+///
+/// Pedido y contestado se comparan por [`href_key`]: `a%2db` pedido y `a%2Db`
+/// contestado son el mismo recurso. Uno de más tamaño que el tope volvió —no se
+/// guarda, pero no falta—.
+pub fn keep_requested_by<T>(
+    read: ReadResources<T>,
+    hrefs: &[url::Url],
+    href_of: impl Fn(&T) -> &url::Url,
+) -> Multiget<T> {
+    let mut pending: std::collections::HashSet<String> = hrefs.iter().map(href_key).collect();
+    let mut unrequested = 0;
+    let mut too_large = 0;
+    for href in &read.oversized {
+        if pending.remove(&href_key(href)) {
+            too_large += 1;
+        } else {
+            unrequested += 1;
+        }
+    }
+    let items = read
+        .items
+        .into_iter()
+        .filter(|item| {
+            let requested = pending.remove(&href_key(href_of(item)));
+            if !requested {
+                unrequested += 1;
+            }
+            requested
+        })
+        .collect();
+    let mut missing: Vec<String> = hrefs
+        .iter()
+        .map(href_key)
+        .filter(|key| pending.remove(key))
+        .collect();
+    missing.sort();
+    Multiget {
+        items,
+        unrequested,
+        too_large,
+        missing,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1182,8 +1470,12 @@ pub fn delta_from(
 ) -> Result<SyncDelta, DavError> {
     let document = parse_xml(xml, limits)?;
     let multistatus = parse_multistatus(&document)?;
+    // El token y cada ETag, con el tope de lo que se guarda: `changed` junta
+    // lo de hasta [`Limits::max_sync_rounds`] respuestas de `507`, y un ETag
+    // de dieciséis kilobytes por recurso eran cientos de megas retenidos antes
+    // de pedir nada. Uno de más es `None`, y el recurso se trae igual.
     let mut delta = SyncDelta {
-        token: multistatus.sync_token.clone(),
+        token: storable(multistatus.sync_token.as_deref()),
         ..Default::default()
     };
 
@@ -1204,7 +1496,7 @@ pub fn delta_from(
             // cambió ni que se fue: se deja para la próxima.
             Some(code) if !(200..300).contains(&code) => {}
             _ => {
-                let etag = response.text(NS_DAV, "getetag").map(str::to_string);
+                let etag = storable(response.text(NS_DAV, "getetag"));
                 delta.changed.push((url, etag));
             }
         }
@@ -1304,7 +1596,26 @@ mod tests {
     // ── La credencial, desde lo que guardó el servicio ────────────────────
 
     fn from(config: serde_json::Value) -> Result<DavCredential, String> {
-        credential_from(&config, Zeroizing::new("la-contrasena".into()))
+        credential_from(&config, Zeroizing::new("la-contrasena".into()), "contacts")
+    }
+
+    /// Los textos de la credencial nombran lo que es de cada área: el
+    /// calendario no dice «libreta».
+    #[test]
+    fn la_credencial_del_calendario_no_habla_de_la_libreta() {
+        let calendar = |config: serde_json::Value| {
+            credential_from(&config, Zeroizing::new("x".into()), "calendar").unwrap_err()
+        };
+        for error in [
+            calendar(serde_json::json!({ "username": "ana" })),
+            calendar(serde_json::json!({ "username": "ana", "url": "no es una dirección" })),
+            calendar(serde_json::json!({ "username": "ana", "url": "https://a:b@x/" })),
+        ] {
+            assert!(error.contains("calendario"), "{error}");
+            assert!(!error.contains("libreta"), "{error}");
+        }
+        let contacts = from(serde_json::json!({ "username": "ana" })).unwrap_err();
+        assert!(contacts.contains("libreta"), "{contacts}");
     }
 
     /// El secreto no puede aparecer en un registro ni en un pánico.
@@ -1417,6 +1728,9 @@ mod tests {
             DavError::bad_xml(server_text),
             DavError::TooManyAddressBooks(100),
             DavError::TooManyCards(20_000),
+            DavError::TooManyCalendars(100),
+            DavError::TooManyObjects(50_000),
+            DavError::MissingResources(50),
         ];
         for error in &all {
             match error {
@@ -1429,7 +1743,10 @@ mod tests {
                 | DavError::Network(_)
                 | DavError::BadXml(_)
                 | DavError::TooManyAddressBooks(_)
-                | DavError::TooManyCards(_) => {}
+                | DavError::TooManyCards(_)
+                | DavError::TooManyCalendars(_)
+                | DavError::TooManyObjects(_)
+                | DavError::MissingResources(_) => {}
             }
         }
         all
@@ -1972,6 +2289,32 @@ mod tests {
         assert_eq!(parse_multistatus(&empty).unwrap(), Multistatus::default());
     }
 
+    /// **N9**: el ETag de un `sync-collection` tiene el tope de lo que se
+    /// guarda al leerlo, como el de un `PROPFIND` o un `multiget`. Sin él,
+    /// cincuenta respuestas de `507` retenían unos 800 MB de ETags.
+    #[test]
+    fn un_etag_desmedido_en_las_diferencias_no_se_guarda() {
+        let collection = url::Url::parse("https://nube.ejemplo.com/dav/personal/").unwrap();
+        let big = "e".repeat(100 * 1024);
+        let xml = format!(
+            r#"<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">
+  <d:response><d:href>/dav/personal/a.ics</d:href>
+    <d:propstat><d:prop><d:getetag>{big}</d:getetag></d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+  <d:response><d:href>/dav/personal/b.ics</d:href>
+    <d:propstat><d:prop><d:getetag>"corto"</d:getetag></d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+  <d:sync-token>{big}</d:sync-token>
+</d:multistatus>"#
+        );
+        let delta = delta_from(&xml, &collection, &Limits::DEFAULT).unwrap();
+        assert_eq!(delta.changed.len(), 2, "el recurso se trae igual");
+        assert_eq!(delta.changed[0].1, None, "el ETag desmedido se guardó");
+        assert_eq!(delta.changed[1].1.as_deref(), Some("\"corto\""));
+        assert_eq!(delta.token, None, "el token desmedido se guardó");
+    }
+
+    /// El pedido de diferencias es XML válido y lleva el token escapado.
     #[test]
     fn el_pedido_de_diferencias_es_xml_valido_y_escapa_el_token() {
         for token in [None, Some("http://x/?a=1&b=<2>")] {

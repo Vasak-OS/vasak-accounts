@@ -14,7 +14,7 @@
 //! entra en la próxima revisión. Un `AccessDenied` sí cuenta: se ve
 //! `unavailable` y **no se vuelve a preguntar hasta la hora siguiente** o un
 //! `RequestSync` (y dos `RequestSync` seguidos de la misma cuenta, con menos de
-//! [`REQUEST_COOLDOWN`] entre ellos, son uno).
+//! [`crate::dav_sync::REQUEST_COOLDOWN`] entre ellos, son uno).
 //!
 //! ── Cómo ────────────────────────────────────────────────────────────────────
 //!
@@ -43,24 +43,27 @@
 //! gigabyte), con el cambio neto de cada lote medido antes de guardarlo: una
 //! tarjeta reescrita cuenta la diferencia y una borrada resta.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use tokio::sync::Mutex;
-use zeroize::Zeroizing;
-
-use crate::broker::{Broker, BrokerError};
 use crate::dav::carddav::{self, AddressBook, CardResource};
 use crate::dav::webdav::{self, href_key, DavClient, DavCredential, DavError, HttpPolicy, Limits};
+use crate::dav_sync::{
+    self, AreaSync, CollectionCap, ListedCollection, MissingStreaks, Plan, RoundError, Settled,
+    MISSING_ROUNDS,
+};
+// La credencial y cuándo le toca a cada cuenta son de las dos
+// sincronizaciones: viven en `dav_sync.rs`.
+pub use crate::dav_sync::{BrokerCredentials, CredentialError, CredentialSource};
 use crate::store::contacts::{
     Applied, BookProgress, ContactOp, ContactRow, StoredAddressBook, WRITE_BATCH_BYTES,
     WRITE_BATCH_ROWS,
 };
 use crate::store::key::{KeyError, KeySource};
 use crate::store::lifecycle::{AreaState, StoreManager, CONTACTS_AREA};
-use crate::store::{Store, StoreError};
+use crate::store::{LogLevel, Store, StoreError};
 use crate::vcard;
 
 /// Cada cuánto se sincronizan los contactos de una cuenta encendida (supuesto
@@ -70,11 +73,6 @@ pub const CONTACTS_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// Cada cuánto se mira qué cuentas toca sincronizar.
 pub const CONTACTS_TICK: Duration = crate::POLL_INTERVAL;
 
-/// Cuánto tiene que pasar entre dos `RequestSync` de la misma cuenta para que
-/// el segundo vuelva a sincronizar. Una aplicación que se abre dos veces
-/// seguidas no tiene por qué pedir todo dos veces.
-pub const REQUEST_COOLDOWN: Duration = Duration::from_secs(30);
-
 /// Lo que se ve en el estado cuando el servicio de cuentas dice que no.
 const DENIED_DETAIL: &str = "el servicio de cuentas no le da al sincronizador permiso para los \
      contactos de esta cuenta: hace falta vasak-permissions 0.15.0 o posterior, y que la persona \
@@ -83,65 +81,6 @@ const DENIED_DETAIL: &str = "el servicio de cuentas no le da al sincronizador pe
 /// Lo que se ve cuando la base no está abierta.
 const CLOSED_DETAIL: &str =
     "la base no está abierta: se sincroniza cuando se desbloquee el llavero";
-
-// ---------------------------------------------------------------------------
-// La credencial
-// ---------------------------------------------------------------------------
-
-/// Por qué no hay credencial.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CredentialError {
-    /// El servicio de cuentas dijo que no (`AccessDenied`). No se reintenta.
-    Denied,
-    /// No contesta, o contestó otra cosa.
-    Failed(String),
-}
-
-/// De dónde sale la credencial de los contactos de una cuenta.
-///
-/// Un rasgo para poder probar la sincronización sin el bus del sistema.
-pub trait CredentialSource: Send + Sync + 'static {
-    fn contacts_credential(
-        &self,
-        account_id: &str,
-    ) -> impl Future<Output = Result<DavCredential, CredentialError>> + Send;
-}
-
-/// La de verdad: el servicio de cuentas, por la puerta de permisos como
-/// cualquier otra aplicación.
-///
-/// La capacidad es `contacts`: el servicio la convierte en el recurso
-/// `account.contacts` al preguntarle a `vasak-permissions`. El token primero,
-/// porque es lo que dispara el permiso; si dice que no, no tiene sentido haber
-/// pedido el resto.
-pub struct BrokerCredentials;
-
-impl CredentialSource for BrokerCredentials {
-    async fn contacts_credential(
-        &self,
-        account_id: &str,
-    ) -> Result<DavCredential, CredentialError> {
-        let classify = |e: BrokerError| match e {
-            BrokerError::Denied(_) => CredentialError::Denied,
-            other => CredentialError::Failed(other.to_string()),
-        };
-        let broker = Broker::connect().await.map_err(classify)?;
-        let secret = Zeroizing::new(
-            broker
-                .access_token(account_id, CONTACTS_AREA)
-                .await
-                .map_err(classify)?,
-        );
-        let data = broker
-            .account_data(account_id, CONTACTS_AREA)
-            .await
-            .map_err(classify)?;
-        // La configuración viene envuelta: el servicio devuelve la cuenta
-        // entera con la capacidad adentro.
-        let config = data.get("config").unwrap_or(&data);
-        webdav::credential_from(config, secret).map_err(CredentialError::Failed)
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Una vuelta
@@ -169,6 +108,9 @@ pub struct SyncReport {
     /// Tarjetas que vinieron en un `multiget` sin haberlas pedido, o
     /// repetidas: no se guardan.
     pub unrequested: usize,
+    /// Tarjetas pedidas que no volvieron en [`MISSING_ROUNDS`] vueltas
+    /// seguidas, y con las que la libreta se dio por al día igual.
+    pub missing: usize,
 }
 
 /// Cómo terminó una vuelta de una cuenta.
@@ -207,6 +149,15 @@ impl From<StoreError> for SyncError {
     }
 }
 
+impl From<RoundError> for SyncError {
+    fn from(error: RoundError) -> Self {
+        match error {
+            RoundError::Dav(e) => SyncError::Dav(e),
+            RoundError::Timeout => SyncError::Timeout,
+        }
+    }
+}
+
 /// Lo que lleva una vuelta de una cuenta de libreta en libreta.
 struct Round {
     report: SyncReport,
@@ -230,10 +181,7 @@ struct Round {
 
 impl Round {
     fn check_deadline(&self) -> Result<(), SyncError> {
-        if tokio::time::Instant::now() >= self.deadline {
-            return Err(SyncError::Timeout);
-        }
-        Ok(())
+        Ok(dav_sync::check_deadline(self.deadline)?)
     }
 
     /// Un pedido a la red, con lo que le queda de plazo a la vuelta.
@@ -241,18 +189,8 @@ impl Round {
         &self,
         request: impl Future<Output = Result<T, DavError>>,
     ) -> Result<T, SyncError> {
-        match tokio::time::timeout_at(self.deadline, request).await {
-            Ok(result) => Ok(result?),
-            Err(_) => Err(SyncError::Timeout),
-        }
+        Ok(dav_sync::net(self.deadline, request).await?)
     }
-}
-
-/// Qué hay que hacer con una libreta.
-struct Plan {
-    fetch: Vec<url::Url>,
-    delete: Vec<String>,
-    progress: BookProgress,
 }
 
 /// La sincronización de contactos de todas las cuentas.
@@ -264,6 +202,8 @@ pub struct ContactsSync<K: KeySource, C: CredentialSource> {
     /// Lo que se llama cuando cambia el estado que se publica: la señal
     /// `StatusChanged`.
     notify: Arc<dyn Fn() + Send + Sync>,
+    /// Cuántas vueltas seguidas le faltó algo pedido a cada libreta.
+    missing: MissingStreaks,
 }
 
 impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
@@ -280,13 +220,14 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
             limits,
             policy,
             notify,
+            missing: MissingStreaks::default(),
         }
     }
 
     async fn set_status(&self, account_id: &str, state: AreaState, detail: &str) {
         if self
             .manager
-            .set_contacts_status(account_id, state, detail)
+            .set_area_status(CONTACTS_AREA, account_id, state, detail)
             .await
         {
             (self.notify)();
@@ -297,14 +238,18 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
     pub async fn sync_account(&self, account_id: &str) -> SyncOutcome {
         // Antes de nada, y releyendo el llavero: con la base cerrada no se le
         // pide nada ni al servicio de cuentas ni al servidor.
-        if !self.manager.prepare_for_sync(account_id).await {
+        if !self
+            .manager
+            .prepare_for_sync(CONTACTS_AREA, account_id)
+            .await
+        {
             self.set_status(account_id, AreaState::Pending, CLOSED_DETAIL)
                 .await;
             return SyncOutcome::StoreClosed;
         }
         self.set_status(account_id, AreaState::Syncing, "").await;
 
-        let credential = match self.credentials.contacts_credential(account_id).await {
+        let credential = match self.credentials.credential(account_id, CONTACTS_AREA).await {
             Ok(credential) => credential,
             Err(CredentialError::Denied) => {
                 tracing::info!("'{account_id}': sin permiso para los contactos");
@@ -497,170 +442,32 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
             })
             .await?;
 
-        let plan = match book.sync_collection {
-            Some(false) => None,
-            _ => {
-                self.plan_by_token(client, book, token, &local, round)
-                    .await?
-            }
-        };
-        let plan = match plan {
-            Some(plan) => plan,
-            None => {
-                round.report.etag_books += 1;
-                self.plan_by_etag(client, book, &local, round).await?
-            }
-        };
+        let mut counters = dav_sync::PlanCounters::default();
+        let plan = dav_sync::plan_collection(
+            client,
+            ListedCollection {
+                href: &book.href,
+                ctag: book.ctag.as_deref(),
+                sync_collection: book.sync_collection,
+            },
+            token,
+            &local,
+            CollectionCap {
+                max: self.limits.max_cards_per_book,
+                error: DavError::TooManyCards,
+            },
+            &self.limits,
+            round.deadline,
+            &mut counters,
+        )
+        .await;
+        round.report.full_resyncs += counters.full_resyncs;
+        round.report.foreign += counters.foreign;
+        round.report.etag_books += usize::from(counters.by_etag);
+        let plan = plan?;
 
         self.execute(account_id, client, book, stored, plan, round)
             .await
-    }
-
-    /// El camino de `sync-collection`. `None` si el servidor no lo sabe.
-    async fn plan_by_token(
-        &self,
-        client: &DavClient,
-        book: &AddressBook,
-        mut token: Option<String>,
-        local: &HashMap<String, Option<String>>,
-        round: &mut Round,
-    ) -> Result<Option<Plan>, SyncError> {
-        let mut full = token.is_none();
-        let mut changed: BTreeMap<String, (url::Url, Option<String>)> = BTreeMap::new();
-        let mut removed: BTreeSet<String> = BTreeSet::new();
-        let mut rounds = 0;
-
-        loop {
-            rounds += 1;
-            if rounds > self.limits.max_sync_rounds {
-                return Err(DavError::Status(507).into());
-            }
-            match round
-                .net(webdav::sync_collection(
-                    client,
-                    &book.href,
-                    token.as_deref(),
-                ))
-                .await?
-            {
-                webdav::SyncCollection::NotSupported => return Ok(None),
-                webdav::SyncCollection::InvalidToken => {
-                    if token.is_none() {
-                        // Sin token no hay nada que tirar: el servidor no sabe
-                        // lo que dice. Por ETag.
-                        return Ok(None);
-                    }
-                    tracing::info!("el token de una libreta venció: sincronización completa");
-                    round.report.full_resyncs += 1;
-                    token = None;
-                    full = true;
-                    changed.clear();
-                    removed.clear();
-                }
-                webdav::SyncCollection::Delta(delta) => {
-                    round.report.foreign += delta.foreign;
-                    merge_delta(
-                        &mut changed,
-                        &mut removed,
-                        delta.changed,
-                        delta.removed,
-                        local,
-                    );
-                    if changed.len() > self.limits.max_cards_per_book {
-                        return Err(DavError::TooManyCards(self.limits.max_cards_per_book).into());
-                    }
-                    let advanced = delta.token.is_some() && delta.token != token;
-                    token = delta.token;
-                    match (delta.truncated, advanced) {
-                        (false, _) => break,
-                        (true, true) => continue,
-                        // Truncado y sin token nuevo: pedir de nuevo daría lo
-                        // mismo, y tomarlo como completo borraría todo lo que
-                        // no llegó en la parte cortada. Error, sin escribir
-                        // nada ni mover el token.
-                        (true, false) => return Err(DavError::Status(507).into()),
-                    }
-                }
-            }
-        }
-
-        let mut delete: Vec<String> = removed
-            .into_iter()
-            .filter(|href| local.contains_key(href))
-            .collect();
-        if full {
-            // La carga completa trae todo lo que hay: lo guardado que no vino,
-            // ya no está.
-            delete.extend(
-                local
-                    .keys()
-                    .filter(|href| !changed.contains_key(*href))
-                    .cloned(),
-            );
-        }
-        let fetch = to_fetch(changed.into_values(), local);
-        self.check_total(local, &delete, &fetch)?;
-
-        let token = token.filter(|t| t.len() <= webdav::MAX_TOKEN_BYTES);
-        Ok(Some(Plan {
-            fetch,
-            delete,
-            progress: BookProgress {
-                token,
-                ctag: book.ctag.clone(),
-            },
-        }))
-    }
-
-    /// El camino por ETag, para el servidor que no sabe `sync-collection`.
-    async fn plan_by_etag(
-        &self,
-        client: &DavClient,
-        book: &AddressBook,
-        local: &HashMap<String, Option<String>>,
-        round: &Round,
-    ) -> Result<Plan, SyncError> {
-        let mut listed = round.net(carddav::list_etags(client, &book.href)).await?;
-        if listed.len() > self.limits.max_cards_per_book {
-            return Err(DavError::TooManyCards(self.limits.max_cards_per_book).into());
-        }
-        // Una tarjeta que el listado nombra dos veces —con escapes distintos—
-        // es una.
-        let mut present = BTreeSet::new();
-        listed.retain(|(u, _)| present.insert(href_key(u)));
-        let delete: Vec<String> = local
-            .keys()
-            .filter(|href| !present.contains(*href))
-            .cloned()
-            .collect();
-        let fetch = to_fetch(listed, local);
-        self.check_total(local, &delete, &fetch)?;
-        Ok(Plan {
-            fetch,
-            delete,
-            progress: BookProgress {
-                token: None,
-                ctag: book.ctag.clone(),
-            },
-        })
-    }
-
-    /// Que la libreta no pase el tope de tarjetas después de aplicar el plan.
-    fn check_total(
-        &self,
-        local: &HashMap<String, Option<String>>,
-        delete: &[String],
-        fetch: &[url::Url],
-    ) -> Result<(), SyncError> {
-        let new = fetch
-            .iter()
-            .filter(|u| !local.contains_key(&href_key(u)))
-            .count();
-        let total = (local.len() + new).saturating_sub(delete.len());
-        if total > self.limits.max_cards_per_book {
-            return Err(DavError::TooManyCards(self.limits.max_cards_per_book).into());
-        }
-        Ok(())
     }
 
     /// Trae lo que hay que traer y escribe de a lotes; el último lleva el token.
@@ -673,6 +480,7 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
         plan: Plan,
         round: &mut Round,
     ) -> Result<(), SyncError> {
+        let settles = plan.settles();
         let mut pending: Vec<ContactOp> = Vec::new();
         let mut pending_bytes = 0;
         round.report.removed += plan.delete.len();
@@ -686,8 +494,10 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
             }
         }
 
+        let mut missing = 0;
         for chunk in plan.fetch.chunks(self.limits.multiget_batch.max(1)) {
-            let cards = self.fetch_cards(client, book, chunk, round).await?;
+            let (cards, lost) = self.fetch_cards(client, book, chunk, round).await?;
+            missing += lost;
             // Desarmar las tarjetas es CPU, y una armada a propósito tarda: fuera
             // del bucle de eventos.
             let max_vcard_bytes = self.limits.max_vcard_bytes;
@@ -706,9 +516,44 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
             }
         }
 
-        // El último lote, aunque esté vacío: es el que guarda el token.
-        self.write(account_id, stored, &mut pending, Some(plan.progress), round)
-            .await
+        // El último lote, aunque esté vacío: es el que guarda el token. Salvo
+        // que el listado haya traído tarjetas de otro origen (ver
+        // `Plan::foreign`), o que algo pedido no haya vuelto (ver
+        // `MissingStreaks`): lo traído se escribe, pero la libreta no queda al
+        // día.
+        let settled = self.missing.settle(account_id, &stored.href, missing);
+        let settles = settles && !matches!(settled, Settled::Retry(_));
+        let progress = settles.then_some(BookProgress {
+            token: plan.token,
+            ctag: plan.ctag,
+        });
+        self.write(account_id, stored, &mut pending, progress, round)
+            .await?;
+        match settled {
+            Settled::Complete => Ok(()),
+            Settled::Retry(count) => {
+                tracing::warn!(
+                    "'{account_id}': {count} tarjetas pedidas no volvieron; la libreta no se da \
+                     por al día y se vuelven a pedir"
+                );
+                Err(SyncError::Dav(DavError::MissingResources(count)))
+            }
+            Settled::GaveUp(count) => {
+                round.report.missing += count;
+                let message = format!(
+                    "{count} tarjetas pedidas no volvieron en {MISSING_ROUNDS} vueltas seguidas: \
+                     la libreta se dio por al día sin ellas, y llegan cuando cambien en el \
+                     servidor"
+                );
+                tracing::warn!("'{account_id}': {message}");
+                let _ = self
+                    .store(account_id, move |s| {
+                        s.log(LogLevel::Warn, Some(CONTACTS_AREA), &message)
+                    })
+                    .await;
+                Ok(())
+            }
+        }
     }
 
     async fn write(
@@ -746,24 +591,30 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
 
     /// Una tanda de `multiget`. Si la respuesta pasa el tope, se parte en dos
     /// hasta llegar a una tarjeta sola, y ésa se saltea: una tarjeta enorme no
-    /// puede trabar la libreta entera para siempre.
+    /// puede trabar la libreta entera para siempre. Devuelve también cuántas
+    /// de las pedidas no volvieron.
     async fn fetch_cards(
         &self,
         client: &DavClient,
         book: &AddressBook,
         hrefs: &[url::Url],
         round: &mut Round,
-    ) -> Result<Vec<CardResource>, SyncError> {
+    ) -> Result<(Vec<CardResource>, usize), SyncError> {
         let mut cards = Vec::new();
+        let mut missing = 0;
         let mut parts = vec![hrefs.to_vec()];
         while let Some(part) = parts.pop() {
             match round
                 .net(carddav::multiget(client, &book.href, &part))
                 .await
             {
-                Ok((fetched, unrequested)) => {
-                    round.report.unrequested += unrequested;
-                    cards.extend(fetched);
+                Ok(fetched) => {
+                    round.report.unrequested += fetched.unrequested;
+                    // Lo que pasaba el tope ya se descartó al leer la
+                    // respuesta: acá no llega.
+                    round.report.too_large += fetched.too_large;
+                    missing += fetched.missing.len();
+                    cards.extend(fetched.items);
                 }
                 Err(SyncError::Dav(DavError::BodyTooLarge(_))) if part.len() > 1 => {
                     let (first, second) = part.split_at(part.len() / 2);
@@ -774,11 +625,13 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
                 Err(e) => return Err(e),
             }
         }
-        Ok(cards)
+        Ok((cards, missing))
     }
 }
 
-/// Lo que se guarda de unas tarjetas, y cuántas no, por pasar el tope.
+/// Lo que se guarda de unas tarjetas, y cuántas no, por pasar el tope. El tope
+/// ya se miró al leer cada respuesta del `multiget` (N8): se vuelve a mirar por
+/// si alguien arma tarjetas por otro camino.
 fn rows_from(cards: Vec<CardResource>, max_vcard_bytes: usize) -> (Vec<ContactRow>, usize) {
     let mut too_large = 0;
     let rows = cards
@@ -811,137 +664,25 @@ fn row_from(card: CardResource) -> Option<ContactRow> {
     })
 }
 
-/// Suma una tanda de `sync-collection` a lo acumulado de las anteriores.
-///
-/// Lo que se borró sólo se anota **si está guardado**: con cincuenta tandas
-/// de dieciséis megas de `404` de direcciones que nadie tiene, la lista crecía
-/// hasta gigabytes antes de filtrarla al final. Así no pasa de lo guardado,
-/// que tiene tope. Lo que cambió y después se borró deja de pedirse igual.
-fn merge_delta(
-    changed: &mut BTreeMap<String, (url::Url, Option<String>)>,
-    removed: &mut BTreeSet<String>,
-    delta_changed: Vec<(url::Url, Option<String>)>,
-    delta_removed: Vec<url::Url>,
-    local: &HashMap<String, Option<String>>,
-) {
-    for url in delta_removed {
-        let key = href_key(&url);
-        changed.remove(&key);
-        if local.contains_key(&key) {
-            removed.insert(key);
-        }
-    }
-    for (url, etag) in delta_changed {
-        let key = href_key(&url);
-        removed.remove(&key);
-        changed.insert(key, (url, etag));
-    }
-}
-
-/// Lo que hay que traer: lo nuevo y lo que cambió de ETag. Sin ETag no hay
-/// cómo saber, y se trae.
-fn to_fetch(
-    listed: impl IntoIterator<Item = (url::Url, Option<String>)>,
-    local: &HashMap<String, Option<String>>,
-) -> Vec<url::Url> {
-    listed
-        .into_iter()
-        .filter(|(url, etag)| match (local.get(&href_key(url)), etag) {
-            (Some(Some(stored)), Some(etag)) => stored != etag,
-            _ => true,
-        })
-        .map(|(url, _)| url)
-        .collect()
-}
-
 // ---------------------------------------------------------------------------
 // Cuándo
 // ---------------------------------------------------------------------------
 
-/// Decide cuándo le toca a cada cuenta.
-pub struct ContactsScheduler<K: KeySource, C: CredentialSource> {
-    sync: ContactsSync<K, C>,
-    /// El último intento que llegó a pedir algo, por cuenta.
-    last_attempt: Mutex<HashMap<String, Instant>>,
-    /// El último `RequestSync` atendido, por cuenta.
-    last_request: Mutex<HashMap<String, Instant>>,
-}
+/// Decide cuándo le toca a cada cuenta: el de `dav_sync.rs`, con los
+/// contactos.
+pub type ContactsScheduler<K, C> = dav_sync::DavScheduler<ContactsSync<K, C>>;
 
-impl<K: KeySource, C: CredentialSource> ContactsScheduler<K, C> {
-    pub fn new(sync: ContactsSync<K, C>) -> Self {
-        Self {
-            sync,
-            last_attempt: Mutex::new(HashMap::new()),
-            last_request: Mutex::new(HashMap::new()),
-        }
+impl<K: KeySource, C: CredentialSource> AreaSync for ContactsSync<K, C> {
+    fn interval(&self) -> Duration {
+        CONTACTS_INTERVAL
     }
 
-    /// Las cuentas a las que les toca, una por una.
-    pub async fn run_due(&self, now: Instant) {
-        for account_id in self.sync.manager.contacts_targets().await {
-            let due = self
-                .last_attempt
-                .lock()
-                .await
-                .get(&account_id)
-                .is_none_or(|last| now.saturating_duration_since(*last) >= CONTACTS_INTERVAL);
-            if due {
-                self.sync_one(&account_id, now).await;
-            }
-        }
+    async fn targets(&self) -> Vec<String> {
+        self.manager.area_targets(CONTACTS_AREA).await
     }
 
-    /// Un `RequestSync`: ya, salvo que la misma cuenta haya pedido hace muy
-    /// poco.
-    pub async fn run_requested(&self, account_id: &str, now: Instant) {
-        {
-            let mut requests = self.last_request.lock().await;
-            if requests
-                .get(account_id)
-                .is_some_and(|last| now.saturating_duration_since(*last) < REQUEST_COOLDOWN)
-            {
-                return;
-            }
-            requests.insert(account_id.to_string(), now);
-        }
-        if self
-            .sync
-            .manager
-            .contacts_targets()
-            .await
-            .iter()
-            .any(|id| id == account_id)
-        {
-            self.sync_one(account_id, now).await;
-        }
-    }
-
-    async fn sync_one(&self, account_id: &str, now: Instant) {
-        let outcome = self.sync.sync_account(account_id).await;
-        // Una base cerrada no pidió nada: no cuenta, y se vuelve a mirar en la
-        // próxima revisión.
-        if outcome != SyncOutcome::StoreClosed {
-            self.last_attempt
-                .lock()
-                .await
-                .insert(account_id.to_string(), now);
-        }
-    }
-
-    /// El bucle: una revisión cada [`CONTACTS_TICK`] y cada `RequestSync` que
-    /// llega por `requests`. De a una cuenta por vez.
-    pub async fn run(self: Arc<Self>, mut requests: tokio::sync::mpsc::Receiver<String>) {
-        let mut tick = tokio::time::interval(CONTACTS_TICK);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                _ = tick.tick() => self.run_due(Instant::now()).await,
-                request = requests.recv() => match request {
-                    Some(account_id) => self.run_requested(&account_id, Instant::now()).await,
-                    None => return,
-                },
-            }
-        }
+    async fn attempt(&self, account_id: &str) -> bool {
+        self.sync_account(account_id).await != SyncOutcome::StoreClosed
     }
 }
 

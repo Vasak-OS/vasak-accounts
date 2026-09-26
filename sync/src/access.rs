@@ -20,7 +20,7 @@
 //!    acepta sin pidfd la de un proceso que terminó antes del `accept`. Sólo
 //!    un bus que no lo da nunca se juzga por el pid, como antes. El pidfd se
 //!    suelta apenas se comprobó, antes de la pregunta.
-//! 4. `CheckPermissionFor(pid, arranque, "store.contacts", cuenta)` en
+//! 4. `CheckPermissionFor(pid, arranque, "store.<área>", cuenta)` en
 //!    `vasak-permissions`, en el bus del sistema. El sincronizador es un
 //!    delegado de ese servicio desde su 0.15.0: pregunta **por quien lo
 //!    llamó**, y la decisión queda anotada contra esa aplicación, no contra el
@@ -111,8 +111,14 @@ pub const CACHE_TTL: Duration = Duration::from_secs(30);
 /// la persona conteste un diálogo.
 pub const CHECK_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Leer los contactos guardados. El recurso de `vasak-permissions`.
+/// Leer los contactos guardados. El recurso de `vasak-permissions`, distinto
+/// de `account.contacts`, que entrega la credencial.
 pub const CONTACTS_RESOURCE: &str = "store.contacts";
+
+/// El recurso de `vasak-permissions` para leer el calendario guardado —los
+/// eventos y las tareas—, distinto de `account.calendar`, que entrega la
+/// credencial.
+pub const CALENDAR_RESOURCE: &str = "store.calendar";
 
 /// Cuántos comandos de control deja pasar [`CallerLimits`] por cuenta y
 /// nombre único en cada ventana.
@@ -902,6 +908,9 @@ pub(crate) mod tests {
         /// Si está, cada pregunta espera un permiso de acá antes de contestar:
         /// la persona mirando el diálogo.
         pub gate: Option<Arc<tokio::sync::Semaphore>>,
+        /// Lo que se contesta para un recurso en particular, antes que
+        /// `answer`.
+        pub per_resource: HashMap<String, Answer>,
     }
 
     /// Un `vasak-permissions` falso: contesta lo que se le diga y cuenta.
@@ -915,6 +924,7 @@ pub(crate) mod tests {
                 calls: 0,
                 asked: Vec::new(),
                 gate: None,
+                per_resource: HashMap::new(),
             })))
         }
 
@@ -924,6 +934,15 @@ pub(crate) mod tests {
 
         pub(crate) fn set(&self, answer: Answer) {
             self.0.lock().unwrap().answer = answer;
+        }
+
+        /// Lo que se contesta para un recurso, sin cambiar los demás.
+        pub(crate) fn set_for(&self, resource: &str, answer: Answer) {
+            self.0
+                .lock()
+                .unwrap()
+                .per_resource
+                .insert(resource.to_string(), answer);
         }
     }
 
@@ -936,18 +955,24 @@ pub(crate) mod tests {
             resource_id: String,
             detail: String,
         ) -> zbus::fdo::Result<bool> {
-            let gate = {
+            let (gate, resource) = {
                 let mut state = self.0.lock().unwrap();
                 state.calls += 1;
                 state
                     .asked
-                    .push((subject_pid, subject_start_time, resource_id, detail));
-                state.gate.clone()
+                    .push((subject_pid, subject_start_time, resource_id.clone(), detail));
+                (state.gate.clone(), resource_id)
             };
             if let Some(gate) = gate {
                 gate.acquire().await.unwrap().forget();
             }
-            match self.0.lock().unwrap().answer {
+            let state = self.0.lock().unwrap();
+            match state
+                .per_resource
+                .get(&resource)
+                .copied()
+                .unwrap_or(state.answer)
+            {
                 Answer::Allow => Ok(true),
                 Answer::Deny => Ok(false),
                 Answer::Fail => Err(zbus::fdo::Error::Failed("roto".into())),

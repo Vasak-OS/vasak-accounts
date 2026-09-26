@@ -169,9 +169,141 @@ BEGIN
 END;
 ";
 
+/// v3 (PR 4): el calendario.
+///
+/// **El iCalendar crudo es la fuente de verdad** (decisión 3 del taller), como
+/// la vCard en la v2: `calendar_objects.raw_ical` guarda el recurso tal como
+/// vino del servidor —la serie y sus excepciones, que viajan juntas en uno—, y
+/// todo lo demás se deriva de él y existe sólo para listar y ordenar.
+///
+/// - `calendars`: los calendarios de la cuenta, con su color y los
+///   componentes que guardan (`VEVENT`, `VTODO`, separados por coma). El
+///   `sync-token` vive en `sync_state` (`area = 'calendar'`), y un disparador
+///   lo borra junto con el calendario, como el de las libretas.
+/// - `calendar_objects`: un objeto por recurso del servidor, identificado por
+///   `(calendario, dirección)` y no por el `UID`. Lo derivado: el componente,
+///   el título, el comienzo y el fin en segundos UTC (el vencimiento, en una
+///   tarea), todo el día, si se repite, cómo quedó la zona (`unknown` es un
+///   `TZID` que no se pudo resolver: se tomó como hora flotante), el estado,
+///   la prioridad y cuándo se completó una tarea. Y lo de la expansión: el
+///   rango que cubren sus ocurrencias guardadas (`expanded_from`,
+///   `expanded_to`; nulo en lo que no se repite, que se guarda entero), cómo
+///   terminó (`complete`, `truncated` si pasó un tope, `invalid` si la regla
+///   no se entendió) y cuánto dura su vez más larga (`span`), que acota la
+///   consulta por rango. `sort_key` ordena las tareas por vencimiento, las sin
+///   vencimiento al final. `component = ''` es un recurso que no es ni evento
+///   ni tarea: se guarda por su ETag y no se lista.
+/// - `occurrences`: las veces de cada evento. **En una serie, las que empiezan
+///   en la ventana** del almacén; en un evento que no se repite, todas. Una
+///   excepción reemplaza su vez (misma clave, `recurrence_id`, el comienzo que
+///   tenía en la serie). Si su título no es el del objeto, `title` dice cuál
+///   de `object_titles` es —el número, no el texto: una `THISANDFUTURE` con
+///   otro título se lo pasa a todas las que le siguen, y copiarlo a cada una
+///   multiplicaba el título por las ocurrencias—. Con el calendario copiado
+///   para filtrar sin ir al objeto. Con cascada desde el objeto.
+/// - `object_titles`: los títulos de las excepciones de un objeto que no son
+///   el suyo, por su lugar entre ellas. Uno por excepción como mucho, y cada
+///   uno salió del recurso: juntos no pesan más que `raw_ical`.
+/// - `alarms`: los disparos de los recordatorios de cada ocurrencia guardada,
+///   en segundos UTC, para las notificaciones que vengan. Con cascada desde su
+///   ocurrencia.
+///
+/// La lista de un rango pagina por `(starts_at, object_id, recurrence_id)`,
+/// con un índice que además lleva el fin y el calendario, así que filtrar por
+/// superposición y por calendario no sale del índice (una prueba mira el plan).
+/// `occurrences_long` es el mismo índice con sólo las veces que duran más de
+/// 400 días (`calendar_read::LONG_OCCURRENCE_SECONDS`): la consulta por rango
+/// mira hacia atrás como mucho eso, y las que duran más las busca ahí.
+const V3: &str = "
+CREATE TABLE calendars (
+    id           INTEGER PRIMARY KEY,
+    href         TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    color        TEXT,
+    components   TEXT NOT NULL,
+    ctag         TEXT,
+    updated_at   TEXT NOT NULL
+) STRICT;
+
+CREATE TRIGGER calendars_forget_token AFTER DELETE ON calendars
+BEGIN
+    DELETE FROM sync_state WHERE area = 'calendar' AND collection = OLD.href;
+END;
+
+CREATE TABLE calendar_objects (
+    id            INTEGER PRIMARY KEY,
+    calendar_id   INTEGER NOT NULL REFERENCES calendars (id) ON DELETE CASCADE,
+    href          TEXT NOT NULL,
+    etag          TEXT,
+    uid           TEXT NOT NULL,
+    component     TEXT NOT NULL CHECK (component IN ('VEVENT', 'VTODO', '')),
+    summary       TEXT NOT NULL,
+    starts_at     INTEGER,
+    ends_at       INTEGER,
+    all_day       INTEGER NOT NULL,
+    recurring     INTEGER NOT NULL,
+    zone          TEXT NOT NULL CHECK (zone IN ('date', 'utc', 'zoned', 'floating', 'unknown')),
+    status        TEXT NOT NULL,
+    priority      INTEGER,
+    completed_at  INTEGER,
+    done          INTEGER NOT NULL,
+    sort_key      INTEGER NOT NULL,
+    span          INTEGER NOT NULL,
+    expansion     TEXT NOT NULL CHECK (expansion IN ('complete', 'truncated', 'invalid')),
+    expanded_from INTEGER,
+    expanded_to   INTEGER,
+    raw_ical      TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    UNIQUE (calendar_id, href)
+) STRICT;
+
+CREATE INDEX calendar_objects_by_uid ON calendar_objects (uid);
+CREATE INDEX calendar_objects_series ON calendar_objects (recurring, starts_at);
+CREATE INDEX calendar_objects_by_span ON calendar_objects (span);
+CREATE INDEX calendar_objects_by_due ON calendar_objects (component, sort_key, id);
+
+CREATE TABLE occurrences (
+    object_id     INTEGER NOT NULL REFERENCES calendar_objects (id) ON DELETE CASCADE,
+    recurrence_id INTEGER NOT NULL,
+    calendar_id   INTEGER NOT NULL,
+    starts_at     INTEGER NOT NULL,
+    ends_at       INTEGER NOT NULL,
+    all_day       INTEGER NOT NULL,
+    title         INTEGER,
+    PRIMARY KEY (object_id, recurrence_id)
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX occurrences_by_start
+    ON occurrences (starts_at, object_id, recurrence_id, ends_at, calendar_id);
+
+CREATE INDEX occurrences_long
+    ON occurrences (starts_at, object_id, recurrence_id, ends_at, calendar_id)
+    WHERE ends_at - starts_at > 34560000;
+
+CREATE TABLE object_titles (
+    object_id INTEGER NOT NULL REFERENCES calendar_objects (id) ON DELETE CASCADE,
+    position  INTEGER NOT NULL,
+    summary   TEXT NOT NULL,
+    PRIMARY KEY (object_id, position)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE alarms (
+    object_id     INTEGER NOT NULL,
+    recurrence_id INTEGER NOT NULL,
+    position      INTEGER NOT NULL,
+    fires_at      INTEGER NOT NULL,
+    action        TEXT NOT NULL,
+    PRIMARY KEY (object_id, recurrence_id, position),
+    FOREIGN KEY (object_id, recurrence_id)
+        REFERENCES occurrences (object_id, recurrence_id) ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX alarms_by_time ON alarms (fires_at);
+";
+
 /// Todas las migraciones, en orden.
 pub fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(V1), M::up(V2)])
+    Migrations::new(vec![M::up(V1), M::up(V2), M::up(V3)])
 }
 
 /// Lleva la base a la última versión. Aplicarlo sobre una base al día no hace
@@ -207,7 +339,7 @@ mod tests {
         let mut connection = Connection::open_in_memory().unwrap();
         apply(&mut connection).unwrap();
         let version = schema_version(&connection).unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
 
         let tables = |c: &Connection| -> Vec<String> {
             let mut statement = c
@@ -238,9 +370,30 @@ mod tests {
             "contact_phones",
             "contacts_fts",
             "contacts_fts_forget",
+            "calendars",
+            "calendars_forget_token",
+            "calendar_objects",
+            "calendar_objects_by_uid",
+            "calendar_objects_series",
+            "calendar_objects_by_span",
+            "calendar_objects_by_due",
+            "occurrences",
+            "occurrences_by_start",
+            "occurrences_long",
+            "object_titles",
+            "alarms",
+            "alarms_by_time",
         ] {
             assert!(before.iter().any(|t| t == table), "falta {table}");
         }
+    }
+
+    /// El índice de las veces largas tiene en su condición el mismo tope que
+    /// la consulta por rango: si no, SQLite no lo puede usar.
+    #[test]
+    fn el_indice_de_las_veces_largas_usa_el_tope_de_la_lectura() {
+        let seconds = crate::store::calendar_read::LONG_OCCURRENCE_SECONDS;
+        assert!(V3.contains(&format!("WHERE ends_at - starts_at > {seconds};")));
     }
 
     /// Una base de una versión más nueva que este programa no se toca.
@@ -318,7 +471,7 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .unwrap();
-        let all = [V1, V2];
+        let all = [V1, V2, V3];
         Migrations::new(all[..version].iter().map(|sql| M::up(sql)).collect())
             .to_latest(&mut connection)
             .unwrap();
@@ -345,7 +498,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 2);
+        assert_eq!(schema_version(&connection).unwrap(), 3);
         let message: String = connection
             .query_row("SELECT message FROM sync_log", [], |row| row.get(0))
             .unwrap();
@@ -561,5 +714,242 @@ mod tests {
         );
         assert!(by_book.contains("contacts_by_book_and_sort"), "{by_book}");
         assert!(!by_book.contains("TEMP B-TREE"), "{by_book}");
+    }
+
+    // ── v3: el calendario ───────────────────────────────────────────────────
+
+    fn insert_calendar(connection: &Connection, href: &str) -> i64 {
+        connection
+            .execute(
+                "INSERT INTO calendars (href, display_name, components, updated_at)
+                 VALUES (?1, 'Personal', 'VEVENT,VTODO', 'ahora')",
+                [href],
+            )
+            .unwrap();
+        let id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO sync_state (area, collection, token, updated_at) VALUES ('calendar', ?1, 't1', 'ahora')",
+                [href],
+            )
+            .unwrap();
+        id
+    }
+
+    /// Un objeto con dos ocurrencias y un recordatorio en cada una, y el
+    /// título de una excepción.
+    fn insert_object(connection: &Connection, calendar: i64, href: &str) -> i64 {
+        connection
+            .execute(
+                "INSERT INTO calendar_objects
+                   (calendar_id, href, uid, component, summary, starts_at, ends_at, all_day,
+                    recurring, zone, status, done, sort_key, span, expansion, raw_ical, updated_at)
+                 VALUES (?1, ?2, ?2, 'VEVENT', 'Reunión', 100, 200, 0, 1, 'utc', '', 0, 100, 100,
+                         'complete', 'BEGIN:VCALENDAR', 'ahora')",
+                rusqlite::params![calendar, href],
+            )
+            .unwrap();
+        let id = connection.last_insert_rowid();
+        for rid in [100, 1000] {
+            connection
+                .execute(
+                    "INSERT INTO occurrences (object_id, recurrence_id, calendar_id, starts_at, ends_at, all_day)
+                     VALUES (?1, ?2, ?3, ?2, ?2 + 100, 0)",
+                    rusqlite::params![id, rid, calendar],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO alarms (object_id, recurrence_id, position, fires_at, action)
+                     VALUES (?1, ?2, 0, ?2 - 10, 'DISPLAY')",
+                    rusqlite::params![id, rid],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO object_titles (object_id, position, summary) VALUES (?1, 0, 'Otra')",
+                [id],
+            )
+            .unwrap();
+        id
+    }
+
+    fn with_foreign_keys() -> Connection {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        apply(&mut connection).unwrap();
+        connection
+    }
+
+    /// **v2 → v3 no pierde nada**: los contactos, sus datos, su índice y su
+    /// token siguen ahí después de migrar, y la bitácora también.
+    #[test]
+    fn de_v2_a_v3_se_conservan_los_contactos() {
+        let mut connection = at_version(2);
+        let book = insert_book(&connection, "https://x/a/");
+        let id = insert_contact(&connection, book, "https://x/a/1.vcf", "José Pérez");
+        connection
+            .execute(
+                "INSERT INTO sync_log (at, level, area, message) VALUES ('ayer', 'warn', 'contacts', 'algo')",
+                [],
+            )
+            .unwrap();
+
+        apply(&mut connection).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 3);
+        assert_eq!(found(&connection, "jose"), vec![id]);
+        assert_eq!(count(&connection, "SELECT count(*) FROM contact_emails"), 1);
+        assert_eq!(count(&connection, "SELECT count(*) FROM contact_phones"), 1);
+        assert_eq!(
+            count(
+                &connection,
+                "SELECT count(*) FROM sync_state WHERE area = 'contacts'"
+            ),
+            1
+        );
+        assert_eq!(count(&connection, "SELECT count(*) FROM sync_log"), 1);
+        // Y se puede escribir en las tablas nuevas.
+        let calendar = insert_calendar(&connection, "https://x/c/");
+        insert_object(&connection, calendar, "https://x/c/1.ics");
+        assert_eq!(count(&connection, "SELECT count(*) FROM occurrences"), 2);
+    }
+
+    /// Borrar un calendario se lleva sus objetos, sus ocurrencias, sus
+    /// recordatorios y su token; lo del otro calendario no se toca.
+    #[test]
+    fn borrar_un_calendario_se_lleva_todo_lo_suyo() {
+        let connection = with_foreign_keys();
+        let gone = insert_calendar(&connection, "https://x/a/");
+        let kept = insert_calendar(&connection, "https://x/b/");
+        insert_object(&connection, gone, "https://x/a/1.ics");
+        insert_object(&connection, gone, "https://x/a/2.ics");
+        insert_object(&connection, kept, "https://x/b/1.ics");
+
+        connection
+            .execute("DELETE FROM calendars WHERE id = ?1", [gone])
+            .unwrap();
+
+        assert_eq!(
+            count(&connection, "SELECT count(*) FROM calendar_objects"),
+            1
+        );
+        assert_eq!(count(&connection, "SELECT count(*) FROM occurrences"), 2);
+        assert_eq!(count(&connection, "SELECT count(*) FROM alarms"), 2);
+        assert_eq!(count(&connection, "SELECT count(*) FROM object_titles"), 1);
+        assert_eq!(
+            count(
+                &connection,
+                "SELECT count(*) FROM sync_state WHERE area = 'calendar'"
+            ),
+            1,
+            "el token del calendario borrado se va con él"
+        );
+    }
+
+    /// Borrar un objeto se lleva sus ocurrencias y sus recordatorios, y borrar
+    /// una ocurrencia se lleva los suyos.
+    #[test]
+    fn borrar_un_objeto_se_lleva_sus_ocurrencias_y_recordatorios() {
+        let connection = with_foreign_keys();
+        let calendar = insert_calendar(&connection, "https://x/a/");
+        let object = insert_object(&connection, calendar, "https://x/a/1.ics");
+        connection
+            .execute(
+                "DELETE FROM occurrences WHERE object_id = ?1 AND recurrence_id = 100",
+                [object],
+            )
+            .unwrap();
+        assert_eq!(count(&connection, "SELECT count(*) FROM alarms"), 1);
+
+        connection
+            .execute("DELETE FROM calendar_objects WHERE id = ?1", [object])
+            .unwrap();
+        assert_eq!(count(&connection, "SELECT count(*) FROM occurrences"), 0);
+        assert_eq!(count(&connection, "SELECT count(*) FROM alarms"), 0);
+        assert_eq!(count(&connection, "SELECT count(*) FROM object_titles"), 0);
+    }
+
+    /// Un objeto es uno por calendario y dirección, y no hay objeto sin
+    /// calendario, ni ocurrencia sin objeto, ni recordatorio sin ocurrencia.
+    #[test]
+    fn un_objeto_es_uno_por_calendario_y_direccion() {
+        let connection = with_foreign_keys();
+        let calendar = insert_calendar(&connection, "https://x/a/");
+        insert_object(&connection, calendar, "https://x/a/1.ics");
+        let again = connection.execute(
+            "INSERT INTO calendar_objects
+               (calendar_id, href, uid, component, summary, all_day, recurring, zone, status,
+                done, sort_key, span, expansion, raw_ical, updated_at)
+             VALUES (?1, 'https://x/a/1.ics', '', 'VEVENT', '', 0, 0, 'utc', '', 0, 0, 0,
+                     'complete', '', 'ahora')",
+            [calendar],
+        );
+        assert!(again.is_err());
+        let orphan = connection.execute(
+            "INSERT INTO calendar_objects
+               (calendar_id, href, uid, component, summary, all_day, recurring, zone, status,
+                done, sort_key, span, expansion, raw_ical, updated_at)
+             VALUES (999, 'https://x/a/2.ics', '', 'VEVENT', '', 0, 0, 'utc', '', 0, 0, 0,
+                     'complete', '', 'ahora')",
+            [],
+        );
+        assert!(orphan.is_err(), "sin calendario no hay objeto");
+        let orphan = connection.execute(
+            "INSERT INTO occurrences (object_id, recurrence_id, calendar_id, starts_at, ends_at, all_day)
+             VALUES (999, 1, 1, 1, 2, 0)",
+            [],
+        );
+        assert!(orphan.is_err());
+        let orphan = connection.execute(
+            "INSERT INTO alarms (object_id, recurrence_id, position, fires_at, action)
+             VALUES (1, 55, 0, 1, 'DISPLAY')",
+            [],
+        );
+        assert!(
+            orphan.is_err(),
+            "un recordatorio sin su ocurrencia no entra"
+        );
+        let bad = connection.execute("UPDATE calendar_objects SET component = 'VJOURNAL'", []);
+        assert!(bad.is_err());
+    }
+
+    /// La consulta por rango del calendario usa su índice —la superposición y
+    /// el calendario se filtran dentro de él— y pagina sin ordenar en memoria.
+    /// Y las tareas, por vencimiento, igual.
+    #[test]
+    fn la_consulta_por_rango_usa_su_indice() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        apply(&mut connection).unwrap();
+        let plan = |sql: &str| -> String {
+            let mut statement = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        };
+        let range = plan(
+            "SELECT o.object_id FROM occurrences o
+              WHERE o.starts_at >= 0 AND o.starts_at < 1000 AND o.ends_at > 10
+                AND o.calendar_id IN (1, 2)
+                AND (o.starts_at, o.object_id, o.recurrence_id) > (5, 1, 1)
+              ORDER BY o.starts_at, o.object_id, o.recurrence_id LIMIT 101",
+        );
+        assert!(range.contains("occurrences_by_start"), "{range}");
+        assert!(range.contains("COVERING INDEX"), "{range}");
+        assert!(!range.contains("TEMP B-TREE"), "{range}");
+
+        let tasks = plan(
+            "SELECT id FROM calendar_objects WHERE component = 'VTODO'
+                AND (sort_key, id) > (5, 1) ORDER BY sort_key, id LIMIT 101",
+        );
+        assert!(tasks.contains("calendar_objects_by_due"), "{tasks}");
+        assert!(!tasks.contains("TEMP B-TREE"), "{tasks}");
     }
 }
