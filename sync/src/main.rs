@@ -87,7 +87,11 @@ use broker::{Broker, BrokerError};
 /// Cinco minutos, y no algo más frecuente, porque cada vuelta abre una conexión
 /// y se autentica contra el servidor de alguien: hacerlo cada treinta segundos
 /// es maltratarlo.
-const INTERVALO: Duration = Duration::from_secs(300);
+///
+/// Es también la vuelta del bucle principal que lee las cuentas, y por eso lo
+/// que tienen que estar separados los dos listados que confirman que una cuenta
+/// se fue antes de borrar su base (ver `store::lifecycle::PRUNE_CONFIRMATION`).
+const POLL_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Cada cuánto se renueva la espera de IDLE.
 ///
@@ -1530,7 +1534,7 @@ async fn sesion_de_cuenta(
         tracing::info!(
             "'{}': el servidor no sabe avisar; se mira cada {} minutos",
             cuenta.id,
-            INTERVALO.as_secs() / 60,
+            POLL_INTERVAL.as_secs() / 60,
         );
     }
 
@@ -1544,7 +1548,7 @@ async fn sesion_de_cuenta(
                 .await
                 .map_err(|e| Salida::Cortada(e.to_string()))?;
         } else {
-            tokio::time::sleep(INTERVALO).await;
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
 
         // Pedirle el token al servicio en cada vuelta es lo que lo mantiene
@@ -1806,7 +1810,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // la persona reconectó la cuenta. La misma vuelta pasa la tabla del
         // almacén, que es lo que nota un llavero que se bloqueó sin avisar.
         tokio::select! {
-            _ = tokio::time::sleep(INTERVALO) => {}
+            _ = tokio::time::sleep(POLL_INTERVAL) => {}
             _ = wakeup.recv() => {
                 tracing::debug!("algo cambió en las cuentas");
                 // Y sólo acá se olvidan los rechazos: la persona pudo haber
@@ -1945,7 +1949,7 @@ mod tests {
             RENOVAR_IDLE < Duration::from_secs(29 * 60),
             "el estándar pide renovar antes de los 29 minutos"
         );
-        assert!(REINTENTO_CUENTA < INTERVALO);
+        assert!(REINTENTO_CUENTA < POLL_INTERVAL);
     }
 
     /// Las ventanas viejas no mandan el campo. Caer a la de entrada es lo que

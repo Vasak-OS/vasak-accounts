@@ -32,10 +32,15 @@
 //!   bloquearse a mitad, o mentir—, y sale de ahí recién cuando una clave
 //!   **nueva** quedó guardada y releída. Mientras tanto, lo que `find` devuelva
 //!   para esa cuenta se descarta.
-//! - **Al desconectar una cuenta** se borra la base de toda cuenta que no esté
-//!   en `ListAccounts`, **sólo si `ListAccounts` respondió bien**, y comparando
-//!   contra todas las cuentas: una que pide reautenticarse sigue siendo de la
-//!   persona y conserva su base.
+//! - **Al desconectar una cuenta** se borra su base —archivos y clave— y lo
+//!   decidido para ella en `stores.json`, pero **sólo cuando la ausencia está
+//!   confirmada**: la cuenta falta en dos `ListAccounts` que respondieron bien,
+//!   y el segundo llegó por lo menos [`PRUNE_CONFIRMATION`] —una vuelta del
+//!   bucle principal— después del primero en que faltó. Un listado que falló
+//!   no cuenta ni a favor ni en contra, y una cuenta que reaparece en cualquier
+//!   listado bueno deja de estar bajo sospecha. Se compara contra todas las
+//!   cuentas: una que pide reautenticarse sigue siendo de la persona y conserva
+//!   su base. Ver [`Listings`].
 //!
 //! Lo que **nunca** lleva a borrar: un error del disco, un error del llavero, un
 //! esquema más nuevo que este programa. Sólo una clave que no está —leída con el
@@ -45,6 +50,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -55,6 +61,97 @@ use super::{LogLevel, Store, StoreError};
 
 /// Las capacidades de una cuenta que van a tener lugar en el almacén.
 pub const STORE_AREAS: [&str; 3] = ["email", "calendar", "contacts"];
+
+/// Cuánto tiene que haber entre el primer listado bueno en que falta una
+/// cuenta y el que confirma que se fue, antes de borrar nada suyo.
+///
+/// Una vuelta del bucle principal, que es el que lee las cuentas. **Dos
+/// listados y una vuelta, las dos cosas**, y no una sola:
+///
+/// - Un listado solo no alcanza. El servicio de cuentas contesta bien y vacío
+///   cuando le falta `accounts.json` (`AccountDatabase::load` en el demonio),
+///   y una sola respuesta así borraba todas las bases.
+/// - Dos listados solos tampoco: una ráfaga de `AccountsChanged` dispara dos
+///   en el mismo segundo, y los dos salen del mismo estado roto del servicio.
+/// - Y una gracia sola —«falta desde hace cinco minutos»— borraría con la
+///   vuelta del llavero o del reloj, sin que el servicio de cuentas haya vuelto
+///   a decir nada: la segunda respuesta es la evidencia, el tiempo es lo que la
+///   hace independiente de la primera.
+///
+/// La sospecha vive en memoria y no se guarda: después de reiniciar el sync
+/// hace falta confirmar de nuevo, que es lo conservador.
+pub const PRUNE_CONFIRMATION: Duration = crate::POLL_INTERVAL;
+
+/// Lo que dijeron los `ListAccounts` que respondieron bien desde que arrancó
+/// el proceso: el último listado, y desde cuándo falta cada cuenta que dejó de
+/// figurar.
+///
+/// Es la única fuente de «esta cuenta se fue». Todo lo que se borra porque una
+/// cuenta ya no está —la base, la clave huérfana, lo decidido en
+/// `stores.json`, la entrada de `pending_key_deletions`— pregunta acá, con
+/// [`Self::is_confirmed_gone`].
+#[derive(Debug, Clone)]
+struct Listings {
+    /// El primer listado bueno. Una cuenta que no figuró en ninguno falta
+    /// desde ahí.
+    first_at: Instant,
+    /// El último listado bueno. La confirmación se mide hasta acá y no hasta
+    /// «ahora»: el tiempo que pasa sin que el servicio conteste no confirma
+    /// nada.
+    last_at: Instant,
+    /// Todas las cuentas del último listado bueno.
+    listed: BTreeSet<String>,
+    /// Las que figuraban y dejaron de figurar: el primer listado bueno en que
+    /// faltaron. Una que reaparece sale de acá.
+    missing_since: BTreeMap<String, Instant>,
+}
+
+impl Listings {
+    fn first(listed: BTreeSet<String>, now: Instant) -> Self {
+        Self {
+            first_at: now,
+            last_at: now,
+            listed,
+            missing_since: BTreeMap::new(),
+        }
+    }
+
+    /// Suma un listado bueno. Devuelve `false`, sin cambiar nada, si es más
+    /// viejo que el último que ya se sumó: cada listado se atiende en una tarea
+    /// propia, y dos seguidas pueden tomar la cerradura en otro orden.
+    fn observe(&mut self, listed: BTreeSet<String>, now: Instant) -> bool {
+        if now < self.last_at {
+            return false;
+        }
+        for gone in self.listed.difference(&listed) {
+            self.missing_since.insert(gone.clone(), now);
+        }
+        // La sospecha se olvida en cuanto la cuenta vuelve a figurar.
+        self.missing_since.retain(|id, _| !listed.contains(id));
+        self.last_at = now;
+        self.listed = listed;
+        true
+    }
+
+    fn is_listed(&self, account_id: &str) -> bool {
+        self.listed.contains(account_id)
+    }
+
+    /// Si la cuenta faltó en todos los listados buenos desde uno que llegó por
+    /// lo menos [`PRUNE_CONFIRMATION`] antes del último. Como la confirmación
+    /// no es cero, eso son siempre dos listados distintos.
+    fn is_confirmed_gone(&self, account_id: &str) -> bool {
+        if self.is_listed(account_id) {
+            return false;
+        }
+        let since = self
+            .missing_since
+            .get(account_id)
+            .copied()
+            .unwrap_or(self.first_at);
+        self.last_at.saturating_duration_since(since) >= PRUNE_CONFIRMATION
+    }
+}
 
 /// En qué está la base de una cuenta.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -140,8 +237,14 @@ pub struct StoreSettings {
     /// Cuentas cuya clave del llavero no se vuelve a usar: se vaciaron o se
     /// apagaron. Se intenta borrarla en cada vuelta con el llavero
     /// desbloqueado, y la cuenta sale de acá recién cuando tiene una clave
-    /// nueva guardada. Una cuenta apagada, o que ya no está, se queda: son unos
-    /// bytes, y sacarla sin una clave nueva es justo lo que esta lista evita.
+    /// nueva guardada. Una cuenta apagada se queda: sacarla sin una clave
+    /// nueva es justo lo que esta lista evita.
+    ///
+    /// La única otra salida es la de una cuenta **que ya no está**, confirmada
+    /// como para podar su base (ver [`PRUNE_CONFIRMATION`]), cuyo `Delete`
+    /// contestó bien y cuya clave ya no aparece al volver a buscarla con el
+    /// llavero desbloqueado. Con el llavero bloqueado no sale nunca: sin poder
+    /// releer, «la clave no está» no se sabe.
     #[serde(default)]
     pub pending_key_deletions: BTreeSet<String>,
 }
@@ -296,9 +399,9 @@ impl Entry {
 #[derive(Default)]
 struct Inner {
     keyring: KeyringState,
-    /// Todas las cuentas del último `ListAccounts` que respondió bien, o nada
-    /// si todavía no respondió ninguno.
-    listed: Option<BTreeSet<String>>,
+    /// Lo que dijeron los `ListAccounts` que respondieron bien, o nada si
+    /// todavía no respondió ninguno.
+    listings: Option<Listings>,
     /// Las que tienen algo que guardar.
     wanted: BTreeSet<String>,
     entries: BTreeMap<String, Entry>,
@@ -387,10 +490,15 @@ impl<K: KeySource> StoreManager<K> {
     /// Lo que hay que hacer cada vez que se leen las cuentas. Devuelve si
     /// cambió el estado que se publica.
     ///
-    /// **Con `Failed` no se hace nada**, y en particular no se borra nada: un
-    /// servicio de cuentas que no contesta no quiere decir que la persona no
-    /// tenga cuentas.
-    pub async fn accounts_listed(&self, listing: AccountListing) -> bool {
+    /// `now` es cuándo llegó la respuesta; se pasa y no se lee acá para poder
+    /// probar la confirmación sin esperar una vuelta entera.
+    ///
+    /// **Con `Failed` no se hace nada**, y en particular no se borra nada ni se
+    /// cuenta para confirmar una ausencia: un servicio de cuentas que no
+    /// contesta no quiere decir que la persona no tenga cuentas. Una respuesta
+    /// buena tampoco borra sola lo de una cuenta que no figura: hace falta la
+    /// confirmación de [`Listings::is_confirmed_gone`].
+    pub async fn accounts_listed(&self, listing: AccountListing, now: Instant) -> bool {
         let AccountListing::Listed(accounts) = listing else {
             return false;
         };
@@ -415,14 +523,27 @@ impl<K: KeySource> StoreManager<K> {
             .map(|a| a.id.clone())
             .collect();
 
-        // Las que ya no tienen nada que guardar se cierran.
+        match &mut inner.listings {
+            Some(listings) => {
+                if !listings.observe(listed, now) {
+                    tracing::debug!("se descartó un listado de cuentas más viejo que el último");
+                    return false;
+                }
+            }
+            None => inner.listings = Some(Listings::first(listed, now)),
+        }
+
+        // Las que ya no tienen nada que guardar se cierran. Cerrar no es
+        // borrar: una que reaparece en el próximo listado se vuelve a abrir con
+        // su clave.
         inner.entries.retain(|id, _| wanted.contains(id));
-        inner.listed = Some(listed.clone());
         inner.wanted = wanted;
 
         self.run(&mut inner, None).await;
         let unlocked = inner.keyring == KeyringState::Unlocked;
-        self.prune(unlocked, &listed).await;
+        if let Some(listings) = &inner.listings {
+            self.prune(unlocked, listings).await;
+        }
 
         before != inner.snapshot()
     }
@@ -517,8 +638,8 @@ impl<K: KeySource> StoreManager<K> {
     /// todavía no se sabe qué cuentas hay, y la ventana que llama las sacó de
     /// ese mismo listado, así que un reintento después del arranque alcanza.
     fn require_listed(inner: &Inner, account_id: &str) -> Result<(), StoreError> {
-        match &inner.listed {
-            Some(listed) if listed.contains(account_id) => Ok(()),
+        match &inner.listings {
+            Some(listings) if listings.is_listed(account_id) => Ok(()),
             _ => Err(StoreError::UnknownAccount(account_id.to_string())),
         }
     }
@@ -611,8 +732,10 @@ impl<K: KeySource> StoreManager<K> {
 
         inner.keyring = KeyringState::Unlocked;
         let cleared = self.flush_pending_deletions(&settings).await;
-        if let Some(listed) = &inner.listed {
-            self.sweep_orphan_keys(listed).await;
+        if let Some(listings) = &inner.listings {
+            self.sweep_orphan_keys(listings).await;
+            self.forget_gone_accounts(locations, &mut settings, listings, &cleared)
+                .await;
         }
 
         for id in targets {
@@ -897,11 +1020,14 @@ impl<K: KeySource> StoreManager<K> {
 
     /// Borra las claves de cuentas que ya no están: las de una cuenta quitada
     /// con el llavero bloqueado, o mientras este servicio no corría.
-    async fn sweep_orphan_keys(&self, listed: &BTreeSet<String>) {
+    ///
+    /// Sólo las de una ausencia confirmada, igual que la poda de la base: una
+    /// clave borrada por un listado vacío suelto deja ilegible una base buena.
+    async fn sweep_orphan_keys(&self, listings: &Listings) {
         let Ok(with_keys) = self.keys.key_accounts().await else {
             return;
         };
-        for account_id in with_keys.iter().filter(|id| !listed.contains(*id)) {
+        for account_id in with_keys.iter().filter(|id| listings.is_confirmed_gone(id)) {
             match self.keys.delete(account_id).await {
                 Ok(()) => tracing::info!("se borró la clave huérfana de «{account_id}»"),
                 Err(e) => tracing::warn!("'{account_id}': la clave huérfana sigue: {e}"),
@@ -909,13 +1035,61 @@ impl<K: KeySource> StoreManager<K> {
         }
     }
 
-    /// Borra la base de toda cuenta que ya no está en `ListAccounts`.
+    /// Saca de `stores.json` lo que queda de las cuentas que ya no están: su
+    /// entrada en `pending_key_deletions` y lo decidido para ellas.
+    ///
+    /// Sin esto, una cuenta vaciada o apagada y después quitada quedaba anotada
+    /// para siempre: nunca iba a tener la clave nueva que la saca de la lista.
+    ///
+    /// Sale sólo una cuenta con la ausencia confirmada, cuyo `Delete` de esta
+    /// vuelta contestó bien (`cleared`), cuya clave **no aparece al volver a
+    /// buscarla**, y con `Locked == false` releído después de esa búsqueda. Un
+    /// `Delete` que contesta bien no prueba nada solo, y con el llavero
+    /// bloqueado no se llega hasta acá.
+    async fn forget_gone_accounts(
+        &self,
+        locations: &Locations,
+        settings: &mut StoreSettings,
+        listings: &Listings,
+        cleared: &BTreeSet<String>,
+    ) {
+        let candidates: Vec<String> = settings
+            .pending_key_deletions
+            .iter()
+            .filter(|id| cleared.contains(*id) && listings.is_confirmed_gone(id))
+            .cloned()
+            .collect();
+
+        let mut changed = false;
+        for account_id in candidates {
+            if !matches!(self.keys.find(&account_id).await, Ok(None)) {
+                continue;
+            }
+            if !matches!(self.keys.is_locked().await, Ok(false)) {
+                continue;
+            }
+            settings.pending_key_deletions.remove(&account_id);
+            settings.accounts.remove(&account_id);
+            changed = true;
+            tracing::info!(
+                "se olvidó la clave pendiente de «{account_id}», que ya no es una cuenta"
+            );
+        }
+        if changed {
+            if let Err(e) = settings.save(&locations.settings) {
+                tracing::warn!("{e}");
+            }
+        }
+    }
+
+    /// Borra la base de toda cuenta cuya ausencia está confirmada (ver
+    /// [`Listings::is_confirmed_gone`]).
     ///
     /// Todo relativo a un descriptor de `stores/` abierto sin seguir enlaces:
     /// si `stores/` o `vasak-accounts-sync/` son un enlace, no se borra nada. Y
     /// sólo carpetas que parecen una base; lo demás que haya ahí no es de este
     /// servicio. Ver [`paths::StoresRoot`].
-    async fn prune(&self, unlocked: bool, listed: &BTreeSet<String>) {
+    async fn prune(&self, unlocked: bool, listings: &Listings) {
         let Ok(locations) = &self.locations else {
             return;
         };
@@ -934,7 +1108,7 @@ impl<K: KeySource> StoreManager<K> {
 
         match opened {
             Ok((Some(root), ids)) => {
-                for account_id in ids.into_iter().filter(|id| !listed.contains(id)) {
+                for account_id in ids.into_iter().filter(|id| listings.is_confirmed_gone(id)) {
                     // La clave primero, si se puede. Si no, la barre
                     // `sweep_orphan_keys` en el próximo desbloqueo.
                     if unlocked {
@@ -960,10 +1134,13 @@ impl<K: KeySource> StoreManager<K> {
             Err(e) => tracing::warn!("no se pudieron leer las bases: {e}"),
         }
 
-        // Y lo decidido para cuentas que ya no existen.
+        // Y lo decidido para cuentas que ya no existen. `pending_key_deletions`
+        // no: ésa necesita el llavero, y la vacía `forget_gone_accounts`.
         if let Ok(mut settings) = StoreSettings::load(&locations.settings) {
             let before = settings.accounts.len();
-            settings.accounts.retain(|id, _| listed.contains(id));
+            settings
+                .accounts
+                .retain(|id, _| !listings.is_confirmed_gone(id));
             if settings.accounts.len() != before {
                 if let Err(e) = settings.save(&locations.settings) {
                     tracing::warn!("{e}");
@@ -1019,6 +1196,8 @@ mod tests {
         temp: TempDir,
         keys: FakeKeys,
         manager: StoreManager<FakeKeys>,
+        /// El reloj de los listados: sólo avanza cuando la prueba lo pide.
+        clock: std::sync::Mutex<Instant>,
     }
 
     impl Fixture {
@@ -1030,7 +1209,24 @@ mod tests {
                 temp,
                 keys,
                 manager,
+                clock: std::sync::Mutex::new(Instant::now()),
             }
+        }
+
+        /// Un listado que llega ahora, según el reloj de la prueba.
+        async fn list(&self, listing: AccountListing) -> bool {
+            let now = *self.clock.lock().unwrap();
+            self.manager.accounts_listed(listing, now).await
+        }
+
+        fn advance(&self, by: Duration) {
+            *self.clock.lock().unwrap() += by;
+        }
+
+        /// Un listado que llega una vuelta después del anterior.
+        async fn list_after_a_round(&self, listing: AccountListing) -> bool {
+            self.advance(PRUNE_CONFIRMATION);
+            self.list(listing).await
         }
 
         fn locations_in(temp: &TempDir) -> Locations {
@@ -1111,7 +1307,7 @@ mod tests {
         let f = Fixture::new("fila1");
         f.keys.state().locked = true;
 
-        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        f.list(listing(&["cuenta"])).await;
 
         {
             let state = f.keys.state();
@@ -1138,7 +1334,7 @@ mod tests {
         let before = std::fs::read(&f.paths("cuenta").db).unwrap();
         f.keys.state().locked = true;
 
-        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        f.list(listing(&["cuenta"])).await;
 
         assert_eq!(std::fs::read(&f.paths("cuenta").db).unwrap(), before);
         assert!(f.keys.state().stored.is_empty());
@@ -1148,7 +1344,7 @@ mod tests {
     #[tokio::test]
     async fn fila_2_sin_clave_ni_base_se_crea_la_clave_y_despues_la_base() {
         let f = Fixture::new("fila2");
-        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        f.list(listing(&["cuenta"])).await;
 
         assert_eq!(f.keys.state().stored, vec!["cuenta".to_string()]);
         assert!(f.paths("cuenta").db_exists().unwrap());
@@ -1166,7 +1362,7 @@ mod tests {
         let f = Fixture::new("fila2b");
         f.keys.state().lose_stores = true;
 
-        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        f.list(listing(&["cuenta"])).await;
 
         assert!(!f.paths("cuenta").db_exists().unwrap());
         assert_eq!(f.state("cuenta").await, StoreState::Unavailable);
@@ -1181,7 +1377,7 @@ mod tests {
             .keys
             .insert("cuenta".into(), fixed_key(b'3').hex().into());
 
-        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        f.list(listing(&["cuenta"])).await;
 
         assert!(
             f.keys.state().stored.is_empty(),
@@ -1204,7 +1400,7 @@ mod tests {
             .keys
             .insert("cuenta".into(), fixed_key(b'3').hex().into());
 
-        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        f.list(listing(&["cuenta"])).await;
 
         assert_eq!(f.state("cuenta").await, StoreState::Open);
     }
@@ -1215,7 +1411,7 @@ mod tests {
         let f = Fixture::new("fila4");
         drop(Store::create(&f.paths("cuenta"), &fixed_key(b'a')).unwrap());
 
-        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        f.list(listing(&["cuenta"])).await;
 
         assert_eq!(f.state("cuenta").await, StoreState::Rebuilt);
         let status = f.manager.status().await;
@@ -1243,7 +1439,7 @@ mod tests {
         drop(Store::create(&f.paths("cuenta"), &fixed_key(b'a')).unwrap());
         f.keys.state().reject_stores = true;
 
-        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        f.list(listing(&["cuenta"])).await;
 
         assert_eq!(f.state("cuenta").await, StoreState::Unavailable);
         assert!(
@@ -1267,7 +1463,7 @@ mod tests {
             state.blind_finds = 1;
         }
 
-        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        f.list(listing(&["cuenta"])).await;
 
         assert_ne!(f.state("cuenta").await, StoreState::Rebuilt);
         assert!(
@@ -1292,7 +1488,7 @@ mod tests {
             .keys
             .insert("cuenta".into(), fixed_key(b'b').hex().into());
 
-        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        f.list(listing(&["cuenta"])).await;
 
         assert_eq!(f.state("cuenta").await, StoreState::Rebuilt);
         assert!(Store::open(&f.paths("cuenta"), &fixed_key(b'b')).is_ok());
@@ -1307,7 +1503,7 @@ mod tests {
         drop(Store::create(&f.paths("cuenta"), &fixed_key(b'a')).unwrap());
         f.keys.state().malformed.insert("cuenta".into());
 
-        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        f.list(listing(&["cuenta"])).await;
 
         assert_eq!(f.state("cuenta").await, StoreState::Rebuilt);
         assert_eq!(f.keys.state().deleted, vec!["cuenta".to_string()]);
@@ -1318,7 +1514,7 @@ mod tests {
     #[tokio::test]
     async fn fila_6_al_bloquearse_se_cierra_la_base_y_al_desbloquear_se_abre() {
         let f = Fixture::new("fila6");
-        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        f.list(listing(&["cuenta"])).await;
         assert!(f.manager.is_open("cuenta").await);
 
         f.keys.state().locked = true;
@@ -1343,7 +1539,7 @@ mod tests {
         let before = std::fs::read(&f.paths("cuenta").db).unwrap();
         f.keys.state().lock_after_find = true;
 
-        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        f.list(listing(&["cuenta"])).await;
 
         assert_eq!(f.keys.state().stored_while_locked, 0);
         assert!(f.keys.state().stored.is_empty());
@@ -1358,7 +1554,7 @@ mod tests {
         drop(Store::create(&f.paths("cuenta"), &fixed_key(b'a')).unwrap());
         f.keys.state().fail_find = true;
 
-        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        f.list(listing(&["cuenta"])).await;
 
         assert!(Store::open(&f.paths("cuenta"), &fixed_key(b'a')).is_ok());
         assert_eq!(f.state("cuenta").await, StoreState::Unavailable);
@@ -1375,7 +1571,7 @@ mod tests {
         std::fs::create_dir_all(&stores).unwrap();
         std::fs::write(stores.join("cuenta"), "de la persona").unwrap();
 
-        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        f.list(listing(&["cuenta"])).await;
 
         assert_eq!(f.state("cuenta").await, StoreState::Unavailable);
         assert!(
@@ -1391,7 +1587,7 @@ mod tests {
     #[tokio::test]
     async fn sin_llavero_se_informa_no_disponible_y_no_se_toca_nada() {
         let f = Fixture::new("sin-llavero");
-        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        f.list(listing(&["cuenta"])).await;
         assert!(f.manager.is_open("cuenta").await);
 
         f.keys.state().unavailable = true;
@@ -1407,7 +1603,9 @@ mod tests {
     async fn sin_directorio_de_datos_todo_queda_no_disponible() {
         let keys = FakeKeys::default();
         let manager = StoreManager::new(keys.clone(), Err(StoreError::NoBaseDir));
-        manager.accounts_listed(listing(&["cuenta"])).await;
+        manager
+            .accounts_listed(listing(&["cuenta"]), Instant::now())
+            .await;
         let status = manager.status().await;
         assert_eq!(status.accounts[0].state, StoreState::Unavailable);
         assert!(keys.state().stored.is_empty());
@@ -1416,46 +1614,52 @@ mod tests {
 
     // ── Las cuentas que se van ──────────────────────────────────────────────
 
-    /// Un `ListAccounts` que falló no dice que la persona no tenga cuentas.
+    /// Un `ListAccounts` que falló no dice que la persona no tenga cuentas,
+    /// ni una vez ni varias separadas por una vuelta.
     #[tokio::test]
     async fn si_list_accounts_falla_no_se_borra_nada() {
         let f = Fixture::new("falla");
-        f.manager.accounts_listed(listing(&["a", "b"])).await;
+        f.list(listing(&["a", "b"])).await;
         assert!(f.paths("a").db_exists().unwrap() && f.paths("b").db_exists().unwrap());
 
-        assert!(!f.manager.accounts_listed(AccountListing::Failed).await);
+        assert!(!f.list(AccountListing::Failed).await);
+        assert!(!f.list_after_a_round(AccountListing::Failed).await);
 
         assert!(f.paths("a").db_exists().unwrap());
         assert!(f.paths("b").db_exists().unwrap());
         assert!(f.keys.state().deleted.is_empty());
     }
 
-    /// Bien respondido, se van sólo las bases de las cuentas que no están. Una
-    /// que pide reautenticarse, o que ya no tiene nada que guardar, sigue siendo
-    /// una cuenta y conserva la suya. La clave se borra antes que los archivos.
+    /// Bien respondido y confirmado, se van sólo las bases de las cuentas que
+    /// no están. Una que pide reautenticarse, o que ya no tiene nada que
+    /// guardar, sigue siendo una cuenta y conserva la suya. La clave se borra
+    /// antes que los archivos.
     #[tokio::test]
     async fn si_list_accounts_responde_se_borran_solo_las_cuentas_que_no_estan() {
         let f = Fixture::new("prune");
-        f.manager.accounts_listed(listing(&["a", "b", "c"])).await;
+        f.list(listing(&["a", "b", "c"])).await;
         // Algo que no puso este servicio: no se toca.
         std::fs::create_dir_all(f.locations().stores.join("no.es.cuenta")).unwrap();
 
-        f.manager
-            .accounts_listed(AccountListing::Listed(vec![
+        let still_accounts = || {
+            AccountListing::Listed(vec![
                 account("a", &["email"]),
                 // Pide reautenticarse: para el servicio de cuentas sigue ahí.
                 account("b", &["email"]),
                 // Ya no tiene correo, calendario ni contactos, pero existe.
                 account("c", &["files"]),
                 account("d", &["contacts"]),
-            ]))
-            .await;
+            ])
+        };
+        f.list(still_accounts()).await;
+        f.list_after_a_round(still_accounts()).await;
         assert!(f.paths("a").db_exists().unwrap());
         assert!(f.paths("b").db_exists().unwrap());
         assert!(f.paths("c").db_exists().unwrap());
         assert!(f.paths("d").db_exists().unwrap());
 
-        f.manager.accounts_listed(listing(&["a", "d"])).await;
+        f.list_after_a_round(listing(&["a", "d"])).await;
+        f.list_after_a_round(listing(&["a", "d"])).await;
 
         assert!(f.paths("a").db_exists().unwrap());
         assert!(f.paths("d").db_exists().unwrap());
@@ -1490,7 +1694,12 @@ mod tests {
             }),
         );
 
-        manager.accounts_listed(listing(&[])).await;
+        // Confirmado: dos listados vacíos separados por una vuelta.
+        let t0 = Instant::now();
+        manager.accounts_listed(listing(&[]), t0).await;
+        manager
+            .accounts_listed(listing(&[]), t0 + PRUNE_CONFIRMATION)
+            .await;
 
         for dir in ["Fotos", "Trabajo", "2024"] {
             assert!(
@@ -1520,7 +1729,12 @@ mod tests {
             }),
         );
 
-        manager.accounts_listed(listing(&[])).await;
+        // Confirmado: dos listados vacíos separados por una vuelta.
+        let t0 = Instant::now();
+        manager.accounts_listed(listing(&[]), t0).await;
+        manager
+            .accounts_listed(listing(&[]), t0 + PRUNE_CONFIRMATION)
+            .await;
 
         assert!(docs.join("stores/Fotos/store.db").exists());
         assert!(docs.join("stores/vacia").exists());
@@ -1541,7 +1755,8 @@ mod tests {
         std::fs::create_dir_all(stores.join("restos")).unwrap();
         std::fs::write(stores.join("restos/store.db-wal"), "x").unwrap();
 
-        f.manager.accounts_listed(listing(&[])).await;
+        f.list(listing(&[])).await;
+        f.list_after_a_round(listing(&[])).await;
 
         assert!(stores.join("Fotos/importante.txt").exists());
         assert!(stores.join("Trabajo/sub").exists());
@@ -1551,14 +1766,20 @@ mod tests {
     }
 
     /// Una cuenta quitada con el llavero bloqueado deja su clave: se barre en
-    /// el primer desbloqueo.
+    /// el primer desbloqueo. Los archivos se van con la confirmación aunque
+    /// el llavero siga bloqueado: borrarlos no necesita la clave.
     #[tokio::test]
     async fn la_clave_de_una_cuenta_quitada_se_barre_al_desbloquear() {
         let f = Fixture::new("huerfana");
-        f.manager.accounts_listed(listing(&["a", "b"])).await;
+        f.list(listing(&["a", "b"])).await;
 
         f.keys.state().locked = true;
-        f.manager.accounts_listed(listing(&["a"])).await;
+        f.list(listing(&["a"])).await;
+        assert!(
+            f.paths("b").db_exists().unwrap(),
+            "falta una vez: se espera"
+        );
+        f.list_after_a_round(listing(&["a"])).await;
         assert!(!f.paths("b").dir.exists(), "los archivos se van igual");
         assert!(f.keys.state().keys.contains_key("b"), "la clave espera");
 
@@ -1566,6 +1787,253 @@ mod tests {
         f.manager.refresh().await;
         assert!(!f.keys.state().keys.contains_key("b"));
         assert!(f.keys.state().keys.contains_key("a"));
+    }
+
+    // ── La confirmación de que una cuenta se fue ────────────────────────────
+
+    /// Lo que se ve de una cuenta en el disco, en el llavero y en
+    /// `stores.json`, para comparar antes y después.
+    fn footprint(f: &Fixture, account_id: &str) -> (bool, bool, bool) {
+        (
+            f.paths(account_id).db_exists().unwrap(),
+            f.keys.state().keys.contains_key(account_id),
+            f.settings().accounts.contains_key(account_id),
+        )
+    }
+
+    #[test]
+    fn la_confirmacion_es_una_vuelta_del_bucle_y_nunca_cero() {
+        assert_eq!(PRUNE_CONFIRMATION, crate::POLL_INTERVAL);
+        // Con cero, un solo listado se confirmaría a sí mismo.
+        assert!(PRUNE_CONFIRMATION > Duration::ZERO);
+    }
+
+    /// El caso que motivó todo: el servicio de cuentas contesta bien y vacío
+    /// —le falta `accounts.json`— una vez. No se va nada: ni archivos, ni
+    /// claves, ni lo decidido en `stores.json`. Tampoco cuando el llavero avisa
+    /// después y se vuelve a pasar la tabla sin un listado nuevo.
+    #[tokio::test]
+    async fn un_listado_vacio_aislado_no_borra_nada() {
+        let f = Fixture::new("vacio-aislado");
+        f.list(listing(&["a", "b"])).await;
+        f.manager.set_enabled("a", true).await.unwrap();
+        assert_eq!(footprint(&f, "a"), (true, true, true));
+
+        f.list(listing(&[])).await;
+        f.advance(PRUNE_CONFIRMATION * 3);
+        f.manager.refresh().await;
+
+        assert_eq!(footprint(&f, "a"), (true, true, true));
+        assert_eq!(footprint(&f, "b"), (true, true, false));
+        assert!(
+            f.keys.state().deleted.is_empty(),
+            "no se borró ninguna clave"
+        );
+
+        // Y cuando el servicio se recupera, todo sigue donde estaba.
+        f.list(listing(&["a", "b"])).await;
+        assert_eq!(f.state("a").await, StoreState::Open);
+        assert_eq!(f.state("b").await, StoreState::Open);
+        assert_eq!(f.keys.state().stored.len(), 2, "no se generó otra clave");
+    }
+
+    /// Dos listados vacíos en el mismo instante —una ráfaga de
+    /// `AccountsChanged`— salen del mismo estado del servicio, y tampoco
+    /// alcanzan. Ni un tercero apenas antes de cumplirse la vuelta.
+    #[tokio::test]
+    async fn dos_listados_vacios_seguidos_en_menos_de_una_vuelta_no_borran_nada() {
+        let f = Fixture::new("vacios-rafaga");
+        f.list(listing(&["a"])).await;
+
+        f.list(listing(&[])).await;
+        f.list(listing(&[])).await;
+        f.advance(PRUNE_CONFIRMATION - Duration::from_secs(1));
+        f.list(listing(&[])).await;
+
+        assert_eq!(footprint(&f, "a"), (true, true, false));
+        assert!(f.keys.state().deleted.is_empty());
+    }
+
+    /// La desconexión de verdad sí se lleva la base: la cuenta falta en dos
+    /// listados buenos separados por una vuelta, y se van los archivos y la
+    /// clave. La que sigue en la lista no se toca.
+    #[tokio::test]
+    async fn la_desconexion_real_se_lleva_la_base_y_la_clave() {
+        let f = Fixture::new("desconexion");
+        f.list(listing(&["a", "b"])).await;
+        f.manager.set_enabled("b", true).await.unwrap();
+
+        f.list(listing(&["a"])).await;
+        assert_eq!(footprint(&f, "b"), (true, true, true), "falta una vez");
+
+        f.list_after_a_round(listing(&["a"])).await;
+        assert!(!f.paths("b").dir.exists());
+        assert!(!f.keys.state().keys.contains_key("b"));
+        assert!(!f.settings().accounts.contains_key("b"));
+        assert_eq!(footprint(&f, "a"), (true, true, false));
+        assert_eq!(f.state("a").await, StoreState::Open);
+    }
+
+    /// Una cuenta que falta una vez y reaparece conserva su base, y la
+    /// sospecha se olvida: la ausencia siguiente vuelve a empezar la cuenta, y
+    /// no se confirma con la vuelta medida desde la primera.
+    #[tokio::test]
+    async fn una_cuenta_que_falta_y_reaparece_conserva_la_base_y_se_olvida_la_sospecha() {
+        let f = Fixture::new("reaparece");
+        f.list(listing(&["a", "b"])).await;
+        let key = f.key("b").unwrap();
+
+        // Falta en t0 y reaparece una vuelta después.
+        f.list(listing(&["a"])).await;
+        f.list_after_a_round(listing(&["a", "b"])).await;
+        assert_eq!(f.state("b").await, StoreState::Open);
+        assert_eq!(f.key("b").unwrap(), key, "la misma clave");
+
+        // Vuelve a faltar un segundo después: la sospecha empieza de nuevo acá.
+        f.advance(Duration::from_secs(1));
+        f.list(listing(&["a"])).await;
+        // Dos vueltas desde la primera ausencia, pero menos de una desde ésta.
+        f.advance(PRUNE_CONFIRMATION - Duration::from_secs(1));
+        f.list(listing(&["a"])).await;
+        assert!(
+            f.paths("b").db_exists().unwrap(),
+            "la ausencia vieja no cuenta"
+        );
+        assert!(f.keys.state().keys.contains_key("b"));
+
+        // Una vuelta entera desde la segunda ausencia, sí.
+        f.advance(Duration::from_secs(1));
+        f.list(listing(&["a"])).await;
+        assert!(!f.paths("b").dir.exists());
+    }
+
+    /// Un listado fallido en el medio no confirma —aunque llegue una vuelta
+    /// después— ni reinicia la cuenta: el siguiente bueno confirma midiendo
+    /// desde la primera ausencia.
+    #[tokio::test]
+    async fn un_listado_fallido_en_el_medio_ni_confirma_ni_reinicia() {
+        let f = Fixture::new("fallido-en-el-medio");
+        f.list(listing(&["a", "b"])).await;
+
+        f.list(listing(&["a"])).await;
+        f.list_after_a_round(AccountListing::Failed).await;
+        assert_eq!(footprint(&f, "b"), (true, true, false), "no confirma");
+
+        // En el mismo instante que el fallido: si lo hubiera reiniciado,
+        // faltaría otra vuelta.
+        f.list(listing(&["a"])).await;
+        assert!(!f.paths("b").dir.exists());
+        assert!(!f.keys.state().keys.contains_key("b"));
+    }
+
+    /// Cada listado se atiende en una tarea propia, y dos pueden tomar la
+    /// cerradura al revés. Uno más viejo que el último no cuenta: ni para
+    /// empezar una ausencia ni para confirmarla.
+    #[tokio::test]
+    async fn un_listado_mas_viejo_que_el_ultimo_no_cuenta() {
+        let f = Fixture::new("listado-viejo");
+        let start = *f.clock.lock().unwrap();
+        f.list(listing(&["a", "b"])).await;
+        f.list_after_a_round(listing(&["a", "b"])).await;
+
+        assert!(
+            !f.manager.accounts_listed(listing(&["a"]), start).await,
+            "un listado viejo no cambia nada"
+        );
+        f.list_after_a_round(listing(&["a"])).await;
+
+        assert!(
+            f.paths("b").db_exists().unwrap(),
+            "la ausencia empieza recién en el último listado"
+        );
+        assert!(f.manager.set_enabled("a", true).await.is_ok());
+    }
+
+    /// La sospecha vive en memoria: un sync que arranca no sabe desde cuándo
+    /// falta nada, y vuelve a hacer falta la confirmación entera.
+    #[tokio::test]
+    async fn despues_de_reiniciar_hay_que_volver_a_confirmar() {
+        let f = Fixture::new("reinicio");
+        f.list(listing(&["a", "b"])).await;
+        f.list(listing(&["a"])).await;
+
+        let restarted = StoreManager::new(f.keys.clone(), Ok(f.locations()));
+        f.advance(PRUNE_CONFIRMATION);
+        let now = *f.clock.lock().unwrap();
+        restarted.accounts_listed(listing(&["a"]), now).await;
+        assert_eq!(footprint(&f, "b"), (true, true, false));
+
+        restarted
+            .accounts_listed(listing(&["a"]), now + PRUNE_CONFIRMATION)
+            .await;
+        assert!(!f.paths("b").dir.exists());
+    }
+
+    /// Una cuenta apagada queda en `pending_key_deletions` hasta tener clave
+    /// nueva. Si en cambio se quita, sale de ahí —y de lo decidido para ella—
+    /// con la confirmación y el llavero desbloqueado, recién después de
+    /// comprobar que su clave ya no está.
+    #[tokio::test]
+    async fn la_clave_pendiente_de_una_cuenta_quitada_se_olvida_al_confirmar() {
+        let f = Fixture::new("pendiente-quitada");
+        f.list(listing(&["a", "b"])).await;
+        f.manager.set_enabled("b", false).await.unwrap();
+        assert!(f.settings().pending_key_deletions.contains("b"));
+
+        f.list(listing(&["a"])).await;
+        assert!(
+            f.settings().pending_key_deletions.contains("b"),
+            "falta una vez: se queda"
+        );
+        assert!(f.settings().accounts.contains_key("b"));
+
+        f.list_after_a_round(listing(&["a"])).await;
+        let settings = f.settings();
+        assert!(settings.pending_key_deletions.is_empty());
+        assert!(!settings.accounts.contains_key("b"));
+        assert!(!f.keys.state().keys.contains_key("b"));
+    }
+
+    /// Con el llavero bloqueado no se saca nada de `pending_key_deletions`,
+    /// aunque la ausencia esté confirmada: sin poder releer, «la clave no está»
+    /// no se sabe. Sale en el primer desbloqueo.
+    #[tokio::test]
+    async fn con_el_llavero_bloqueado_la_clave_pendiente_no_se_olvida() {
+        let f = Fixture::new("pendiente-bloqueado");
+        f.list(listing(&["a", "b"])).await;
+        f.keys.state().locked = true;
+        f.manager.clear("b").await.unwrap();
+        assert!(f.settings().pending_key_deletions.contains("b"));
+
+        f.list(listing(&["a"])).await;
+        f.list_after_a_round(listing(&["a"])).await;
+        f.manager.refresh().await;
+        assert!(
+            f.settings().pending_key_deletions.contains("b"),
+            "con el llavero bloqueado se queda"
+        );
+        assert!(f.keys.state().keys.contains_key("b"));
+
+        f.keys.state().locked = false;
+        f.manager.refresh().await;
+        assert!(f.settings().pending_key_deletions.is_empty());
+        assert!(!f.keys.state().keys.contains_key("b"));
+    }
+
+    /// Un `Delete` que contesta bien y no borra no alcanza: la clave sigue
+    /// apareciendo al volver a buscarla, y la cuenta sigue anotada.
+    #[tokio::test]
+    async fn una_clave_pendiente_que_no_se_va_no_se_olvida() {
+        let f = Fixture::new("pendiente-mentiroso");
+        f.list(listing(&["a", "b"])).await;
+        f.keys.state().lose_deletes = true;
+        f.manager.set_enabled("b", false).await.unwrap();
+
+        f.list(listing(&["a"])).await;
+        f.list_after_a_round(listing(&["a"])).await;
+
+        assert!(f.keys.state().keys.contains_key("b"));
+        assert!(f.settings().pending_key_deletions.contains("b"));
     }
 
     // ── Apagar, vaciar ──────────────────────────────────────────────────────
@@ -1587,7 +2055,7 @@ mod tests {
     #[tokio::test]
     async fn apagar_persiste_y_borra_la_clave_y_los_archivos() {
         let f = Fixture::new("apagar");
-        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        f.list(listing(&["cuenta"])).await;
 
         f.manager.set_enabled("cuenta", false).await.unwrap();
 
@@ -1603,7 +2071,7 @@ mod tests {
 
         // Y no vuelve sola.
         f.manager.refresh().await;
-        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        f.list(listing(&["cuenta"])).await;
         assert!(!f.paths("cuenta").dir.exists());
         assert_eq!(f.state("cuenta").await, StoreState::Disabled);
 
@@ -1616,7 +2084,7 @@ mod tests {
     #[tokio::test]
     async fn vaciar_borra_y_vuelve_a_crear_con_otra_clave() {
         let f = Fixture::new("vaciar");
-        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        f.list(listing(&["cuenta"])).await;
         let old_key = f.key("cuenta").unwrap();
         f.manager.request_sync("cuenta").await.unwrap();
 
@@ -1639,7 +2107,7 @@ mod tests {
     #[tokio::test]
     async fn vaciar_con_el_llavero_bloqueado_borra_la_clave_al_desbloquear() {
         let f = Fixture::new("vaciar-bloqueado");
-        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        f.list(listing(&["cuenta"])).await;
         let old_key = f.key("cuenta").unwrap();
 
         f.keys.state().locked = true;
@@ -1667,7 +2135,7 @@ mod tests {
     #[tokio::test]
     async fn vaciar_con_bloqueo_a_mitad_no_reusa_la_clave_vieja() {
         let f = Fixture::new("vaciar-carrera");
-        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        f.list(listing(&["cuenta"])).await;
         let old_key = f.key("cuenta").unwrap();
         {
             let mut state = f.keys.state();
@@ -1698,7 +2166,7 @@ mod tests {
     #[tokio::test]
     async fn apagar_y_encender_con_un_delete_que_no_borra_no_reusa_la_clave_vieja() {
         let f = Fixture::new("delete-mentiroso");
-        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        f.list(listing(&["cuenta"])).await;
         let old_key = f.key("cuenta").unwrap();
         f.keys.state().lose_deletes = true;
 
@@ -1719,7 +2187,7 @@ mod tests {
     #[tokio::test]
     async fn sin_poder_borrar_la_clave_vieja_no_se_rehace_la_base() {
         let f = Fixture::new("clave-que-no-se-va");
-        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        f.list(listing(&["cuenta"])).await;
         f.keys.state().fail_delete = true;
 
         f.manager.clear("cuenta").await.unwrap();
@@ -1739,7 +2207,7 @@ mod tests {
     #[tokio::test]
     async fn el_temporal_de_stores_json_no_sigue_enlaces() {
         let f = Fixture::new("temporal-enlace");
-        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        f.list(listing(&["cuenta"])).await;
         let victim = f.temp.0.join("victima.txt");
         std::fs::write(&victim, "contenido de la persona").unwrap();
         let dir = f.locations().settings.parent().unwrap().to_path_buf();
@@ -1808,7 +2276,7 @@ mod tests {
     #[tokio::test]
     async fn un_stores_json_ilegible_no_enciende_ni_borra() {
         let f = Fixture::new("ilegible");
-        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        f.list(listing(&["cuenta"])).await;
         let settings = f.locations().settings;
         std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
         std::fs::write(&settings, "{ esto no es json").unwrap();
@@ -1842,13 +2310,13 @@ mod tests {
         assert!(!f.locations().settings.exists());
 
         // Un listado que falló tampoco da cuentas conocidas.
-        f.manager.accounts_listed(AccountListing::Failed).await;
+        f.list(AccountListing::Failed).await;
         assert!(matches!(
             f.manager.set_enabled("cuenta", false).await,
             Err(StoreError::UnknownAccount(_))
         ));
 
-        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        f.list(listing(&["cuenta"])).await;
         for i in 0..300 {
             let invented = format!("inventada{i}");
             assert!(matches!(
@@ -1866,12 +2334,11 @@ mod tests {
         assert_eq!(f.manager.inner.lock().await.entries.len(), 1);
 
         // Una cuenta listada sí, aunque no tenga nada que guardar.
-        f.manager
-            .accounts_listed(AccountListing::Listed(vec![
-                account("cuenta", &["email"]),
-                account("archivos", &["files"]),
-            ]))
-            .await;
+        f.list(AccountListing::Listed(vec![
+            account("cuenta", &["email"]),
+            account("archivos", &["files"]),
+        ]))
+        .await;
         f.manager.set_enabled("cuenta", false).await.unwrap();
         f.manager.set_enabled("archivos", false).await.unwrap();
         assert_eq!(f.settings().accounts.len(), 2);
@@ -1905,7 +2372,7 @@ mod tests {
     #[tokio::test]
     async fn el_estado_trae_el_llavero_y_cada_cuenta_con_su_tamano() {
         let f = Fixture::new("estado");
-        f.manager.accounts_listed(listing(&["b", "a"])).await;
+        f.list(listing(&["b", "a"])).await;
 
         let status = f.manager.status().await;
         let json = serde_json::to_value(&status).unwrap();
