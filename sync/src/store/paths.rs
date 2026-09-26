@@ -11,11 +11,24 @@
 //! seguridad restaurada, de alguien que hizo `chmod` a mano— quedaría legible
 //! para otra cuenta del equipo. El cifrado cubre ese caso igual, pero que otra
 //! cuenta no pueda ni leer el archivo cifrado es gratis y se suma.
+//!
+//! **Borrar nunca sigue un enlace, y nunca se lleva algo que no sea una base.**
+//! Todo lo que se borra bajo `stores/` —vaciar, apagar, rehacer, podar— pasa por
+//! [`StoresRoot`]: `vasak-accounts-sync/` y `stores/` se abren con
+//! `O_NOFOLLOW|O_DIRECTORY`, y lo de adentro se borra relativo a ese
+//! descriptor, sin recursión. Si alguien cambió `stores/` por un enlace a la
+//! carpeta de la persona, la poda no llega ni a leerla; y una carpeta con nombre
+//! de cuenta que no tiene una base adentro —ni está vacía— no se toca.
 
+use std::ffi::{CStr, CString};
 use std::fs;
 use std::io;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+
+use rustix::fs::{AtFlags, FileType, Mode, OFlags, CWD};
+use rustix::io::Errno;
 
 use super::StoreError;
 
@@ -94,6 +107,10 @@ pub struct StorePaths {
     pub db: PathBuf,
     pub wal: PathBuf,
     pub shm: PathBuf,
+    /// La carpeta de todas las bases, y el nombre de ésta adentro: lo que hace
+    /// falta para borrarla relativo a un descriptor y no por la ruta.
+    root: PathBuf,
+    account_id: String,
 }
 
 impl StorePaths {
@@ -107,6 +124,8 @@ impl StorePaths {
             wal: dir.join(format!("{DB_FILE}-wal")),
             shm: dir.join(format!("{DB_FILE}-shm")),
             dir,
+            root: root.to_path_buf(),
+            account_id: account_id.to_string(),
         })
     }
 
@@ -125,10 +144,15 @@ impl StorePaths {
     /// Si ya existían se cierran igual. Si no se puede cerrar el acceso **no se
     /// sigue**: una base que anda y que otra cuenta del equipo puede leer, sin
     /// que nada lo diga, es peor que no tener base.
+    ///
+    /// Tampoco se sigue si `vasak-accounts-sync/` es un enlace: la poda no lo
+    /// seguiría para borrar, y una base que se crea donde después no se puede
+    /// borrar es una base que sobrevive a «vaciar».
     pub fn prepare_dir(&self) -> Result<(), StoreError> {
-        if let Some(root) = self.dir.parent() {
-            create_private_dir(root)?;
+        if let Some(app_dir) = self.root.parent() {
+            reject_symlink(app_dir, "guardar")?;
         }
+        create_private_dir(&self.root)?;
         create_private_dir(&self.dir)
     }
 
@@ -179,16 +203,14 @@ impl StorePaths {
     /// versión vieja, o cualquier otro resto, también es de esta base. Que no
     /// exista no es un error — borrar algo que ya no está es haberlo borrado.
     ///
-    /// `remove_dir_all` no sigue enlaces simbólicos: si alguien cambió la
-    /// carpeta por un enlace, se va el enlace y no lo que apunta.
+    /// Relativo a un descriptor de `stores/` abierto sin seguir enlaces, y sólo
+    /// si la carpeta parece una base (ver [`StoresRoot::remove`]). Si alguien
+    /// cambió la carpeta por un enlace, se va el enlace y no lo que apunta.
     pub fn remove(&self) -> Result<(), StoreError> {
-        match fs::symlink_metadata(&self.dir) {
-            Ok(meta) if meta.file_type().is_symlink() => fs::remove_file(&self.dir),
-            Ok(_) => fs::remove_dir_all(&self.dir),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
+        match StoresRoot::open(&self.root)? {
+            Some(root) => root.remove(&self.account_id),
+            None => Ok(()),
         }
-        .map_err(|e| io_error(&self.dir, "borrar", e))
     }
 
     /// Cuánto ocupa la base en el disco, con el `-wal` y el `-shm`.
@@ -202,36 +224,205 @@ impl StorePaths {
     }
 }
 
-/// Las cuentas que tienen una carpeta en `root`.
+/// `stores/`, abierta sin seguir enlaces.
 ///
-/// Sólo las carpetas cuyo nombre es un identificador válido: lo demás que haya
-/// ahí no lo puso este servicio y no es suyo para borrar. Que `root` no exista
-/// quiere decir que no hay ninguna.
-pub fn list_store_ids(root: &Path) -> Result<Vec<String>, StoreError> {
-    let entries = match fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(io_error(root, "leer", e)),
-    };
+/// Se abren `vasak-accounts-sync/` y `stores/` con `O_NOFOLLOW|O_DIRECTORY`, así
+/// que ninguna de las dos puede ser un enlace; lo de más arriba —la
+/// `XDG_DATA_HOME` de la persona— sí se sigue, porque es suyo y lo puede tener
+/// donde quiera. Después, todo se hace relativo al descriptor: listar, mirar y
+/// borrar. Cambiar `stores/` por un enlace a mitad de camino no cambia a qué
+/// carpeta apunta el descriptor.
+pub struct StoresRoot {
+    fd: OwnedFd,
+    path: PathBuf,
+}
 
-    let mut ids: Vec<String> = entries
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|name| validate_account_id(name).is_ok())
-        .collect();
-    ids.sort();
-    Ok(ids)
+impl StoresRoot {
+    /// Abre `root`. `None` si no existe —no hay bases—; un error si alguno de
+    /// los dos últimos componentes es un enlace o no es una carpeta.
+    pub fn open(root: &Path) -> Result<Option<Self>, StoreError> {
+        let (Some(app_dir), Some(name)) = (root.parent(), root.file_name()) else {
+            return Err(StoreError::Io(format!(
+                "{} no es una carpeta de bases",
+                root.display()
+            )));
+        };
+        let app_fd = match open_dir_at(CWD, app_dir) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => return Ok(None),
+            Err(e) => return Err(dir_error(app_dir, e)),
+        };
+        match open_dir_at(&app_fd, name) {
+            Ok(fd) => Ok(Some(Self {
+                fd,
+                path: root.to_path_buf(),
+            })),
+            Err(Errno::NOENT) => Ok(None),
+            Err(e) => Err(dir_error(root, e)),
+        }
+    }
+
+    /// Las cuentas que tienen una base acá.
+    pub fn store_ids(&self) -> Result<Vec<String>, StoreError> {
+        let entries = read_entries(&self.fd).map_err(|e| errno_error(&self.path, "leer", e))?;
+        let mut ids: Vec<String> = entries
+            .into_iter()
+            .filter(|(_, kind)| *kind == FileType::Directory)
+            .filter_map(|(name, _)| name.into_string().ok())
+            .filter(|name| validate_account_id(name).is_ok())
+            .filter(|name| {
+                open_dir_at(&self.fd, name.as_str())
+                    .and_then(|dir| read_entries(&dir))
+                    .is_ok_and(|entries| looks_like_store(&entries))
+            })
+            .collect();
+        ids.sort();
+        Ok(ids)
+    }
+
+    /// Borra la carpeta de una cuenta.
+    ///
+    /// Sólo si **parece una base**: vacía, o con un `store.db` que es un archivo
+    /// regular, o con nada más que restos `store.db*` regulares —un `-wal`
+    /// suelto de una base anterior—. Y nunca con una carpeta adentro: una base
+    /// no tiene subcarpetas, y lo que no es una base no se borra. Sin recursión:
+    /// se borran los archivos de adentro, relativos al descriptor de la carpeta,
+    /// y después la carpeta, que si ganó algo mientras tanto no se va.
+    ///
+    /// Si en lugar de la carpeta hay un enlace, se va el enlace.
+    pub fn remove(&self, account_id: &str) -> Result<(), StoreError> {
+        validate_account_id(account_id)?;
+        let shown = self.path.join(account_id);
+
+        let stat = match rustix::fs::statat(&self.fd, account_id, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => stat,
+            Err(Errno::NOENT) => return Ok(()),
+            Err(e) => return Err(errno_error(&shown, "mirar", e)),
+        };
+        match FileType::from_raw_mode(stat.st_mode) {
+            FileType::Symlink => {
+                return ignore_missing(rustix::fs::unlinkat(
+                    &self.fd,
+                    account_id,
+                    AtFlags::empty(),
+                ))
+                .map_err(|e| errno_error(&shown, "borrar", e));
+            }
+            FileType::Directory => {}
+            _ => {
+                return Err(StoreError::Io(format!(
+                    "{} no es una carpeta; no se borra",
+                    shown.display()
+                )))
+            }
+        }
+
+        let dir = open_dir_at(&self.fd, account_id).map_err(|e| dir_error(&shown, e))?;
+        let entries = read_entries(&dir).map_err(|e| errno_error(&shown, "leer", e))?;
+        if !looks_like_store(&entries) {
+            return Err(StoreError::Io(format!(
+                "{} no parece una base del almacén; no se borra",
+                shown.display()
+            )));
+        }
+        for (name, _) in &entries {
+            ignore_missing(rustix::fs::unlinkat(
+                &dir,
+                name.as_c_str(),
+                AtFlags::empty(),
+            ))
+            .map_err(|e| errno_error(&shown, "borrar lo que hay en", e))?;
+        }
+        ignore_missing(rustix::fs::unlinkat(
+            &self.fd,
+            account_id,
+            AtFlags::REMOVEDIR,
+        ))
+        .map_err(|e| errno_error(&shown, "borrar", e))
+    }
+}
+
+fn open_dir_at<Fd: AsFd, P: rustix::path::Arg>(dir: Fd, path: P) -> rustix::io::Result<OwnedFd> {
+    rustix::fs::openat(
+        dir,
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+}
+
+/// Lo que hay en una carpeta abierta, con el tipo de cada cosa **sin seguir
+/// enlaces**. Sin `.` ni `..`.
+fn read_entries(dir: &OwnedFd) -> rustix::io::Result<Vec<(CString, FileType)>> {
+    let mut reader = rustix::fs::Dir::read_from(dir)?;
+    let mut entries = Vec::new();
+    while let Some(entry) = reader.read() {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == c"." || name == c".." {
+            continue;
+        }
+        let kind = match entry.file_type() {
+            FileType::Unknown => rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)
+                .map(|stat| FileType::from_raw_mode(stat.st_mode))?,
+            kind => kind,
+        };
+        entries.push((name.to_owned(), kind));
+    }
+    Ok(entries)
+}
+
+/// Si lo que hay en una carpeta es una base, o lo que queda de una.
+fn looks_like_store(entries: &[(CString, FileType)]) -> bool {
+    let db = CString::new(DB_FILE).expect("sin ceros");
+    let is_store_file = |name: &CStr| name.to_bytes().starts_with(DB_FILE.as_bytes());
+    if entries.iter().any(|(_, kind)| *kind == FileType::Directory) {
+        return false;
+    }
+    entries.is_empty()
+        || entries
+            .iter()
+            .any(|(name, kind)| *name == db && *kind == FileType::RegularFile)
+        || entries
+            .iter()
+            .all(|(name, kind)| *kind == FileType::RegularFile && is_store_file(name))
+}
+
+fn ignore_missing(result: rustix::io::Result<()>) -> rustix::io::Result<()> {
+    match result {
+        Err(Errno::NOENT) => Ok(()),
+        other => other,
+    }
+}
+
+fn dir_error(path: &Path, error: Errno) -> StoreError {
+    if error == Errno::LOOP || error == Errno::NOTDIR {
+        return StoreError::Io(format!(
+            "{} es un enlace simbólico o no es una carpeta; no se usa",
+            path.display()
+        ));
+    }
+    errno_error(path, "abrir", error)
+}
+
+fn errno_error(path: &Path, what: &str, error: Errno) -> StoreError {
+    io_error(path, what, io::Error::from(error))
+}
+
+/// Falla si `path` es un enlace simbólico.
+fn reject_symlink(path: &Path, what: &str) -> Result<(), StoreError> {
+    if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(StoreError::Io(format!(
+            "{} es un enlace simbólico; no se usa para {what}",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Crea una carpeta —y las de arriba— y la deja en 0700.
 pub(super) fn create_private_dir(dir: &Path) -> Result<(), StoreError> {
-    if fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
-        return Err(StoreError::Io(format!(
-            "{} es un enlace simbólico; no se usa para guardar",
-            dir.display()
-        )));
-    }
+    reject_symlink(dir, "guardar")?;
     fs::create_dir_all(dir).map_err(|e| io_error(dir, "crear", e))?;
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
         .map_err(|e| io_error(dir, "cerrar el acceso a", e))
@@ -274,6 +465,14 @@ pub(crate) mod tests {
 
     fn mode(path: &Path) -> u32 {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// Las cuentas con base en `root`, o ninguna si `root` no está.
+    fn list_store_ids(root: &Path) -> Result<Vec<String>, StoreError> {
+        match StoresRoot::open(root)? {
+            Some(root) => root.store_ids(),
+            None => Ok(Vec::new()),
+        }
     }
 
     #[test]
@@ -421,6 +620,59 @@ pub(crate) mod tests {
         assert!(!paths.dir.exists());
         assert_eq!(paths.size_bytes(), 0);
         paths.remove().unwrap();
+    }
+
+    /// Borrar no se lleva lo que no es una base: ni una carpeta sin `store.db`
+    /// con archivos ajenos, ni una con una subcarpeta aunque tenga `store.db`.
+    #[test]
+    fn borrar_no_se_lleva_una_carpeta_que_no_es_una_base() {
+        let temp = TempDir::new("ajena");
+        let paths = StorePaths::new(&temp.0, "Fotos").unwrap();
+        fs::create_dir_all(&paths.dir).unwrap();
+        fs::write(paths.dir.join("importante.txt"), "x").unwrap();
+        assert!(matches!(paths.remove(), Err(StoreError::Io(_))));
+        assert!(paths.dir.join("importante.txt").exists());
+
+        let paths = StorePaths::new(&temp.0, "Trabajo").unwrap();
+        fs::create_dir_all(paths.dir.join("sub")).unwrap();
+        fs::write(&paths.db, "x").unwrap();
+        fs::write(paths.dir.join("sub/informe.txt"), "x").unwrap();
+        assert!(matches!(paths.remove(), Err(StoreError::Io(_))));
+        assert!(paths.dir.join("sub/informe.txt").exists());
+        assert!(paths.db.exists());
+    }
+
+    /// Si la carpeta de todas las bases es un enlace, borrar no lo sigue.
+    #[test]
+    fn borrar_no_sigue_una_carpeta_de_bases_enlazada() {
+        let temp = TempDir::new("raiz-enlazada");
+        let elsewhere = temp.0.join("Documentos");
+        fs::create_dir_all(elsewhere.join("cuenta")).unwrap();
+        fs::write(elsewhere.join("cuenta/store.db"), "x").unwrap();
+        fs::create_dir_all(temp.0.join("data")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, temp.0.join("data/stores")).unwrap();
+
+        let paths = StorePaths::new(&temp.0.join("data/stores"), "cuenta").unwrap();
+        assert!(matches!(paths.remove(), Err(StoreError::Io(_))));
+        assert!(elsewhere.join("cuenta/store.db").exists());
+        // Y tampoco se crea nada del otro lado.
+        assert!(paths.prepare_dir().is_err());
+    }
+
+    /// `vasak-accounts-sync/` enlazado tampoco se usa para guardar: lo que se
+    /// crea ahí, la poda no lo podría borrar después.
+    #[test]
+    fn la_carpeta_del_servicio_enlazada_no_se_usa() {
+        let temp = TempDir::new("servicio-enlazado");
+        let elsewhere = temp.0.join("Documentos");
+        fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, temp.0.join("vasak-accounts-sync")).unwrap();
+
+        let root = temp.0.join("vasak-accounts-sync/stores");
+        let paths = StorePaths::new(&root, "cuenta").unwrap();
+        assert!(paths.prepare_dir().is_err());
+        assert!(!elsewhere.join("stores").exists());
+        assert!(StoresRoot::open(&root).is_err());
     }
 
     #[test]

@@ -54,6 +54,12 @@ rusqlite_migration = "2.6"
 zeroize = "1"
 # Los 32 bytes al azar de cada clave, del generador del sistema operativo.
 getrandom = "0.4"
+# Borrar bajo `stores/` relativo a un descriptor abierto sin seguir enlaces
+# (`openat`, `unlinkat`), y `PR_SET_DUMPABLE` al arrancar. Ya estaba en el
+# candado por zbus —la misma versión y las mismas funciones—, así que no suma
+# ninguna crate; y habla con el kernel sin pasar por la libc, así que tampoco
+# suma bibliotecas compartidas. Sin `unsafe` de este lado.
+rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
 # Las conexiones punto a punto de zbus, para probar el cliente del llavero y la

@@ -33,6 +33,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -798,25 +799,41 @@ impl<K: KeySource> StoreManager<K> {
     }
 
     /// Borra la base de toda cuenta que ya no está en `ListAccounts`.
+    ///
+    /// Todo relativo a un descriptor de `stores/` abierto sin seguir enlaces:
+    /// si `stores/` o `vasak-accounts-sync/` son un enlace, no se borra nada. Y
+    /// sólo carpetas que parecen una base; lo demás que haya ahí no es de este
+    /// servicio. Ver [`paths::StoresRoot`].
     async fn prune(&self, unlocked: bool, listed: &BTreeSet<String>) {
         let Ok(locations) = &self.locations else {
             return;
         };
 
-        match paths::list_store_ids(&locations.stores) {
-            Ok(ids) => {
-                for account_id in ids.iter().filter(|id| !listed.contains(*id)) {
+        let stores = locations.stores.clone();
+        let opened = blocking(move || {
+            let root = paths::StoresRoot::open(&stores)?;
+            let ids = match &root {
+                Some(root) => root.store_ids()?,
+                None => Vec::new(),
+            };
+            Ok::<_, StoreError>((root.map(Arc::new), ids))
+        })
+        .await
+        .and_then(|result| result);
+
+        match opened {
+            Ok((Some(root), ids)) => {
+                for account_id in ids.into_iter().filter(|id| !listed.contains(id)) {
                     // La clave primero, si se puede. Si no, la barre
                     // `sweep_orphan_keys` en el próximo desbloqueo.
                     if unlocked {
-                        if let Err(e) = self.keys.delete(account_id).await {
+                        if let Err(e) = self.keys.delete(&account_id).await {
                             tracing::warn!("'{account_id}': la clave se borra después: {e}");
                         }
                     }
-                    let Ok(paths) = StorePaths::new(&locations.stores, account_id) else {
-                        continue;
-                    };
-                    match blocking(move || paths.remove()).await {
+                    let root = Arc::clone(&root);
+                    let id = account_id.clone();
+                    match blocking(move || root.remove(&id)).await {
                         Ok(Ok(())) => {
                             tracing::info!(
                                 "se borró la base de «{account_id}», que ya no es una cuenta"
@@ -828,6 +845,7 @@ impl<K: KeySource> StoreManager<K> {
                     }
                 }
             }
+            Ok((None, _)) => {}
             Err(e) => tracing::warn!("no se pudieron leer las bases: {e}"),
         }
 
@@ -1266,6 +1284,88 @@ mod tests {
         assert!(state.deleted.contains(&"b".to_string()));
         assert!(state.deleted.contains(&"c".to_string()));
         assert!(!state.keys.contains_key("b"));
+    }
+
+    /// Si `stores/` es un enlace a la carpeta de la persona, la poda no lo
+    /// sigue: ni lee lo que hay del otro lado ni borra nada.
+    #[tokio::test]
+    async fn la_poda_no_sigue_un_stores_enlazado_ni_borra_carpetas_ajenas() {
+        let temp = TempDir::new("poda-enlace");
+        let docs = temp.0.join("Documentos");
+        for dir in ["Fotos", "Trabajo", "2024", "vacia"] {
+            std::fs::create_dir_all(docs.join(dir)).unwrap();
+        }
+        for dir in ["Fotos", "Trabajo", "2024"] {
+            std::fs::write(docs.join(dir).join("importante.txt"), "x").unwrap();
+        }
+        std::fs::create_dir_all(temp.0.join("data")).unwrap();
+        std::os::unix::fs::symlink(&docs, temp.0.join("data/stores")).unwrap();
+        let manager = StoreManager::new(
+            FakeKeys::default(),
+            Ok(Locations {
+                stores: temp.0.join("data/stores"),
+                settings: temp.0.join("config/stores.json"),
+            }),
+        );
+
+        manager.accounts_listed(listing(&[])).await;
+
+        for dir in ["Fotos", "Trabajo", "2024"] {
+            assert!(
+                docs.join(dir).join("importante.txt").exists(),
+                "{dir} se tenía que quedar"
+            );
+        }
+        // Ni siquiera una carpeta vacía: del otro lado del enlace nada es suyo.
+        assert!(docs.join("vacia").exists());
+    }
+
+    /// Lo mismo si el enlace es `vasak-accounts-sync/`, un nivel más arriba.
+    #[tokio::test]
+    async fn la_poda_no_sigue_la_carpeta_del_servicio_enlazada() {
+        let temp = TempDir::new("poda-enlace-servicio");
+        let docs = temp.0.join("Documentos");
+        std::fs::create_dir_all(docs.join("stores/Fotos")).unwrap();
+        std::fs::create_dir_all(docs.join("stores/vacia")).unwrap();
+        std::fs::write(docs.join("stores/Fotos/store.db"), "x").unwrap();
+        std::fs::create_dir_all(temp.0.join("data")).unwrap();
+        std::os::unix::fs::symlink(&docs, temp.0.join("data/vasak-accounts-sync")).unwrap();
+        let manager = StoreManager::new(
+            FakeKeys::default(),
+            Ok(Locations {
+                stores: temp.0.join("data/vasak-accounts-sync/stores"),
+                settings: temp.0.join("config/stores.json"),
+            }),
+        );
+
+        manager.accounts_listed(listing(&[])).await;
+
+        assert!(docs.join("stores/Fotos/store.db").exists());
+        assert!(docs.join("stores/vacia").exists());
+    }
+
+    /// En un `stores/` de verdad, una carpeta con nombre de cuenta que no es una
+    /// base —sin `store.db`, o con una subcarpeta— no se toca. Una vacía, o con
+    /// sólo restos de una base, sí se va.
+    #[tokio::test]
+    async fn la_poda_solo_borra_carpetas_que_son_una_base() {
+        let f = Fixture::new("poda-ajenas");
+        let stores = f.locations().stores;
+        std::fs::create_dir_all(stores.join("Fotos")).unwrap();
+        std::fs::write(stores.join("Fotos/importante.txt"), "x").unwrap();
+        std::fs::create_dir_all(stores.join("Trabajo/sub")).unwrap();
+        std::fs::write(stores.join("Trabajo/store.db"), "x").unwrap();
+        std::fs::create_dir_all(stores.join("vacia")).unwrap();
+        std::fs::create_dir_all(stores.join("restos")).unwrap();
+        std::fs::write(stores.join("restos/store.db-wal"), "x").unwrap();
+
+        f.manager.accounts_listed(listing(&[])).await;
+
+        assert!(stores.join("Fotos/importante.txt").exists());
+        assert!(stores.join("Trabajo/sub").exists());
+        assert!(stores.join("Trabajo/store.db").exists());
+        assert!(!stores.join("vacia").exists());
+        assert!(!stores.join("restos").exists());
     }
 
     /// Una cuenta quitada con el llavero bloqueado deja su clave: se barre en

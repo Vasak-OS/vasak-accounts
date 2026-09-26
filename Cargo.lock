@@ -2361,6 +2361,7 @@ dependencies = [
  "reqwest",
  "rusqlite",
  "rusqlite_migration",
+ "rustix",
  "rustls-native-certs",
  "serde",
  "serde_json",
