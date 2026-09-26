@@ -1342,9 +1342,9 @@ mod tests {
     }
 
     /// **Que no se dispare.** Una regla por segundo sin fin, una con cada
-    /// segundo en `BYSECOND`, un `COUNT` de diez millones desde hace años y
-    /// miles de `RDATE`: terminan enseguida, con el tope de ocurrencias, y
-    /// marcadas.
+    /// segundo en `BYSECOND`, un `COUNT` de diez millones desde hace años,
+    /// miles de `RDATE` y una por minuto: terminan enseguida, con el tope de
+    /// ocurrencias, y marcadas.
     #[test]
     fn una_regla_desmedida_no_se_dispara() {
         let seconds: Vec<String> = (0..60).map(|s| s.to_string()).collect();
@@ -1360,6 +1360,9 @@ mod tests {
             format!("RRULE:FREQ=MINUTELY;BYSECOND={}", seconds.join(",")),
             "RRULE:FREQ=SECONDLY;COUNT=10000000".to_string(),
             format!("RDATE:{}", rdates.join(",")),
+            // Una por minuto: entra en el tope de fechas, y lo que la frena es
+            // el de ocurrencias por objeto.
+            "RRULE:FREQ=MINUTELY".to_string(),
         ];
         for rule in rules {
             let ical = event(&format!("DTSTART:20240101T000000Z\r\n{rule}\r\n"));
