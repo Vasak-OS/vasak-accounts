@@ -628,7 +628,10 @@ impl<K: KeySource> StoreManager<K> {
             Err(e) => return Err(e.into()),
         };
 
-        match (key, paths.db_exists()) {
+        // Un error del disco al mirar si hay base no es «no hay base»: se corta
+        // acá, antes de crear —que barre la carpeta— o de rehacer.
+        let db_exists = paths.db_exists()?;
+        match (key, db_exists) {
             (Some(key), true) => {
                 let (key, opened) = blocking({
                     let paths = paths.clone();
@@ -1040,7 +1043,7 @@ mod tests {
         f.manager.accounts_listed(listing(&["cuenta"])).await;
 
         assert_eq!(f.keys.state().stored, vec!["cuenta".to_string()]);
-        assert!(f.paths("cuenta").db_exists());
+        assert!(f.paths("cuenta").db_exists().unwrap());
         assert_eq!(f.state("cuenta").await, StoreState::Open);
         assert!(f.manager.is_open("cuenta").await);
         // Y la base abre con la clave que quedó en el llavero.
@@ -1057,7 +1060,7 @@ mod tests {
 
         f.manager.accounts_listed(listing(&["cuenta"])).await;
 
-        assert!(!f.paths("cuenta").db_exists());
+        assert!(!f.paths("cuenta").db_exists().unwrap());
         assert_eq!(f.state("cuenta").await, StoreState::Unavailable);
     }
 
@@ -1206,6 +1209,29 @@ mod tests {
         assert!(f.keys.state().stored.is_empty());
     }
 
+    /// Un error del disco al mirar si hay base no es «no hay base»: ni se
+    /// genera una clave ni se barre nada. Acá el error es un `ENOTDIR`, porque
+    /// donde va la carpeta de la cuenta hay un archivo.
+    #[tokio::test]
+    async fn un_error_del_disco_al_mirar_la_base_no_genera_ni_borra() {
+        let f = Fixture::new("error-disco");
+        let stores = f.locations().stores;
+        std::fs::create_dir_all(&stores).unwrap();
+        std::fs::write(stores.join("cuenta"), "de la persona").unwrap();
+
+        f.manager.accounts_listed(listing(&["cuenta"])).await;
+
+        assert_eq!(f.state("cuenta").await, StoreState::Unavailable);
+        assert!(
+            f.keys.state().stored.is_empty(),
+            "no se tenía que generar ninguna clave"
+        );
+        assert_eq!(
+            std::fs::read_to_string(stores.join("cuenta")).unwrap(),
+            "de la persona"
+        );
+    }
+
     #[tokio::test]
     async fn sin_llavero_se_informa_no_disponible_y_no_se_toca_nada() {
         let f = Fixture::new("sin-llavero");
@@ -1218,7 +1244,7 @@ mod tests {
         assert!(!f.manager.is_open("cuenta").await);
         assert_eq!(f.state("cuenta").await, StoreState::Unavailable);
         assert_eq!(f.manager.status().await.keyring, KeyringState::Unavailable);
-        assert!(f.paths("cuenta").db_exists());
+        assert!(f.paths("cuenta").db_exists().unwrap());
     }
 
     #[tokio::test]
@@ -1239,12 +1265,12 @@ mod tests {
     async fn si_list_accounts_falla_no_se_borra_nada() {
         let f = Fixture::new("falla");
         f.manager.accounts_listed(listing(&["a", "b"])).await;
-        assert!(f.paths("a").db_exists() && f.paths("b").db_exists());
+        assert!(f.paths("a").db_exists().unwrap() && f.paths("b").db_exists().unwrap());
 
         assert!(!f.manager.accounts_listed(AccountListing::Failed).await);
 
-        assert!(f.paths("a").db_exists());
-        assert!(f.paths("b").db_exists());
+        assert!(f.paths("a").db_exists().unwrap());
+        assert!(f.paths("b").db_exists().unwrap());
         assert!(f.keys.state().deleted.is_empty());
     }
 
@@ -1268,15 +1294,15 @@ mod tests {
                 account("d", &["contacts"]),
             ]))
             .await;
-        assert!(f.paths("a").db_exists());
-        assert!(f.paths("b").db_exists());
-        assert!(f.paths("c").db_exists());
-        assert!(f.paths("d").db_exists());
+        assert!(f.paths("a").db_exists().unwrap());
+        assert!(f.paths("b").db_exists().unwrap());
+        assert!(f.paths("c").db_exists().unwrap());
+        assert!(f.paths("d").db_exists().unwrap());
 
         f.manager.accounts_listed(listing(&["a", "d"])).await;
 
-        assert!(f.paths("a").db_exists());
-        assert!(f.paths("d").db_exists());
+        assert!(f.paths("a").db_exists().unwrap());
+        assert!(f.paths("d").db_exists().unwrap());
         assert!(!f.paths("b").dir.exists());
         assert!(!f.paths("c").dir.exists());
         assert!(f.locations().stores.join("no.es.cuenta").exists());
@@ -1505,12 +1531,12 @@ mod tests {
 
         f.manager.refresh().await;
         assert_eq!(f.state("cuenta").await, StoreState::Unavailable);
-        assert!(f.paths("cuenta").db_exists());
+        assert!(f.paths("cuenta").db_exists().unwrap());
         assert!(matches!(
             f.manager.set_enabled("cuenta", false).await,
             Err(StoreError::Settings(_))
         ));
-        assert!(f.paths("cuenta").db_exists());
+        assert!(f.paths("cuenta").db_exists().unwrap());
         assert!(f.key("cuenta").is_some());
     }
 

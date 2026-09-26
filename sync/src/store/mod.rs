@@ -164,7 +164,7 @@ impl Store {
         paths.prepare_dir()?;
         if create {
             paths.create_empty_db()?;
-        } else if !paths.db_exists() {
+        } else if !paths.db_exists()? {
             return Err(StoreError::Missing);
         }
         paths.tighten_files()?;
@@ -399,7 +399,7 @@ mod tests {
             Store::open(&paths, &key_of(b'a')).err(),
             Some(StoreError::Missing)
         );
-        assert!(!paths.db_exists());
+        assert!(!paths.db_exists().unwrap());
     }
 
     #[test]

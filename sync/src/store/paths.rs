@@ -134,9 +134,22 @@ impl StorePaths {
         [&self.db, &self.wal, &self.shm]
     }
 
-    /// Si hay una base en el disco. Un enlace simbólico no cuenta como base.
-    pub fn db_exists(&self) -> bool {
-        fs::symlink_metadata(&self.db).is_ok_and(|m| m.file_type().is_file())
+    /// Si hay una base en el disco.
+    ///
+    /// `Ok(false)` **sólo** si el archivo no está. Cualquier otra cosa —un
+    /// error de E/S, un permiso, un enlace simbólico donde iría la base— es un
+    /// error y no «no hay base»: el ciclo de vida lee «no hay base» como permiso
+    /// para crear una encima, y crear empieza por barrer la carpeta.
+    pub fn db_exists(&self) -> Result<bool, StoreError> {
+        match fs::symlink_metadata(&self.db) {
+            Ok(meta) if meta.file_type().is_file() => Ok(true),
+            Ok(_) => Err(StoreError::Io(format!(
+                "{} no es un archivo regular; no se usa como base",
+                self.db.display()
+            ))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(io_error(&self.db, "mirar", e)),
+        }
     }
 
     /// Crea la carpeta de la cuenta, y la de todas las bases, cerradas.
@@ -580,7 +593,7 @@ pub(crate) mod tests {
         paths.prepare_dir().unwrap();
         paths.create_empty_db().unwrap();
         assert_eq!(mode(&paths.db), 0o600);
-        assert!(paths.db_exists());
+        assert!(paths.db_exists().unwrap());
         // Y no pisa una que ya existe.
         assert!(paths.create_empty_db().is_err());
     }
@@ -640,6 +653,28 @@ pub(crate) mod tests {
         assert!(matches!(paths.remove(), Err(StoreError::Io(_))));
         assert!(paths.dir.join("sub/informe.txt").exists());
         assert!(paths.db.exists());
+    }
+
+    /// «No hay base» es sólo que el archivo no esté. Un error al mirar —acá
+    /// un `ENOTDIR`, porque donde va la carpeta hay un archivo— o un enlace
+    /// donde va la base son errores, no «no hay base».
+    #[test]
+    fn mirar_si_hay_base_no_confunde_un_error_con_que_no_esta() {
+        let temp = TempDir::new("existe");
+        let paths = StorePaths::new(&temp.0, "cuenta").unwrap();
+        assert_eq!(paths.db_exists(), Ok(false));
+
+        paths.prepare_dir().unwrap();
+        paths.create_empty_db().unwrap();
+        assert_eq!(paths.db_exists(), Ok(true));
+
+        fs::remove_file(&paths.db).unwrap();
+        std::os::unix::fs::symlink(temp.0.join("otro"), &paths.db).unwrap();
+        assert!(matches!(paths.db_exists(), Err(StoreError::Io(_))));
+
+        let file = StorePaths::new(&temp.0, "archivo").unwrap();
+        fs::write(&file.dir, "no soy una carpeta").unwrap();
+        assert!(matches!(file.db_exists(), Err(StoreError::Io(_))));
     }
 
     /// Si la carpeta de todas las bases es un enlace, borrar no lo sigue.
