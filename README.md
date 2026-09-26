@@ -390,6 +390,8 @@ pub struct Account {
 vasak-accounts/
 ├── Cargo.toml            # el workspace
 ├── README.md
+├── common/               # lo que comparten los dos: el momento de arranque de un
+│   └── src/              # proceso y la pregunta a vasak-permissions por él
 ├── daemon/               # el servicio de root
 │   ├── packaging/
 │   │   ├── vasak-accounts.service                 # unidad de sistema, Type=dbus
@@ -414,7 +416,8 @@ vasak-accounts/
         ├── main.rs          # el bucle y la interfaz de sesión
         ├── broker.rs        # le pide al servicio, como cualquier aplicación
         ├── imap.rs          # lo justo para contar el correo sin leer
-        ├── store_api.rs     # ar.net.vasak.os.AccountsStore: estado y control
+        ├── store_api.rs     # ar.net.vasak.os.AccountsStore: lecturas, estado y control
+        ├── access.rs        # el permiso store.contacts de quien lee, y su caché
         ├── contacts_sync.rs # los contactos de cada cuenta al almacén, y cuándo
         ├── vcard.rs         # leer una vCard (2.1, 3.0 y 4.0), sin escribir
         ├── dav/             # hablar con servidores DAV, sólo lectura
@@ -425,6 +428,8 @@ vasak-accounts/
             ├── paths.rs      # dónde vive cada base, y con qué permisos
             ├── migrations.rs # el esquema, versión por versión
             ├── contacts.rs   # los contactos en la base, de a lotes
+            ├── contacts_read.rs # listar, paginar y buscar contactos
+            ├── readers.rs    # las dos conexiones de sólo lectura de cada base
             └── lifecycle.rs  # cuándo se crea, se abre, se cierra y se borra
 ```
 
@@ -672,12 +677,13 @@ le pide que se desbloquee: con el llavero bloqueado no se hace nada y se espera.
 | desbloqueado | está | no está | la base, con esa clave |
 | desbloqueado | no está | está | se rehace vacía, se anota y el estado lo dice |
 | desbloqueado | está | no abre | igual |
-| se bloquea | — | abierta | se cierra, en la próxima revisión |
+| se bloquea | — | abierta | se cierra, en la próxima revisión o la próxima lectura |
 
 El cierre al bloquear **no es inmediato**: `vasak-keyring` avisa al desbloquear
-pero no al bloquear, así que lo nota la revisión de cada cinco minutos. Hasta
-300 segundos después de bloquear, la base sigue abierta y SQLCipher tiene su
-clave en memoria. Por eso el proceso no deja volcados de memoria (`LimitCORE=0`
+pero no al bloquear, así que lo nota la revisión de cada cinco minutos, o antes
+cualquier lectura o lote de escritura, que releen el llavero cada vez. Hasta
+300 segundos después de bloquear, una base que nadie usa sigue abierta y
+SQLCipher tiene su clave en memoria. Por eso el proceso no deja volcados de memoria (`LimitCORE=0`
 en la unidad y `PR_SET_DUMPABLE` en cero al arrancar), y la clave llega a
 SQLCipher por `sqlite3_key_v2` desde memoria que se borra, sin pasar por el
 texto de un `PRAGMA`.
@@ -685,8 +691,8 @@ texto de un `PRAGMA`.
 **Lo que el cifrado protege, y lo que no.** Protege en reposo: el disco robado,
 la copia de seguridad, otra cuenta del equipo. No protege contra un proceso que
 corre como la misma persona: el llavero le entrega los secretos a cualquiera de
-sus procesos. El permiso que llegue para leer el almacén será consentimiento y
-visibilidad, no una frontera.
+sus procesos. El permiso para leer el almacén (`store.contacts`, abajo) es
+consentimiento y visibilidad, no una frontera.
 
 Encendido por omisión. Lo que la persona decide por cuenta vive en
 `$XDG_CONFIG_HOME/vasak-accounts-sync/stores.json`. Apagar o vaciar borra
@@ -708,6 +714,15 @@ reiniciar el sync hace falta confirmar de nuevo. Una cuenta quitada después de
 vaciarla o apagarla sale también de la lista de claves por borrar, pero sólo
 con el llavero desbloqueado y la clave vieja comprobada fuera.
 
+**La colección del llavero se fija una vez por vuelta** y se anota en qué
+colección está la clave de cada base (`key_collections` en `stores.json`, con la
+ruta y el `Created` de la colección). Si el alias `default` pasa a apuntar a
+otra —`SetAlias` lo puede mandar cualquier proceso de la sesión— o el llavero es
+otro, que las claves «no estén» no quiere decir que se perdieron: **ninguna base
+se rehace**, cada una queda `unavailable` con el motivo, y abren como estaban en
+cuanto vuelve la colección. Si el cambio fue a propósito, vaciarla la rehace en
+la colección nueva.
+
 Borrar bajo `stores/` no sigue enlaces: `vasak-accounts-sync/` y `stores/` se
 abren con `O_NOFOLLOW` y todo se borra relativo a ese descriptor, sin
 recursión, y sólo carpetas que son una base (vacías, con un `store.db` regular o
@@ -720,18 +735,75 @@ bus. Contra el mismo usuario negociar Diffie-Hellman no ganaría nada —ese
 proceso le puede pedir la clave al llavero directamente—, así que queda así.
 
 Publica en `ar.net.vasak.os.AccountsStore`, en `/ar/net/vasak/os/AccountsStore`
-del mismo nombre de bus:
+del mismo nombre de bus. Todo contesta en JSON.
 
-| Método | Qué hace |
-|---|---|
-| `GetStatus` | El llavero y, por cuenta, `locked`, `open`, `rebuilt`, `disabled` o `unavailable`, con el motivo y `size_bytes`. |
-| `SetStoreEnabled(account_id, enabled)` | Enciende o apaga. Apagar borra. Sólo cuentas del último `ListAccounts` bueno. |
-| `ClearStore(account_id)` | Borra y, si está encendida, la vuelve a crear vacía con otra clave. Sólo cuentas del último `ListAccounts` bueno. |
-| `RequestSync(account_id)` | Deja lista la base de esa cuenta y, si tiene contactos, enciende esa área y la sincroniza ya. |
+| Método | Pide | Qué hace |
+|---|---|---|
+| `ListAddressBooks(account_id)` | `store.contacts` | Las libretas: `[{id, display_name, contacts}]`. |
+| `ListContacts(account_id, address_book_id, cursor, limit)` | `store.contacts` | Una página por nombre, de todas las libretas (`""`) o de una: `{items: [{id, address_book_id, display_name, email, phone}], next_cursor}`. |
+| `SearchContacts(account_id, query, cursor, limit)` | `store.contacts` | Lo mismo, buscando por el principio de cada palabra en nombre, correos, teléfonos y organización. |
+| `GetContact(account_id, contact_id)` | `store.contacts` | Un contacto entero, leído de su vCard en el momento: `{id, address_book_id, uid, display_name, emails, phones, organization, notes, related}`, o `null`. |
+| `GetStatus()` | nada | El estado, recortado según quién pregunta (abajo). |
+| `SetStoreEnabled(account_id, enabled)` | límite | Enciende o apaga. Apagar borra. |
+| `ClearStore(account_id)` | límite | Borra y, si está encendida, la vuelve a crear vacía con otra clave; los contactos se vuelven a traer ya. |
+| `RequestSync(account_id)` | límite, y `store.contacts` si enciende los contactos | Deja lista la base y, si tiene contactos, los sincroniza ya. |
 
-Y la señal `StatusChanged`, sin detalle. Nada de esto lee lo guardado, así que no
-pide permiso; el permiso llega con la primera lectura (el próximo paso de
-`vasak-accounts#23`: hoy no hay ningún método que devuelva contactos).
+Y dos señales: `StatusChanged`, sin detalle, y **`Changed(area, account_id,
+generation)`**, una por cada lote de la sincronización que cambió algo guardado
+(ninguna por un lote que no): dice **cuándo** cambió, no **qué**. `generation`
+sólo crece —vive en la base, así que tampoco vuelve atrás al reiniciar—, y
+quien la reciba repetida o fuera de orden sabe cuál es la última.
+
+**Las páginas van por cursor.** `next_cursor` es lo que se pasa como `cursor`
+para la siguiente —vacío para la primera— y es `null` cuando no hay más; si
+entre una página y la otra entra o se va un contacto, no se repite ni se saltea
+ninguno de los que ya estaban. Un cursor que no es uno de los nuestros es
+`InvalidArgs`. `limit` 0 pide 100, y nada pasa de 1000. **Lo que se busca es
+texto**: cada palabra va entre comillas al índice, así que `OR`, `NOT`, `NEAR`,
+comillas, guiones o paréntesis son letras y no operadores. Una búsqueda vacía,
+de más de 256 bytes o de más de 8 palabras es `InvalidArgs`. Un contacto sin
+nada que mostrar se guarda pero no se lista.
+
+**El permiso de lectura.** Por cada lectura, el nombre único de quien llama, su
+pid (`GetConnectionUnixProcessID`) y su momento de arranque, y
+`CheckPermissionFor(pid, arranque, "store.contacts", cuenta)` en
+`vasak-permissions`: el sincronizador pregunta **en nombre de la aplicación**, y
+la decisión queda anotada contra ella. Sin permiso, `AccessDenied` y ningún
+dato. La respuesta —sí o no— se guarda **30 segundos por nombre único**, y se
+olvida cuando ese nombre se va del bus; dos pedidos a la vez de la misma
+aplicación son una sola pregunta. Un error del servicio de permisos no se
+guarda y cuenta como no: **falla cerrado**. La primera lectura puede abrir un
+diálogo y tardar lo que tarde la persona; el sincronizador espera hasta dos
+minutos, y **quien llama tiene que esperar también** —no los 25 s por omisión
+de libdbus o GDBus—. La primera lectura de una cuenta **enciende** su área de
+contactos, recién después de que el permiso dijo que sí.
+
+**Lo que el permiso no protege**, sin adornos: es consentimiento y visibilidad,
+no una frontera. La base es un archivo de la persona y su clave está en el
+llavero de la sesión, que se la da a cualquier proceso de ese usuario: un
+programa que no quiera preguntar puede ir directo. El permiso decide qué
+contesta este servicio y le deja ver a la persona quién pidió qué.
+
+**Lo que ve cualquiera en `GetStatus`**: el estado del llavero y, por cuenta,
+el estado de su base (`locked`, `open`, `rebuilt`, `disabled`, `unavailable`) y
+el de su área de contactos (`off`, `pending`, `syncing`, `synced`,
+`unavailable`, `failed`). Nada más. El texto que explica cada estado, cuánto
+ocupa la base (`size_bytes`) y cuándo terminó bien la última vuelta
+(`last_synced_at`) los ve sólo quien tiene `store.contacts` —una lectura
+concedida en los últimos 30 s—, en las cuentas con contactos. `GetStatus`
+nunca abre un diálogo. Los textos son fijos siempre: ninguno lleva una ruta ni
+algo que haya escrito un servidor o el llavero.
+
+**El límite por llamante**: `SetStoreEnabled`, `ClearStore` y `RequestSync`
+aceptan 3 llamadas por cuenta y por nombre único cada 60 s; la siguiente
+contesta `LimitsExceeded`. Vaciar son dos escrituras del llavero y un `fsync`
+con el almacén tomado, y no tiene sentido pedirlo en bucle. Los tres, sólo para
+una cuenta del último `ListAccounts` bueno (si no, `InvalidArgs`).
+
+Las lecturas van por **dos conexiones de sólo lectura** por base
+(`SQLITE_OPEN_READONLY` y `query_only`), con la misma clave, que se cierran con
+la base: no esperan a un lote de escritura y no pueden escribir. El único que
+escribe sigue siendo la sincronización, de a un lote por vez.
 
 #### Los contactos
 
@@ -739,12 +811,13 @@ Qué se guarda: por cada libreta de la cuenta, **cada vCard tal como vino del
 servidor** —ésa es la fuente de verdad— y, derivados de ella sólo para ordenar
 y buscar, el nombre, los correos, los teléfonos y un índice de búsqueda sin
 acentos. Además la dirección y el ETag de cada tarjeta y el `sync-token` de cada
-libreta, para traer después sólo lo que cambió. Nada de eso sale de la base
-todavía, y `GetStatus` sólo dice en qué está el área (`off`, `pending`,
-`syncing`, `synced`, `unavailable`, `failed`), sin datos ni direcciones.
+libreta, para traer después sólo lo que cambió. Sale sólo por las lecturas de
+arriba, con permiso, y lo que se devuelve se lee de la vCard: nunca la tarjeta
+cruda ni su dirección en el servidor.
 
 Cuándo: el área de contactos de una cuenta **se enciende la primera vez que
-alguien pide un `RequestSync`** de esa cuenta, queda anotada en `stores.json` y
+alguien la pide** —una lectura o un `RequestSync`, con `store.contacts`—, queda
+anotada en `stores.json` y
 desde ahí se sincroniza sola **cada hora**, además de con cada `RequestSync`.
 Con el llavero bloqueado **no se pide nada** —ni la credencial ni un solo pedido
 al servidor— y no se escribe nada; si se bloquea a mitad de camino, lo que llegó
@@ -768,9 +841,11 @@ fijo: lo que mandó el servidor va sólo al diario, recortado. Sólo `https`, si
 seguir redirecciones, y **una dirección de otro origen que la cuenta no se pide
 ni se guarda**: la credencial va sólo al servidor de la cuenta.
 
-**Hace falta `vasak-permissions` 0.15.0 o posterior.** Las anteriores no le dan
-al sincronizador `account.contacts`; con ellas el área se ve `unavailable` y no
-se reintenta hasta la hora siguiente.
+**Hace falta `vasak-permissions` 0.15.0 o posterior**, para las dos puntas. Las
+anteriores no le dan al sincronizador `account.contacts` —el área se ve
+`unavailable` y no se reintenta hasta la hora siguiente— ni lo tienen como
+delegado: `CheckPermissionFor` lo rechaza, y **toda lectura contesta
+`AccessDenied`**.
 
 ## Nextcloud: el único que no hay que configurar
 
@@ -904,6 +979,7 @@ No caduca, no depende de ningún registro y no cuesta nada.
 | Prueba de conexión al registrar IMAP/SMTP | ⛔ falta |
 | CalDAV/CardDAV con autodescubrimiento | ⛔ falta |
 | Contactos en el almacén local cifrado (`vasak-accounts-sync`) | ✅ |
+| Lectura de los contactos guardados, con `store.contacts` | ✅ |
 | Contador de correo sin leer (`vasak-accounts-sync`) | ✅ |
 | IMAP IDLE, para que avise en vez de preguntar | ✅ |
 | Caché de mensajes para la aplicación de correo | ⛔ falta (y a propósito: no existe la app) |
