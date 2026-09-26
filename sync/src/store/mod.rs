@@ -115,6 +115,22 @@ fn classify(error: rusqlite::Error) -> StoreError {
     }
 }
 
+/// Abre el archivo de una base.
+///
+/// Sin `SQLITE_OPEN_CREATE`: el archivo lo creó `create_empty_db` con 0600, y
+/// abrir no tiene por qué crear nada. Con `SQLITE_OPEN_NOFOLLOW`: si entre la
+/// revisión de permisos y acá alguien cambió `store.db` —o una carpeta del
+/// camino— por un enlace, SQLite no abre. Sin la bandera, SQLite resuelve los
+/// enlaces del camino y abre lo apuntado. Como la bandera rechaza un enlace en
+/// **cualquier** componente, la ruta llega con lo de la persona ya resuelto
+/// ([`StorePaths::db_to_open`]).
+fn open_connection(db: &std::path::Path) -> Result<Connection, StoreError> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    Connection::open_with_flags(db, flags).map_err(classify)
+}
+
 /// Le da la clave a SQLCipher sin pasar por el parser de SQL.
 ///
 /// `PRAGMA key = "x'…'"` hace lo mismo, pero el parser copia el texto de la
@@ -204,10 +220,7 @@ impl Store {
         }
         paths.tighten_files()?;
 
-        // Sin `SQLITE_OPEN_CREATE`: el archivo lo creó `create_empty_db` con
-        // 0600, y abrir no tiene por qué crear nada.
-        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let mut connection = Connection::open_with_flags(&paths.db, flags).map_err(classify)?;
+        let mut connection = open_connection(&paths.db_to_open()?)?;
 
         apply_key(&connection, key)?;
         // Los parámetros del cifrado, fijos en los de SQLCipher 4. Sin esto, una
@@ -354,6 +367,39 @@ mod tests {
             .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
             .unwrap();
         assert!(count > 0);
+    }
+
+    /// SQLite no abre una base que es un enlace: `tighten_files` ya lo
+    /// rechaza antes, y esto cubre el rato entre esa revisión y la apertura.
+    #[test]
+    fn abrir_no_sigue_un_enlace_en_lugar_de_la_base() {
+        let temp = TempDir::new("enlace-base");
+        let real = StorePaths::new(&temp.0, "real").unwrap();
+        drop(Store::create(&real, &key_of(b'a')).unwrap());
+        let link = temp.0.join("enlace.db");
+        std::os::unix::fs::symlink(&real.db, &link).unwrap();
+
+        assert!(open_connection(&real.db).is_ok());
+        assert!(open_connection(&link).is_err());
+    }
+
+    /// Un `HOME` o una `XDG_DATA_HOME` que son un enlace son de la persona, y
+    /// la base abre igual: el enlace se resuelve antes de la carpeta del
+    /// servicio, y lo nuestro sigue sin poder serlo.
+    #[test]
+    fn la_base_abre_con_la_carpeta_de_datos_enlazada() {
+        let temp = TempDir::new("datos-enlazados");
+        std::fs::create_dir_all(temp.0.join("disco/datos")).unwrap();
+        std::os::unix::fs::symlink(temp.0.join("disco/datos"), temp.0.join("datos")).unwrap();
+        let root = temp.0.join("datos/vasak-accounts-sync/stores");
+        let paths = StorePaths::new(&root, "cuenta").unwrap();
+
+        drop(Store::create(&paths, &key_of(b'a')).unwrap());
+        assert!(Store::open(&paths, &key_of(b'a')).is_ok());
+        assert!(temp
+            .0
+            .join("disco/datos/vasak-accounts-sync/stores/cuenta/store.db")
+            .exists());
     }
 
     /// Lo que se ve desde afuera: ni siquiera la firma de SQLite.

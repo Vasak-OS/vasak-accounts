@@ -129,6 +129,28 @@ impl StorePaths {
         })
     }
 
+    /// La ruta de la base para abrirla con `SQLITE_OPEN_NOFOLLOW`.
+    ///
+    /// SQLite, con esa bandera, rechaza la ruta si **cualquier** componente es
+    /// un enlace, no sólo el último. Lo de más arriba de `vasak-accounts-sync/`
+    /// —la `XDG_DATA_HOME` de la persona, o su `HOME`— puede serlo a propósito,
+    /// así que eso se resuelve acá una vez; lo nuestro —`vasak-accounts-sync/`,
+    /// `stores/`, la carpeta de la cuenta y `store.db`— va tal cual, y si
+    /// alguno es un enlace SQLite no abre.
+    pub fn db_to_open(&self) -> Result<PathBuf, StoreError> {
+        let missing = || StoreError::Io(format!("{} no es una ruta de base", self.db.display()));
+        let app_dir = self.root.parent().ok_or_else(missing)?;
+        let base = app_dir.parent().ok_or_else(missing)?;
+        let app_name = app_dir.file_name().ok_or_else(missing)?;
+        let root_name = self.root.file_name().ok_or_else(missing)?;
+        let base = fs::canonicalize(base).map_err(|e| io_error(base, "resolver", e))?;
+        Ok(base
+            .join(app_name)
+            .join(root_name)
+            .join(&self.account_id)
+            .join(DB_FILE))
+    }
+
     /// Los tres archivos que forman la base.
     pub fn files(&self) -> [&Path; 3] {
         [&self.db, &self.wal, &self.shm]
