@@ -180,9 +180,12 @@ impl StoreSettings {
 
     /// Escribe el archivo entero, a un temporal y renombrado: o queda el de
     /// antes o el de ahora, nunca uno a medias.
+    ///
+    /// El temporal tiene un nombre propio de esta escritura y se crea **nuevo**
+    /// (`O_CREAT|O_EXCL`) y con `O_NOFOLLOW`: un enlace plantado con ese nombre,
+    /// o un archivo que ya estaba, hacen fallar la escritura en vez de pisar lo
+    /// que apunten. Si algo falla después de crearlo, se borra.
     pub fn save(&self, path: &Path) -> Result<(), StoreError> {
-        use std::io::Write;
-
         let dir = path
             .parent()
             .ok_or_else(|| StoreError::Settings("la ruta no tiene carpeta".into()))?;
@@ -190,22 +193,52 @@ impl StoreSettings {
         let json = serde_json::to_vec_pretty(self)
             .map_err(|e| StoreError::Settings(format!("no se pudo serializar: {e}")))?;
 
-        let temporary = dir.join(".stores.json.tmp");
-        let write = || -> std::io::Result<()> {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&temporary)?;
-            file.write_all(&json)?;
-            file.sync_all()?;
-            std::fs::rename(&temporary, path)
-        };
-        write().map_err(|e| {
-            StoreError::Settings(format!("no se pudo guardar {}: {e}", path.display()))
-        })
+        let temporary = dir.join(temporary_name());
+        write_new_private(&temporary, &json)
+            .and_then(|()| {
+                std::fs::rename(&temporary, path).inspect_err(|_| {
+                    let _ = std::fs::remove_file(&temporary);
+                })
+            })
+            .map_err(|e| {
+                StoreError::Settings(format!("no se pudo guardar {}: {e}", path.display()))
+            })
     }
+}
+
+/// Un nombre de temporal que no usa ninguna otra escritura: el proceso, un
+/// contador y la hora. No hace falta que sea impredecible —el temporal se crea
+/// con `O_EXCL`, así que adivinarlo sólo hace fallar la escritura—, sólo que
+/// dos escrituras no se pisen.
+fn temporary_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!(
+        ".stores.json.{}.{}.{nanos}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Escribe `bytes` en un archivo **nuevo**, 0600, sin seguir un enlace, y lo
+/// lleva al disco. Si falla después de crearlo, lo borra: es de esta escritura.
+fn write_new_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(path);
+        })
 }
 
 /// Dónde viven las bases y lo decidido por cuenta.
@@ -1694,6 +1727,76 @@ mod tests {
         f.manager.refresh().await;
         assert_eq!(f.state("cuenta").await, StoreState::Open);
         assert!(f.settings().pending_key_deletions.is_empty());
+    }
+
+    /// El temporal de `stores.json` no sigue un enlace: el que estaba plantado
+    /// con el nombre fijo de antes queda como estaba, y lo apuntado también.
+    #[tokio::test]
+    async fn el_temporal_de_stores_json_no_sigue_enlaces() {
+        let f = Fixture::new("temporal-enlace");
+        f.manager.accounts_listed(listing(&["cuenta"])).await;
+        let victim = f.temp.0.join("victima.txt");
+        std::fs::write(&victim, "contenido de la persona").unwrap();
+        let dir = f.locations().settings.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join(".stores.json.tmp")).unwrap();
+
+        f.manager.set_enabled("cuenta", false).await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "contenido de la persona"
+        );
+        assert!(!f.settings().is_enabled("cuenta"));
+    }
+
+    /// Crear el temporal no pisa nada: ni lo que apunta un enlace con ese
+    /// nombre ni un archivo que ya estaba.
+    #[test]
+    fn el_temporal_se_crea_nuevo_y_sin_seguir_enlaces() {
+        let temp = TempDir::new("temporal-nuevo");
+        let victim = temp.0.join("victima.txt");
+        std::fs::write(&victim, "de la persona").unwrap();
+        let link = temp.0.join("enlace");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        assert!(write_new_private(&link, b"{}").is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "de la persona");
+
+        let dangling = temp.0.join("colgado");
+        std::os::unix::fs::symlink(temp.0.join("no-existe"), &dangling).unwrap();
+        assert!(write_new_private(&dangling, b"{}").is_err());
+        assert!(!temp.0.join("no-existe").exists());
+
+        assert!(write_new_private(&victim, b"{}").is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "de la persona");
+
+        let fresh = temp.0.join("nuevo");
+        write_new_private(&fresh, b"{}").unwrap();
+        let mode = std::fs::metadata(&fresh).unwrap();
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(&mode.permissions()) & 0o777,
+            0o600
+        );
+        assert_ne!(temporary_name(), temporary_name());
+    }
+
+    /// Si guardar falla después de crear el temporal, el temporal no queda.
+    #[test]
+    fn si_guardar_falla_no_queda_el_temporal() {
+        let temp = TempDir::new("temporal-fallido");
+        let path = temp.0.join("config/stores.json");
+        // `stores.json` es una carpeta con algo adentro: el `rename` falla.
+        std::fs::create_dir_all(path.join("algo")).unwrap();
+
+        assert!(StoreSettings::default().save(&path).is_err());
+
+        let leftovers: Vec<_> = std::fs::read_dir(temp.0.join("config"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "quedaron temporales: {leftovers:?}");
     }
 
     /// Un `stores.json` que no se entiende no enciende ni borra nada.
