@@ -419,12 +419,22 @@ fn read_error(error: StoreError) -> zbus::fdo::Error {
     }
 }
 
+/// El error de un comando de control, **con texto fijo**, como el de una
+/// lectura.
+///
+/// Los comandos de control no piden permiso, así que lo que contestan lo ve
+/// cualquier proceso de la sesión. El texto entero de `Io`, `Settings` o del
+/// llavero lleva rutas bajo `$HOME` y lo que dijo el llavero: va sólo al
+/// diario, y por el bus sale [`StoreError::public_detail`].
 fn to_fdo(error: StoreError) -> zbus::fdo::Error {
-    match error {
+    match &error {
         StoreError::InvalidAccountId(_) | StoreError::UnknownAccount(_) => {
-            zbus::fdo::Error::InvalidArgs(error.to_string())
+            zbus::fdo::Error::InvalidArgs(error.public_detail().into())
         }
-        other => zbus::fdo::Error::Failed(other.to_string()),
+        other => {
+            tracing::warn!("un comando del almacén falló: {other}");
+            zbus::fdo::Error::Failed(other.public_detail().into())
+        }
     }
 }
 
@@ -1198,6 +1208,31 @@ mod tests {
             .is_none());
         // Y mirar el estado no abrió ningún diálogo.
         assert_eq!(api.access.permissions.calls(), 1);
+    }
+
+    /// Lo que contesta un comando de control que falló es un texto fijo: sin
+    /// la ruta de `stores.json` ni nada bajo `$HOME`, que lo leería cualquier
+    /// proceso de la sesión.
+    #[tokio::test]
+    async fn un_error_de_un_comando_no_lleva_rutas() {
+        let mut api = Api::new("api-ruta", vec![account("cuenta", false)], Answer::Allow).await;
+        let (client, _service) = api.client(":1.7").await;
+        // Un directorio donde tendría que estar `stores.json`: leerlo falla, y
+        // el error del disco lleva la ruta.
+        let settings = api.temp.0.join("stores.json");
+        let _ = std::fs::remove_file(&settings);
+        std::fs::create_dir_all(settings.join("adentro")).unwrap();
+
+        let result = call_unit(&client, "SetStoreEnabled", &("cuenta", false)).await;
+        match &result {
+            Err(zbus::Error::MethodError(name, Some(text), _)) => {
+                assert!(name.as_str().ends_with(".Failed"));
+                let root = api.temp.0.to_string_lossy().to_string();
+                assert!(!text.contains(&root), "el texto lleva la ruta del almacén");
+                assert!(!text.contains('/'), "el texto lleva una ruta");
+            }
+            other => panic!("tenía que fallar con Failed: {}", error_name(other)),
+        }
     }
 
     /// El límite por llamante: la llamada de control que pasa el cupo contesta
