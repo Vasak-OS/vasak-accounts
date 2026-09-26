@@ -118,7 +118,7 @@ impl ReadPool {
 
 /// Una conexión de sólo lectura, con la clave y la misma comprobación que la
 /// de escritura.
-fn open_reader(db: &Path, key: &StoreKey) -> Result<Connection, StoreError> {
+pub(super) fn open_reader(db: &Path, key: &StoreKey) -> Result<Connection, StoreError> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_NOFOLLOW;

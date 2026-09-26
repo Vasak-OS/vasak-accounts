@@ -380,6 +380,15 @@ impl Store {
         })
     }
 
+    /// Si `key` abre la base de `paths`, sin tocarla: una conexión de sólo
+    /// lectura, la clave y la misma comprobación que al abrir.
+    pub fn key_opens(paths: &StorePaths, key: &StoreKey) -> bool {
+        paths
+            .db_to_open()
+            .and_then(|db| readers::open_reader(&db, key))
+            .is_ok()
+    }
+
     /// Las conexiones de lectura de esta base.
     pub fn readers(&self) -> Arc<ReadPool> {
         Arc::clone(&self.readers)
