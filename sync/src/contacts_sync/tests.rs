@@ -403,6 +403,91 @@ async fn un_token_vencido_lleva_a_la_sincronizacion_completa() {
     assert!(sync[0].body.contains(&token));
 }
 
+fn parse_url(text: &str) -> url::Url {
+    url::Url::parse(text).unwrap()
+}
+
+/// **Los borrados de lo que no está guardado no se acumulan.** Diez mil
+/// `404` de direcciones que nadie tiene dejan la lista vacía: si no, con
+/// cincuenta tandas de dieciséis megas se llegaba a gigabytes antes de
+/// filtrarla.
+#[test]
+fn los_borrados_de_lo_que_no_esta_guardado_no_se_acumulan() {
+    let local: HashMap<String, Option<String>> = [(
+        "https://x/libro/ana.vcf".to_string(),
+        Some("\"1\"".to_string()),
+    )]
+    .into();
+    let mut changed = BTreeMap::new();
+    let mut removed = BTreeSet::new();
+
+    merge_delta(
+        &mut changed,
+        &mut removed,
+        vec![(parse_url("https://x/libro/nueva.vcf"), None)],
+        (0..10_000)
+            .map(|i| parse_url(&format!("https://x/libro/nadie-{i}.vcf")))
+            .collect(),
+        &local,
+    );
+    assert!(removed.is_empty(), "{}", removed.len());
+    assert_eq!(changed.len(), 1);
+
+    // Lo guardado sí se anota, y lo que cambió y después se fue deja de
+    // pedirse.
+    merge_delta(
+        &mut changed,
+        &mut removed,
+        Vec::new(),
+        vec![
+            parse_url("https://x/libro/ana.vcf"),
+            parse_url("https://x/libro/nueva.vcf"),
+        ],
+        &local,
+    );
+    assert_eq!(
+        removed.into_iter().collect::<Vec<_>>(),
+        vec!["https://x/libro/ana.vcf"]
+    );
+    assert!(changed.is_empty());
+}
+
+/// **Un `507` que no avanza el token no borra ni guarda nada.** Con el token
+/// vencido, la carga completa vuelve cortada —una tarjeta y un `507`— y el
+/// pedido siguiente, desde el token nuevo, vuelve cortado con el mismo token.
+/// Tomarlo como completo borraba las tarjetas guardadas que no llegaron en la
+/// parte cortada, y guardaba el token: no volvían hasta que cambiaran.
+#[tokio::test]
+async fn un_507_que_no_avanza_el_token_no_borra_ni_guarda_nada() {
+    let f = Fixture::new("contactos-507").await;
+    f.server.put(0, "ana.vcf", &card("1", "Ana", "ana@x.com"));
+    f.server
+        .put(0, "juan.vcf", &card("2", "Juan", "juan@x.com"));
+    f.server
+        .put(0, "luis.vcf", &card("3", "Luis", "luis@x.com"));
+    f.synced().await;
+    let old = f.token(0).await.unwrap();
+
+    {
+        let mut state = f.server.state();
+        state.min_valid_token = state.version + 1;
+        state.truncate_sync = Some(1);
+    }
+    f.server.put(0, "zoe.vcf", &card("4", "Zoe", "zoe@x.com"));
+
+    let outcome = f.sync().await;
+    assert!(matches!(outcome, SyncOutcome::Failed(_)), "{outcome:?}");
+    assert_eq!(f.names().await, vec!["Ana", "Juan", "Luis"]);
+    assert_eq!(f.token(0).await, Some(old));
+    let syncs = f
+        .server
+        .requests()
+        .iter()
+        .filter(|r| r.is_sync_collection())
+        .count();
+    assert_eq!(syncs, 1 + 3, "el vencido, la completa y la que no avanzó");
+}
+
 // ── Sin sync-collection ─────────────────────────────────────────────────────
 
 /// El servidor que dice que no sabe `sync-collection` va por ETag: lo nuevo y

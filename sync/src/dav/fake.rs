@@ -87,6 +87,9 @@ pub struct FakeState {
     pub extra_sync_xml: String,
     /// `<d:response>` de más que se suman a cada `addressbook-multiget`.
     pub extra_multiget_xml: String,
+    /// Cortar cada `sync-collection` a estas tarjetas, con un `507` sobre la
+    /// libreta: la respuesta truncada de RFC 6578.
+    pub truncate_sync: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -123,6 +126,7 @@ impl FakeDav {
             extra_books_xml: String::new(),
             extra_sync_xml: String::new(),
             extra_multiget_xml: String::new(),
+            truncate_sync: None,
         }));
 
         let shared = Arc::clone(&state);
@@ -406,17 +410,20 @@ fn answer(state: &mut FakeState, request: &RecordedRequest) -> (u16, String) {
                 }
             };
             let mut xml = String::from(HEAD);
-            for (name, card) in &book.cards {
-                if since.is_none_or(|n| card.version > n) {
-                    xml.push_str(&format!(
-                        "<d:response><d:href>{}{name}</d:href>{}</d:response>",
-                        book.path,
-                        ok(&format!(
-                            "<d:getetag>{}</d:getetag>",
-                            xml_escape(&card.etag)
-                        ))
-                    ));
-                }
+            let changed = book
+                .cards
+                .iter()
+                .filter(|(_, card)| since.is_none_or(|n| card.version > n))
+                .take(state.truncate_sync.unwrap_or(usize::MAX));
+            for (name, card) in changed {
+                xml.push_str(&format!(
+                    "<d:response><d:href>{}{name}</d:href>{}</d:response>",
+                    book.path,
+                    ok(&format!(
+                        "<d:getetag>{}</d:getetag>",
+                        xml_escape(&card.etag)
+                    ))
+                ));
             }
             if let Some(n) = since {
                 for (name, version) in &book.removed {
@@ -428,6 +435,13 @@ fn answer(state: &mut FakeState, request: &RecordedRequest) -> (u16, String) {
                         ));
                     }
                 }
+            }
+            if state.truncate_sync.is_some() {
+                xml.push_str(&format!(
+                    "<d:response><d:href>{}</d:href>\
+                     <d:status>HTTP/1.1 507 Insufficient Storage</d:status></d:response>",
+                    book.path
+                ));
             }
             xml.push_str(&state.extra_sync_xml);
             xml.push_str(&format!("<d:sync-token>t{}</d:sync-token>", state.version));

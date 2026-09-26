@@ -300,7 +300,7 @@ pub fn authorization_header(credential: &DavCredential) -> Zeroizing<String> {
 /// **Otro origen —esquema, máquina o puerto— es `ForeignOrigin`**: pedirla
 /// mandaría la credencial de la cuenta a quien diga el servidor, y guardarla
 /// haría que la próxima vuelta la pida. También se rechaza una con usuario y
-/// contraseña adentro, o una desmedida. El fragmento se descarta: no llega al
+/// contraseña adentro, o una desmedida, antes o después de resolverla. El fragmento se descarta: no llega al
 /// servidor, así que dos direcciones que sólo difieren en él son la misma.
 pub fn resolve_href(base: &url::Url, href: &str) -> Result<url::Url, DavError> {
     let href = href.trim();
@@ -308,7 +308,10 @@ pub fn resolve_href(base: &url::Url, href: &str) -> Result<url::Url, DavError> {
         return Err(DavError::ForeignOrigin);
     }
     let mut resolved = base.join(href).map_err(|_| DavError::ForeignOrigin)?;
-    if resolved.origin() != base.origin()
+    // Otra vez después de resolver: `join` codifica, y dos mil espacios son
+    // seis mil bytes de `%20`.
+    if resolved.as_str().len() > MAX_HREF_BYTES
+        || resolved.origin() != base.origin()
         || !resolved.username().is_empty()
         || resolved.password().is_some()
     {
@@ -1341,6 +1344,19 @@ mod tests {
         }
         let long = format!("/{}", "a".repeat(MAX_HREF_BYTES));
         assert_eq!(resolve_href(&base, &long), Err(DavError::ForeignOrigin));
+    }
+
+    /// El largo se mira también **después** de resolver: `join` codifica, y
+    /// una dirección de dos mil espacios pasa el tope como seis mil bytes de
+    /// `%20`.
+    #[test]
+    fn una_direccion_que_crece_al_resolverla_se_rechaza() {
+        let base = url::Url::parse("https://nube.ejemplo.com/dav/libro/").unwrap();
+        let spaces = format!("/dav/libro/{}x.vcf", " ".repeat(2000));
+        assert!(spaces.len() <= MAX_HREF_BYTES);
+        assert_eq!(resolve_href(&base, &spaces), Err(DavError::ForeignOrigin));
+        // Una normal sigue entrando.
+        assert!(resolve_href(&base, "/dav/libro/a%20b.vcf").is_ok());
     }
 
     #[test]

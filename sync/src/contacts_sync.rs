@@ -450,23 +450,27 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
                 }
                 webdav::SyncCollection::Delta(delta) => {
                     report.foreign += delta.foreign;
-                    for url in delta.removed {
-                        changed.remove(url.as_str());
-                        removed.insert(url.to_string());
-                    }
-                    for (url, etag) in delta.changed {
-                        removed.remove(url.as_str());
-                        changed.insert(url.to_string(), (url, etag));
-                    }
+                    merge_delta(
+                        &mut changed,
+                        &mut removed,
+                        delta.changed,
+                        delta.removed,
+                        local,
+                    );
                     if changed.len() > self.limits.max_cards_per_book {
                         return Err(DavError::TooManyCards(self.limits.max_cards_per_book).into());
                     }
                     let advanced = delta.token.is_some() && delta.token != token;
                     token = delta.token;
-                    if delta.truncated && advanced {
-                        continue;
+                    match (delta.truncated, advanced) {
+                        (false, _) => break,
+                        (true, true) => continue,
+                        // Truncado y sin token nuevo: pedir de nuevo daría lo
+                        // mismo, y tomarlo como completo borraría todo lo que
+                        // no llegó en la parte cortada. Error, sin escribir
+                        // nada ni mover el token.
+                        (true, false) => return Err(DavError::Status(507).into()),
                     }
-                    break;
                 }
             }
         }
@@ -677,6 +681,31 @@ fn row_from(card: CardResource) -> Option<ContactRow> {
         raw_vcard: card.data,
         contact,
     })
+}
+
+/// Suma una tanda de `sync-collection` a lo acumulado de las anteriores.
+///
+/// Lo que se borró sólo se anota **si está guardado**: con cincuenta tandas
+/// de dieciséis megas de `404` de direcciones que nadie tiene, la lista crecía
+/// hasta gigabytes antes de filtrarla al final. Así no pasa de lo guardado,
+/// que tiene tope. Lo que cambió y después se borró deja de pedirse igual.
+fn merge_delta(
+    changed: &mut BTreeMap<String, (url::Url, Option<String>)>,
+    removed: &mut BTreeSet<String>,
+    delta_changed: Vec<(url::Url, Option<String>)>,
+    delta_removed: Vec<url::Url>,
+    local: &HashMap<String, Option<String>>,
+) {
+    for url in delta_removed {
+        changed.remove(url.as_str());
+        if local.contains_key(url.as_str()) {
+            removed.insert(url.to_string());
+        }
+    }
+    for (url, etag) in delta_changed {
+        removed.remove(url.as_str());
+        changed.insert(url.to_string(), (url, etag));
+    }
 }
 
 /// Lo que hay que traer: lo nuevo y lo que cambió de ETag. Sin ETag no hay
