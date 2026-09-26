@@ -7,9 +7,19 @@
 //! (`x'…'`), sin derivar nada de una contraseña: ya son una clave, y derivar en
 //! cada apertura sería pagar un PBKDF2 por nada.
 //!
-//! En memoria vive dentro de `Zeroizing`, que la pone en cero al soltarla, y
-//! sólo lo que dura abrir la base: después la tiene SQLCipher, que borra la suya
-//! al cerrar.
+//! De este lado vive en `Zeroizing`, que la pone en cero al soltarla, y sólo lo
+//! que dura abrir la base. Se le entrega a SQLCipher con `sqlite3_key_v2` desde
+//! un búfer del largo justo —sin `PRAGMA key`, cuyo texto copia el parser de
+//! SQL en memoria que se libera sin borrar—; SQLCipher la copia a su montículo
+//! privado, deriva la de las páginas y borra las dos al soltarlas, a más tardar
+//! al cerrar la base.
+//!
+//! Lo que **no** se borra: la copia en el búfer del mensaje de D-Bus que la
+//! trajo del llavero (es de zbus, y vive lo que el mensaje), y la clave de
+//! páginas que SQLCipher tiene mientras la base está abierta. Por eso el
+//! proceso no deja volcados de memoria: `LimitCORE=0` en la unidad y
+//! `PR_SET_DUMPABLE` en cero al arrancar, que además le cierra `ptrace` a los
+//! demás procesos de la persona.
 //!
 //! ── La regla que no se rompe ────────────────────────────────────────────────
 //!
@@ -92,13 +102,20 @@ impl StoreKey {
         &self.0
     }
 
-    /// La orden que le da la clave a SQLCipher, también en memoria que se borra.
+    /// La clave como se la entrega a SQLCipher: `x'…'`, la forma de clave
+    /// cruda —sin derivar nada—, en memoria que se borra.
     ///
-    /// Con la forma `x'…'`, que es la de clave cruda. La clave se validó al
-    /// crearla —sólo hexadecimal—, así que no hay comillas que puedan cerrar la
-    /// cadena antes de tiempo.
-    pub(super) fn pragma(&self) -> Zeroizing<String> {
-        Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", self.hex()))
+    /// **Del largo justo desde el principio.** Un búfer que crece copia lo que
+    /// tiene a uno nuevo y suelta el viejo sin borrarlo; `Zeroizing` sólo
+    /// borra el último. La clave se validó al crearla —sólo hexadecimal—, así
+    /// que no hay comillas que cierren nada antes de tiempo.
+    pub(super) fn sqlcipher_key(&self) -> Zeroizing<Vec<u8>> {
+        let hex = self.hex().as_bytes();
+        let mut literal = Zeroizing::new(Vec::with_capacity(hex.len() + 3));
+        literal.extend_from_slice(b"x'");
+        literal.extend_from_slice(hex);
+        literal.push(b'\'');
+        literal
     }
 }
 
@@ -713,13 +730,17 @@ mod tests {
         assert_eq!(upper.hex(), "a".repeat(64));
     }
 
+    /// La forma de clave cruda, y en un búfer que nunca creció: si hubiera
+    /// crecido, el de antes —con la clave— se habría soltado sin borrar.
     #[test]
-    fn la_orden_de_sqlcipher_usa_la_clave_cruda() {
+    fn la_clave_para_sqlcipher_es_cruda_y_del_largo_justo() {
         let key = StoreKey::from_secret(Zeroizing::new(vec![b'0'; 64])).unwrap();
+        let literal = key.sqlcipher_key();
         assert_eq!(
-            key.pragma().as_str(),
-            format!("PRAGMA key = \"x'{}'\";", "0".repeat(64))
+            literal.as_slice(),
+            format!("x'{}'", "0".repeat(64)).as_bytes()
         );
+        assert_eq!(literal.capacity(), literal.len());
     }
 
     // ── Un llavero falso del otro lado de una conexión punto a punto ────────

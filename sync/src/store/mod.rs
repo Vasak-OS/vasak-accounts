@@ -115,6 +115,41 @@ fn classify(error: rusqlite::Error) -> StoreError {
     }
 }
 
+/// Le da la clave a SQLCipher sin pasar por el parser de SQL.
+///
+/// `PRAGMA key = "x'…'"` hace lo mismo, pero el parser copia el texto de la
+/// orden —con la clave— a memoria de SQLite que se libera sin borrar
+/// (`cipher_memory_security` viene apagado). `sqlite3_key_v2` recibe los bytes
+/// tal cual, desde el búfer `Zeroizing` de [`StoreKey::sqlcipher_key`], y
+/// SQLCipher los copia a su montículo privado, que borra al soltar. Con la
+/// misma forma `x'…'`, que es la de clave cruda: las bases abren igual que con
+/// el `PRAGMA`.
+fn apply_key(connection: &Connection, key: &StoreKey) -> Result<(), StoreError> {
+    let literal = key.sqlcipher_key();
+    let length = std::ffi::c_int::try_from(literal.len())
+        .map_err(|_| StoreError::Sqlite("la clave es demasiado larga".into()))?;
+    // SAFETY: `handle()` es el puntero de la conexión abierta de `connection`,
+    // que vive más que esta llamada y no se usa desde otro hilo mientras tanto
+    // (`Connection` no es `Sync`, y acá se la presta). `c"main"` es una cadena
+    // C estática. `literal` son `length` bytes válidos hasta el final de la
+    // función; SQLCipher sólo los lee durante la llamada —los copia a memoria
+    // propia— y no guarda ningún puntero a ellos.
+    let code = unsafe {
+        rusqlite::ffi::sqlite3_key_v2(
+            connection.handle(),
+            c"main".as_ptr(),
+            literal.as_ptr().cast(),
+            length,
+        )
+    };
+    if code != rusqlite::ffi::SQLITE_OK {
+        return Err(StoreError::Sqlite(format!(
+            "SQLCipher no aceptó la clave (código {code})"
+        )));
+    }
+    Ok(())
+}
+
 /// Qué tan grave es una línea de la bitácora.
 ///
 /// Por ahora sólo escribe el ciclo de vida, y sólo avisos. La columna acepta
@@ -174,7 +209,7 @@ impl Store {
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let mut connection = Connection::open_with_flags(&paths.db, flags).map_err(classify)?;
 
-        connection.execute_batch(&key.pragma()).map_err(classify)?;
+        apply_key(&connection, key)?;
         // Los parámetros del cifrado, fijos en los de SQLCipher 4. Sin esto, una
         // versión futura con otros valores por omisión no abriría las bases de
         // hoy, y el ciclo de vida lo tomaría por una clave que no abre: las
@@ -281,6 +316,44 @@ mod tests {
             .query_row("SELECT message FROM sync_log", [], |row| row.get(0))
             .unwrap();
         assert_eq!(message, "hola");
+    }
+
+    /// La clave va por `sqlite3_key_v2` y no por `PRAGMA key`, pero es la
+    /// misma clave cruda: una base creada con la orden de antes abre, y una
+    /// creada ahora abre con la orden. Si la forma `x'…'` se tomara por una
+    /// contraseña, SQLCipher derivaría otra clave y ninguna de las dos abriría.
+    #[test]
+    fn la_clave_por_la_api_es_la_misma_que_por_pragma() {
+        let temp = TempDir::new("pragma");
+        let with_pragma = |paths: &StorePaths, c: u8| {
+            let connection = Connection::open(&paths.db).unwrap();
+            connection
+                .execute_batch(&format!(
+                    "PRAGMA key = \"x'{}'\"; PRAGMA cipher_compatibility = 4;",
+                    (c as char).to_string().repeat(64)
+                ))
+                .unwrap();
+            connection
+        };
+
+        let old = StorePaths::new(&temp.0, "vieja").unwrap();
+        old.prepare_dir().unwrap();
+        with_pragma(&old, b'a')
+            .execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1);")
+            .unwrap();
+        let store = Store::open(&old, &key_of(b'a')).unwrap();
+        let x: i64 = store
+            .connection()
+            .query_row("SELECT x FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(x, 1);
+
+        let new = StorePaths::new(&temp.0, "nueva").unwrap();
+        drop(Store::create(&new, &key_of(b'b')).unwrap());
+        let count: i64 = with_pragma(&new, b'b')
+            .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+            .unwrap();
+        assert!(count > 0);
     }
 
     /// Lo que se ve desde afuera: ni siquiera la firma de SQLite.
