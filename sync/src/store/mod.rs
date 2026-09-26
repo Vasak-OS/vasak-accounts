@@ -2,12 +2,12 @@
 //!
 //! ── Qué hay acá, y qué todavía no ───────────────────────────────────────────
 //!
-//! La base **vacía**: su clave en el llavero, su archivo cifrado, el esquema v1
-//! —dónde quedó la sincronización y una bitácora— y el ciclo de vida entero
-//! (crear, abrir, cerrar al bloquear, rehacer si se perdió la clave, apagar,
-//! vaciar, borrar al quitar la cuenta). **Todavía no se guarda nada de nadie**:
-//! los contactos, el calendario y el correo llegan después, de a uno, con su
-//! propia migración. Ver `vasak-accounts#23`.
+//! La base: su clave en el llavero, su archivo cifrado, el esquema —dónde quedó
+//! la sincronización, una bitácora y, desde la v2, **los contactos** (ver
+//! `migrations.rs` y `contacts.rs`)— y el ciclo de vida entero (crear, abrir,
+//! cerrar al bloquear, rehacer si se perdió la clave, apagar, vaciar, borrar al
+//! quitar la cuenta). El calendario y el correo llegan después, de a uno, con
+//! su propia migración. Ver `vasak-accounts#23`.
 //!
 //! ── Qué protege el cifrado, y qué no ────────────────────────────────────────
 //!
@@ -34,6 +34,7 @@
 //! —la clave vive en el llavero de la sesión, y parsear lo que llega de la red
 //! tiene que pasar como la persona— y con un solo escritor no hay carreras.
 
+pub mod contacts;
 pub mod key;
 pub mod lifecycle;
 pub mod migrations;
@@ -472,7 +473,7 @@ mod tests {
             .connection()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
     }
 
     /// 0700 la carpeta y 0600 los tres archivos, y otra vez en cada apertura si

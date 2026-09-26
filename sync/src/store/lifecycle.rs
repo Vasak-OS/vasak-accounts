@@ -45,6 +45,18 @@
 //! Lo que **nunca** lleva a borrar: un error del disco, un error del llavero, un
 //! esquema más nuevo que este programa. Sólo una clave que no está —leída con el
 //! llavero desbloqueado— o una que no abre.
+//!
+//! ── Las áreas, y quién escribe ──────────────────────────────────────────────
+//!
+//! Un área de una cuenta —hoy sólo los contactos— **se enciende la primera vez
+//! que alguien la pide** (`RequestSync`) y queda anotada en `stores.json`
+//! (`active_areas`), así que después de reiniciar sigue sola. Su estado se ve en
+//! `GetStatus`, al lado del de la base.
+//!
+//! **Un solo escritor por base**: todo lo que toca una base abierta pasa por
+//! [`StoreManager::with_store`], con la cerradura del administrador tomada y el
+//! llavero releído en ese momento. Con el llavero bloqueado no se escribe nada
+//! —se pasa la tabla, que cierra la base— y la sincronización se corta ahí.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::OpenOptionsExt;
@@ -61,6 +73,10 @@ use super::{LogLevel, Store, StoreError};
 
 /// Las capacidades de una cuenta que van a tener lugar en el almacén.
 pub const STORE_AREAS: [&str; 3] = ["email", "calendar", "contacts"];
+
+/// El nombre del área de contactos, en la capacidad de la cuenta y en
+/// `active_areas` de `stores.json`.
+pub const CONTACTS_AREA: &str = "contacts";
 
 /// Cuánto tiene que haber entre el primer listado bueno en que falta una
 /// cuenta y el que confirma que se fue, antes de borrar nada suyo.
@@ -183,6 +199,45 @@ pub enum KeyringState {
     Unavailable,
 }
 
+/// En qué está un área —los contactos— de una cuenta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AreaState {
+    /// Nadie la pidió todavía: no se sincroniza.
+    Off,
+    /// Encendida, esperando su vuelta o que se abra la base.
+    Pending,
+    Syncing,
+    /// La última vuelta terminó bien.
+    Synced,
+    /// No se puede: el servicio de cuentas no da permiso. No se reintenta
+    /// hasta la próxima vuelta o un `RequestSync`.
+    Unavailable,
+    /// La última vuelta falló: el servidor, la red. `detail` dice qué.
+    Failed,
+}
+
+/// El estado de un área, como lo contesta `GetStatus`. **Sin datos de
+/// contactos ni direcciones**: sólo en qué está y un texto fijo que lo explica.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AreaStatus {
+    pub state: AreaState,
+    /// Vacío si no hay nada que explicar.
+    pub detail: String,
+    /// Cuándo terminó bien la última vuelta, en esta sesión del servicio.
+    pub last_synced_at: Option<String>,
+}
+
+impl AreaStatus {
+    fn new(state: AreaState) -> Self {
+        Self {
+            state,
+            detail: String::new(),
+            last_synced_at: None,
+        }
+    }
+}
+
 /// El estado de la base de una cuenta, como lo contesta `GetStatus`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AccountStatus {
@@ -192,6 +247,9 @@ pub struct AccountStatus {
     pub detail: String,
     /// Cuánto ocupa en el disco, con el `-wal` y el `-shm`.
     pub size_bytes: u64,
+    /// El área de contactos, sólo en las cuentas que tienen contactos.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contacts: Option<AreaStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -205,6 +263,9 @@ pub struct Status {
 pub struct ListedAccount {
     pub id: String,
     pub capabilities: Vec<String>,
+    /// La base se conserva igual; lo que no se hace es sincronizarla: pedirle
+    /// el token daría error en cada vuelta.
+    pub needs_reauth: bool,
 }
 
 impl ListedAccount {
@@ -216,6 +277,11 @@ impl ListedAccount {
         self.capabilities
             .iter()
             .any(|c| STORE_AREAS.contains(&c.as_str()))
+    }
+
+    /// Si hay contactos que sincronizar.
+    fn has_contacts_to_sync(&self) -> bool {
+        !self.needs_reauth && self.capabilities.iter().any(|c| c == CONTACTS_AREA)
     }
 }
 
@@ -253,6 +319,20 @@ pub struct StoreSettings {
 pub struct AccountSettings {
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
+    /// Las áreas que alguien pidió alguna vez y que desde ahí se sincronizan
+    /// solas. Texto y no un tipo cerrado: un área que llegue en una versión
+    /// posterior no puede volver ilegible el archivo al volver a esta.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub active_areas: BTreeSet<String>,
+}
+
+impl Default for AccountSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            active_areas: BTreeSet::new(),
+        }
+    }
 }
 
 fn enabled_by_default() -> bool {
@@ -266,6 +346,13 @@ impl StoreSettings {
         self.accounts
             .get(account_id)
             .is_none_or(|settings| settings.enabled)
+    }
+
+    /// Si alguien pidió alguna vez esta área de esta cuenta.
+    pub fn is_active(&self, account_id: &str, area: &str) -> bool {
+        self.accounts
+            .get(account_id)
+            .is_some_and(|settings| settings.active_areas.contains(area))
     }
 
     /// Lee el archivo. Que no exista es lo normal: todo encendido.
@@ -370,6 +457,8 @@ struct Entry {
     store: Option<Store>,
     state: StoreState,
     detail: String,
+    /// El área de contactos, desde que alguien la tocó en esta sesión.
+    contacts: Option<AreaStatus>,
 }
 
 impl Entry {
@@ -378,6 +467,7 @@ impl Entry {
             store: None,
             state: StoreState::Locked,
             detail: String::new(),
+            contacts: None,
         }
     }
 
@@ -404,6 +494,8 @@ struct Inner {
     listings: Option<Listings>,
     /// Las que tienen algo que guardar.
     wanted: BTreeSet<String>,
+    /// De ésas, las que tienen contactos que sincronizar.
+    with_contacts: BTreeSet<String>,
     entries: BTreeMap<String, Entry>,
 }
 
@@ -461,10 +553,29 @@ impl<K: KeySource> StoreManager<K> {
     pub async fn status(&self) -> Status {
         let inner = self.inner.lock().await;
         let root = self.locations.as_ref().ok().map(|l| l.stores.clone());
+        let settings = self
+            .locations
+            .as_ref()
+            .ok()
+            .and_then(|l| StoreSettings::load(&l.settings).ok())
+            .unwrap_or_default();
         let accounts = inner
             .wanted
             .iter()
             .map(|id| {
+                let contacts = inner.with_contacts.contains(id).then(|| {
+                    inner
+                        .entries
+                        .get(id)
+                        .and_then(|e| e.contacts.clone())
+                        .unwrap_or_else(|| {
+                            AreaStatus::new(if settings.is_active(id, CONTACTS_AREA) {
+                                AreaState::Pending
+                            } else {
+                                AreaState::Off
+                            })
+                        })
+                });
                 let (state, detail) = inner.entries.get(id).map_or(
                     (StoreState::Unavailable, "todavía no se revisó".to_string()),
                     |e| (e.state, e.detail.clone()),
@@ -478,6 +589,7 @@ impl<K: KeySource> StoreManager<K> {
                     state,
                     detail,
                     size_bytes,
+                    contacts,
                 }
             })
             .collect();
@@ -533,11 +645,18 @@ impl<K: KeySource> StoreManager<K> {
             None => inner.listings = Some(Listings::first(listed, now)),
         }
 
+        let with_contacts: BTreeSet<String> = accounts
+            .iter()
+            .filter(|a| a.has_contacts_to_sync() && wanted.contains(&a.id))
+            .map(|a| a.id.clone())
+            .collect();
+
         // Las que ya no tienen nada que guardar se cierran. Cerrar no es
         // borrar: una que reaparece en el próximo listado se vuelve a abrir con
         // su clave.
         inner.entries.retain(|id, _| wanted.contains(id));
         inner.wanted = wanted;
+        inner.with_contacts = with_contacts;
 
         self.run(&mut inner, None).await;
         let unlocked = inner.keyring == KeyringState::Unlocked;
@@ -586,9 +705,13 @@ impl<K: KeySource> StoreManager<K> {
         let locations = self.locations()?;
 
         let mut settings = StoreSettings::load(&locations.settings)?;
+        // Lo demás que se decidió para la cuenta —las áreas encendidas— se
+        // conserva: apagar la base no es olvidar que alguien pidió sus contactos.
         settings
             .accounts
-            .insert(account_id.to_string(), AccountSettings { enabled });
+            .entry(account_id.to_string())
+            .or_default()
+            .enabled = enabled;
         settings.save(&locations.settings)?;
 
         if enabled {
@@ -626,6 +749,142 @@ impl<K: KeySource> StoreManager<K> {
             self.run(&mut inner, Some(account_id)).await;
         }
         Ok(())
+    }
+
+    /// Enciende el área de contactos de una cuenta, si tiene contactos que
+    /// sincronizar. Queda anotado en `stores.json`, así que sigue encendida
+    /// después de reiniciar. Devuelve si hay contactos que sincronizar.
+    ///
+    /// Es lo que hace `RequestSync`: una cuenta de sólo correo no enciende nada
+    /// y tampoco es un error.
+    pub async fn activate_contacts(&self, account_id: &str) -> Result<bool, StoreError> {
+        paths::validate_account_id(account_id)?;
+        let inner = self.inner.lock().await;
+        Self::require_listed(&inner, account_id)?;
+        if !inner.with_contacts.contains(account_id) {
+            return Ok(false);
+        }
+        let locations = self.locations()?;
+        let mut settings = StoreSettings::load(&locations.settings)?;
+        if !settings.is_active(account_id, CONTACTS_AREA) {
+            settings
+                .accounts
+                .entry(account_id.to_string())
+                .or_default()
+                .active_areas
+                .insert(CONTACTS_AREA.to_string());
+            settings.save(&locations.settings)?;
+        }
+        Ok(true)
+    }
+
+    /// Las cuentas cuyos contactos hay que sincronizar: con contactos, con la
+    /// base encendida y con el área encendida.
+    pub async fn contacts_targets(&self) -> Vec<String> {
+        let inner = self.inner.lock().await;
+        let Ok(locations) = self.locations() else {
+            return Vec::new();
+        };
+        let Ok(settings) = StoreSettings::load(&locations.settings) else {
+            return Vec::new();
+        };
+        inner
+            .with_contacts
+            .iter()
+            .filter(|id| settings.is_enabled(id) && settings.is_active(id, CONTACTS_AREA))
+            .cloned()
+            .collect()
+    }
+
+    /// Antes de pedir nada a la red: pasa la tabla por la cuenta —releyendo el
+    /// llavero **ahora**— y dice si su base quedó abierta. Con el llavero
+    /// bloqueado, sin llavero o con la base cerrada, `false`, y no se pide nada.
+    pub async fn prepare_for_sync(&self, account_id: &str) -> bool {
+        let mut inner = self.inner.lock().await;
+        if !inner.with_contacts.contains(account_id) {
+            return false;
+        }
+        self.run(&mut inner, Some(account_id)).await;
+        inner
+            .entries
+            .get(account_id)
+            .is_some_and(|e| e.store.is_some())
+    }
+
+    /// Hace algo con la base abierta de una cuenta. **El único camino para
+    /// escribir en una base**: con la cerradura tomada, así que no hay dos
+    /// escritores, y con el llavero releído en este momento.
+    ///
+    /// Con el llavero bloqueado —o sin poder saberlo— no se hace nada: se pasa
+    /// la tabla, que cierra lo abierto, y vuelve `Err(Key(Locked))`. Con la
+    /// base cerrada, `Err(Missing)`.
+    ///
+    /// El trabajo corre fuera del hilo del bucle de eventos, con la base
+    /// prestada, y vuelve a su lugar al terminar. Quien llama lo corta en lotes
+    /// chicos (ver `store::contacts::WRITE_BATCH_ROWS`): mientras corre, nadie
+    /// más llega al almacén.
+    pub async fn with_store<T, F>(&self, account_id: &str, work: F) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Store) -> Result<T, StoreError> + Send + 'static,
+    {
+        let mut inner = self.inner.lock().await;
+        if !matches!(self.keys.is_locked().await, Ok(false)) {
+            self.run(&mut inner, Some(account_id)).await;
+            return Err(StoreError::Key(KeyError::Locked));
+        }
+        let Some(mut store) = inner
+            .entries
+            .get_mut(account_id)
+            .and_then(|e| e.store.take())
+        else {
+            return Err(StoreError::Missing);
+        };
+        match blocking(move || {
+            let result = work(&mut store);
+            (store, result)
+        })
+        .await
+        {
+            Ok((store, result)) => {
+                inner.entry(account_id).store = Some(store);
+                result
+            }
+            Err(e) => {
+                // La tarea se cayó con la base adentro: se cerró al soltarse.
+                inner
+                    .entry(account_id)
+                    .set(StoreState::Unavailable, e.to_string());
+                Err(e)
+            }
+        }
+    }
+
+    /// Anota en qué está el área de contactos de una cuenta. Devuelve si
+    /// cambió lo que se publica.
+    pub async fn set_contacts_status(
+        &self,
+        account_id: &str,
+        state: AreaState,
+        detail: &str,
+    ) -> bool {
+        let mut inner = self.inner.lock().await;
+        if !inner.wanted.contains(account_id) {
+            return false;
+        }
+        let entry = inner.entry(account_id);
+        let previous = entry.contacts.clone();
+        let mut status = previous
+            .clone()
+            .unwrap_or_else(|| AreaStatus::new(AreaState::Off));
+        status.state = state;
+        status.detail = detail.to_string();
+        if state == AreaState::Synced {
+            status.last_synced_at = Some(chrono::Utc::now().to_rfc3339());
+        }
+        let changed = previous.as_ref() != Some(&status);
+        entry.contacts = Some(status);
+        changed
     }
 
     /// Falla con `UnknownAccount` —lo mismo que `RequestSync`— si la cuenta
@@ -1272,6 +1531,7 @@ mod tests {
         ListedAccount {
             id: id.into(),
             capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
+            needs_reauth: false,
         }
     }
 
@@ -2381,5 +2641,120 @@ mod tests {
         assert_eq!(json["accounts"][0]["state"], "open");
         assert!(json["accounts"][0]["size_bytes"].as_u64().unwrap() > 0);
         assert_eq!(json["accounts"][1]["account_id"], "b");
+    }
+
+    // ── Las áreas ───────────────────────────────────────────────────────────
+
+    fn with_contacts(ids: &[&str]) -> AccountListing {
+        AccountListing::Listed(
+            ids.iter()
+                .map(|id| account(id, &["email", "contacts"]))
+                .collect(),
+        )
+    }
+
+    /// El área de contactos se enciende la primera vez que alguien la pide, y
+    /// queda en `stores.json`: después de reiniciar sigue encendida.
+    #[tokio::test]
+    async fn el_area_de_contactos_se_enciende_al_pedirla_y_sigue_despues_de_reiniciar() {
+        let f = Fixture::new("area-encendida");
+        f.list(with_contacts(&["cuenta"])).await;
+        assert!(
+            f.manager.contacts_targets().await.is_empty(),
+            "nadie la pidió"
+        );
+        let status = serde_json::to_value(f.manager.status().await).unwrap();
+        assert_eq!(status["accounts"][0]["contacts"]["state"], "off");
+
+        assert!(f.manager.activate_contacts("cuenta").await.unwrap());
+        assert_eq!(f.manager.contacts_targets().await, vec!["cuenta"]);
+        assert!(f.settings().is_active("cuenta", CONTACTS_AREA));
+        let status = serde_json::to_value(f.manager.status().await).unwrap();
+        assert_eq!(status["accounts"][0]["contacts"]["state"], "pending");
+
+        // Otro proceso, la misma configuración.
+        let again = StoreManager::new(f.keys.clone(), Ok(f.locations()));
+        again
+            .accounts_listed(with_contacts(&["cuenta"]), Instant::now())
+            .await;
+        assert_eq!(again.contacts_targets().await, vec!["cuenta"]);
+    }
+
+    /// Una cuenta sin contactos no enciende nada ni es un error, y en el estado
+    /// no aparece el área.
+    #[tokio::test]
+    async fn una_cuenta_sin_contactos_no_enciende_nada() {
+        let f = Fixture::new("area-sin-contactos");
+        f.list(listing(&["cuenta"])).await;
+        assert!(!f.manager.activate_contacts("cuenta").await.unwrap());
+        assert!(!f.settings().is_active("cuenta", CONTACTS_AREA));
+        let status = serde_json::to_value(f.manager.status().await).unwrap();
+        assert!(status["accounts"][0].get("contacts").is_none());
+        assert!(f.manager.activate_contacts("otra").await.is_err());
+    }
+
+    /// Una cuenta que pide reautenticarse conserva su base, pero sus contactos
+    /// no se sincronizan: pedirle el token daría error en cada vuelta.
+    #[tokio::test]
+    async fn una_cuenta_que_pide_reautenticarse_no_sincroniza_contactos() {
+        let f = Fixture::new("area-reautenticar");
+        f.list(with_contacts(&["cuenta"])).await;
+        f.manager.activate_contacts("cuenta").await.unwrap();
+        let mut stale = account("cuenta", &["contacts"]);
+        stale.needs_reauth = true;
+        f.list(AccountListing::Listed(vec![stale])).await;
+
+        assert!(f.manager.contacts_targets().await.is_empty());
+        assert!(!f.manager.prepare_for_sync("cuenta").await);
+        assert!(
+            f.paths("cuenta").db_exists().unwrap(),
+            "la base se conserva"
+        );
+    }
+
+    /// Apagar la base no olvida que alguien pidió los contactos, pero mientras
+    /// está apagada no hay nada que sincronizar.
+    #[tokio::test]
+    async fn apagar_la_base_no_olvida_el_area() {
+        let f = Fixture::new("area-apagada");
+        f.list(with_contacts(&["cuenta"])).await;
+        f.manager.activate_contacts("cuenta").await.unwrap();
+
+        f.manager.set_enabled("cuenta", false).await.unwrap();
+        assert!(f.settings().is_active("cuenta", CONTACTS_AREA));
+        assert!(f.manager.contacts_targets().await.is_empty());
+        assert!(!f.manager.prepare_for_sync("cuenta").await);
+
+        f.manager.set_enabled("cuenta", true).await.unwrap();
+        assert_eq!(f.manager.contacts_targets().await, vec!["cuenta"]);
+    }
+
+    /// **Un solo camino para escribir, y con el llavero releído**: bloqueado,
+    /// no se corre nada y la base se cierra.
+    #[tokio::test]
+    async fn con_el_llavero_bloqueado_no_se_llega_a_la_base() {
+        let f = Fixture::new("area-escritor");
+        f.list(with_contacts(&["cuenta"])).await;
+        assert!(f.manager.prepare_for_sync("cuenta").await);
+        assert!(f
+            .manager
+            .with_store("cuenta", |s| s.log(LogLevel::Warn, None, "hola"))
+            .await
+            .is_ok());
+
+        f.keys.state().locked = true;
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+        let result = f
+            .manager
+            .with_store("cuenta", move |_| {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+        assert_eq!(result, Err(StoreError::Key(KeyError::Locked)));
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!f.manager.is_open("cuenta").await, "la base se cerró");
+        assert_eq!(f.state("cuenta").await, StoreState::Locked);
     }
 }

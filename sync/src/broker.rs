@@ -73,25 +73,25 @@ impl Broker {
         Ok(Self { connection })
     }
 
-    async fn llamar<A>(&self, metodo: &str, argumentos: &A) -> Result<String, BrokerError>
+    async fn call<A>(&self, method: &str, args: &A) -> Result<String, BrokerError>
     where
         A: serde::ser::Serialize + zbus::zvariant::DynamicType,
     {
-        let respuesta = self
+        let reply = self
             .connection
-            .call_method(Some(SERVICE), PATH, Some(INTERFACE), metodo, argumentos)
+            .call_method(Some(SERVICE), PATH, Some(INTERFACE), method, args)
             .await
-            .map_err(|e| clasificar(metodo, e))?;
+            .map_err(|e| classify(method, e))?;
 
-        respuesta
+        reply
             .body()
             .deserialize()
-            .map_err(|e| BrokerError::Failed(format!("respuesta inválida de {metodo}: {e}")))
+            .map_err(|e| BrokerError::Failed(format!("respuesta inválida de {method}: {e}")))
     }
 
     /// Las cuentas de esta persona. No pide permiso: son metadatos.
     pub async fn accounts(&self) -> Result<Vec<Account>, BrokerError> {
-        let json = self.llamar("ListAccounts", &()).await?;
+        let json = self.call("ListAccounts", &()).await?;
         serde_json::from_str(&json)
             .map_err(|e| BrokerError::Failed(format!("no se pudo leer la lista de cuentas: {e}")))
     }
@@ -106,8 +106,7 @@ impl Broker {
         account_id: &str,
         capability: &str,
     ) -> Result<String, BrokerError> {
-        self.llamar("GetAccessToken", &(account_id, capability))
-            .await
+        self.call("GetAccessToken", &(account_id, capability)).await
     }
 
     /// La configuración de una capacidad: el servidor, el usuario, los puertos.
@@ -117,7 +116,7 @@ impl Broker {
         capability: &str,
     ) -> Result<serde_json::Value, BrokerError> {
         let json = self
-            .llamar("GetAccountData", &(account_id, capability))
+            .call("GetAccountData", &(account_id, capability))
             .await?;
         serde_json::from_str(&json)
             .map_err(|e| BrokerError::Failed(format!("no se pudo leer la configuración: {e}")))
@@ -130,20 +129,20 @@ impl Broker {
 /// estar arrancando; lo segundo no, porque la respuesta va a ser la misma hasta
 /// que la persona cambie de opinión, y reintentar sería insistir con un diálogo
 /// que ya rechazó.
-fn clasificar(metodo: &str, error: zbus::Error) -> BrokerError {
-    if let zbus::Error::MethodError(nombre, detalle, _) = &error {
-        let nombre = nombre.as_str();
-        let detalle = detalle.clone().unwrap_or_default();
+fn classify(method: &str, error: zbus::Error) -> BrokerError {
+    if let zbus::Error::MethodError(name, detail, _) = &error {
+        let name = name.as_str();
+        let detail = detail.clone().unwrap_or_default();
 
-        if nombre.ends_with(".AccessDenied") {
-            return BrokerError::Denied(detalle);
+        if name.ends_with(".AccessDenied") {
+            return BrokerError::Denied(detail);
         }
-        if nombre.ends_with(".ServiceUnknown") || nombre.ends_with(".NoReply") {
-            return BrokerError::Unavailable(detalle);
+        if name.ends_with(".ServiceUnknown") || name.ends_with(".NoReply") {
+            return BrokerError::Unavailable(detail);
         }
-        return BrokerError::Failed(format!("{metodo}: {detalle}"));
+        return BrokerError::Failed(format!("{method}: {detail}"));
     }
-    BrokerError::Unavailable(format!("{metodo}: {error}"))
+    BrokerError::Unavailable(format!("{method}: {error}"))
 }
 
 /// Cómo hay que autenticarse contra el servidor de esta cuenta.
