@@ -1229,8 +1229,88 @@ pub fn expect_multistatus(reply: Reply) -> Result<String, DavError> {
     }
 }
 
+/// Los recursos que trajo un `multiget`, tal como se leyeron: antes de
+/// quedarse con lo pedido.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadResources<T> {
+    pub items: Vec<T>,
+    /// Direcciones de otro origen que se descartaron.
+    pub foreign: usize,
+    /// Los que pasaban el tope de tamaño, por su dirección. **Se descartan al
+    /// leerlos**, sin retenerlos: una tanda de cincuenta objetos de casi
+    /// dieciséis megas —uno por respuesta, partida hasta aislarlos— eran unos
+    /// 1,5 GB en memoria antes de mirar el tope (N8 del #55).
+    pub oversized: Vec<url::Url>,
+}
+
+/// Saca los recursos de un `multiget` —su dirección, su ETag y el texto de la
+/// propiedad `namespace:name`— con su tope de tamaño, `max_bytes`: el que lo
+/// pasa no se copia ni se devuelve, sólo su dirección en
+/// [`ReadResources::oversized`]. Uno sin datos, o con un estado de error, no
+/// vino.
+pub fn resources_from<T>(
+    xml: &str,
+    base: &url::Url,
+    limits: &Limits,
+    (namespace, name): (&str, &str),
+    max_bytes: usize,
+    make: impl Fn(url::Url, Option<String>, String) -> T,
+) -> Result<ReadResources<T>, DavError> {
+    let document = parse_xml(xml, limits)?;
+    let multistatus = parse_multistatus(&document)?;
+    drop(document);
+    let mut read = ReadResources {
+        items: Vec::new(),
+        foreign: 0,
+        oversized: Vec::new(),
+    };
+    for mut response in multistatus.responses {
+        let Some(position) = response
+            .props
+            .iter()
+            .position(|p| p.namespace == namespace && p.name == name)
+        else {
+            continue;
+        };
+        if response.props[position].text.trim().is_empty() {
+            continue;
+        }
+        let Ok(href) = resolve_href(base, &response.href) else {
+            read.foreign += 1;
+            continue;
+        };
+        if response.props[position].text.len() > max_bytes {
+            read.oversized.push(href);
+            continue;
+        }
+        let etag = storable(response.text(NS_DAV, "getetag"));
+        // Se mueve y no se copia: el texto de un recurso puede ser el tope
+        // entero.
+        let data = std::mem::take(&mut response.props[position].text);
+        read.items.push(make(href, etag, data));
+    }
+    Ok(read)
+}
+
+/// Lo que queda de un `multiget` después de quedarse con lo pedido.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Multiget<T> {
+    /// Lo pedido, una vez cada uno.
+    pub items: Vec<T>,
+    /// Lo que vino sin pedirlo, o repetido.
+    pub unrequested: usize,
+    /// Lo pedido que vino y pasaba el tope de tamaño: no se guarda, y queda
+    /// contado.
+    pub too_large: usize,
+    /// Lo pedido que **no volvió**, por su clave ([`href_key`]): el servidor
+    /// lo omitió, lo contestó con un estado de error o sin datos, o con la
+    /// dirección escrita de otra forma (un reservado escapado distinto, que a
+    /// propósito no se iguala).
+    pub missing: Vec<String>,
+}
+
 /// Se queda con los recursos que se pidieron en un `multiget`, **una vez cada
-/// uno**, y cuenta los que no.
+/// uno**, cuenta los que no y dice cuáles de los pedidos no volvieron.
 ///
 /// Un servidor puede contestar un `multiget` de un recurso con dieciséis megas
 /// de recursos que nadie pidió: guardarlos saltaría el tope por colección, que
@@ -1238,15 +1318,25 @@ pub fn expect_multistatus(reply: Reply) -> Result<String, DavError> {
 /// nunca listó. Uno repetido es lo mismo: el primero que llega es el que vale.
 ///
 /// Pedido y contestado se comparan por [`href_key`]: `a%2db` pedido y `a%2Db`
-/// contestado son el mismo recurso.
+/// contestado son el mismo recurso. Uno de más tamaño que el tope volvió —no se
+/// guarda, pero no falta—.
 pub fn keep_requested_by<T>(
-    items: Vec<T>,
+    read: ReadResources<T>,
     hrefs: &[url::Url],
     href_of: impl Fn(&T) -> &url::Url,
-) -> (Vec<T>, usize) {
+) -> Multiget<T> {
     let mut pending: std::collections::HashSet<String> = hrefs.iter().map(href_key).collect();
     let mut unrequested = 0;
-    let kept = items
+    let mut too_large = 0;
+    for href in &read.oversized {
+        if pending.remove(&href_key(href)) {
+            too_large += 1;
+        } else {
+            unrequested += 1;
+        }
+    }
+    let items = read
+        .items
         .into_iter()
         .filter(|item| {
             let requested = pending.remove(&href_key(href_of(item)));
@@ -1256,7 +1346,18 @@ pub fn keep_requested_by<T>(
             requested
         })
         .collect();
-    (kept, unrequested)
+    let mut missing: Vec<String> = hrefs
+        .iter()
+        .map(href_key)
+        .filter(|key| pending.remove(key))
+        .collect();
+    missing.sort();
+    Multiget {
+        items,
+        unrequested,
+        too_large,
+        missing,
+    }
 }
 
 // ---------------------------------------------------------------------------

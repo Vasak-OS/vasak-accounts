@@ -563,9 +563,12 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
                 .net(carddav::multiget(client, &book.href, &part))
                 .await
             {
-                Ok((fetched, unrequested)) => {
-                    round.report.unrequested += unrequested;
-                    cards.extend(fetched);
+                Ok(fetched) => {
+                    round.report.unrequested += fetched.unrequested;
+                    // Lo que pasaba el tope ya se descartó al leer la
+                    // respuesta: acá no llega.
+                    round.report.too_large += fetched.too_large;
+                    cards.extend(fetched.items);
                 }
                 Err(SyncError::Dav(DavError::BodyTooLarge(_))) if part.len() > 1 => {
                     let (first, second) = part.split_at(part.len() / 2);
@@ -580,7 +583,9 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
     }
 }
 
-/// Lo que se guarda de unas tarjetas, y cuántas no, por pasar el tope.
+/// Lo que se guarda de unas tarjetas, y cuántas no, por pasar el tope. El tope
+/// ya se miró al leer cada respuesta del `multiget` (N8): se vuelve a mirar por
+/// si alguien arma tarjetas por otro camino.
 fn rows_from(cards: Vec<CardResource>, max_vcard_bytes: usize) -> (Vec<ContactRow>, usize) {
     let mut too_large = 0;
     let rows = cards

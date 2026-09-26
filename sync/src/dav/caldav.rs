@@ -25,7 +25,8 @@
 
 use super::webdav::{
     self, expect_multistatus, href_for_request, off_runtime, parse_multistatus, resolve_href,
-    storable, xml_escape, DavClient, DavError, Limits, Method, NS_CALENDARSERVER, NS_DAV,
+    storable, xml_escape, DavClient, DavError, Limits, Method, Multiget, ReadResources,
+    NS_CALENDARSERVER, NS_DAV,
 };
 
 pub const NS_CALDAV: &str = "urn:ietf:params:xml:ns:caldav";
@@ -161,38 +162,22 @@ pub fn calendars_from(
 }
 
 /// Saca los objetos, su dirección y su ETag de una respuesta
-/// `calendar-multiget`. Devuelve también cuántas direcciones de otro origen se
-/// descartaron.
+/// `calendar-multiget`, con el tope de tamaño de un objeto
+/// ([`Limits::max_ical_bytes`]) mirado **al leer cada uno**: el que lo pasa no
+/// se retiene. Cuenta también las direcciones de otro origen que descartó.
 pub fn objects_from(
     xml: &str,
     base: &url::Url,
     limits: &Limits,
-) -> Result<(Vec<CalendarResource>, usize), DavError> {
-    let document = webdav::parse_xml(xml, limits)?;
-    let multistatus = parse_multistatus(&document)?;
-    let mut foreign = 0;
-
-    let objects = multistatus
-        .responses
-        .iter()
-        .filter_map(|response| {
-            let data = response.prop(NS_CALDAV, "calendar-data")?.text.clone();
-            if data.trim().is_empty() {
-                return None;
-            }
-            let Ok(href) = resolve_href(base, &response.href) else {
-                foreign += 1;
-                return None;
-            };
-            Some(CalendarResource {
-                href,
-                etag: storable(response.text(NS_DAV, "getetag")),
-                data,
-            })
-        })
-        .collect();
-
-    Ok((objects, foreign))
+) -> Result<ReadResources<CalendarResource>, DavError> {
+    webdav::resources_from(
+        xml,
+        base,
+        limits,
+        (NS_CALDAV, "calendar-data"),
+        limits.max_ical_bytes,
+        |href, etag, data| CalendarResource { href, etag, data },
+    )
 }
 
 /// El cuerpo del `PROPFIND` que pide los calendarios.
@@ -222,10 +207,10 @@ pub fn multiget_body(hrefs: &[url::Url]) -> String {
 /// Se queda con los objetos que se pidieron, una vez cada uno, y cuenta los
 /// que no (ver [`webdav::keep_requested_by`]).
 pub fn keep_requested(
-    objects: Vec<CalendarResource>,
+    read: ReadResources<CalendarResource>,
     hrefs: &[url::Url],
-) -> (Vec<CalendarResource>, usize) {
-    webdav::keep_requested_by(objects, hrefs, |o| &o.href)
+) -> Multiget<CalendarResource> {
+    webdav::keep_requested_by(read, hrefs, |o| &o.href)
 }
 
 // ---------------------------------------------------------------------------
@@ -256,12 +241,13 @@ pub async fn list_calendars(
 }
 
 /// Unos objetos de un calendario, por su dirección. Sólo los pedidos, una vez
-/// cada uno; devuelve también cuántos vinieron de más.
+/// cada uno; dice también cuántos vinieron de más, cuántos pasaban el tope y
+/// cuáles de los pedidos no volvieron ([`Multiget`]).
 pub async fn multiget(
     client: &DavClient,
     calendar: &url::Url,
     hrefs: &[url::Url],
-) -> Result<(Vec<CalendarResource>, usize), DavError> {
+) -> Result<Multiget<CalendarResource>, DavError> {
     // 1: los objetos de este calendario. El estándar lo pide, y hay servidores
     // que sin esto devuelven vacío.
     let reply = client
@@ -271,19 +257,22 @@ pub async fn multiget(
     let limits = *client.limits();
     let calendar = calendar.clone();
     let requested = hrefs.to_vec();
-    let (objects, foreign, unrequested) = off_runtime(move || {
-        let (objects, foreign) = objects_from(&xml, &calendar, &limits)?;
-        let (objects, unrequested) = keep_requested(objects, &requested);
-        Ok((objects, foreign, unrequested))
+    let (fetched, foreign) = off_runtime(move || {
+        let read = objects_from(&xml, &calendar, &limits)?;
+        let foreign = read.foreign;
+        Ok((keep_requested(read, &requested), foreign))
     })
     .await?;
     if foreign > 0 {
         tracing::warn!("se descartaron {foreign} objetos con dirección de otro servidor");
     }
-    if unrequested > 0 {
-        tracing::warn!("se descartaron {unrequested} objetos que no se pidieron");
+    if fetched.unrequested > 0 {
+        tracing::warn!(
+            "se descartaron {} objetos que no se pidieron",
+            fetched.unrequested
+        );
     }
-    Ok((objects, unrequested))
+    Ok(fetched)
 }
 
 #[cfg(test)]
@@ -464,12 +453,13 @@ END:VCALENDAR
     /// identifica en el servidor, no el `UID` de adentro.
     #[test]
     fn el_objeto_sale_con_su_direccion() {
-        let (objects, _) = objects_from(
+        let objects = objects_from(
             OBJECTS,
             &url("https://nube.ejemplo.com/dav/calendars/ana/personal/"),
             NODES,
         )
-        .unwrap();
+        .unwrap()
+        .items;
         assert_eq!(objects.len(), 1);
         assert!(objects[0].href.as_str().ends_with("/r.ics"));
         assert!(objects[0].data.contains("Reunión"));
@@ -483,10 +473,47 @@ END:VCALENDAR
             "/dav/calendars/ana/personal/r.ics",
             "https://otra.ejemplo.com/r.ics",
         );
-        let (objects, foreign) =
-            objects_from(&xml, &url("https://nube.ejemplo.com/dav/"), NODES).unwrap();
-        assert!(objects.is_empty());
-        assert_eq!(foreign, 1);
+        let read = objects_from(&xml, &url("https://nube.ejemplo.com/dav/"), NODES).unwrap();
+        assert!(read.items.is_empty());
+        assert_eq!(read.foreign, 1);
+    }
+
+    /// **N8**: un objeto que pasa el tope se descarta **al leer la
+    /// respuesta**, sin retenerlo: queda sólo su dirección, y
+    /// `keep_requested` lo cuenta como de más tamaño y no como faltante. Antes
+    /// se miraba recién después de juntar la tanda entera del `multiget`: con
+    /// objetos de 15 MiB, unos 1,5 GB por tanda.
+    #[test]
+    fn un_objeto_de_mas_no_se_retiene_en_la_tanda() {
+        let limits = Limits {
+            max_ical_bytes: 64,
+            ..*NODES
+        };
+        let base = url("https://nube.ejemplo.com/dav/calendars/ana/personal/");
+        let object = |name: &str, data: &str| {
+            format!(
+                "<d:response><d:href>/dav/calendars/ana/personal/{name}</d:href><d:propstat>\
+                 <d:prop><d:getetag>\"e\"</d:getetag><c:calendar-data>{data}</c:calendar-data>\
+                 </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
+            )
+        };
+        let xml = format!(
+            r#"<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:c="{NS_CALDAV}">{}{}</d:multistatus>"#,
+            object("r.ics", &"X".repeat(65)),
+            object("s.ics", "BEGIN:VCALENDAR\nEND:VCALENDAR\n"),
+        );
+        let read = objects_from(&xml, &base, &limits).unwrap();
+        assert_eq!(read.items.len(), 1, "se retuvo el de más");
+        assert!(read.items.iter().all(|o| o.data.len() <= 64));
+        assert_eq!(read.oversized.len(), 1);
+        assert!(read.oversized[0].as_str().ends_with("/r.ics"));
+
+        let asked = [base.join("r.ics").unwrap(), base.join("s.ics").unwrap()];
+        let kept = keep_requested(read, &asked);
+        assert_eq!(kept.items.len(), 1);
+        assert_eq!(kept.too_large, 1);
+        assert!(kept.missing.is_empty(), "{:?}", kept.missing);
+        assert_eq!(kept.unrequested, 0);
     }
 
     #[test]

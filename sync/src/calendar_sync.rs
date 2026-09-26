@@ -647,9 +647,12 @@ impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
                 .net(caldav::multiget(client, &calendar.href, &part))
                 .await
             {
-                Ok((fetched, unrequested)) => {
-                    round.report.unrequested += unrequested;
-                    objects.extend(fetched);
+                Ok(fetched) => {
+                    round.report.unrequested += fetched.unrequested;
+                    // Lo que pasaba el tope ya se descartó al leer la
+                    // respuesta: acá no llega.
+                    round.report.too_large += fetched.too_large;
+                    objects.extend(fetched.items);
                 }
                 Err(SyncError::Dav(DavError::BodyTooLarge(_))) if part.len() > 1 => {
                     let (first, second) = part.split_at(part.len() / 2);
@@ -821,6 +824,10 @@ fn shifts_until(
 /// Lo que se guarda de unos objetos, y cuántos no, por pasar el tope. Deja de
 /// derivar cuando pasa `deadline`: lo que queda no se deriva, y quien llama
 /// corta la vuelta.
+///
+/// El tope ya se miró al leer cada respuesta del `multiget` (N8): lo que lo
+/// pasa no llega hasta acá. Se vuelve a mirar por si alguien arma objetos por
+/// otro camino.
 fn rows_from(
     objects: Vec<CalendarResource>,
     max_bytes: usize,

@@ -1003,3 +1003,61 @@ fn correr_una_tanda_de_la_ventana_mira_el_plazo() {
         Some(100)
     );
 }
+
+// ── Lo que pasa el tope, al leerlo (N8) ─────────────────────────────────────
+
+/// **N8**: `fetch_objects` no devuelve —ni retiene hasta el final de la
+/// tanda— ningún objeto que pase el tope de tamaño: se descarta al leer cada
+/// respuesta y queda contado en `too_large`. Antes se miraba en `rows_from`,
+/// después de juntar la tanda entera: con objetos de 15 MiB, que parten la
+/// tanda hasta uno por pedido, eran ~30 MB de pico por objeto y ~1,5 GB por
+/// tanda de 50.
+#[tokio::test]
+async fn una_tanda_del_calendario_no_retiene_lo_que_pasa_el_tope() {
+    let limits = Limits {
+        max_ical_bytes: 1024,
+        ..Limits::DEFAULT
+    };
+    let f = Fixture::with("calendario-tanda-de-mas", limits, ExpansionLimits::DEFAULT).await;
+    let big = format!(
+        "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:g\r\nDESCRIPTION:{}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        "d".repeat(4096)
+    );
+    for i in 0..20 {
+        f.server.put(0, &format!("grande{i}.ics"), &big);
+    }
+    f.server
+        .put(0, "chico.ics", &event("c", "Chico", "20260928T140000Z"));
+
+    let credential = f.credentials.0.lock().unwrap().result.clone().unwrap();
+    let client = DavClient::new(&credential, limits, HttpPolicy::plain_loopback()).unwrap();
+    let (calendars, _) = caldav::list_calendars(&client).await.unwrap();
+    let base = &calendars[0].href;
+    let mut hrefs: Vec<url::Url> = (0..20)
+        .map(|i| base.join(&format!("grande{i}.ics")).unwrap())
+        .collect();
+    hrefs.push(base.join("chico.ics").unwrap());
+    let mut round = Round {
+        report: CalendarReport::default(),
+        deadline: tokio::time::Instant::now() + Duration::from_secs(60),
+        stored_bytes: 0,
+        stored_occurrences: 0,
+        stored_alarms: 0,
+        window: Window::around(Utc.timestamp_opt(TODAY, 0).unwrap()),
+    };
+    let objects = f
+        .sync
+        .fetch_objects(&client, &calendars[0], &hrefs, &mut round)
+        .await
+        .unwrap();
+    assert_eq!(objects.len(), 1, "se retuvieron los de más");
+    assert!(objects.iter().all(|o| o.data.len() <= 1024));
+    assert_eq!(round.report.too_large, 20);
+
+    // Y de punta a punta: el chico se guarda, los grandes quedan contados, y
+    // el token se guarda —un objeto de más no traba el calendario—.
+    let report = f.synced().await;
+    assert_eq!((report.fetched, report.too_large), (1, 20));
+    assert_eq!(f.summaries().await, vec!["Chico"]);
+    assert_eq!(f.token(0).await, Some(f.server_token()));
+}

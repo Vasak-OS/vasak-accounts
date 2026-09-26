@@ -19,7 +19,8 @@
 
 use super::webdav::{
     self, expect_multistatus, href_for_request, off_runtime, parse_multistatus, resolve_href,
-    storable, xml_escape, DavClient, DavError, Limits, Method, NS_CALENDARSERVER, NS_DAV,
+    storable, xml_escape, DavClient, DavError, Limits, Method, Multiget, ReadResources,
+    NS_CALENDARSERVER, NS_DAV,
 };
 
 pub const NS_CARDDAV: &str = "urn:ietf:params:xml:ns:carddav";
@@ -127,8 +128,9 @@ pub fn address_books_from(
 }
 
 /// Saca las tarjetas, su dirección y su ETag de una respuesta
-/// `addressbook-multiget`. Devuelve también cuántas direcciones de otro origen
-/// se descartaron.
+/// `addressbook-multiget`, con el tope de tamaño de una tarjeta
+/// ([`Limits::max_vcard_bytes`]) mirado **al leer cada una**: la que lo pasa no
+/// se retiene. Cuenta también las direcciones de otro origen que descartó.
 ///
 /// La dirección va con la tarjeta porque es lo que la identifica en el
 /// servidor: el `UID` de adentro lo escribe quien la creó y puede faltar, estar
@@ -137,32 +139,15 @@ pub fn cards_from(
     xml: &str,
     base: &url::Url,
     limits: &Limits,
-) -> Result<(Vec<CardResource>, usize), DavError> {
-    let document = webdav::parse_xml(xml, limits)?;
-    let multistatus = parse_multistatus(&document)?;
-    let mut foreign = 0;
-
-    let cards = multistatus
-        .responses
-        .iter()
-        .filter_map(|response| {
-            let data = response.prop(NS_CARDDAV, "address-data")?.text.clone();
-            if data.trim().is_empty() {
-                return None;
-            }
-            let Ok(href) = resolve_href(base, &response.href) else {
-                foreign += 1;
-                return None;
-            };
-            Some(CardResource {
-                href,
-                etag: storable(response.text(NS_DAV, "getetag")),
-                data,
-            })
-        })
-        .collect();
-
-    Ok((cards, foreign))
+) -> Result<ReadResources<CardResource>, DavError> {
+    webdav::resources_from(
+        xml,
+        base,
+        limits,
+        (NS_CARDDAV, "address-data"),
+        limits.max_vcard_bytes,
+        |href, etag, data| CardResource { href, etag, data },
+    )
 }
 
 /// El cuerpo del `PROPFIND` que pide las libretas.
@@ -227,17 +212,21 @@ pub async fn list_address_books(client: &DavClient) -> Result<(Vec<AddressBook>,
 /// Pedida y contestada se comparan por [`webdav::href_key`]: `a%2db.vcf` pedida y
 /// `a%2Db.vcf` contestada son la misma tarjeta, y descartarla la dejaba
 /// afuera hasta que cambiara.
-pub fn keep_requested(cards: Vec<CardResource>, hrefs: &[url::Url]) -> (Vec<CardResource>, usize) {
-    webdav::keep_requested_by(cards, hrefs, |card| &card.href)
+pub fn keep_requested(
+    read: ReadResources<CardResource>,
+    hrefs: &[url::Url],
+) -> Multiget<CardResource> {
+    webdav::keep_requested_by(read, hrefs, |card| &card.href)
 }
 
 /// Unas tarjetas de una libreta, por su dirección. Sólo las pedidas, una vez
-/// cada una ([`keep_requested`]); devuelve también cuántas vinieron de más.
+/// cada una ([`keep_requested`]); dice también cuántas vinieron de más, cuántas
+/// pasaban el tope y cuáles de las pedidas no volvieron ([`Multiget`]).
 pub async fn multiget(
     client: &DavClient,
     book: &url::Url,
     hrefs: &[url::Url],
-) -> Result<(Vec<CardResource>, usize), DavError> {
+) -> Result<Multiget<CardResource>, DavError> {
     // 1: las tarjetas de esta libreta. El estándar lo pide, y hay servidores
     // que sin esto devuelven vacío.
     let reply = client
@@ -247,24 +236,27 @@ pub async fn multiget(
     let limits = *client.limits();
     let book = book.clone();
     let requested = hrefs.to_vec();
-    let (cards, foreign, unrequested) = off_runtime(move || {
-        let (cards, foreign) = cards_from(&xml, &book, &limits)?;
-        let (cards, unrequested) = keep_requested(cards, &requested);
-        Ok((cards, foreign, unrequested))
+    let (fetched, foreign) = off_runtime(move || {
+        let read = cards_from(&xml, &book, &limits)?;
+        let foreign = read.foreign;
+        Ok((keep_requested(read, &requested), foreign))
     })
     .await?;
     if foreign > 0 {
         tracing::warn!("se descartaron {foreign} tarjetas con dirección de otro servidor");
     }
-    if unrequested > 0 {
-        tracing::warn!("se descartaron {unrequested} tarjetas que no se pidieron");
+    if fetched.unrequested > 0 {
+        tracing::warn!(
+            "se descartaron {} tarjetas que no se pidieron",
+            fetched.unrequested
+        );
     }
-    Ok((cards, unrequested))
+    Ok(fetched)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::webdav::{etags_from, etags_query};
+    use super::super::webdav::{etags_from, etags_query, href_key};
     use super::*;
 
     const NODES: &Limits = &Limits {
@@ -401,12 +393,13 @@ END:VCARD
     /// estar repetido, o ser el mismo en dos libretas distintas.
     #[test]
     fn la_tarjeta_sale_con_su_direccion() {
-        let (cards, _) = cards_from(
+        let cards = cards_from(
             CARDS,
             &url("https://nube.ejemplo.com/dav/addressbooks/users/ana/personal/"),
             NODES,
         )
-        .unwrap();
+        .unwrap()
+        .items;
 
         assert_eq!(cards.len(), 1);
         assert!(
@@ -425,10 +418,9 @@ END:VCARD
             "/dav/addressbooks/users/ana/personal/ana.vcf",
             "https://otra.ejemplo.com/ana.vcf",
         );
-        let (cards, foreign) =
-            cards_from(&xml, &url("https://nube.ejemplo.com/dav/"), NODES).unwrap();
-        assert!(cards.is_empty());
-        assert_eq!(foreign, 1);
+        let read = cards_from(&xml, &url("https://nube.ejemplo.com/dav/"), NODES).unwrap();
+        assert!(read.items.is_empty());
+        assert_eq!(read.foreign, 1);
     }
 
     /// **Un XML roto no es una libreta vacía.** Devolver una lista vacía hacía
@@ -464,7 +456,7 @@ END:VCARD
             .is_empty());
         assert!(cards_from(empty, &url("https://x/"), NODES)
             .unwrap()
-            .0
+            .items
             .is_empty());
         assert!(etags_from(empty, &url("https://x/"), NODES)
             .unwrap()
@@ -487,6 +479,14 @@ END:VCARD
         );
     }
 
+    fn read(items: Vec<CardResource>) -> ReadResources<CardResource> {
+        ReadResources {
+            items,
+            foreign: 0,
+            oversized: Vec::new(),
+        }
+    }
+
     fn resource(href: &str, data: &str) -> CardResource {
         CardResource {
             href: url(href),
@@ -501,22 +501,23 @@ END:VCARD
     #[test]
     fn del_multiget_solo_queda_lo_pedido_una_vez() {
         let asked = [url("https://x/libro/a.vcf"), url("https://x/libro/b.vcf")];
-        let (kept, unrequested) = keep_requested(
-            vec![
+        let kept = keep_requested(
+            read(vec![
                 resource("https://x/libro/a.vcf", "primera"),
                 resource("https://x/libro/intrusa.vcf", "x"),
                 resource("https://x/libro/a.vcf", "repetida"),
                 resource("https://x/libro/b.vcf", "b"),
-            ],
+            ]),
             &asked,
         );
-        let hrefs: Vec<&str> = kept.iter().map(|c| c.href.as_str()).collect();
+        let hrefs: Vec<&str> = kept.items.iter().map(|c| c.href.as_str()).collect();
         assert_eq!(
             hrefs,
             vec!["https://x/libro/a.vcf", "https://x/libro/b.vcf"]
         );
-        assert_eq!(kept[0].data, "primera");
-        assert_eq!(unrequested, 2);
+        assert_eq!(kept.items[0].data, "primera");
+        assert_eq!(kept.unrequested, 2);
+        assert!(kept.missing.is_empty());
     }
 
     /// **La tarjeta pedida se reconoce aunque vuelva con otros escapes.**
@@ -530,17 +531,19 @@ END:VCARD
             url("https://x/libro/b%7Ec.vcf"),
             url("https://x/libro/c%40d.vcf"),
         ];
-        let (kept, unrequested) = keep_requested(
-            vec![
+        let kept = keep_requested(
+            read(vec![
                 resource("https://x/libro/a%2Db.vcf", "a"),
                 resource("https://x/libro/b~c.vcf", "b"),
                 resource("https://x/libro/c@d.vcf", "c"),
-            ],
+            ]),
             &asked,
         );
-        let data: Vec<&str> = kept.iter().map(|c| c.data.as_str()).collect();
+        let data: Vec<&str> = kept.items.iter().map(|c| c.data.as_str()).collect();
         assert_eq!(data, vec!["a", "b"]);
-        assert_eq!(unrequested, 1);
+        assert_eq!(kept.unrequested, 1);
+        // Y la pedida con `%40` no volvió: falta, por su clave.
+        assert_eq!(kept.missing, vec![href_key(&asked[2])]);
     }
 
     #[test]

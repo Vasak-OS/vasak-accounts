@@ -1507,3 +1507,55 @@ async fn el_estado_del_area_no_lleva_datos_ni_direcciones() {
     assert_eq!(json["accounts"][0]["contacts"]["state"], "failed");
     assert!(json["accounts"][0]["contacts"]["last_synced_at"].is_string());
 }
+
+/// **N8**, en los contactos: `fetch_cards` no devuelve —ni retiene hasta el
+/// final de la tanda— ninguna tarjeta que pase el tope de tamaño: se descarta
+/// al leer cada respuesta y queda contada en `too_large`. Antes se miraba en
+/// `rows_from`, después de juntar la tanda entera.
+#[tokio::test]
+async fn una_tarjeta_de_mas_no_se_retiene_en_la_tanda() {
+    let limits = Limits {
+        max_vcard_bytes: 1024,
+        ..Limits::DEFAULT
+    };
+    let f = Fixture::with_limits("contactos-tanda-de-mas", limits).await;
+    let big = format!(
+        "BEGIN:VCARD\r\nFN:Grande\r\nNOTE:{}\r\nEND:VCARD\r\n",
+        "n".repeat(4096)
+    );
+    for i in 0..20 {
+        f.server.put(0, &format!("grande{i}.vcf"), &big);
+    }
+    f.server.put(0, "ana.vcf", &card("1", "Ana", "ana@x.com"));
+
+    let client = DavClient::new(
+        &credential_for(&f.server),
+        limits,
+        HttpPolicy::plain_loopback(),
+    )
+    .unwrap();
+    let (books, _) = carddav::list_address_books(&client).await.unwrap();
+    let base = &books[0].href;
+    let mut hrefs: Vec<url::Url> = (0..20)
+        .map(|i| base.join(&format!("grande{i}.vcf")).unwrap())
+        .collect();
+    hrefs.push(base.join("ana.vcf").unwrap());
+    let mut round = Round {
+        report: SyncReport::default(),
+        deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+        stored_bytes: 0,
+    };
+    let cards = f
+        .sync
+        .fetch_cards(&client, &books[0], &hrefs, &mut round)
+        .await
+        .unwrap();
+    assert_eq!(cards.len(), 1, "se retuvieron las de más");
+    assert!(cards.iter().all(|c| c.data.len() <= 1024));
+    assert_eq!(round.report.too_large, 20);
+
+    let report = f.synced().await;
+    assert_eq!((report.fetched, report.too_large), (1, 20));
+    assert_eq!(f.names().await, vec!["Ana"]);
+    assert_eq!(f.token(0).await, Some(f.server_token()));
+}
