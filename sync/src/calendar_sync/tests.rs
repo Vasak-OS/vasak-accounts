@@ -955,3 +955,51 @@ async fn el_estado_del_area_no_lleva_datos_ni_direcciones() {
         assert!(!status.contains(forbidden), "el estado lleva «{forbidden}»");
     }
 }
+
+/// **El plazo de la vuelta se mira entre objeto y objeto.** Una tanda son
+/// cincuenta objetos y cada uno puede gastar el plazo de su expansión entero:
+/// derivados todos de una vez, la vuelta no se podía cortar en ese rato. Con el
+/// plazo ya pasado no se deriva ninguno; con tiempo, todos.
+#[test]
+fn derivar_una_tanda_mira_el_plazo_de_la_vuelta() {
+    let window = Window::around(Utc.timestamp_opt(TODAY, 0).unwrap());
+    let objects = || -> Vec<CalendarResource> {
+        (0..50)
+            .map(|i| CalendarResource {
+                href: url::Url::parse(&format!("https://x/c/{i}.ics")).unwrap(),
+                etag: None,
+                data: daily(&format!("d{i}"), "20260901T080000Z"),
+            })
+            .collect()
+    };
+    let expansion = ExpansionLimits::DEFAULT;
+    let past = std::time::Instant::now();
+    let (rows, _) = rows_from(objects(), 512 * 1024, window, &expansion, past);
+    assert!(rows.is_empty(), "derivó {} con el plazo pasado", rows.len());
+    let later = std::time::Instant::now() + Duration::from_secs(600);
+    let (rows, _) = rows_from(objects(), 512 * 1024, window, &expansion, later);
+    assert_eq!(rows.len(), 50);
+}
+
+/// Lo mismo al correr la ventana: con el plazo pasado, la tanda no se
+/// expande ni se escribe.
+#[test]
+fn correr_una_tanda_de_la_ventana_mira_el_plazo() {
+    let target = Window::around(Utc.timestamp_opt(TODAY, 0).unwrap());
+    let stale: Vec<StaleSeries> = (0..100)
+        .map(|i| StaleSeries {
+            id: i + 1,
+            calendar_id: 1,
+            raw_ical: daily(&format!("d{i}"), "20260901T080000Z"),
+            expanded: None,
+            truncated: false,
+        })
+        .collect();
+    let expansion = ExpansionLimits::DEFAULT;
+    assert!(shifts_until(&stale, target, &expansion, std::time::Instant::now()).is_none());
+    let later = std::time::Instant::now() + Duration::from_secs(600);
+    assert_eq!(
+        shifts_until(&stale, target, &expansion, later).map(|s| s.len()),
+        Some(100)
+    );
+}

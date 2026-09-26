@@ -65,8 +65,8 @@ use crate::dav_sync::{
 use crate::ical::recurrence::ExpansionLimits;
 use crate::store::calendar::{
     derive_with_occurrences, shift_series, CalendarApplied, CalendarListing, CalendarProgress,
-    CalendarRoom, ExpansionState, ObjectOp, ObjectRow, SeriesShift, StoredCalendar, Window,
-    SHIFT_BATCH_ROWS, WRITE_BATCH_ALARMS, WRITE_BATCH_BYTES, WRITE_BATCH_OCCURRENCES,
+    CalendarRoom, ExpansionState, ObjectOp, ObjectRow, SeriesShift, StaleSeries, StoredCalendar,
+    Window, SHIFT_BATCH_ROWS, WRITE_BATCH_ALARMS, WRITE_BATCH_BYTES, WRITE_BATCH_OCCURRENCES,
     WRITE_BATCH_ROWS,
 };
 use crate::store::key::{KeyError, KeySource};
@@ -544,11 +544,20 @@ impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
             let objects = self.fetch_objects(client, calendar, chunk, round).await?;
             // Leer y expandir es CPU, y un objeto armado a propósito tarda:
             // fuera del bucle de eventos y fuera de la cerradura del almacén.
-            let (max_bytes, window, expansion) =
-                (self.limits.max_ical_bytes, round.window, self.expansion);
-            let (rows, too_large) =
-                webdav::off_runtime(move || Ok(rows_from(objects, max_bytes, window, &expansion)))
-                    .await?;
+            // Y el plazo de la vuelta se mira entre objeto y objeto: una
+            // tanda son cincuenta, y cada uno puede gastar su plazo entero.
+            let (max_bytes, window, expansion, deadline) = (
+                self.limits.max_ical_bytes,
+                round.window,
+                self.expansion,
+                round.deadline.into_std(),
+            );
+            let (rows, too_large) = webdav::off_runtime(move || {
+                Ok(rows_from(objects, max_bytes, window, &expansion, deadline))
+            })
+            .await?;
+            // Si se pasó mientras derivaba, lo derivado a medias no se escribe.
+            round.check_deadline()?;
             round.report.too_large += too_large;
             for row in rows {
                 round.report.fetched += 1;
@@ -706,15 +715,19 @@ impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
             let last = stale.len() < SHIFT_BATCH_ROWS;
             after = stale.last().map_or(after, |s| s.id);
             let expansion = self.expansion;
+            let until = deadline.into_std();
             let shifts: Vec<SeriesShift> = match webdav::off_runtime(move || {
-                Ok(stale
-                    .iter()
-                    .map(|s| shift_series(s, target, &expansion))
-                    .collect())
+                Ok(shifts_until(&stale, target, &expansion, until))
             })
             .await
             {
-                Ok(shifts) => shifts,
+                Ok(Some(shifts)) => shifts,
+                Ok(None) => {
+                    tracing::warn!(
+                        "'{account_id}': correr la ventana tardó demasiado; sigue después"
+                    );
+                    return true;
+                }
                 Err(_) => return true,
             };
             let expansion = self.expansion;
@@ -786,16 +799,39 @@ impl Batch {
     }
 }
 
-/// Lo que se guarda de unos objetos, y cuántos no, por pasar el tope.
+/// Lo que hay que escribir de unas series para la ventana nueva, o `None` si
+/// el plazo pasó antes de terminar: cada una puede gastar el plazo de su
+/// expansión, y una tanda son cien.
+fn shifts_until(
+    stale: &[StaleSeries],
+    target: Window,
+    expansion: &ExpansionLimits,
+    deadline: std::time::Instant,
+) -> Option<Vec<SeriesShift>> {
+    let mut shifts = Vec::with_capacity(stale.len());
+    for series in stale {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        shifts.push(shift_series(series, target, expansion));
+    }
+    Some(shifts)
+}
+
+/// Lo que se guarda de unos objetos, y cuántos no, por pasar el tope. Deja de
+/// derivar cuando pasa `deadline`: lo que queda no se deriva, y quien llama
+/// corta la vuelta.
 fn rows_from(
     objects: Vec<CalendarResource>,
     max_bytes: usize,
     window: Window,
     expansion: &ExpansionLimits,
+    deadline: std::time::Instant,
 ) -> (Vec<ObjectRow>, usize) {
     let mut too_large = 0;
     let rows = objects
         .into_iter()
+        .take_while(|_| std::time::Instant::now() < deadline)
         .filter_map(|object| {
             if object.data.len() > max_bytes {
                 too_large += 1;
