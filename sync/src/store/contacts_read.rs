@@ -25,6 +25,10 @@
 //! ella: la lista nunca queda trabada. La búsqueda ordena y pagina igual que
 //! la lista.
 //!
+//! **El final de la lista es `next_cursor == null`, no una página vacía.** Si
+//! todas las filas que se miraron para una página se saltearon, la página
+//! vuelve sin ninguna y **con** cursor, y la siguiente trae lo que sigue.
+//!
 //! Los contactos sin nada que mostrar (`display_name = ''`) se guardan —son del
 //! servidor, y sin su ETag se volverían a pedir— pero **no se listan** ni se
 //! devuelven.
@@ -222,7 +226,9 @@ pub struct ContactSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Page<T> {
     pub items: Vec<T>,
-    /// Con qué pedir la siguiente; `null` si no hay más.
+    /// Con qué pedir la siguiente; `null` si no hay más. Es lo único que dice
+    /// que la lista terminó: una página puede venir vacía y con cursor, si
+    /// todas sus filas se saltearon.
     pub next_cursor: Option<String>,
 }
 
@@ -743,6 +749,39 @@ mod tests {
             }
         }
         assert_eq!(seen, vec!["C 0", "C 1", "C 3", "C 4"]);
+    }
+
+    /// Si todas las filas que mira una página se saltean, la página vuelve
+    /// vacía **con** cursor, y el cursor avanza: la siguiente trae lo que
+    /// sigue. El final es `next_cursor == null`, no la página vacía.
+    #[test]
+    fn una_pagina_de_filas_salteadas_vuelve_vacia_con_cursor_y_la_siguiente_trae_lo_que_sigue() {
+        let temp = TempDir::new("pagina-salteadas");
+        let mut store = open_store(&temp);
+        let b = book(&mut store, "https://x/a/", "A");
+        add(
+            &mut store,
+            &b,
+            vec![
+                named(0, &format!("A {}", "x".repeat(2000))),
+                named(1, &format!("B {}", "x".repeat(2000))),
+                named(2, "C"),
+            ],
+        );
+        let first = page(store.connection(), None, None, None, 1, 600).unwrap();
+        assert!(first.items.is_empty());
+        let next = first
+            .next_cursor
+            .expect("una página vacía de filas salteadas no es el final");
+        let cursor = Cursor::decode(&next).unwrap();
+        let second = page(store.connection(), None, None, cursor.as_ref(), 1, 600).unwrap();
+        let names: Vec<&str> = second
+            .items
+            .iter()
+            .map(|c| c.display_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["C"]);
+        assert_eq!(second.next_cursor, None);
     }
 
     #[test]

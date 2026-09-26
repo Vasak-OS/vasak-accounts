@@ -757,7 +757,10 @@ quien la reciba repetida o fuera de orden sabe cuál es la última.
 **Las páginas van por cursor.** `next_cursor` es lo que se pasa como `cursor`
 para la siguiente —vacío para la primera— y es `null` cuando no hay más; si
 entre una página y la otra entra o se va un contacto, no se repite ni se saltea
-ninguno de los que ya estaban. Un cursor que no es uno de los nuestros es
+ninguno de los que ya estaban. **El final de la lista es `next_cursor ==
+null`, no una página vacía**: una página puede venir sin ninguna fila y con
+cursor —si todas las que miró se saltearon, ver abajo—, y la siguiente trae lo
+que sigue. Un cursor que no es uno de los nuestros es
 `InvalidArgs`. `limit` 0 pide 100, y nada pasa de 1000. **Lo que se busca es
 texto**: cada palabra va entre comillas al índice, así que `OR`, `NOT`, `NEAR`,
 comillas, guiones o paréntesis son letras y no operadores. Una búsqueda vacía,

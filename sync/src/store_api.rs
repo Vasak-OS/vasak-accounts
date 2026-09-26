@@ -220,7 +220,10 @@ impl<K: KeySource> StoreApi<K> {
     /// (`address_book_id` vacío) o de una. `{items: [{id, address_book_id,
     /// display_name, email, phone}], next_cursor}`: `next_cursor` es lo que se
     /// pasa como `cursor` para la siguiente —vacío para la primera—, y `null`
-    /// cuando no hay más. `limit` 0 pide 100, y nada pasa de 1000.
+    /// cuando no hay más. **El final es `next_cursor == null`**, no una página
+    /// vacía: si todas las filas de una página se saltearon porque solas no
+    /// entraban, vuelve sin ninguna y con cursor, y la siguiente trae lo que
+    /// sigue. `limit` 0 pide 100, y nada pasa de 1000.
     ///
     /// Pide `store.contacts`.
     async fn list_contacts(
