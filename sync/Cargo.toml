@@ -60,6 +60,11 @@ getrandom = "0.4"
 # ninguna crate; y habla con el kernel sin pasar por la libc, así que tampoco
 # suma bibliotecas compartidas. Sin `unsafe` de este lado.
 rustix = { version = "1", features = ["fs", "process"] }
+# El XML de CardDAV (`PROPFIND`, `REPORT`, `multistatus`). Rust puro y de sólo
+# lectura, sin ninguna biblioteca compartida; rechaza la DTD por omisión, que es
+# lo que cierra las entidades externas y las expansiones en cadena. Es la misma
+# que usaba `vasak-contacts`, de donde viene el parser. Ver `dav/webdav.rs`.
+roxmltree = "0.21"
 
 [dev-dependencies]
 # Las conexiones punto a punto de zbus, para probar el cliente del llavero y la
