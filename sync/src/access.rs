@@ -50,9 +50,21 @@
 //!
 //! Los comandos que cambian algo (`ClearStore`, `SetStoreEnabled`,
 //! `RequestSync`) no leen nada, pero cuestan: vaciar son dos escrituras del
-//! llavero y un `fsync`, con el almacén tomado. [`CallerLimits`] deja pasar
-//! [`CONTROL_BURST`] por cuenta y por nombre único cada [`CONTROL_WINDOW`]; el
-//! siguiente contesta `LimitsExceeded`.
+//! llavero y un `fsync`, con el almacén tomado. [`CallerLimits`] pone dos
+//! topes, y el pedido que pasa cualquiera de los dos contesta
+//! `LimitsExceeded`:
+//!
+//! - [`CONTROL_BURST`] por cuenta y por nombre único cada [`CONTROL_WINDOW`],
+//!   para los tres. Frena a una aplicación con un bucle por error, **no a un
+//!   proceso que quiera esquivarlo**: cada conexión nueva es un nombre único
+//!   nuevo, y el bus no limita cuántas se abren por segundo —sólo cuántas hay
+//!   abiertas a la vez—. Medido: más de 300 por segundo con `busctl`.
+//! - Un **piso por cuenta, venga de quien venga**: un `ClearStore`, un
+//!   `SetStoreEnabled(true)` y un `SetStoreEnabled(false)` por cuenta cada
+//!   [`ACCOUNT_FLOOR`], cada uno por su lado. Vaciar dos veces en diez
+//!   segundos nunca hace falta, y con esto el costo queda acotado aunque cada
+//!   pedido llegue de una conexión distinta. `RequestSync` no lo tiene: no
+//!   borra nada, y dos aplicaciones que se abren a la vez lo piden las dos.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -76,6 +88,39 @@ pub const CONTROL_BURST: usize = 3;
 
 /// La ventana de [`CONTROL_BURST`].
 pub const CONTROL_WINDOW: Duration = Duration::from_secs(60);
+
+/// El piso por cuenta de lo que borra o rehace una base: uno de cada
+/// [`ControlAction`] con piso, por cuenta, en este tiempo, de cualquier
+/// llamante.
+pub const ACCOUNT_FLOOR: Duration = Duration::from_secs(10);
+
+/// Qué comando de control es: el piso por cuenta va por cada uno.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ControlAction {
+    /// `ClearStore`.
+    Clear,
+    /// `SetStoreEnabled(true)`.
+    Enable,
+    /// `SetStoreEnabled(false)`.
+    Disable,
+    /// `RequestSync`: sin piso por cuenta.
+    Sync,
+}
+
+impl ControlAction {
+    fn has_floor(self) -> bool {
+        !matches!(self, ControlAction::Sync)
+    }
+}
+
+/// Por qué no entró un comando de control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// Quien llama pasó su cupo sobre la cuenta, o no dice quién es.
+    Caller,
+    /// La cuenta recibió ese mismo comando hace menos de [`ACCOUNT_FLOOR`].
+    Account,
+}
 
 /// El reloj de la caché y del límite, para poder probarlos sin esperar.
 pub trait Clock: Send + Sync + 'static {
@@ -303,37 +348,58 @@ async fn ask(
 }
 
 /// El límite de los comandos de control: [`CONTROL_BURST`] por cuenta y
-/// nombre único cada [`CONTROL_WINDOW`].
+/// nombre único cada [`CONTROL_WINDOW`], y el piso por cuenta
+/// ([`ACCOUNT_FLOOR`]) de lo que borra.
 ///
-/// Por nombre único y no por programa: es lo que el bus garantiza sin
-/// preguntarle a nadie, y un programa que abre conexiones nuevas para
-/// esquivarlo paga una conexión por cada tanda, que el bus también limita.
+/// El cupo va por nombre único porque es lo que el bus garantiza sin
+/// preguntarle a nadie. **No alcanza contra quien lo quiera esquivar**: abrir
+/// una conexión nueva es un nombre nuevo, y el bus no limita cuántas se abren
+/// por segundo. Por eso el piso: no mira quién llama, y un nombre que se va del
+/// bus —o un aviso falso de que se fue— no lo reinicia.
 pub struct CallerLimits {
     clock: Arc<dyn Clock>,
-    calls: Mutex<HashMap<(String, String), VecDeque<Instant>>>,
+    state: Mutex<LimitsState>,
+}
+
+#[derive(Default)]
+struct LimitsState {
+    /// Por nombre único y cuenta, cuándo llegó cada comando de la ventana.
+    calls: HashMap<(String, String), VecDeque<Instant>>,
+    /// Por cuenta y comando, cuándo entró el último con piso.
+    floors: HashMap<(String, ControlAction), Instant>,
 }
 
 impl CallerLimits {
     fn new(clock: Arc<dyn Clock>) -> Self {
         Self {
             clock,
-            calls: Mutex::new(HashMap::new()),
+            state: Mutex::new(LimitsState::default()),
         }
     }
 
+    fn state(&self) -> std::sync::MutexGuard<'_, LimitsState> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Anota un comando de `caller` sobre `account_id` y dice si entra. Uno
-    /// que no entra no se anota: no alarga la espera.
+    /// que no entra no se anota en ninguno de los dos topes: no alarga la
+    /// espera.
     ///
     /// Sin remitente no hay a quién contarle, y no entra.
-    pub fn allow(&self, caller: Option<&str>, account_id: &str) -> bool {
+    pub fn admit(
+        &self,
+        caller: Option<&str>,
+        account_id: &str,
+        action: ControlAction,
+    ) -> Result<(), Refusal> {
         let Some(name) = caller else {
-            return false;
+            return Err(Refusal::Caller);
         };
         let now = self.clock.now();
-        let mut calls = self.calls.lock().unwrap_or_else(|p| p.into_inner());
-        // Lo vencido se va, de todos: así la tabla no crece con los nombres
-        // que ya no llaman.
-        calls.retain(|_, times| {
+        let mut state = self.state();
+        // Lo vencido se va, de todos: así las tablas no crecen con los nombres
+        // que ya no llaman ni con las cuentas que nadie toca.
+        state.calls.retain(|_, times| {
             while times
                 .front()
                 .is_some_and(|t| now.saturating_duration_since(*t) >= CONTROL_WINDOW)
@@ -342,47 +408,69 @@ impl CallerLimits {
             }
             !times.is_empty()
         });
-        let times = calls
-            .entry((name.to_string(), account_id.to_string()))
-            .or_default();
-        if times.len() >= CONTROL_BURST {
-            return false;
+        state
+            .floors
+            .retain(|_, at| now.saturating_duration_since(*at) < ACCOUNT_FLOOR);
+
+        let key = (name.to_string(), account_id.to_string());
+        if state
+            .calls
+            .get(&key)
+            .is_some_and(|t| t.len() >= CONTROL_BURST)
+        {
+            return Err(Refusal::Caller);
         }
-        times.push_back(now);
-        true
+        let floor = (account_id.to_string(), action);
+        if action.has_floor() && state.floors.contains_key(&floor) {
+            return Err(Refusal::Account);
+        }
+        state.calls.entry(key).or_default().push_back(now);
+        if action.has_floor() {
+            state.floors.insert(floor, now);
+        }
+        Ok(())
     }
 
+    /// Lo de un nombre único que se fue: su cupo. El piso por cuenta no es de
+    /// nadie y no se toca.
     fn forget(&self, unique_name: &str) {
-        self.calls
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+        self.state()
+            .calls
             .retain(|(name, _), _| name != unique_name);
     }
 }
 
+/// Quien manda las señales del bus.
+const BUS_NAME: &str = "org.freedesktop.DBus";
+
 /// Olvida lo de cada nombre único que se va del bus: `NameOwnerChanged` con un
 /// nombre único y sin dueño nuevo.
 ///
-/// En el bus, sólo las señales del bus mismo (`org.freedesktop.DBus`). Y aunque
-/// alguien se hiciera pasar por él, lo único que consigue es que se vuelva a
-/// preguntar: olvidar nunca concede nada.
+/// **Sólo las del bus mismo** (`org.freedesktop.DBus`), y se mira en cada
+/// señal además de pedirlo en la regla: zbus no compara el remitente de la
+/// regla con un nombre conocido en su filtro local, así que un
+/// `NameOwnerChanged` que otro proceso mande directo a este —unicast, que el
+/// bus entrega sin mirar la regla— pasaría. Olvidar no concede ningún
+/// permiso, pero reiniciaba el cupo de ese nombre y hacía volver a preguntar.
 pub async fn watch_departures(
     connection: zbus::Connection,
     access: Arc<Access>,
 ) -> zbus::Result<()> {
     use futures_util::StreamExt;
 
+    // En una conexión punto a punto —las pruebas— no hay bus ni remitentes.
+    let expected_sender = connection.is_bus().then_some(BUS_NAME);
     let mut rule = zbus::MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
         .interface("org.freedesktop.DBus")?
         .member("NameOwnerChanged")?;
-    if connection.is_bus() {
-        rule = rule.sender("org.freedesktop.DBus")?;
+    if let Some(sender) = expected_sender {
+        rule = rule.sender(sender)?;
     }
     let mut departures =
         zbus::MessageStream::for_match_rule(rule.build(), &connection, None).await?;
     while let Some(Ok(message)) = departures.next().await {
-        if let Some(name) = departed_name(&message) {
+        if let Some(name) = departed_name(&message, expected_sender) {
             access.forget(&name);
         }
     }
@@ -390,8 +478,15 @@ pub async fn watch_departures(
 }
 
 /// El nombre único que se fue, si el mensaje dice eso: `(nombre, dueño viejo,
-/// dueño nuevo)` con un nombre que empieza con `:` y el dueño nuevo vacío.
-fn departed_name(message: &zbus::Message) -> Option<String> {
+/// dueño nuevo)` con un nombre que empieza con `:` y el dueño nuevo vacío, y
+/// mandado por `expected_sender` si hay uno que esperar.
+fn departed_name(message: &zbus::Message, expected_sender: Option<&str>) -> Option<String> {
+    if let Some(expected) = expected_sender {
+        let header = message.header();
+        if header.sender().map(|s| s.as_str()) != Some(expected) {
+            return None;
+        }
+    }
     let (name, _old, new): (String, String, String) = message.body().deserialize().ok()?;
     (name.starts_with(':') && new.is_empty()).then_some(name)
 }
@@ -852,32 +947,114 @@ pub(crate) mod tests {
 
     #[test]
     fn el_limite_por_llamante_corta_la_llamada_siguiente() {
+        use ControlAction::Sync;
         let clock = FakeClock::new();
         let limits = CallerLimits::new(Arc::clone(&clock) as Arc<dyn Clock>);
         for _ in 0..CONTROL_BURST {
-            assert!(limits.allow(Some(":1.7"), "cuenta"));
+            assert_eq!(limits.admit(Some(":1.7"), "cuenta", Sync), Ok(()));
         }
-        assert!(
-            !limits.allow(Some(":1.7"), "cuenta"),
+        assert_eq!(
+            limits.admit(Some(":1.7"), "cuenta", Sync),
+            Err(Refusal::Caller),
             "la siguiente no entra"
         );
-        assert!(!limits.allow(Some(":1.7"), "cuenta"), "ni la otra");
+        assert_eq!(
+            limits.admit(Some(":1.7"), "cuenta", ControlAction::Clear),
+            Err(Refusal::Caller),
+            "ni otro comando"
+        );
         // Por cuenta y por nombre.
-        assert!(limits.allow(Some(":1.7"), "otra"));
-        assert!(limits.allow(Some(":1.8"), "cuenta"));
+        assert_eq!(limits.admit(Some(":1.7"), "otra", Sync), Ok(()));
+        assert_eq!(limits.admit(Some(":1.8"), "cuenta", Sync), Ok(()));
         // Sin remitente, nunca.
-        assert!(!limits.allow(None, "cuenta"));
+        assert_eq!(limits.admit(None, "cuenta", Sync), Err(Refusal::Caller));
 
         // Pasada la ventana, vuelve a entrar.
         clock.advance(CONTROL_WINDOW);
-        assert!(limits.allow(Some(":1.7"), "cuenta"));
+        assert_eq!(limits.admit(Some(":1.7"), "cuenta", Sync), Ok(()));
 
         // Y un nombre que se va se olvida.
         for _ in 0..CONTROL_BURST {
-            limits.allow(Some(":1.9"), "cuenta");
+            let _ = limits.admit(Some(":1.9"), "cuenta", Sync);
         }
-        assert!(!limits.allow(Some(":1.9"), "cuenta"));
+        assert!(limits.admit(Some(":1.9"), "cuenta", Sync).is_err());
         limits.forget(":1.9");
-        assert!(limits.allow(Some(":1.9"), "cuenta"));
+        assert_eq!(limits.admit(Some(":1.9"), "cuenta", Sync), Ok(()));
+    }
+
+    /// El cupo por nombre se esquiva abriendo conexiones nuevas: cada una es un
+    /// nombre nuevo. El piso por cuenta no mira quién llama, y un nombre que se
+    /// va no lo reinicia.
+    #[test]
+    fn vaciar_desde_nombres_nuevos_no_pasa_el_piso_por_cuenta() {
+        use ControlAction::{Clear, Disable, Enable, Sync};
+        let clock = FakeClock::new();
+        let limits = CallerLimits::new(Arc::clone(&clock) as Arc<dyn Clock>);
+        assert_eq!(limits.admit(Some(":1.7"), "cuenta", Clear), Ok(()));
+        for name in [":1.8", ":1.9"] {
+            assert_eq!(
+                limits.admit(Some(name), "cuenta", Clear),
+                Err(Refusal::Account),
+                "{name} vació la misma cuenta dentro de los 10 s"
+            );
+        }
+        limits.forget(":1.7");
+        assert_eq!(
+            limits.admit(Some(":1.10"), "cuenta", Clear),
+            Err(Refusal::Account),
+            "que el nombre se vaya no reinicia el piso"
+        );
+        // Lo mismo para encender y apagar, cada uno por su lado.
+        assert_eq!(limits.admit(Some(":1.7"), "cuenta", Disable), Ok(()));
+        assert_eq!(limits.admit(Some(":1.8"), "cuenta", Enable), Ok(()));
+        assert_eq!(
+            limits.admit(Some(":1.9"), "cuenta", Disable),
+            Err(Refusal::Account)
+        );
+        // Otra cuenta tiene el suyo, y pedir una vuelta no tiene piso.
+        assert_eq!(limits.admit(Some(":1.8"), "otra", Clear), Ok(()));
+        assert_eq!(limits.admit(Some(":1.9"), "cuenta", Sync), Ok(()));
+        assert_eq!(limits.admit(Some(":1.10"), "cuenta", Sync), Ok(()));
+
+        clock.advance(ACCOUNT_FLOOR);
+        assert_eq!(limits.admit(Some(":1.11"), "cuenta", Clear), Ok(()));
+    }
+
+    /// Un `NameOwnerChanged` que no manda el bus no se cree: si no, cualquiera
+    /// le reinicia el cupo a un nombre, o le borra la respuesta guardada.
+    #[test]
+    fn un_aviso_de_salida_que_no_manda_el_bus_no_se_cree() {
+        let departure = |sender: &str| {
+            zbus::Message::signal(
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "NameOwnerChanged",
+            )
+            .unwrap()
+            .sender(sender)
+            .unwrap()
+            .build(&(":1.7", ":1.7", ""))
+            .unwrap()
+        };
+        assert_eq!(
+            departed_name(&departure(BUS_NAME), Some(BUS_NAME)),
+            Some(":1.7".to_string())
+        );
+        assert_eq!(departed_name(&departure(":1.66"), Some(BUS_NAME)), None);
+        // Sin remitente, tampoco.
+        let anonymous = zbus::Message::signal(
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "NameOwnerChanged",
+        )
+        .unwrap()
+        .build(&(":1.7", ":1.7", ""))
+        .unwrap();
+        assert_eq!(departed_name(&anonymous, Some(BUS_NAME)), None);
+        // Punto a punto no hay bus que mande nada: se acepta.
+        assert_eq!(
+            departed_name(&departure(":1.66"), None),
+            Some(":1.7".to_string())
+        );
     }
 }

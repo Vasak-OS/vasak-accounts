@@ -794,11 +794,19 @@ concedida en los últimos 30 s—, en las cuentas con contactos. `GetStatus`
 nunca abre un diálogo. Los textos son fijos siempre: ninguno lleva una ruta ni
 algo que haya escrito un servidor o el llavero.
 
-**El límite por llamante**: `SetStoreEnabled`, `ClearStore` y `RequestSync`
+**El límite de los comandos**: `SetStoreEnabled`, `ClearStore` y `RequestSync`
 aceptan 3 llamadas por cuenta y por nombre único cada 60 s; la siguiente
-contesta `LimitsExceeded`. Vaciar son dos escrituras del llavero y un `fsync`
-con el almacén tomado, y no tiene sentido pedirlo en bucle. Los tres, sólo para
-una cuenta del último `ListAccounts` bueno (si no, `InvalidArgs`).
+contesta `LimitsExceeded`. Eso frena a una aplicación con un bucle por error,
+**no a un proceso que lo quiera esquivar**: cada conexión nueva al bus es un
+nombre único nuevo, y el bus limita cuántas hay abiertas a la vez, no cuántas
+se abren por segundo. Por eso hay además un **piso por cuenta, venga de quien
+venga**: un `ClearStore`, un `SetStoreEnabled(true)` y un
+`SetStoreEnabled(false)` por cuenta cada 10 s, cada uno por su lado; el que
+llega antes también contesta `LimitsExceeded`. Vaciar son dos escrituras del
+llavero y un `fsync` con el almacén tomado, y dos veces en diez segundos nunca
+hace falta. `RequestSync` no tiene piso. Los tres, sólo para una cuenta del
+último `ListAccounts` bueno (si no, `InvalidArgs`), y cuando fallan contestan
+un texto fijo, sin rutas.
 
 Las lecturas van por **dos conexiones de sólo lectura** por base
 (`SQLITE_OPEN_READONLY` y `query_only`), con la misma clave, que se cierran con

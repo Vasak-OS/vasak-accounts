@@ -39,7 +39,7 @@ use zbus::interface;
 use zbus::message::Header;
 use zbus::object_server::SignalContext;
 
-use crate::access::{self, Access, CONTACTS_RESOURCE};
+use crate::access::{self, Access, ControlAction, Refusal, CONTACTS_RESOURCE};
 use crate::broker::{self, BrokerError};
 use crate::contacts_sync::{BrokerCredentials, ContactsScheduler, ContactsSync};
 use crate::dav::webdav::{HttpPolicy, Limits};
@@ -113,7 +113,12 @@ impl<K: KeySource> StoreApi<K> {
         account_id: String,
         enabled: bool,
     ) -> zbus::fdo::Result<()> {
-        self.admit_control(&header, &account_id).await?;
+        let action = if enabled {
+            ControlAction::Enable
+        } else {
+            ControlAction::Disable
+        };
+        self.admit_control(&header, &account_id, action).await?;
         let result = self.manager.set_enabled(&account_id, enabled).await;
         let _ = Self::status_changed(&emitter).await;
         result.map_err(to_fdo)
@@ -135,7 +140,8 @@ impl<K: KeySource> StoreApi<K> {
         #[zbus(signal_context)] emitter: SignalContext<'_>,
         account_id: String,
     ) -> zbus::fdo::Result<()> {
-        self.admit_control(&header, &account_id).await?;
+        self.admit_control(&header, &account_id, ControlAction::Clear)
+            .await?;
         let result = self.manager.clear(&account_id).await;
         if result.is_ok() {
             self.manager.announce_cleared(&account_id).await;
@@ -165,7 +171,8 @@ impl<K: KeySource> StoreApi<K> {
         #[zbus(signal_context)] emitter: SignalContext<'_>,
         account_id: String,
     ) -> zbus::fdo::Result<()> {
-        self.admit_control(&header, &account_id).await?;
+        self.admit_control(&header, &account_id, ControlAction::Sync)
+            .await?;
         // Si hace falta preguntar se mira acá, pero **encender lo decide
         // `activate_contacts`** con lo que haya en ese momento, y sin un «sí»
         // no enciende: si la cuenta cambia en el medio —un `ListAccounts`
@@ -327,20 +334,33 @@ impl<K: KeySource> StoreApi<K> {
 impl<K: KeySource> StoreApi<K> {
     /// Lo que pasa antes de un comando de control: la cuenta se conoce, y quien
     /// llama no pasó su límite.
-    async fn admit_control(&self, header: &Header<'_>, account_id: &str) -> zbus::fdo::Result<()> {
+    async fn admit_control(
+        &self,
+        header: &Header<'_>,
+        account_id: &str,
+        action: ControlAction,
+    ) -> zbus::fdo::Result<()> {
         paths::validate_account_id(account_id).map_err(to_fdo)?;
         if !self.manager.is_known(account_id).await {
             return Err(to_fdo(StoreError::UnknownAccount(account_id.to_string())));
         }
         let sender = sender_of(header);
-        if !self.access.limits().allow(sender.as_deref(), account_id) {
-            return Err(zbus::fdo::Error::LimitsExceeded(format!(
+        match self
+            .access
+            .limits()
+            .admit(sender.as_deref(), account_id, action)
+        {
+            Ok(()) => Ok(()),
+            Err(Refusal::Caller) => Err(zbus::fdo::Error::LimitsExceeded(format!(
                 "demasiados pedidos seguidos sobre esta cuenta: como mucho {} cada {} s",
                 access::CONTROL_BURST,
                 access::CONTROL_WINDOW.as_secs()
-            )));
+            ))),
+            Err(Refusal::Account) => Err(zbus::fdo::Error::LimitsExceeded(format!(
+                "esta cuenta recibió el mismo pedido hace menos de {} s",
+                access::ACCOUNT_FLOOR.as_secs()
+            ))),
         }
-        Ok(())
     }
 
     /// `store.contacts` de quien llama, o `AccessDenied`.
@@ -1311,20 +1331,38 @@ mod tests {
         let mut api = Api::new("api-limite", vec![account("cuenta", false)], Answer::Allow).await;
         let (client, _s1) = api.client(":1.7").await;
         for _ in 0..access::CONTROL_BURST {
-            call_unit(&client, "ClearStore", &("cuenta",))
+            call_unit(&client, "RequestSync", &("cuenta",))
                 .await
                 .unwrap();
         }
         assert_eq!(
-            error_name(&call_unit(&client, "ClearStore", &("cuenta",)).await),
+            error_name(&call_unit(&client, "RequestSync", &("cuenta",)).await),
             LIMITS_EXCEEDED
         );
         assert_eq!(
-            error_name(&call_unit(&client, "RequestSync", &("cuenta",)).await),
+            error_name(&call_unit(&client, "ClearStore", &("cuenta",)).await),
             LIMITS_EXCEEDED
         );
         let (other, _s2) = api.client(":1.8").await;
         call_unit(&other, "ClearStore", &("cuenta",)).await.unwrap();
+    }
+
+    /// El piso por cuenta, por el bus: un segundo `ClearStore` de otra conexión
+    /// dentro de los 10 s contesta `LimitsExceeded`; pasado el piso, entra.
+    #[tokio::test]
+    async fn vaciar_desde_otra_conexion_respeta_el_piso_por_cuenta() {
+        let mut api = Api::new("api-piso", vec![account("cuenta", false)], Answer::Allow).await;
+        let (first, _s1) = api.client(":1.7").await;
+        let (second, _s2) = api.client(":1.8").await;
+        call_unit(&first, "ClearStore", &("cuenta",)).await.unwrap();
+        assert_eq!(
+            error_name(&call_unit(&second, "ClearStore", &("cuenta",)).await),
+            LIMITS_EXCEEDED
+        );
+        api.access.clock.advance(access::ACCOUNT_FLOOR);
+        call_unit(&second, "ClearStore", &("cuenta",))
+            .await
+            .unwrap();
     }
 
     async fn next_changed(signals: &mut zbus::MessageStream) -> (String, String, u64) {
