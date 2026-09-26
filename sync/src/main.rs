@@ -63,6 +63,7 @@ mod broker;
 mod compose;
 mod contacts_sync;
 mod dav;
+mod dav_sync;
 mod html;
 // Lo usa el calendario del almacén, que llega en los commits que siguen.
 #[allow(dead_code)]

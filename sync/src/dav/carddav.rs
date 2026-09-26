@@ -21,9 +21,6 @@ use super::webdav::{
     self, expect_multistatus, href_for_request, off_runtime, parse_multistatus, resolve_href,
     storable, xml_escape, DavClient, DavError, Limits, Method, NS_CALENDARSERVER, NS_DAV,
 };
-// El ETag de cada tarjeta es lo mismo que el de cada evento: vive en
-// `webdav.rs`, y se sigue llamando desde acá como antes.
-pub use super::webdav::list_etags;
 
 pub const NS_CARDDAV: &str = "urn:ietf:params:xml:ns:carddav";
 

@@ -41,7 +41,7 @@ use zbus::object_server::SignalContext;
 
 use crate::access::{self, Access, ControlAction, Refusal, CONTACTS_RESOURCE};
 use crate::broker::{self, BrokerError};
-use crate::contacts_sync::{BrokerCredentials, ContactsScheduler, ContactsSync};
+use crate::contacts_sync::{BrokerCredentials, ContactsScheduler, ContactsSync, CONTACTS_TICK};
 use crate::dav::webdav::{HttpPolicy, Limits};
 use crate::store::contacts_read::{self, Cursor, InvalidArgument};
 use crate::store::key::{self, KeyError, KeySource, SecretServiceKeys};
@@ -623,7 +623,7 @@ impl StoreService<SecretServiceKeys> {
             HttpPolicy::default(),
             notify,
         );
-        tokio::spawn(Arc::new(ContactsScheduler::new(sync)).run(requests));
+        tokio::spawn(Arc::new(ContactsScheduler::new(sync)).run(CONTACTS_TICK, requests));
     }
 
     /// Escucha los cambios de `Locked` del llavero y vuelve a pasar la tabla.

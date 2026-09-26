@@ -1,7 +1,11 @@
 //! La sincronización de contactos contra un servidor CardDAV de mentira en
 //! `127.0.0.1`, sin red, sin bus y con el llavero falso.
 
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
+
+use zeroize::Zeroizing;
 
 use base64::Engine;
 use rusqlite::OptionalExtension;
@@ -9,6 +13,7 @@ use rusqlite::OptionalExtension;
 use super::*;
 use crate::dav::fake::{card, FakeDav, RecordedRequest};
 use crate::dav::webdav::AuthKind;
+use crate::dav_sync::{merge_delta, REQUEST_COOLDOWN};
 use crate::store::key::fake::FakeKeys;
 use crate::store::lifecycle::{AccountListing, Consent, ListedAccount, Locations};
 use crate::store::paths::tests::TempDir;
@@ -20,6 +25,8 @@ struct CredentialState {
     /// La de una cuenta en particular, antes que `result`.
     per_account: HashMap<String, DavCredential>,
     calls: usize,
+    /// Las capacidades que se pidieron, en orden.
+    asked: Vec<&'static str>,
 }
 
 #[derive(Clone)]
@@ -36,12 +43,14 @@ impl FakeCredentials {
 }
 
 impl CredentialSource for FakeCredentials {
-    async fn contacts_credential(
+    async fn credential(
         &self,
         account_id: &str,
+        capability: &'static str,
     ) -> Result<DavCredential, CredentialError> {
         let mut state = self.0.lock().unwrap();
         state.calls += 1;
+        state.asked.push(capability);
         match state.per_account.get(account_id) {
             Some(credential) => Ok(credential.clone()),
             None => state.result.clone(),
@@ -117,6 +126,7 @@ impl Fixture {
             result: Ok(credential_for(&server)),
             per_account: HashMap::new(),
             calls: 0,
+            asked: Vec::new(),
         })));
         let notified = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&notified);
@@ -311,6 +321,8 @@ async fn la_carga_inicial_trae_todas_las_tarjetas_y_guarda_el_token() {
     }
     assert_eq!(f.contacts_status().await["state"], "synced");
     assert!(f.notified.load(Ordering::SeqCst) > 0);
+    // Y a la credencial se le pidió `contacts`, y nada más.
+    assert_eq!(f.credentials.0.lock().unwrap().asked, vec!["contacts"]);
 }
 
 // ── Las diferencias ─────────────────────────────────────────────────────────
@@ -1320,6 +1332,7 @@ async fn una_cuenta_lenta_no_frena_a_las_otras() {
         ]
         .into(),
         calls: 0,
+        asked: Vec::new(),
     })));
     let limits = Limits {
         max_round: Duration::from_millis(500),
