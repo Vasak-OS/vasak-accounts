@@ -35,6 +35,11 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
+# Sin volcados de memoria. En la memoria de este proceso están la clave de cada
+# base cifrada abierta y los tokens de las cuentas, y un volcado por un cuelgue
+# los dejaría sin cifrar en /var/lib/systemd/coredump. El proceso además se pone
+# PR_SET_DUMPABLE en cero al arrancar, que lo cubre también lanzado a mano.
+LimitCORE=0
 
 [Install]
 WantedBy=graphical-session.target

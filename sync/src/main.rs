@@ -1696,6 +1696,28 @@ async fn reconcile_tasks(
     Ok(accounts)
 }
 
+/// Que este proceso no deje volcados de memoria ni se deje leer con `ptrace`.
+///
+/// En la memoria del sync están la clave de cada base abierta —la tiene
+/// SQLCipher mientras la base está abierta— y los tokens de las cuentas. Un
+/// volcado por un cuelgue los escribiría sin cifrar en
+/// `/var/lib/systemd/coredump`; la unidad ya lo corta con `LimitCORE=0`, y esto
+/// lo corta también cuando el proceso se lanza a mano. `PR_SET_DUMPABLE` en cero
+/// hace además que otro proceso de la misma persona no pueda leerle la memoria
+/// con `ptrace` ni por `/proc/<pid>/mem`. No es una frontera —ese proceso le
+/// puede pedir la clave al llavero directamente, ver `store/mod.rs`—, pero la
+/// clave deja de estar a un `gdb -p` de distancia.
+///
+/// **Lo que sigue funcionando:** el servicio de cuentas y `vasak-permissions`
+/// corren como root con `CAP_SYS_PTRACE` y leen `/proc/<pid>/exe` y
+/// `/proc/<pid>/stat` de este proceso para identificarlo. Si alguna de las dos
+/// unidades suma un `CapabilityBoundingSet` sin esa capacidad, el sync deja de
+/// poder identificarse y se queda sin tokens.
+fn forbid_memory_dumps() -> std::io::Result<()> {
+    rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -1705,6 +1727,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     tracing::info!("Iniciando vasak-accounts-sync…");
+
+    // Antes de tocar una clave: sin volcados de memoria ni `ptrace` de otros
+    // procesos de la persona. Si no se puede, se sigue —el correo no depende
+    // de esto— y queda dicho en el diario.
+    if let Err(e) = forbid_memory_dumps() {
+        tracing::warn!("no se pudo apagar el volcado de memoria del proceso: {e}");
+    }
 
     let service = Servicio::default();
 
@@ -1817,6 +1846,17 @@ async fn escuchar_al_servicio(despertar: &tokio::sync::mpsc::Sender<()>) -> zbus
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Después de arrancar, el proceso no es volcable. (Deja así al proceso de
+    /// las pruebas, que no pierde nada: sólo sus propios volcados.)
+    #[test]
+    fn al_arrancar_el_proceso_deja_de_ser_volcable() {
+        forbid_memory_dumps().unwrap();
+        assert_eq!(
+            rustix::process::dumpable_behavior().unwrap(),
+            rustix::process::DumpableBehavior::NotDumpable
+        );
+    }
 
     fn cuenta(id: &str) -> broker::Account {
         broker::Account {
