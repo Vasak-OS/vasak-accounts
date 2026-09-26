@@ -18,8 +18,8 @@
 //! No crea, no edita y no borra nada en el servidor.
 
 use super::webdav::{
-    self, href_for_request, off_runtime, parse_multistatus, resolve_href, same_collection,
-    xml_escape, DavClient, DavError, Limits, Method, NS_DAV,
+    self, href_for_request, href_key, off_runtime, parse_multistatus, resolve_href,
+    same_collection, xml_escape, DavClient, DavError, Limits, Method, NS_DAV,
 };
 
 pub const NS_CARDDAV: &str = "urn:ietf:params:xml:ns:carddav";
@@ -298,13 +298,17 @@ pub async fn list_etags(client: &DavClient, book: &url::Url) -> Result<Etags, Da
 /// por libreta, que se mira sobre lo que se pide, y llenaría la base con
 /// contactos que el servidor nunca listó. Una repetida es lo mismo: la
 /// primera que llega es la que vale.
+///
+/// Pedida y contestada se comparan por [`href_key`]: `a%2db.vcf` pedida y
+/// `a%2Db.vcf` contestada son la misma tarjeta, y descartarla la dejaba
+/// afuera hasta que cambiara.
 pub fn keep_requested(cards: Vec<CardResource>, hrefs: &[url::Url]) -> (Vec<CardResource>, usize) {
-    let mut pending: std::collections::HashSet<&str> = hrefs.iter().map(url::Url::as_str).collect();
+    let mut pending: std::collections::HashSet<String> = hrefs.iter().map(href_key).collect();
     let mut unrequested = 0;
     let kept = cards
         .into_iter()
         .filter(|card| {
-            let requested = pending.remove(card.href.as_str());
+            let requested = pending.remove(&href_key(&card.href));
             if !requested {
                 unrequested += 1;
             }
@@ -599,6 +603,30 @@ END:VCARD
         );
         assert_eq!(kept[0].data, "primera");
         assert_eq!(unrequested, 2);
+    }
+
+    /// **La tarjeta pedida se reconoce aunque vuelva con otros escapes.**
+    /// `%2d` pedida y `%2D` contestada, o `%7E` y `~`, son la misma: se
+    /// descartaba como no pedida y no se guardaba. `%40` por `@` sigue sin
+    /// igualarse (ver `href_key`).
+    #[test]
+    fn la_tarjeta_pedida_vuelve_con_otros_escapes() {
+        let asked = [
+            url("https://x/libro/a%2db.vcf"),
+            url("https://x/libro/b%7Ec.vcf"),
+            url("https://x/libro/c%40d.vcf"),
+        ];
+        let (kept, unrequested) = keep_requested(
+            vec![
+                resource("https://x/libro/a%2Db.vcf", "a"),
+                resource("https://x/libro/b~c.vcf", "b"),
+                resource("https://x/libro/c@d.vcf", "c"),
+            ],
+            &asked,
+        );
+        let data: Vec<&str> = kept.iter().map(|c| c.data.as_str()).collect();
+        assert_eq!(data, vec!["a", "b"]);
+        assert_eq!(unrequested, 1);
     }
 
     #[test]

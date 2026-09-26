@@ -391,11 +391,74 @@ pub fn resolve_href(base: &url::Url, href: &str) -> Result<url::Url, DavError> {
     Ok(resolved)
 }
 
-/// Si dos direcciones son la misma colección, con la barra final o sin ella.
+/// Por qué dirección se reconoce un recurso: la clave con la que se comparan
+/// las del servidor entre sí y contra las guardadas, y la que se guarda.
+///
+/// `Url` no iguala los escapes: deja `%2d`, `%2D` y `-` como vinieron, y son el
+/// mismo recurso. Un servidor que lista una tarjeta de una forma y la contesta
+/// en el `multiget` de otra hacía que se descartara como no pedida, o que se
+/// guardara con una dirección que el listado siguiente no reconocía. La clave
+/// hace las dos normalizaciones que RFC 3986 (§6.2.2.1 y §6.2.2.2) da por
+/// equivalentes para cualquier esquema: el hexadecimal de un escape en
+/// mayúsculas, y un carácter no reservado (§2.3: letras, dígitos y `-._~`)
+/// sin escapar.
+///
+/// **Un reservado escapado no se toca**: `%40` no pasa a `@` ni `%2F` a `/`.
+/// Que signifiquen lo mismo escapados o no lo decide cada servidor, no el
+/// estándar —`a%2Fb` y `a/b` son dos recursos en casi todos—, e igualarlos
+/// podría juntar dos tarjetas distintas en una fila.
+///
+/// Lo que se pide al servidor sigue siendo la dirección tal como la dio él
+/// (`href_for_request` sobre el `Url`): la clave es sólo la identidad.
+pub fn href_key(url: &url::Url) -> String {
+    // El esquema, la máquina y el puerto no llevan escapes: se recorre entera.
+    normalize_escapes(url.as_str())
+}
+
+/// Las dos normalizaciones de [`href_key`] sobre un pedazo de una dirección ya
+/// resuelta. La serialización de `Url` es ASCII —lo que no lo es ya vino
+/// escapado—, así que se recorre por bytes.
+fn normalize_escapes(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let hex = |b: u8| (b as char).to_digit(16);
+    let mut key = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let escape = (bytes[i] == b'%')
+            .then(|| Some((hex(*bytes.get(i + 1)?)?, hex(*bytes.get(i + 2)?)?)))
+            .flatten();
+        match escape {
+            Some((high, low)) => {
+                let byte = (high * 16 + low) as u8;
+                if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+                    key.push(byte as char);
+                } else {
+                    key.push('%');
+                    key.push(bytes[i + 1].to_ascii_uppercase() as char);
+                    key.push(bytes[i + 2].to_ascii_uppercase() as char);
+                }
+                i += 3;
+            }
+            // Un `%` que no es un escape queda como está.
+            None => {
+                key.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+    }
+    key
+}
+
+/// Si dos direcciones son la misma colección, con la barra final o sin ella, y
+/// con los escapes igualados como en [`href_key`]: la libreta que el servidor
+/// nombra `/libro%2d1/` en su respuesta es la `/libro-1/` que se le pidió, y
+/// no reconocerla hacía, por ejemplo, que el `507` de un `sync-collection`
+/// truncado no se viera.
 pub fn same_collection(a: &url::Url, b: &url::Url) -> bool {
+    let path = |u: &url::Url| normalize_escapes(u.path().trim_end_matches('/'));
     a.origin() == b.origin()
-        && a.path().trim_end_matches('/') == b.path().trim_end_matches('/')
-        && a.query() == b.query()
+        && path(a) == path(b)
+        && a.query().map(normalize_escapes) == b.query().map(normalize_escapes)
 }
 
 /// Escapa un texto para meterlo en un elemento XML.
@@ -1513,6 +1576,72 @@ mod tests {
         assert_eq!(resolve_href(&base, &spaces), Err(DavError::ForeignOrigin));
         // Una normal sigue entrando.
         assert!(resolve_href(&base, "/dav/libro/a%20b.vcf").is_ok());
+    }
+
+    /// **La clave de una dirección iguala los escapes que el estándar da por
+    /// iguales, y ninguno más.** Hexadecimal en mayúsculas y los no reservados
+    /// sin escapar; `%40` y `%2F` quedan escapados, porque para el servidor
+    /// pueden ser otro recurso.
+    #[test]
+    fn la_clave_de_una_direccion_iguala_solo_los_escapes_equivalentes() {
+        let base = url::Url::parse("https://nube.ejemplo.com/dav/libro/").unwrap();
+        let key = |href: &str| href_key(&resolve_href(&base, href).unwrap());
+
+        let same = [
+            ("a%2db.vcf", "a-b.vcf"),
+            ("a%2Db.vcf", "a-b.vcf"),
+            ("a%7Eb.vcf", "a~b.vcf"),
+            ("%41na%5f1%2E%76cf", "Ana_1.vcf"),
+            ("%c3%a9.vcf", "é.vcf"),
+            ("a%2fb.vcf", "a%2Fb.vcf"),
+            ("a.vcf?v=%7e1", "a.vcf?v=~1"),
+        ];
+        for (one, other) in same {
+            assert_eq!(key(one), key(other), "{one} y {other}");
+        }
+        assert_eq!(
+            key("a%2db.vcf"),
+            "https://nube.ejemplo.com/dav/libro/a-b.vcf"
+        );
+        assert_eq!(
+            key("%c3%a9.vcf"),
+            "https://nube.ejemplo.com/dav/libro/%C3%A9.vcf"
+        );
+
+        let different = [
+            ("a%40b.vcf", "a@b.vcf"),
+            ("a%2Fb.vcf", "a/b.vcf"),
+            ("a%3Bb.vcf", "a;b.vcf"),
+            ("a%2Bb.vcf", "a+b.vcf"),
+        ];
+        for (one, other) in different {
+            assert_ne!(key(one), key(other), "{one} y {other}");
+        }
+        assert_eq!(
+            key("a%40b.vcf"),
+            "https://nube.ejemplo.com/dav/libro/a%40b.vcf"
+        );
+
+        // Un `%` que no es un escape queda, y dos pasadas son una.
+        assert_eq!(
+            key("a%zz%4.vcf"),
+            "https://nube.ejemplo.com/dav/libro/a%zz%4.vcf"
+        );
+        for href in ["a%2db.vcf", "%c3%a9.vcf", "a%40b%7e.vcf"] {
+            let once = key(href);
+            assert_eq!(href_key(&url::Url::parse(&once).unwrap()), once);
+        }
+    }
+
+    /// La libreta se reconoce en su propia respuesta aunque el servidor la
+    /// escriba con otros escapes; una reservada escapada sigue siendo otra.
+    #[test]
+    fn la_misma_coleccion_con_otros_escapes() {
+        let book = url::Url::parse("https://x/dav/libro-1/").unwrap();
+        let other = |path: &str| url::Url::parse(&format!("https://x{path}")).unwrap();
+        assert!(same_collection(&other("/dav/libro%2d1"), &book));
+        assert!(same_collection(&other("/dav/libro%2D1/"), &book));
+        assert!(!same_collection(&other("/dav/libro%2F1/"), &book));
     }
 
     #[test]

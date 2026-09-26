@@ -87,6 +87,9 @@ pub struct FakeState {
     pub extra_sync_xml: String,
     /// `<d:response>` de más que se suman a cada `addressbook-multiget`.
     pub extra_multiget_xml: String,
+    /// Cómo escribe el `multiget` el `href` de cada tarjeta que contesta. Sin
+    /// nada, tal como se lo pidieron.
+    pub multiget_href: Option<fn(&str) -> String>,
     /// Cortar cada `sync-collection` a estas tarjetas, con un `507` sobre la
     /// libreta: la respuesta truncada de RFC 6578.
     pub truncate_sync: Option<usize>,
@@ -128,6 +131,7 @@ impl FakeDav {
             extra_books_xml: String::new(),
             extra_sync_xml: String::new(),
             extra_multiget_xml: String::new(),
+            multiget_href: None,
             truncate_sync: None,
             stall: false,
         }));
@@ -462,6 +466,7 @@ fn answer(state: &mut FakeState, request: &RecordedRequest) -> (u16, String) {
             {
                 return (500, String::new());
             }
+            let shown = state.multiget_href;
             let book = &state.books[index];
             let hrefs: Vec<String> = roxmltree::Document::parse(&request.body)
                 .map(|d| {
@@ -474,9 +479,10 @@ fn answer(state: &mut FakeState, request: &RecordedRequest) -> (u16, String) {
             let mut xml = String::from(HEAD);
             for href in hrefs {
                 let name = href.strip_prefix(&book.path).unwrap_or("");
+                let answered = shown.map_or_else(|| href.clone(), |f| f(&href));
                 match book.cards.get(name) {
                     Some(card) => xml.push_str(&format!(
-                        "<d:response><d:href>{href}</d:href>{}</d:response>",
+                        "<d:response><d:href>{answered}</d:href>{}</d:response>",
                         ok(&format!(
                             "<d:getetag>{}</d:getetag><c:address-data>{}</c:address-data>",
                             xml_escape(&card.etag),

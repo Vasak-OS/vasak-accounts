@@ -960,6 +960,49 @@ async fn un_multiget_que_trae_tarjetas_no_pedidas_no_las_guarda() {
     );
 }
 
+/// **Una tarjeta que el `multiget` contesta con otros escapes se guarda, y es
+/// la misma en las vueltas siguientes.** El servidor las lista como
+/// `a%2db.vcf` y `b%7ec.vcf` y las contesta como `a%2Db.vcf` y `b~c.vcf`: se
+/// descartaban como no pedidas y no se guardaban nunca. Guardadas por su
+/// clave, el cambio, el `404` y el camino por ETag las reconocen por la
+/// dirección del listado.
+#[tokio::test]
+async fn una_tarjeta_contestada_con_otros_escapes_se_guarda_y_se_reconoce() {
+    let f = Fixture::new("contactos-escapes").await;
+    f.server.put(0, "a%2db.vcf", &card("1", "Ana", "ana@x.com"));
+    f.server
+        .put(0, "b%7ec.vcf", &card("2", "Juan", "juan@x.com"));
+    f.server.state().multiget_href = Some(|href| href.replace("%2d", "%2D").replace("%7e", "~"));
+
+    let report = f.synced().await;
+    assert_eq!((report.fetched, report.unrequested), (2, 0));
+    assert_eq!(f.names().await, vec!["Ana", "Juan"]);
+
+    // Una cambia: se reemplaza su fila, no se suma otra.
+    f.server
+        .put(0, "a%2db.vcf", &card("1", "Ana María", "ana@x.com"));
+    let report = f.synced().await;
+    assert_eq!((report.fetched, report.unrequested), (1, 0));
+    assert_eq!(f.names().await, vec!["Ana María", "Juan"]);
+
+    // La otra se va: el `404` del listado la borra.
+    f.server.remove(0, "b%7ec.vcf");
+    let report = f.synced().await;
+    assert_eq!(report.removed, 1);
+    assert_eq!(f.names().await, vec!["Ana María"]);
+
+    // Y por ETag, sin cambios: ni se trae ni se borra.
+    f.server.state().books[0].supports_sync = false;
+    let before = f.server.requests().len();
+    let report = f.synced().await;
+    assert_eq!(
+        (report.etag_books, report.fetched, report.removed),
+        (1, 0, 0)
+    );
+    assert!(!f.requests_since(before).iter().any(|r| r.is_multiget()));
+    assert_eq!(f.names().await, vec!["Ana María"]);
+}
+
 /// **Un XML roto no lleva texto del servidor al estado.** El error de
 /// `roxmltree` repite el nombre de la etiqueta que no cierra, y ese nombre lo
 /// elige el servidor: sin el texto fijo, «Entrá-a-otro-sitio» —u ocho megas de

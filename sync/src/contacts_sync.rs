@@ -53,7 +53,7 @@ use zeroize::Zeroizing;
 
 use crate::broker::{Broker, BrokerError};
 use crate::dav::carddav::{self, AddressBook, CardResource};
-use crate::dav::webdav::{self, DavClient, DavCredential, DavError, HttpPolicy, Limits};
+use crate::dav::webdav::{self, href_key, DavClient, DavCredential, DavError, HttpPolicy, Limits};
 use crate::store::contacts::{
     Applied, BookProgress, ContactOp, ContactRow, StoredAddressBook, WRITE_BATCH_BYTES,
     WRITE_BATCH_ROWS,
@@ -405,12 +405,12 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
         let books: Vec<AddressBook> = books
             .into_iter()
             // Una libreta que el servidor nombra dos veces es una.
-            .filter(|b| seen.insert(b.href.to_string()))
+            .filter(|b| seen.insert(href_key(&b.href)))
             .collect();
         round.report.books = books.len();
         let listed: Vec<(String, String)> = books
             .iter()
-            .map(|b| (b.href.to_string(), b.display_name.clone()))
+            .map(|b| (href_key(&b.href), b.display_name.clone()))
             .collect();
 
         // Las libretas que ya no están, de a tandas. **Salvo que el listado haya
@@ -620,11 +620,14 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
         local: &HashMap<String, Option<String>>,
         round: &Round,
     ) -> Result<Plan, SyncError> {
-        let listed = round.net(carddav::list_etags(client, &book.href)).await?;
+        let mut listed = round.net(carddav::list_etags(client, &book.href)).await?;
         if listed.len() > self.limits.max_cards_per_book {
             return Err(DavError::TooManyCards(self.limits.max_cards_per_book).into());
         }
-        let present: BTreeSet<String> = listed.iter().map(|(u, _)| u.to_string()).collect();
+        // Una tarjeta que el listado nombra dos veces —con escapes distintos—
+        // es una.
+        let mut present = BTreeSet::new();
+        listed.retain(|(u, _)| present.insert(href_key(u)));
         let delete: Vec<String> = local
             .keys()
             .filter(|href| !present.contains(*href))
@@ -651,7 +654,7 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
     ) -> Result<(), SyncError> {
         let new = fetch
             .iter()
-            .filter(|u| !local.contains_key(u.as_str()))
+            .filter(|u| !local.contains_key(&href_key(u)))
             .count();
         let total = (local.len() + new).saturating_sub(delete.len());
         if total > self.limits.max_cards_per_book {
@@ -796,9 +799,12 @@ fn row_from(card: CardResource) -> Option<ContactRow> {
     // Un recurso de CardDAV es una tarjeta. Si trae varias pegadas, lo que se
     // indexa es la primera; lo crudo se guarda entero.
     let first = vcard::split_cards(&card.data).into_iter().next()?;
-    let contact = vcard::contact_from(&first, card.href.as_str()).unwrap_or_default();
+    // Se guarda por su clave ([`href_key`]), que es con la que la comparan el
+    // listado y el `multiget` de la vuelta siguiente.
+    let href = href_key(&card.href);
+    let contact = vcard::contact_from(&first, &href).unwrap_or_default();
     Some(ContactRow {
-        href: card.href.to_string(),
+        href,
         etag: card.etag,
         raw_vcard: card.data,
         contact,
@@ -819,14 +825,16 @@ fn merge_delta(
     local: &HashMap<String, Option<String>>,
 ) {
     for url in delta_removed {
-        changed.remove(url.as_str());
-        if local.contains_key(url.as_str()) {
-            removed.insert(url.to_string());
+        let key = href_key(&url);
+        changed.remove(&key);
+        if local.contains_key(&key) {
+            removed.insert(key);
         }
     }
     for (url, etag) in delta_changed {
-        removed.remove(url.as_str());
-        changed.insert(url.to_string(), (url, etag));
+        let key = href_key(&url);
+        removed.remove(&key);
+        changed.insert(key, (url, etag));
     }
 }
 
@@ -838,7 +846,7 @@ fn to_fetch(
 ) -> Vec<url::Url> {
     listed
         .into_iter()
-        .filter(|(url, etag)| match (local.get(url.as_str()), etag) {
+        .filter(|(url, etag)| match (local.get(&href_key(url)), etag) {
             (Some(Some(stored)), Some(etag)) => stored != etag,
             _ => true,
         })
