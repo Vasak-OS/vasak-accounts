@@ -18,7 +18,7 @@
 //! reservados. Y **nunca** se usa para decidir dónde escribir: es una sugerencia
 //! que se sanea, y el destino lo elige la persona.
 
-use crate::mensaje::{
+use crate::message::{
     a_texto, como_latin1, decodificar_palabras, es_adjunto, partir, tipo_de, Cabeceras,
     MAX_PROFUNDIDAD,
 };
@@ -240,7 +240,7 @@ pub fn destransportar_parte(cabeceras_crudas: &[u8], contenido: &[u8]) -> Vec<u8
     let (cabeceras, _) = partir(&vista);
     let codificacion = cabeceras.texto("content-transfer-encoding");
 
-    crate::mensaje::destransportar(contenido, codificacion.trim())
+    crate::message::destransportar(contenido, codificacion.trim())
 }
 
 /// Los adjuntos de un mensaje, con su número de parte.
@@ -274,7 +274,7 @@ fn recorrer(
         .unwrap_or_default();
 
     if let Some(frontera) = &tipo.frontera {
-        for (i, parte) in crate::mensaje::partes_de(cuerpo, frontera)
+        for (i, parte) in crate::message::partes_de(cuerpo, frontera)
             .into_iter()
             .enumerate()
         {

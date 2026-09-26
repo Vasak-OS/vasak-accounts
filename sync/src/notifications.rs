@@ -27,8 +27,8 @@
 
 use std::collections::HashMap;
 
-use crate::mensaje::Resumen;
-use crate::preferencias::Detalle;
+use crate::message::Resumen;
+use crate::preferences::Detalle;
 
 /// El identificador del botón, con el que vuelve la señal.
 ///

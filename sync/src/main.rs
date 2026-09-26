@@ -27,7 +27,7 @@
 //!
 //! Empezó contando y nada más, a propósito, porque contar no necesita interpretar
 //! nada de lo que escribió un desconocido. Ese parser llegó con la aplicación de
-//! correo y vive en `mensaje.rs`, con su propia discusión escrita arriba.
+//! correo y vive en `message.rs`, con su propia discusión escrita arriba.
 //!
 //! Prepara además una base **cifrada** por cuenta —el almacén local de
 //! `store/`, publicado en `ar.net.vasak.os.AccountsStore`— y guarda ahí los
@@ -54,24 +54,24 @@
 //! tiene para perder.
 //!
 //! Y **envía**: `SendMessage` deja el mensaje en una cola en el disco
-//! (`cola.rs`) que sobrevive a que se apague el equipo, y un despachador lo
+//! (`outbox.rs`) que sobrevive a que se apague el equipo, y un despachador lo
 //! manda por SMTP (`smtp.rs`) en cuanto el servidor lo acepta.
 
 mod access;
-mod adjuntos;
-mod avisos;
+mod attachments;
 mod broker;
-mod casillas;
-mod cola;
-mod consulta;
+mod compose;
 mod contacts_sync;
 mod dav;
 mod html;
-mod imagenes;
+mod images;
 mod imap;
-mod mensaje;
-mod preferencias;
-mod redactar;
+mod mailboxes;
+mod message;
+mod notifications;
+mod outbox;
+mod preferences;
+mod query;
 mod smtp;
 mod store;
 mod store_api;
@@ -159,7 +159,7 @@ struct Estado {
     /// nadie recuerda que existe — y a cambio ahorraría los dos segundos que
     /// tarda la primera lista. La lista se rehace sola en cuanto la cuenta se
     /// conecta, que es de todos modos lo que pasa al arrancar la sesión.
-    mensajes: HashMap<String, Vec<mensaje::Resumen>>,
+    mensajes: HashMap<String, Vec<message::Resumen>>,
     /// Las cuentas cuyo servidor rechazó las credenciales.
     ///
     /// Sin esta lista, la tarea de una cuenta rechazada termina, deja de figurar
@@ -193,7 +193,7 @@ struct Servicio {
     ///
     /// Sirven para reemplazar el anterior en vez de apilar: veinte mensajes que
     /// llegan juntos son un cartel que dice cuántos, no veinte carteles.
-    carteles: Arc<Mutex<avisos::Carteles>>,
+    carteles: Arc<Mutex<notifications::Carteles>>,
 }
 
 /// Un mensaje abierto, listo para mostrar.
@@ -216,7 +216,7 @@ struct Abierto {
     /// mirando lo que se trajo, y lo que se trae tiene tope; un adjunto que
     /// quedó más allá del corte no aparece. La ventana ya tiene que decir que el
     /// mensaje está recortado, y eso cubre también esto.
-    adjuntos: Vec<adjuntos::Adjunto>,
+    adjuntos: Vec<attachments::Adjunto>,
     /// El mismo mensaje con su formato, ya saneado, o nada si no traía HTML.
     ///
     /// Va **además** del texto y no en su lugar: el texto plano se queda como la
@@ -235,7 +235,7 @@ struct Abierto {
     /// las mismas cabeceras que ya se trajeron: pedirlo después sería volver al
     /// servidor por algo que ya está en memoria.
     #[serde(flatten)]
-    responder: mensaje::ParaResponder,
+    responder: message::ParaResponder,
 }
 
 /// La conexión que atiende los pedidos de la aplicación de correo.
@@ -265,7 +265,7 @@ impl Lector {
         &mut self,
         broker: &Broker,
         cuenta: &broker::Account,
-    ) -> Result<Vec<casillas::Casilla>, String> {
+    ) -> Result<Vec<mailboxes::Casilla>, String> {
         self.con_reintento(broker, cuenta, |sesion| Box::pin(sesion.listar_casillas()))
             .await
     }
@@ -281,8 +281,8 @@ impl Lector {
         broker: &Broker,
         cuenta: &broker::Account,
         casilla: &str,
-        terminos: Vec<consulta::Termino>,
-    ) -> Result<Vec<mensaje::Resumen>, String> {
+        terminos: Vec<query::Termino>,
+    ) -> Result<Vec<message::Resumen>, String> {
         let casilla = casilla.to_string();
         self.con_reintento(broker, cuenta, move |sesion| {
             let casilla = casilla.clone();
@@ -326,7 +326,7 @@ impl Lector {
             .await?;
 
         Ok((
-            adjuntos::destransportar_parte(&cabeceras, &contenido),
+            attachments::destransportar_parte(&cabeceras, &contenido),
             recortado,
         ))
     }
@@ -367,7 +367,7 @@ impl Lector {
         let casillas = self.casillas(broker, cuenta).await?;
         Ok(casillas
             .into_iter()
-            .find(|c| c.uso == casillas::Uso::Papelera && c.seleccionable)
+            .find(|c| c.uso == mailboxes::Uso::Papelera && c.seleccionable)
             .map(|c| c.ruta))
     }
 
@@ -385,7 +385,7 @@ impl Lector {
         broker: &Broker,
         cuenta: &broker::Account,
         casilla: &str,
-    ) -> Result<Vec<mensaje::Resumen>, String> {
+    ) -> Result<Vec<message::Resumen>, String> {
         let casilla = casilla.to_string();
         self.con_reintento(broker, cuenta, move |sesion| {
             let casilla = casilla.clone();
@@ -427,15 +427,15 @@ impl Lector {
         // leerlo como latin-1. En qué idioma está escrito lo dice el propio
         // mensaje, y eso se resuelve adentro.
         Ok(Abierto {
-            texto: mensaje::texto_de(&crudo),
+            texto: message::texto_de(&crudo),
             recortado,
-            adjuntos: adjuntos::listar(&crudo),
+            adjuntos: attachments::listar(&crudo),
             // El saneado pasa **acá**, en el servicio, y no en la ventana: es lo
             // que hace que la ventana no vea nunca el HTML crudo de un
             // desconocido, del mismo modo que no ve una contraseña ni abre una
             // conexión propia.
-            con_formato: mensaje::html_de(&crudo).map(|bruto| html::sanear(&bruto)),
-            responder: mensaje::para_responder(&crudo),
+            con_formato: message::html_de(&crudo).map(|bruto| html::sanear(&bruto)),
+            responder: message::para_responder(&crudo),
         })
     }
 
@@ -667,7 +667,7 @@ impl Servicio {
         mailbox: String,
         query: String,
     ) -> zbus::fdo::Result<String> {
-        let terminos: Vec<consulta::Termino> = serde_json::from_str(&query)
+        let terminos: Vec<query::Termino> = serde_json::from_str(&query)
             .map_err(|e| zbus::fdo::Error::InvalidArgs(format!("consulta inválida: {e}")))?;
 
         let (broker, cuenta) = self.cuenta(&account_id).await?;
@@ -733,11 +733,11 @@ impl Servicio {
     ///
     /// Que la pida este proceso trae un riesgo nuevo —la máquina pidiéndose
     /// cosas a sí misma— y por eso la dirección se revisa y se resuelve antes.
-    /// Ver `imagenes.rs`, que es donde está la decisión y sus pruebas.
+    /// Ver `images.rs`, que es donde está la decisión y sus pruebas.
     ///
     /// No se pide sola nunca: este método existe porque alguien apretó un botón.
     async fn fetch_image(&self, url: String) -> zbus::fdo::Result<String> {
-        let imagen = imagenes::traer(&url)
+        let imagen = images::traer(&url)
             .await
             .map_err(zbus::fdo::Error::Failed)?;
 
@@ -948,7 +948,7 @@ impl Servicio {
                 "«{no_antes_de}» no es una hora válida"
             )));
         }
-        let mut borrador: redactar::Borrador = serde_json::from_str(&borrador).map_err(|e| {
+        let mut borrador: compose::Borrador = serde_json::from_str(&borrador).map_err(|e| {
             zbus::fdo::Error::InvalidArgs(format!("el borrador no se entiende: {e}"))
         })?;
 
@@ -970,26 +970,26 @@ impl Servicio {
             borrador.nombre = cuenta.display_name.clone();
         }
 
-        redactar::revisar(&borrador).map_err(zbus::fdo::Error::InvalidArgs)?;
+        compose::revisar(&borrador).map_err(zbus::fdo::Error::InvalidArgs)?;
 
         let ahora = chrono::Utc::now();
         let unico = siguiente_unico();
-        let salida = cola::Salida {
-            id: cola::nuevo_id(ahora, unico),
+        let salida = outbox::Salida {
+            id: outbox::nuevo_id(ahora, unico),
             account_id,
-            identificador: redactar::identificador(&borrador.de, ahora, unico),
+            identificador: compose::identificador(&borrador.de, ahora, unico),
             // La fecha de cuando se escribió y no de cuando sale: un mensaje
             // redactado anoche que sale a la mañana tiene que decir anoche.
-            fecha: redactar::fecha_de_cabecera(chrono::Local::now()),
+            fecha: compose::fecha_de_cabecera(chrono::Local::now()),
             borrador,
             intentos: 0,
-            estado: cola::Estado::Pendiente,
+            estado: outbox::Estado::Pendiente,
             ultimo_error: String::new(),
             proximo_intento: String::new(),
             programado_para: no_antes_de,
         };
 
-        cola::Cola::nueva(cola::directorio())
+        outbox::Cola::nueva(outbox::directorio())
             .and_then(|c| c.encolar(&salida))
             .map_err(zbus::fdo::Error::Failed)?;
 
@@ -1002,7 +1002,7 @@ impl Servicio {
 
     /// Lo que está esperando salir, y lo que se trabó.
     async fn list_outbox(&self) -> zbus::fdo::Result<String> {
-        let salidas = cola::Cola::nueva(cola::directorio())
+        let salidas = outbox::Cola::nueva(outbox::directorio())
             .and_then(|c| c.todos())
             .map_err(zbus::fdo::Error::Failed)?;
 
@@ -1050,7 +1050,7 @@ impl Servicio {
             ));
         }
 
-        cola::Cola::nueva(cola::directorio())
+        outbox::Cola::nueva(outbox::directorio())
             .and_then(|c| c.quitar(&id))
             .map_err(zbus::fdo::Error::Failed)?;
 
@@ -1163,7 +1163,7 @@ async fn despachar(servicio: Servicio, emisor: SignalContext<'static>) {
 
 /// Intenta mandar lo que esté listo. Devuelve si cambió algo.
 async fn vaciar_la_cola(servicio: &Servicio) -> bool {
-    let Ok(cola) = cola::Cola::nueva(cola::directorio()) else {
+    let Ok(cola) = outbox::Cola::nueva(outbox::directorio()) else {
         return false;
     };
     let Ok(pendientes) = cola.todos() else {
@@ -1174,7 +1174,7 @@ async fn vaciar_la_cola(servicio: &Servicio) -> bool {
     let mut cambio = false;
 
     for mut salida in pendientes {
-        if salida.estado == cola::Estado::Trabado {
+        if salida.estado == outbox::Estado::Trabado {
             continue;
         }
         // Todavía no le toca: la espera crece con cada intento fallido.
@@ -1209,8 +1209,8 @@ async fn vaciar_la_cola(servicio: &Servicio) -> bool {
                 // aceptarlo nunca, o cuando se acabaron los intentos. En los dos
                 // casos hace falta que la persona haga algo, y seguir golpeando
                 // el servidor de alguien no ayuda.
-                if !e.se_reintenta() || salida.intentos >= cola::MAX_INTENTOS {
-                    salida.estado = cola::Estado::Trabado;
+                if !e.se_reintenta() || salida.intentos >= outbox::MAX_INTENTOS {
+                    salida.estado = outbox::Estado::Trabado;
                     tracing::warn!("el mensaje {} no se pudo mandar: {e}", salida.id);
                 } else {
                     tracing::info!("el mensaje {} espera otro intento: {e}", salida.id);
@@ -1225,7 +1225,7 @@ async fn vaciar_la_cola(servicio: &Servicio) -> bool {
 }
 
 /// Manda un mensaje, de principio a fin.
-async fn mandar_uno(servicio: &Servicio, salida: &cola::Salida) -> Result<(), smtp::SmtpError> {
+async fn mandar_uno(servicio: &Servicio, salida: &outbox::Salida) -> Result<(), smtp::SmtpError> {
     let (broker, cuenta) = servicio
         .cuenta(&salida.account_id)
         .await
@@ -1251,7 +1251,7 @@ async fn mandar_uno(servicio: &Servicio, salida: &cola::Salida) -> Result<(), sm
     let destino =
         broker::destino_smtp_de(&config, Some(token)).map_err(smtp::SmtpError::Permanente)?;
 
-    let mensaje = redactar::armar(&salida.borrador, &salida.identificador, &salida.fecha)
+    let mensaje = compose::armar(&salida.borrador, &salida.identificador, &salida.fecha)
         .map_err(smtp::SmtpError::Permanente)?;
 
     let mut sesion = smtp::Sesion::abrir(&destino).await?;
@@ -1336,7 +1336,7 @@ async fn publicar_mensajes(
     servicio: &Servicio,
     emisor: &SignalContext<'_>,
     account_id: &str,
-    mensajes: Vec<mensaje::Resumen>,
+    mensajes: Vec<message::Resumen>,
 ) {
     let mut estado = servicio.estado.lock().await;
     let anterior = estado.mensajes.get(account_id);
@@ -1345,7 +1345,7 @@ async fn publicar_mensajes(
     // única forma: después ya no hay con qué comparar. Y sale `0` la primera
     // vez, porque no había lista anterior — que es justo lo que evita veinte
     // carteles de correo de la semana pasada al conectarse.
-    let recien_llegados = avisos::recien_llegados(anterior.map(|v| v.as_slice()), &mensajes);
+    let recien_llegados = notifications::recien_llegados(anterior.map(|v| v.as_slice()), &mensajes);
     let nuevos = recien_llegados.len();
     if cambio {
         estado.mensajes.insert(account_id.to_string(), mensajes);
@@ -1365,10 +1365,10 @@ async fn publicar_mensajes(
     // normal— y ésta es la única forma de que alguien se entere.
     // Se releen acá y no al arrancar: un cambio vale en el próximo cartel y no
     // en la próxima sesión. Es una vez por aviso, o sea unas pocas por día.
-    let detalle = preferencias::leer().detalle_del_aviso;
-    let (titulo, cuerpo) = avisos::texto(&recien_llegados, account_id, detalle);
+    let detalle = preferences::leer().detalle_del_aviso;
+    let (titulo, cuerpo) = notifications::texto(&recien_llegados, account_id, detalle);
     let mut carteles = servicio.carteles.lock().await;
-    if let Some(id) = avisos::mostrar(
+    if let Some(id) = notifications::mostrar(
         emisor.connection(),
         carteles.anterior(account_id),
         &titulo,
@@ -1376,7 +1376,7 @@ async fn publicar_mensajes(
         // Preguntado cada vez y no una: el servidor de notificaciones se puede
         // reiniciar —o cambiar por otro— sin que este servicio se entere, y la
         // respuesta viene de un método que ya está conectado.
-        avisos::soporta_botones(emisor.connection()).await,
+        notifications::soporta_botones(emisor.connection()).await,
     )
     .await
     {
@@ -1431,7 +1431,7 @@ async fn seguir_los_carteles(
         if accion != "abrir" || !servicio.carteles.lock().await.es_nuestro(id) {
             continue;
         }
-        avisos::abrir_el_correo();
+        notifications::abrir_el_correo();
     }
 
     Err("el bus de sesión cerró la conexión".into())

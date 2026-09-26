@@ -7,7 +7,7 @@
 //! sea, ni una línea de parser sobre lo que escribió un desconocido—. Ese módulo
 //! decía que el día que hubiera que leer mensajes de verdad el parser sería la
 //! parte peligrosa y merecería su propia discusión. Ese día llegó con la
-//! aplicación de correo, y esa discusión está en `mensaje.rs`.
+//! aplicación de correo, y esa discusión está en `message.rs`.
 //!
 //! Acá sigue viviendo sólo el **protocolo**: pedirle cosas al servidor y
 //! entender su respuesta. Lo que dice el mensaje se interpreta en el otro lado.
@@ -33,8 +33,8 @@ use tokio::net::TcpStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 
 use crate::broker::{Credencial, Destino};
-use crate::casillas::{casilla_de_list, uidvalidity_de, Casilla};
-use crate::consulta::{armar, uids_de_search, Termino, Trozo};
+use crate::mailboxes::{casilla_de_list, uidvalidity_de, Casilla};
+use crate::query::{armar, uids_de_search, Termino, Trozo};
 
 /// Tope para conectarse y autenticarse.
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -214,11 +214,7 @@ pub fn resultados_de_search(linea: &str) -> Option<u32> {
     // `* SEARCHING 1` pasaba por una respuesta de `SEARCH` con un resultado —
     // la misma clase de error que el de las etiquetas, que ya tiene su prueba
     // más abajo.
-    Some(
-        crate::consulta::tras_search(linea)?
-            .split_whitespace()
-            .count() as u32,
-    )
+    Some(crate::query::tras_search(linea)?.split_whitespace().count() as u32)
 }
 
 /// Cómo terminó un movimiento.
@@ -749,7 +745,7 @@ impl<F: AsyncRead + AsyncWrite + Unpin + Send> Sesion<F> {
     pub async fn resumenes_de(
         &mut self,
         uids: &[u32],
-    ) -> Result<Vec<crate::mensaje::Resumen>, ImapError> {
+    ) -> Result<Vec<crate::message::Resumen>, ImapError> {
         if uids.is_empty() {
             return Ok(Vec::new());
         }
@@ -882,7 +878,7 @@ impl<F: AsyncRead + AsyncWrite + Unpin + Send> Sesion<F> {
     pub async fn resumenes(
         &mut self,
         mensajes: u32,
-    ) -> Result<Vec<crate::mensaje::Resumen>, ImapError> {
+    ) -> Result<Vec<crate::message::Resumen>, ImapError> {
         let Some(rango) = ultimos(mensajes, CUANTOS) else {
             return Ok(Vec::new());
         };
@@ -899,7 +895,7 @@ impl<F: AsyncRead + AsyncWrite + Unpin + Send> Sesion<F> {
     async fn fetch_de_resumenes(
         &mut self,
         comando: &str,
-    ) -> Result<Vec<crate::mensaje::Resumen>, ImapError> {
+    ) -> Result<Vec<crate::message::Resumen>, ImapError> {
         let etiqueta = self.siguiente_etiqueta();
         // `CONTENT-TYPE` viene para saber si hay algo pegado. Es una pista y no
         // una certeza —un `multipart/mixed` puede ser texto con una imagen
@@ -933,9 +929,9 @@ impl<F: AsyncRead + AsyncWrite + Unpin + Send> Sesion<F> {
                     // lo que esto arregla son las cabeceras con bytes de ocho
                     // bits sin codificar, que el estándar no permite y los
                     // clientes mandan igual.
-                    let cabeceras = crate::mensaje::a_texto(bloque, "");
+                    let cabeceras = crate::message::a_texto(bloque, "");
                     let adjuntos = cabeceras.to_ascii_lowercase().contains("multipart/mixed");
-                    resumenes.push(crate::mensaje::resumen_de(
+                    resumenes.push(crate::message::resumen_de(
                         uid,
                         &cabeceras,
                         !esta_visto(&linea),
@@ -996,7 +992,7 @@ impl<F: AsyncRead + AsyncWrite + Unpin + Send> Sesion<F> {
     /// Una parte suelta de un mensaje, con sus cabeceras.
     ///
     /// `parte` es el número del árbol MIME —`2`, `1.3`—, el mismo que devuelve
-    /// `adjuntos::listar`. Traer la parte sola y no el mensaje entero es lo que
+    /// `attachments::listar`. Traer la parte sola y no el mensaje entero es lo que
     /// hace que se pueda bajar un adjunto de veinte megas sin traer los otros
     /// tres que venían con él.
     ///
@@ -1355,7 +1351,7 @@ mod tests {
         );
 
         let uids = sesion
-            .buscar(&[crate::consulta::Termino::De("ana".into())])
+            .buscar(&[crate::query::Termino::De("ana".into())])
             .await
             .unwrap();
         tarea.await.unwrap();
@@ -1381,7 +1377,7 @@ mod tests {
         );
 
         let uids = sesion
-            .buscar(&[crate::consulta::Termino::De("ana".into())])
+            .buscar(&[crate::query::Termino::De("ana".into())])
             .await
             .unwrap();
         let recibidos = tarea.await.unwrap();
@@ -1401,7 +1397,7 @@ mod tests {
         );
 
         assert!(sesion
-            .buscar(&[crate::consulta::Termino::De("ana".into())])
+            .buscar(&[crate::query::Termino::De("ana".into())])
             .await
             .is_err());
         assert_eq!(tarea.await.unwrap().len(), 1);
@@ -1422,7 +1418,7 @@ mod tests {
         );
 
         let uids = sesion
-            .buscar(&[crate::consulta::Termino::Asunto("reunión".into())])
+            .buscar(&[crate::query::Termino::Asunto("reunión".into())])
             .await
             .unwrap();
         tarea.await.unwrap();
@@ -1446,7 +1442,7 @@ mod tests {
         );
 
         let uids = sesion
-            .buscar(&[crate::consulta::Termino::De("nadie".into())])
+            .buscar(&[crate::query::Termino::De("nadie".into())])
             .await
             .unwrap();
         tarea.await.unwrap();
@@ -1712,7 +1708,7 @@ mod tests {
 
         assert_eq!(casillas.len(), 3);
         assert_eq!(casillas[0].ruta, "INBOX");
-        assert_eq!(casillas[1].uso, crate::casillas::Uso::Enviados);
+        assert_eq!(casillas[1].uso, crate::mailboxes::Uso::Enviados);
         // La `\Noselect` viene igual y marcada: hace falta para dibujar el
         // árbol, y quien la muestre decide si la ofrece.
         assert!(!casillas[2].seleccionable);

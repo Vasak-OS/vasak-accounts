@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::redactar::Borrador;
+use crate::compose::Borrador;
 
 /// Cuántos mensajes se aceptan sin mandar.
 ///

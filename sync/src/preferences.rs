@@ -59,9 +59,9 @@ pub struct Preferencias {
 /// Dónde vive el archivo.
 ///
 /// `XDG_CONFIG_HOME` y, si no está, `~/.config`, que es lo que dice el estándar
-/// y lo que ya hace `cola.rs` con `XDG_DATA_HOME`.
+/// y lo que ya hace `outbox.rs` con `XDG_DATA_HOME`.
 pub fn archivo() -> Option<PathBuf> {
-    // Por `dirs`, igual que `cola.rs`. Acá no se escribe, pero una base relativa
+    // Por `dirs`, igual que `outbox.rs`. Acá no se escribe, pero una base relativa
     // igual duele: se leería un archivo de preferencias de donde no está —o de
     // donde haya uno que no es—, y quien llama no lo distingue de «no hay
     // preferencias guardadas», así que se cae a las de por omisión sin decirlo.

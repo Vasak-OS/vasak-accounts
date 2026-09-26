@@ -345,7 +345,7 @@ impl Sesion {
         mensaje: &str,
     ) -> Result<(), SmtpError> {
         // **Las direcciones se revisan otra vez acá.** Ya pasaron por
-        // `redactar::revisar` antes de encolarse, así que esto no debería
+        // `compose::revisar` antes de encolarse, así que esto no debería
         // encontrar nada — y por eso mismo va: que `entregar` sea segura no
         // puede depender de que quien la llame se haya acordado de validar
         // primero. Una dirección con un salto de línea es un comando SMTP

@@ -49,7 +49,7 @@ const MAX_ACCOUNT_ID_LEN: usize = 128;
 /// Sale de `dirs`, como la cola de salida y las preferencias: la regla del
 /// estándar —una `XDG_DATA_HOME` relativa o vacía se ignora— vive ahí y no en
 /// una copia más. `dirs` no filtra `HOME` por absoluta, así que esa mitad se
-/// mira acá, con el mismo criterio que `cola.rs`.
+/// mira acá, con el mismo criterio que `outbox.rs`.
 ///
 /// **Sin un lugar de repuesto.** La cola cae a `/tmp` cuando no hay base, porque
 /// perder un correo sin mandar es peor; una base cifrada en `/tmp` no gana nada

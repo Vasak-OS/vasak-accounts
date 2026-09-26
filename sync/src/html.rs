@@ -8,7 +8,7 @@
 //! es dibujar el documento de un desconocido adentro de la aplicación más
 //! expuesta del escritorio.
 //!
-//! Hasta ahora no se mostraba: `mensaje::sin_etiquetas` saca las etiquetas y
+//! Hasta ahora no se mostraba: `message::sin_etiquetas` saca las etiquetas y
 //! deja el texto. Eso se queda como la vista segura de siempre; esto es lo otro.
 //!
 //! # Dos cosas distintas, y las dos hacen falta

@@ -589,7 +589,7 @@ Todavía no manda adjuntos ni HTML, y no guarda copia en «Enviados».
 
 #### La inyección de cabeceras
 
-`redactar.rs` arma el mensaje, y ahí está el agujero clásico de cualquier cosa que
+`compose.rs` arma el mensaje, y ahí está el agujero clásico de cualquier cosa que
 arma correo: un mensaje son cabeceras, una línea vacía y el cuerpo, y **el asunto
 lo escribe la persona**. Un asunto con un salto de línea y `Bcc: alguien@ajeno.com`
 manda una copia oculta que quien escribió el mensaje no ve ni en su carpeta de
@@ -608,7 +608,7 @@ lo dice el servidor— sino que **no puedan salirse de su renglón**.
 
 #### El parser, que es la parte peligrosa
 
-`mensaje.rs` interpreta cabeceras y MIME. Lo que entra ahí **lo escribió un
+`message.rs` interpreta cabeceras y MIME. Lo que entra ahí **lo escribió un
 desconocido** —no un servidor con el que la persona decidió tener una cuenta:
 cualquiera que sepa su dirección—, así que es la superficie más expuesta de todo
 el escritorio. Por eso corre como el usuario y nunca como root, no tiene `unsafe`,

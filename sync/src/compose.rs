@@ -486,7 +486,7 @@ pub fn armar(borrador: &Borrador, identificador: &str, fecha: &str) -> Result<St
         cuerpo.push_str(&format!("--{frontera}\r\n"));
         // El nombre va en los dos lados: en el `Content-Type` para los clientes
         // viejos, y en el `Content-Disposition`, que es donde lo dice el
-        // estándar. Es lo mismo que `adjuntos.rs` busca al leer.
+        // estándar. Es lo mismo que `attachments.rs` busca al leer.
         cuerpo.push_str(&format!(
             "Content-Type: {tipo}; {}\r\n",
             nombre_de_archivo(&adjunto.nombre).replace("filename", "name")
@@ -567,7 +567,7 @@ pub fn frontera(partes: &[&str]) -> String {
 /// El nombre de archivo para el `Content-Disposition`.
 ///
 /// ASCII entre comillas cuando se puede; RFC 2231 cuando no, que es la forma
-/// que el estándar pide para lo que no es ASCII y la que `mensaje.rs` ya sabe
+/// que el estándar pide para lo que no es ASCII y la que `message.rs` ya sabe
 /// leer del otro lado.
 ///
 /// Las comillas y las barras del nombre se escapan, y los saltos de línea se
@@ -613,7 +613,7 @@ pub fn en_renglones(base64: &str) -> String {
 ///
 /// Se parte poniendo un espacio al principio de cada renglón que sigue, que es
 /// como el formato dice que continúa una cabecera. El que la lee vuelve a
-/// juntarlas — es lo mismo que hace `mensaje.rs` al leer.
+/// juntarlas — es lo mismo que hace `message.rs` al leer.
 /// `separador` es lo que va **pegado** al valor cuando no es el último: una coma
 /// para una lista de direcciones, y nada para una cadena de referencias, donde
 /// el espacio que ya pone el plegado alcanza. Pasar un espacio acá daría dos.
@@ -866,7 +866,7 @@ mod tests {
 
         // Y se vuelve a juntar como una sola cabecera: los renglones que siguen
         // empiezan con un espacio, que es lo que el que lee reconoce.
-        let cabeceras = crate::mensaje::Cabeceras::leer(&mensaje);
+        let cabeceras = crate::message::Cabeceras::leer(&mensaje);
         let to = cabeceras.valor("to").unwrap();
         assert_eq!(to.matches('@').count(), 60, "se perdió algún destinatario");
         assert!(to.contains("destinatario.numero59@ejemplo.com"), "{to}");
@@ -884,7 +884,7 @@ mod tests {
         for linea in mensaje.split("\r\n") {
             assert!(linea.len() <= 998, "línea de {} octetos", linea.len());
         }
-        let cabeceras = crate::mensaje::Cabeceras::leer(&mensaje);
+        let cabeceras = crate::message::Cabeceras::leer(&mensaje);
         assert_eq!(
             cabeceras.valor("references").unwrap().matches('<').count(),
             20
@@ -974,7 +974,7 @@ mod tests {
             // por un salto y un espacio.
             let desplegado = codificado.replace("\r\n ", " ");
             assert_eq!(
-                crate::mensaje::decodificar_palabras(&desplegado),
+                crate::message::decodificar_palabras(&desplegado),
                 original,
                 "no cerró el viaje de ida y vuelta"
             );
@@ -1030,7 +1030,7 @@ mod tests {
             "línea con un = en el medio",
         ] {
             let codificado = quoted_printable(original);
-            let vuelta = crate::mensaje::imprimible_de(codificado.as_bytes(), false);
+            let vuelta = crate::message::imprimible_de(codificado.as_bytes(), false);
             let vuelta = String::from_utf8_lossy(&vuelta).replace("\r\n", "\n");
             assert_eq!(vuelta, *original, "no cerró el viaje de ida y vuelta");
         }
@@ -1174,7 +1174,7 @@ mod tests {
         )
         .unwrap();
 
-        let leidos = crate::adjuntos::listar(armado.as_bytes());
+        let leidos = crate::attachments::listar(armado.as_bytes());
         assert_eq!(leidos.len(), 1);
         assert_eq!(leidos[0].nombre, "informe.pdf");
         assert_eq!(leidos[0].tipo, "application/pdf");
@@ -1182,7 +1182,7 @@ mod tests {
         assert_eq!(leidos[0].parte, "2");
 
         // Y el texto sigue siendo legible.
-        assert!(crate::mensaje::texto_de(armado.as_bytes()).contains("Va el archivo"));
+        assert!(crate::message::texto_de(armado.as_bytes()).contains("Va el archivo"));
     }
 
     /// Es la condición que hace que un `multipart` se pueda volver a partir. Si
@@ -1254,7 +1254,7 @@ mod tests {
 
         // Y del otro lado se vuelve a leer entero.
         assert_eq!(
-            crate::adjuntos::listar(armado.as_bytes())[0].nombre,
+            crate::attachments::listar(armado.as_bytes())[0].nombre,
             "árbol.pdf"
         );
     }
@@ -1282,7 +1282,7 @@ mod tests {
         }
 
         // Y el adjunto se sigue leyendo, con el nombre ya sin los saltos.
-        let leidos = crate::adjuntos::listar(armado.as_bytes());
+        let leidos = crate::attachments::listar(armado.as_bytes());
         assert_eq!(leidos.len(), 1);
         assert!(!leidos[0].nombre.contains('\n'));
     }
@@ -1317,7 +1317,7 @@ mod tests {
         });
         let armado = armar(&borrador, "<x@b.c>", "Thu, 10 Sep 2026 12:00:00 +0000").unwrap();
 
-        let leidos = crate::adjuntos::listar(armado.as_bytes());
+        let leidos = crate::attachments::listar(armado.as_bytes());
         assert_eq!(leidos.len(), 2);
         assert_eq!(leidos[0].parte, "2");
         assert_eq!(leidos[1].parte, "3");
