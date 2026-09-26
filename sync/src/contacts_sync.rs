@@ -288,8 +288,12 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
                 SyncOutcome::Failed(shown.into())
             }
             Err(SyncError::Dav(e)) => {
-                tracing::warn!("'{account_id}': no se pudieron sincronizar los contactos: {e}");
-                // El texto de `DavError` no lleva direcciones: se puede mostrar.
+                tracing::warn!(
+                    "'{account_id}': no se pudieron sincronizar los contactos: {}",
+                    e.log_text()
+                );
+                // El texto de `DavError` es fijo, sin direcciones ni nada del
+                // servidor: se puede mostrar. El detalle se quedó en el diario.
                 let shown = e.to_string();
                 self.set_status(account_id, AreaState::Failed, &shown).await;
                 SyncOutcome::Failed(shown)
@@ -362,7 +366,10 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
             {
                 Ok(()) => {}
                 Err(SyncError::Dav(e)) => {
-                    tracing::warn!("'{account_id}': una libreta no se pudo sincronizar: {e}");
+                    tracing::warn!(
+                        "'{account_id}': una libreta no se pudo sincronizar: {}",
+                        e.log_text()
+                    );
                     first_error.get_or_insert(e);
                 }
                 Err(store) => return Err(store),

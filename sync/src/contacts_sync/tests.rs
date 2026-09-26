@@ -849,6 +849,30 @@ async fn un_multiget_que_trae_tarjetas_no_pedidas_no_las_guarda() {
     );
 }
 
+/// **Un XML roto no lleva texto del servidor al estado.** El error de
+/// `roxmltree` repite el nombre de la etiqueta que no cierra, y ese nombre lo
+/// elige el servidor: sin el texto fijo, «Entrá-a-otro-sitio» —u ocho megas de
+/// lo que quiera— llegaba al `detail` de `GetStatus`, que lee cualquiera de la
+/// sesión y que Configuración muestra como el motivo.
+#[tokio::test]
+async fn un_xml_roto_no_lleva_texto_del_servidor_al_estado() {
+    let f = Fixture::new("contactos-xml-roto").await;
+    f.server.state().extra_books_xml = "<Entrá-a-otro-sitio></x>".into();
+
+    let outcome = f.sync().await;
+    let SyncOutcome::Failed(shown) = outcome else {
+        panic!("tenía que fallar: {outcome:?}");
+    };
+    assert!(!shown.contains("otro-sitio"), "{shown}");
+    let detail = f.contacts_status().await["detail"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(f.contacts_status().await["state"], "failed");
+    assert!(!detail.contains("otro-sitio"), "{detail}");
+    assert!(detail.len() < 300, "{detail}");
+}
+
 /// **Una respuesta anidada de más no tumba el sincronizador.** Diez mil
 /// niveles en el listado de libretas —el primer pedido de cada vuelta— son
 /// cien kilobytes; leídos sin tope, desbordan la pila y el proceso aborta, con

@@ -105,11 +105,22 @@ impl Limits {
     };
 }
 
+/// Hasta cuánto del detalle de un error se guarda para el diario.
+pub const MAX_ERROR_DETAIL_BYTES: usize = 200;
+
 /// Lo que puede salir mal hablando con un servidor DAV.
 ///
-/// El texto de cada uno **no lleva direcciones** ni nada del servidor: sale
-/// tal cual en el estado del almacén, que lo lee cualquiera de la sesión. El
-/// detalle va al diario.
+/// El texto de cada uno (`Display`) **es fijo**: sin direcciones y sin nada que
+/// haya escrito el servidor, ni siquiera de paso. Sale tal cual en el estado
+/// del almacén, que lo lee cualquiera de la sesión y que Configuración muestra
+/// como el motivo del error. El error de `roxmltree` lleva nombres de
+/// etiquetas y prefijos del documento —ocho megas cada uno, si el servidor
+/// quiere, o «tu cuenta fue suspendida, entrá a…»—, y el de la red puede
+/// llevar los nombres del certificado del otro lado.
+///
+/// El detalle va aparte, recortado a [`MAX_ERROR_DETAIL_BYTES`] y **sólo al
+/// diario** ([`DavError::log_text`]). Los que lo llevan se arman con
+/// [`DavError::bad_xml`] y [`DavError::network`], que recortan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DavError {
     /// La dirección de la cuenta no es `https`, o trae usuario y contraseña.
@@ -124,9 +135,11 @@ pub enum DavError {
     Status(u16),
     /// La respuesta pasó el tope.
     BodyTooLarge(usize),
-    /// No se pudo hablar con el servidor.
+    /// No se pudo hablar con el servidor. El detalle, recortado, es para el
+    /// diario.
     Network(String),
-    /// La respuesta no es un XML que se entienda.
+    /// La respuesta no es un XML que se entienda. El detalle, recortado, es
+    /// para el diario.
     BadXml(String),
     TooManyAddressBooks(usize),
     TooManyCards(usize),
@@ -156,10 +169,8 @@ impl std::fmt::Display for DavError {
                 f,
                 "el servidor mandó más de {cap} bytes, que es lo que se lee de una vez"
             ),
-            DavError::Network(detail) => write!(f, "no se pudo hablar con el servidor: {detail}"),
-            DavError::BadXml(detail) => {
-                write!(f, "el servidor contestó algo que no se entiende: {detail}")
-            }
+            DavError::Network(_) => f.write_str("no se pudo hablar con el servidor"),
+            DavError::BadXml(_) => f.write_str("el servidor contestó algo que no se entiende"),
             DavError::TooManyAddressBooks(cap) => {
                 write!(f, "la cuenta tiene más de {cap} libretas")
             }
@@ -169,6 +180,42 @@ impl std::fmt::Display for DavError {
 }
 
 impl std::error::Error for DavError {}
+
+/// Lo primero de un texto, hasta `cap` bytes y sin partir un carácter.
+fn clipped(text: &str, cap: usize) -> String {
+    if text.len() <= cap {
+        return text.to_string();
+    }
+    let mut cut = cap;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…", &text[..cut])
+}
+
+impl DavError {
+    /// Un XML que no se entiende, con el detalle recortado para el diario.
+    pub fn bad_xml(detail: impl std::fmt::Display) -> Self {
+        DavError::BadXml(clipped(&detail.to_string(), MAX_ERROR_DETAIL_BYTES))
+    }
+
+    /// No se pudo hablar con el servidor, con el detalle recortado para el
+    /// diario.
+    pub fn network(detail: impl std::fmt::Display) -> Self {
+        DavError::Network(clipped(&detail.to_string(), MAX_ERROR_DETAIL_BYTES))
+    }
+
+    /// Lo que va al diario: el texto fijo y, si hay, el detalle recortado. **No
+    /// va al estado**: el detalle puede venir del servidor.
+    pub fn log_text(&self) -> String {
+        match self {
+            DavError::Network(detail) | DavError::BadXml(detail) => {
+                format!("{self}: {}", clipped(detail, MAX_ERROR_DETAIL_BYTES))
+            }
+            _ => self.to_string(),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // La credencial
@@ -461,7 +508,7 @@ impl DavClient {
 
         let header = authorization_header(credential);
         let mut authorization = reqwest::header::HeaderValue::from_str(header.as_str())
-            .map_err(|_| DavError::Network("la credencial no se puede mandar en HTTP".into()))?;
+            .map_err(|_| DavError::network("la credencial no se puede mandar en HTTP"))?;
         // Para que ni `{:?}` ni el diario de `reqwest` la muestren.
         authorization.set_sensitive(true);
 
@@ -474,7 +521,7 @@ impl DavClient {
             .https_only(policy.https_only())
             .user_agent("VasakOS")
             .build()
-            .map_err(|e| DavError::Network(e.without_url().to_string()))?;
+            .map_err(|e| DavError::network(e.without_url()))?;
 
         Ok(Self {
             http,
@@ -522,7 +569,7 @@ impl DavClient {
             .body(body)
             .send()
             .await
-            .map_err(|e| DavError::Network(e.without_url().to_string()))?;
+            .map_err(|e| DavError::network(e.without_url()))?;
 
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
@@ -561,7 +608,7 @@ pub async fn body_with_cap(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|e| DavError::Network(e.without_url().to_string()))?
+        .map_err(|e| DavError::network(e.without_url()))?
     {
         if body.len() + chunk.len() > cap {
             return Err(DavError::BodyTooLarge(cap));
@@ -586,14 +633,13 @@ pub async fn body_with_cap(
 /// Es trabajo de CPU: quien lo llama desde el bucle de eventos lo hace con
 /// [`off_runtime`].
 pub fn parse_xml<'a>(xml: &'a str, limits: &Limits) -> Result<roxmltree::Document<'a>, DavError> {
-    check_shape(xml, limits).map_err(|reason| DavError::BadXml(reason.to_string()))?;
+    check_shape(xml, limits).map_err(DavError::bad_xml)?;
     let options = roxmltree::ParsingOptions {
         allow_dtd: false,
         nodes_limit: limits.max_xml_nodes,
         ..roxmltree::ParsingOptions::default()
     };
-    roxmltree::Document::parse_with_options(xml, options)
-        .map_err(|e| DavError::BadXml(e.to_string()))
+    roxmltree::Document::parse_with_options(xml, options).map_err(DavError::bad_xml)
 }
 
 /// Corre un trabajo de CPU —leer un XML, desarmar tarjetas— fuera de los
@@ -610,7 +656,7 @@ where
 {
     tokio::task::spawn_blocking(work)
         .await
-        .map_err(|_| DavError::BadXml("la lectura de la respuesta se cayó".into()))?
+        .map_err(|_| DavError::bad_xml("la lectura de la respuesta se cayó"))?
 }
 
 /// Cuánto trabajo de espacios de nombres se le deja hacer a `roxmltree` en un
@@ -871,7 +917,7 @@ fn all_text(node: roxmltree::Node<'_, '_>) -> String {
 pub fn parse_multistatus(document: &roxmltree::Document<'_>) -> Result<Multistatus, DavError> {
     let root = document.root_element();
     if !root.has_tag_name((NS_DAV, "multistatus")) {
-        return Err(DavError::BadXml("no es un multistatus".into()));
+        return Err(DavError::bad_xml("no es un multistatus"));
     }
 
     let mut multistatus = Multistatus {
@@ -1244,6 +1290,71 @@ mod tests {
     fn una_cuenta_sin_direccion_dice_que_se_reconecte() {
         let error = from(serde_json::json!({ "username": "ana" })).unwrap_err();
         assert!(error.contains("volvé a conectarla"), "{error}");
+    }
+
+    // ── Los errores ────────────────────────────────────────────────────────
+
+    /// Una variante de cada, con texto del servidor en las que llevan texto.
+    /// El `match` no tiene comodín: una variante nueva no compila sin pasar
+    /// por acá.
+    fn every_error(server_text: &str) -> Vec<DavError> {
+        let all = vec![
+            DavError::InsecureUrl,
+            DavError::ForeignOrigin,
+            DavError::Unauthorized,
+            DavError::Redirect(302),
+            DavError::Status(507),
+            DavError::BodyTooLarge(16 * 1024 * 1024),
+            DavError::network(server_text),
+            DavError::bad_xml(server_text),
+            DavError::TooManyAddressBooks(100),
+            DavError::TooManyCards(20_000),
+        ];
+        for error in &all {
+            match error {
+                DavError::InsecureUrl
+                | DavError::ForeignOrigin
+                | DavError::Unauthorized
+                | DavError::Redirect(_)
+                | DavError::Status(_)
+                | DavError::BodyTooLarge(_)
+                | DavError::Network(_)
+                | DavError::BadXml(_)
+                | DavError::TooManyAddressBooks(_)
+                | DavError::TooManyCards(_) => {}
+            }
+        }
+        all
+    }
+
+    /// **Ningún error lleva texto del servidor al estado.** El texto de cada
+    /// variante es corto y fijo, aunque adentro tenga un megabyte de lo que
+    /// mandó el servidor; el detalle va al diario, recortado a doscientos
+    /// bytes por un borde de carácter.
+    #[test]
+    fn ningun_error_lleva_texto_del_servidor_al_estado() {
+        let marker = "Entrá-a-otro-sitio";
+        let server_text = format!("expected '{}' tag", marker.repeat(60_000));
+        for error in every_error(&server_text) {
+            let shown = error.to_string();
+            assert!(shown.len() <= 300, "{error:?}: {} bytes", shown.len());
+            assert!(!shown.contains("Entr"), "{shown}");
+
+            let logged = error.log_text();
+            assert!(logged.starts_with(&shown), "{logged}");
+            assert!(logged.len() <= shown.len() + 2 + MAX_ERROR_DETAIL_BYTES + 3);
+            // Y el `{:?}`, que es lo que sale en un pánico, tampoco lo lleva
+            // entero.
+            assert!(format!("{error:?}").len() <= 300);
+        }
+        // Lo que se recorta cae en un borde de carácter aunque el tope caiga en
+        // la mitad de una «á».
+        let accents = "á".repeat(MAX_ERROR_DETAIL_BYTES);
+        let DavError::BadXml(detail) = DavError::bad_xml(&accents) else {
+            unreachable!()
+        };
+        assert!(detail.ends_with('…'));
+        assert!(detail.len() <= MAX_ERROR_DETAIL_BYTES + 3);
     }
 
     // ── El cliente ─────────────────────────────────────────────────────────
