@@ -344,7 +344,7 @@ pub fn label_from(params: &[String]) -> String {
         })
         .map(|p| p.trim().trim_matches('"').to_string())
         .find(|p| meaningful(p))
-        .map(|p| cut(&p.to_ascii_lowercase(), MAX_LABEL).to_string())
+        .map(|p| cut(&visible(&p.to_ascii_lowercase(), Lines::One), MAX_LABEL).to_string())
         .unwrap_or_default()
 }
 
@@ -486,8 +486,8 @@ pub fn contact_from(raw: &str, href: &str) -> Option<Contact> {
         };
 
         match property.name.as_str() {
-            "UID" => contact.uid = truncated(&display_value(&property)),
-            "FN" => contact.display_name = truncated(&display_value(&property)),
+            "UID" => contact.uid = shown(&display_value(&property)),
+            "FN" => contact.display_name = shown(&display_value(&property)),
             "N" => structured_name = split_fields(&decoded(&property)),
             "EMAIL" => {
                 // En la 4.0 la dirección viene como `mailto:ana@x`. Dejarlo
@@ -505,7 +505,7 @@ pub fn contact_from(raw: &str, href: &str) -> Option<Contact> {
                 // `ORG` trae la empresa y sus divisiones separadas por punto y
                 // coma. Se muestran juntas y no sólo la primera: «Vasak Group»
                 // y «Vasak Group, Soporte» son cosas distintas.
-                contact.organization = truncated(
+                contact.organization = shown(
                     &split_fields(&decoded(&property))
                         .into_iter()
                         .filter(|c| !c.trim().is_empty())
@@ -513,7 +513,7 @@ pub fn contact_from(raw: &str, href: &str) -> Option<Contact> {
                         .join(", "),
                 );
             }
-            "NOTE" => contact.notes = truncated(&display_value(&property)),
+            "NOTE" => contact.notes = shown_note(&display_value(&property)),
             "RELATED" => {
                 let value = display_value(&property).trim().to_string();
                 push_field(&mut contact.related, &property, value);
@@ -542,7 +542,8 @@ pub fn contact_from(raw: &str, href: &str) -> Option<Contact> {
     // dirían dos veces lo mismo, o peor, dos cosas distintas.
     if contact.related.is_empty() {
         for related in apple_related {
-            if related.value.is_empty() {
+            let value = shown(&related.value);
+            if value.trim().is_empty() {
                 continue;
             }
             let label = related
@@ -551,10 +552,7 @@ pub fn contact_from(raw: &str, href: &str) -> Option<Contact> {
                 .and_then(|g| apple_labels.iter().find(|(group, _)| group == g))
                 .map(|(_, label)| label.clone())
                 .unwrap_or(related.label);
-            contact.related.push(Field {
-                label,
-                value: truncated(&related.value),
-            });
+            contact.related.push(Field { label, value });
         }
     }
 
@@ -562,13 +560,13 @@ pub fn contact_from(raw: &str, href: &str) -> Option<Contact> {
     // Una tarjeta sin `FN` es inválida según el estándar y aparece igual, así
     // que armarlo es la diferencia entre ver a alguien y ver un renglón vacío.
     //
-    // Los dos con el tope de un valor: el `N` no pasa por `truncated`, y el
+    // Los dos con el tope de un valor: el `N` no pasa por `shown`, y el
     // nombre va a la columna, a la clave de orden con sus dos índices y al
     // índice de búsqueda.
     if contact.display_name.trim().is_empty() {
-        contact.display_name = truncated(&display_name_from(&structured_name));
+        contact.display_name = shown(&display_name_from(&structured_name));
     }
-    contact.sort_name = truncated(&sort_name_from(&structured_name, &contact.display_name));
+    contact.sort_name = shown(&sort_name_from(&structured_name, &contact.display_name));
 
     let has_something = !contact.display_name.trim().is_empty()
         || !contact.emails.is_empty()
@@ -586,7 +584,7 @@ fn apple_label(raw: &str) -> String {
         .strip_prefix("_$!<")
         .and_then(|rest| rest.strip_suffix(">!$_"))
         .unwrap_or(trimmed);
-    cut(&inner.to_lowercase(), MAX_LABEL).to_string()
+    cut(&visible(&inner.to_lowercase(), Lines::One), MAX_LABEL).to_string()
 }
 
 /// Saca el esquema de un valor, **sin mirar mayúsculas**.
@@ -605,24 +603,76 @@ fn strip_scheme<'a>(value: &'a str, scheme: &str) -> &'a str {
     value
 }
 
-/// Suma un dato, hasta [`MAX_FIELDS_PER_KIND`]. Los de más se descartan.
+/// Suma un dato, hasta [`MAX_FIELDS_PER_KIND`]. Los de más se descartan, y
+/// uno que sin sus caracteres de control queda vacío también.
 fn push_field(target: &mut Vec<Field>, property: &Property, value: String) {
-    if value.is_empty() || target.len() >= MAX_FIELDS_PER_KIND {
+    if target.len() >= MAX_FIELDS_PER_KIND {
+        return;
+    }
+    let value = shown(&value);
+    if value.trim().is_empty() {
         return;
     }
     target.push(Field {
         label: label_from(&property.params),
-        value: truncated(&value),
+        value,
     });
 }
 
-/// Un valor que no rompa la lista al dibujarla: hasta [`MAX_VALUE`], con
-/// «…» si se cortó.
-fn truncated(value: &str) -> String {
-    if value.len() <= MAX_VALUE {
-        return value.to_string();
+/// Si un valor puede tener varias líneas: sólo la nota.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lines {
+    One,
+    Many,
+}
+
+/// Un valor sin caracteres de control.
+///
+/// **No se ven, y cuestan**: ensucian la clave de orden, y en el JSON que
+/// contesta el almacén cada uno pesa seis bytes (`\u0001`). Un servidor que
+/// manda nombres hechos de `=01` en `quoted-printable` —XML válido— llenaba
+/// una página de controles hasta pasar su tope, y la lista no avanzaba.
+///
+/// En un valor de una línea, la tabulación y los saltos separan palabras:
+/// quedan como un espacio. En la nota, el salto de línea y la tabulación son
+/// parte del texto y se quedan (`\r\n` y un `\r` suelto pasan a `\n`). El
+/// resto de los controles —C0, DEL y C1— se van.
+fn visible(value: &str, lines: Lines) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (c, lines) {
+            ('\t' | '\n' | '\r', Lines::One) => out.push(' '),
+            ('\t' | '\n', Lines::Many) => out.push(c),
+            ('\r', Lines::Many) => {
+                if chars.peek() != Some(&'\n') {
+                    out.push('\n');
+                }
+            }
+            (c, _) if c.is_control() => {}
+            (c, _) => out.push(c),
+        }
     }
-    format!("{}…", cut(value, MAX_VALUE))
+    out
+}
+
+/// Un valor de una línea, listo para mostrar: sin caracteres de control
+/// ([`visible`]) y hasta [`MAX_VALUE`], con «…» si se cortó, así no rompe la
+/// lista al dibujarla.
+fn shown(value: &str) -> String {
+    capped(visible(value, Lines::One))
+}
+
+/// La nota, igual que [`shown`] pero con sus saltos de línea.
+fn shown_note(value: &str) -> String {
+    capped(visible(value, Lines::Many))
+}
+
+fn capped(value: String) -> String {
+    if value.len() <= MAX_VALUE {
+        return value;
+    }
+    format!("{}…", cut(&value, MAX_VALUE))
 }
 
 /// Lo primero de un texto, hasta `cap` bytes y sin partir un carácter.
@@ -1154,6 +1204,65 @@ mod tests {
     }
 
     // ── Lo que llega roto ──────────────────────────────────────────────────
+
+    /// Los caracteres de control no llegan a nada de lo que se muestra: ni al
+    /// nombre, ni a la clave de orden, ni a los correos, teléfonos,
+    /// relaciones, organización o etiquetas. Vienen sobre todo en
+    /// `quoted-printable` (`=01`), que es XML válido; en el JSON de la
+    /// respuesta cada uno pesaba seis bytes.
+    #[test]
+    fn los_caracteres_de_control_no_llegan_a_lo_que_se_muestra() {
+        let card = "BEGIN:VCARD\r\n\
+             FN;ENCODING=QUOTED-PRINTABLE:A=01n=7Fa=C2=85=0B\r\n\
+             N;ENCODING=QUOTED-PRINTABLE:P=01=E9rez;Ana;;;\r\n\
+             EMAIL;TYPE=ca\x01sa;ENCODING=QUOTED-PRINTABLE:ana=00@x.com\r\n\
+             EMAIL;ENCODING=QUOTED-PRINTABLE:=01=02=03\r\n\
+             TEL;ENCODING=QUOTED-PRINTABLE:+54=0911\r\n\
+             ORG;ENCODING=QUOTED-PRINTABLE:Vasak=1B[31m\r\n\
+             RELATED;ENCODING=QUOTED-PRINTABLE:Ju=01an\r\n\
+             END:VCARD";
+        let c = contact_from(card, "").unwrap();
+        let clean = |what: &str, value: &str| {
+            assert!(
+                !value.chars().any(char::is_control),
+                "{what} tiene controles: {value:?}"
+            );
+        };
+        assert_eq!(c.display_name, "Ana");
+        assert_eq!(c.sort_name, "Pérez, Ana");
+        assert_eq!(
+            c.emails.len(),
+            1,
+            "uno hecho sólo de controles no es un correo"
+        );
+        assert_eq!(c.emails[0].value, "ana@x.com");
+        assert_eq!(c.emails[0].label, "casa");
+        assert_eq!(c.phones[0].value, "+54 11", "la tabulación separa palabras");
+        assert_eq!(c.organization, "Vasak[31m");
+        assert_eq!(c.related[0].value, "Juan");
+        for (what, value) in [
+            ("el nombre", c.display_name.as_str()),
+            ("el nombre para ordenar", c.sort_name.as_str()),
+            ("la clave de orden", sort_key(&c.sort_name).as_str()),
+            ("la organización", c.organization.as_str()),
+        ] {
+            clean(what, value);
+        }
+    }
+
+    /// En la nota los saltos de línea son parte del texto y se quedan; lo
+    /// demás que no se ve, no.
+    #[test]
+    fn la_nota_conserva_sus_renglones_y_nada_mas() {
+        let card = "BEGIN:VCARD\r\nFN:Ana\r\n\
+             NOTE;ENCODING=QUOTED-PRINTABLE:uno=0D=0Ados=0Dtres=09cuatro=01=07\r\n\
+             END:VCARD";
+        let c = contact_from(card, "").unwrap();
+        assert_eq!(c.notes, "uno\ndos\ntres\tcuatro");
+        // Y el salto escapado de la 3.0, también.
+        let escaped = contact_from("BEGIN:VCARD\r\nFN:Ana\r\nNOTE:a\\nb\r\nEND:VCARD", "").unwrap();
+        assert_eq!(escaped.notes, "a\nb");
+    }
 
     /// Una tarjeta sin nada que mostrar ocupa lugar en la lista y no sirve para
     /// nada.

@@ -2337,7 +2337,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vasak-accounts"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "chrono",
  "dirs",
@@ -2352,12 +2352,21 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "vasak-accounts-common",
+ "zbus",
+]
+
+[[package]]
+name = "vasak-accounts-common"
+version = "0.16.0"
+dependencies = [
+ "tokio",
  "zbus",
 ]
 
 [[package]]
 name = "vasak-accounts-sync"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "ammonia",
  "base64 0.23.1",
@@ -2380,6 +2389,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "vasak-accounts-common",
  "zbus",
  "zeroize",
 ]

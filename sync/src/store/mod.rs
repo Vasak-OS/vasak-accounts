@@ -17,8 +17,8 @@
 //! **No** protege contra un proceso que corre como la misma persona. La clave
 //! vive en el llavero de la sesión, y el llavero es un Secret Service estándar:
 //! cualquier proceso de la persona puede pedirle todos los secretos. El permiso
-//! por D-Bus que llegue para leer el almacén será consentimiento y visibilidad,
-//! no una frontera. La frontera de verdad —control por ítem en el llavero— es
+//! por D-Bus para leer el almacén (`store.contacts`, ver `access.rs`) es
+//! consentimiento y visibilidad, no una frontera. La frontera de verdad —control por ítem en el llavero— es
 //! otro trabajo, y hasta que exista hay que decirlo así.
 //!
 //! ── Por qué SQLCipher compilado, y OpenSSL del sistema ──────────────────────
@@ -35,15 +35,21 @@
 //! tiene que pasar como la persona— y con un solo escritor no hay carreras.
 
 pub mod contacts;
+pub mod contacts_read;
 pub mod key;
 pub mod lifecycle;
 pub mod migrations;
 pub mod paths;
+pub mod readers;
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use key::{KeyError, StoreKey};
 use paths::StorePaths;
+use readers::ReadPool;
 
 /// Lo que puede salir mal con una base.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +77,10 @@ pub enum StoreError {
     Settings(String),
     /// La cuenta no tiene almacén: no existe, o no tiene nada que guardar.
     UnknownAccount(String),
+    /// La colección del llavero no es en la que se guardó la clave de esta
+    /// base: el alias `default` cambió, o el llavero es otro. La base no se
+    /// rehace.
+    CollectionChanged,
 }
 
 impl std::fmt::Display for StoreError {
@@ -92,6 +102,40 @@ impl std::fmt::Display for StoreError {
             StoreError::Key(e) => write!(f, "{e}"),
             StoreError::Settings(d) => write!(f, "stores.json: {d}"),
             StoreError::UnknownAccount(id) => write!(f, "la cuenta «{id}» no tiene almacén"),
+            StoreError::CollectionChanged => f.write_str(COLLECTION_CHANGED),
+        }
+    }
+}
+
+const COLLECTION_CHANGED: &str = "la colección del llavero no es en la que se guardó la clave \
+                                  de esta base; no se rehace hasta que vuelva, o hasta vaciarla";
+
+impl StoreError {
+    /// Lo que se puede mostrar en el estado: **un texto fijo por clase de
+    /// error**, sin rutas bajo `$HOME`, sin identificadores y sin nada que haya
+    /// escrito el llavero o un servidor. El detalle entero va sólo al diario.
+    pub fn public_detail(&self) -> &'static str {
+        match self {
+            StoreError::NoBaseDir => "no hay un directorio de datos para el almacén",
+            StoreError::InvalidAccountId(_) => "el identificador de la cuenta no es válido",
+            StoreError::WrongKey => "la clave no abre la base",
+            StoreError::NotEncrypted => "esta compilación no cifra la base; no se usa sin cifrar",
+            StoreError::Missing => "no hay base",
+            StoreError::Schema(_) => "el esquema de la base no se pudo poner al día",
+            StoreError::Io(_) => "no se pudo usar el disco",
+            StoreError::Sqlite(_) => "la base dio un error",
+            StoreError::Key(KeyError::Unavailable(_)) => "el llavero no está disponible",
+            StoreError::Key(KeyError::Locked) => "el llavero está bloqueado",
+            StoreError::Key(KeyError::PromptRequired) => {
+                "el llavero pidió un diálogo, y este servicio no los abre"
+            }
+            StoreError::Key(KeyError::Malformed) => {
+                "lo guardado en el llavero no es una clave válida"
+            }
+            StoreError::Key(KeyError::Failed(_)) => "el llavero no pudo hacer lo que se le pidió",
+            StoreError::Settings(_) => "no se pudo leer lo decidido por cuenta (stores.json)",
+            StoreError::UnknownAccount(_) => "la cuenta no tiene almacén",
+            StoreError::CollectionChanged => COLLECTION_CHANGED,
         }
     }
 }
@@ -187,10 +231,69 @@ impl LogLevel {
 
 /// Una base abierta.
 ///
-/// Dueña de su conexión, y sin la clave: SQLCipher ya la tiene, y guardarla acá
-/// también sería tenerla dos veces en memoria sin ganar nada.
+/// Dueña de su conexión de escritura y de las de lectura ([`ReadPool`]), y sin
+/// la clave: SQLCipher ya la tiene, y guardarla acá también sería tenerla dos
+/// veces en memoria sin ganar nada. Por eso las de lectura se abren junto con
+/// la de escritura, mientras la clave todavía está a mano.
+///
+/// Soltarla cierra las tres: la de escritura al soltarse, y las de lectura con
+/// [`ReadPool::close`], aunque alguien tenga todavía el grupo prestado.
 pub struct Store {
     connection: Connection,
+    readers: Arc<ReadPool>,
+    /// Lo que cambió desde la última vez que se preguntó: la última generación
+    /// de cada área que se escribió y se confirmó. Ver [`Store::take_changes`].
+    changes: BTreeMap<&'static str, u64>,
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        self.readers.close();
+    }
+}
+
+/// La clave de `store_meta` donde vive la generación de un área.
+fn generation_key(area: &str) -> String {
+    format!("generation.{area}")
+}
+
+/// La generación de un área: cuántas veces cambió lo que se guarda de ella, en
+/// un número que sólo crece.
+///
+/// **Persistida en `store_meta`**, y en la misma transacción que el cambio: una
+/// lectura que ve la generación N ve los datos de la N, y reiniciar el servicio
+/// no la vuelve a cero. Cada cambio la lleva a `max(anterior + 1, ahora en
+/// microsegundos)`: dentro de una base crece de a uno como mínimo, y una base
+/// rehecha —vaciada, o con la clave perdida— empieza más arriba que la que
+/// reemplazó, salvo que el reloj haya vuelto atrás.
+pub fn read_generation(connection: &Connection, area: &str) -> Result<u64, StoreError> {
+    let value: Option<String> = connection
+        .query_row(
+            "SELECT value FROM store_meta WHERE key = ?1",
+            [generation_key(area)],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(classify)?;
+    Ok(value.and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+/// Sube la generación de un área, dentro de la transacción del cambio.
+/// Devuelve la nueva.
+fn bump_generation(connection: &Connection, area: &str) -> Result<u64, StoreError> {
+    let previous = read_generation(connection, area)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX));
+    let next = previous.saturating_add(1).max(now);
+    connection
+        .execute(
+            "INSERT INTO store_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![generation_key(area), next.to_string()],
+        )
+        .map_err(classify)?;
+    Ok(next)
 }
 
 impl Store {
@@ -264,7 +367,40 @@ impl Store {
         // Otra vez: el `-wal` y el `-shm` recién aparecen al escribir.
         paths.tighten_files()?;
 
-        Ok(Self { connection })
+        let readers = Arc::new(ReadPool::open(&paths.db_to_open()?, key)?);
+
+        Ok(Self {
+            connection,
+            readers,
+            changes: BTreeMap::new(),
+        })
+    }
+
+    /// Las conexiones de lectura de esta base.
+    pub fn readers(&self) -> Arc<ReadPool> {
+        Arc::clone(&self.readers)
+    }
+
+    /// Anota que un área cambió y quedó en `generation`. Se llama **después**
+    /// del `commit`: una transacción que se deshizo no cambió nada.
+    fn note_change(&mut self, area: &'static str, generation: u64) {
+        self.changes.insert(area, generation);
+    }
+
+    /// Lo que cambió desde la última vez, un área por vez con su última
+    /// generación, y se olvida. Es lo que `with_store` anuncia con `Changed`
+    /// después de cada lote: una vez por área que cambió, y nada si no cambió
+    /// ninguna.
+    pub fn take_changes(&mut self) -> Vec<(&'static str, u64)> {
+        std::mem::take(&mut self.changes).into_iter().collect()
+    }
+
+    /// Marca un área como cambiada aunque no se haya escrito nada en ella: la
+    /// base se vació, y lo que alguien tenía leído ya no está.
+    pub fn touch(&mut self, area: &'static str) -> Result<u64, StoreError> {
+        let generation = bump_generation(&self.connection, area)?;
+        self.note_change(area, generation);
+        Ok(generation)
     }
 
     /// Anota algo en la bitácora de la base.

@@ -30,10 +30,11 @@
 //! correo y vive en `mensaje.rs`, con su propia discusión escrita arriba.
 //!
 //! Prepara además una base **cifrada** por cuenta —el almacén local de
-//! `store/`, con su estado en `ar.net.vasak.os.AccountsStore`— y guarda ahí los
-//! **contactos** de las cuentas que los piden (`contacts_sync.rs`). El correo
-//! todavía no pasa por ahí: lo que dicen los dos párrafos que siguen sigue
-//! siendo cierto hasta que pase.
+//! `store/`, publicado en `ar.net.vasak.os.AccountsStore`— y guarda ahí los
+//! **contactos** de las cuentas que los piden (`contacts_sync.rs`), que las
+//! aplicaciones leen por esa interfaz con el permiso `store.contacts`
+//! (`access.rs`). El correo todavía no pasa por ahí: lo que dicen los dos
+//! párrafos que siguen sigue siendo cierto hasta que pase.
 //!
 //! **La lista vive en memoria, no en un archivo.** Un caché en disco guardaría el
 //! remitente y el asunto de todo el correo de la persona en texto plano, para
@@ -56,6 +57,7 @@
 //! (`cola.rs`) que sobrevive a que se apague el equipo, y un despachador lo
 //! manda por SMTP (`smtp.rs`) en cuanto el servidor lo acepta.
 
+mod access;
 mod adjuntos;
 mod avisos;
 mod broker;
@@ -1768,7 +1770,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (wake, mut wakeup) = tokio::sync::mpsc::channel::<()>(1);
     tokio::spawn(async move {
         loop {
-            match escuchar_al_servicio(&wake).await {
+            match watch_account_service(&wake).await {
                 Ok(()) => tracing::warn!("se cortó la escucha del servicio de cuentas"),
                 Err(e) => tracing::warn!("no se pudo escuchar al servicio de cuentas: {e}"),
             }
@@ -1828,32 +1830,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Escucha `AccountsChanged` del servicio de cuentas y avisa al bucle.
-async fn escuchar_al_servicio(despertar: &tokio::sync::mpsc::Sender<()>) -> zbus::Result<()> {
+///
+/// **Sólo del servicio de cuentas.** Cualquier proceso puede mandar una señal
+/// con esa interfaz y ese nombre al bus del sistema, y cada una hace que el
+/// bucle le vuelva a pedir las cuentas al servicio y que el almacén pase su
+/// tabla. Así que la regla le pide al bus sólo las del dueño de
+/// `ar.net.vasak.os.AccountManager`, y cada señal se compara además con ese
+/// dueño: zbus no puede comparar un nombre conocido con el remitente, que
+/// siempre es un nombre único. Si no coincide con el que se sabía, se vuelve a
+/// preguntar —el servicio pudo haberse reiniciado con otro nombre único—.
+async fn watch_account_service(wake: &tokio::sync::mpsc::Sender<()>) -> zbus::Result<()> {
     use futures_util::StreamExt;
 
-    let conexion = zbus::Connection::system().await?;
-    let mut señales = zbus::MessageStream::for_match_rule(
+    let connection = zbus::Connection::system().await?;
+    let mut signals = zbus::MessageStream::for_match_rule(
         zbus::MatchRule::builder()
             .msg_type(zbus::message::Type::Signal)
-            .interface("ar.net.vasak.os.AccountManager")?
+            .sender(broker::SERVICE)?
+            .path(broker::PATH)?
+            .interface(broker::INTERFACE)?
             .member("AccountsChanged")?
             .build(),
-        &conexion,
+        &connection,
         None,
     )
     .await?;
+    let bus = zbus::fdo::DBusProxy::new(&connection).await?;
+    let service = zbus::names::BusName::try_from(broker::SERVICE)?;
+    let mut owner: Option<zbus::names::OwnedUniqueName> = None;
 
-    while let Some(Ok(_)) = señales.next().await {
+    while let Some(Ok(message)) = signals.next().await {
+        let header = message.header();
+        if !sent_by(header.sender(), owner.as_deref()) {
+            owner = bus.get_name_owner(service.clone()).await.ok();
+            if !sent_by(header.sender(), owner.as_deref()) {
+                tracing::debug!(
+                    "se descartó un AccountsChanged que no mandó el servicio de cuentas"
+                );
+                continue;
+            }
+        }
         // Sin esperar si el bucle está ocupado: una vuelta ya en curso va a ver
         // el cambio igual, y encolar varias no aporta nada.
-        let _ = despertar.try_send(());
+        let _ = wake.try_send(());
     }
     Ok(())
+}
+
+/// Si el remitente de un mensaje es el dueño que se conoce. Sin dueño conocido,
+/// o sin remitente, no.
+fn sent_by(
+    sender: Option<&zbus::names::UniqueName<'_>>,
+    owner: Option<&zbus::names::UniqueName<'_>>,
+) -> bool {
+    matches!((sender, owner), (Some(sender), Some(owner)) if sender == owner)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `AccountsChanged` cuenta sólo si lo mandó el dueño del nombre del
+    /// servicio de cuentas: otro nombre único, o no saber quién es el dueño,
+    /// no despiertan al bucle.
+    #[test]
+    fn el_aviso_de_cuentas_cuenta_solo_si_lo_manda_el_servicio() {
+        let service = zbus::names::UniqueName::try_from(":1.10").unwrap();
+        let other = zbus::names::UniqueName::try_from(":1.99").unwrap();
+        assert!(sent_by(Some(&service), Some(&service)));
+        assert!(!sent_by(Some(&other), Some(&service)));
+        assert!(!sent_by(Some(&service), None));
+        assert!(!sent_by(None, Some(&service)));
+    }
 
     /// Después de arrancar, el proceso no es volcable. (Deja así al proceso de
     /// las pruebas, que no pierde nada: sólo sus propios volcados.)

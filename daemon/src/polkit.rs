@@ -35,43 +35,37 @@ pub async fn authorize_removal(
     connection: &zbus::Connection,
     caller: &crate::auth::PinnedCaller,
 ) -> Result<(), FdoError> {
-    let start_time = crate::permissions::process_start_time(caller.pid)?;
+    let start_time = vasak_accounts_common::process::process_start_time(caller.pid)?;
 
-    let mut sujeto: HashMap<&str, Value<'_>> = HashMap::new();
-    sujeto.insert("pid", Value::U32(caller.pid));
-    sujeto.insert("start-time", Value::U64(start_time));
+    let mut subject_details: HashMap<&str, Value<'_>> = HashMap::new();
+    subject_details.insert("pid", Value::U32(caller.pid));
+    subject_details.insert("start-time", Value::U64(start_time));
 
-    let subject = ("unix-process", sujeto);
-    let detalles: HashMap<&str, &str> = HashMap::new();
+    let subject = ("unix-process", subject_details);
+    let details: HashMap<&str, &str> = HashMap::new();
     // 1 = permitir el diálogo interactivo. Sin esto polkit contesta «no
     // autorizado» para cualquier cosa que pida contraseña, y la pantalla
     // fallaría sin darle a la persona forma de seguir.
-    let banderas: u32 = 1;
-    let id_de_cancelacion = "";
+    let flags: u32 = 1;
+    let cancellation_id = "";
 
-    let respuesta = connection
+    let reply = connection
         .call_method(
             Some("org.freedesktop.PolicyKit1"),
             "/org/freedesktop/PolicyKit1/Authority",
             Some("org.freedesktop.PolicyKit1.Authority"),
             "CheckAuthorization",
-            &(
-                subject,
-                REMOVE_ACTION,
-                detalles,
-                banderas,
-                id_de_cancelacion,
-            ),
+            &(subject, REMOVE_ACTION, details, flags, cancellation_id),
         )
         .await
         .map_err(|e| FdoError::Failed(format!("no se pudo consultar a polkit: {e}")))?;
 
-    let (autorizado, _desafio, _detalles): (bool, bool, HashMap<String, String>) = respuesta
+    let (authorized, _challenge, _details): (bool, bool, HashMap<String, String>) = reply
         .body()
         .deserialize()
         .map_err(|e| FdoError::Failed(format!("respuesta inválida de polkit: {e}")))?;
 
-    if autorizado {
+    if authorized {
         return Ok(());
     }
 
@@ -95,10 +89,10 @@ mod tests {
     /// llegó a aparecer. Falla del lado seguro, pero falla, y sin ninguna pista.
     #[test]
     fn la_accion_es_la_misma_que_declara_el_archivo_de_polkit() {
-        let politica = include_str!("../packaging/ar.net.vasak.os.accounts.policy");
+        let policy = include_str!("../packaging/ar.net.vasak.os.accounts.policy");
 
         assert!(
-            politica.contains(&format!(r#"<action id="{REMOVE_ACTION}">"#)),
+            policy.contains(&format!(r#"<action id="{REMOVE_ACTION}">"#)),
             "el archivo no declara «{REMOVE_ACTION}»"
         );
     }
@@ -110,15 +104,15 @@ mod tests {
     /// todo el trabajo hecho y ninguna protección puesta.
     #[test]
     fn la_accion_pide_autenticarse() {
-        let politica = include_str!("../packaging/ar.net.vasak.os.accounts.policy");
+        let policy = include_str!("../packaging/ar.net.vasak.os.accounts.policy");
 
         assert!(
-            politica.contains("<allow_active>auth_self_keep</allow_active>"),
+            policy.contains("<allow_active>auth_self_keep</allow_active>"),
             "la acción tendría que pedir autenticación de la propia persona"
         );
         // Y que no se conceda sin sesión activa ni a cualquiera.
-        assert!(politica.contains("<allow_any>no</allow_any>"));
-        assert!(politica.contains("<allow_inactive>no</allow_inactive>"));
+        assert!(policy.contains("<allow_any>no</allow_any>"));
+        assert!(policy.contains("<allow_inactive>no</allow_inactive>"));
     }
 
     /// El archivo tiene que ser XML que polkit pueda leer. Uno mal formado se
@@ -126,14 +120,14 @@ mod tests {
     /// existe y todo borrado se deniega.
     #[test]
     fn el_archivo_de_polkit_esta_bien_formado() {
-        let politica = include_str!("../packaging/ar.net.vasak.os.accounts.policy");
+        let policy = include_str!("../packaging/ar.net.vasak.os.accounts.policy");
 
-        assert!(politica.starts_with("<?xml"), "falta la declaración XML");
+        assert!(policy.starts_with("<?xml"), "falta la declaración XML");
         assert_eq!(
-            politica.matches("<action").count(),
-            politica.matches("</action>").count(),
+            policy.matches("<action").count(),
+            policy.matches("</action>").count(),
             "las etiquetas de acción no cierran"
         );
-        assert!(politica.trim_end().ends_with("</policyconfig>"));
+        assert!(policy.trim_end().ends_with("</policyconfig>"));
     }
 }
