@@ -18,10 +18,12 @@
 //!   llega y no después de leerla entera.
 //! - **El XML sin DTD**: `roxmltree` la rechaza por omisión, que es lo que
 //!   cierra las entidades externas y las expansiones en cadena. Y con tope de
-//!   nodos, de profundidad y de espacios de nombres, mirados antes de armarlo
-//!   ([`check_shape`]): `roxmltree` baja de forma recursiva —un anidado de
-//!   más aborta el proceso— y tarda como el cubo con miles de espacios de
-//!   nombres. Se lee fuera del bucle de eventos ([`off_runtime`]).
+//!   nodos, de profundidad, de espacios de nombres y de atributos por
+//!   elemento, mirados antes de armarlo ([`check_shape`]): `roxmltree` baja
+//!   de forma recursiva —un anidado de más aborta el proceso—, tarda como el
+//!   cubo con miles de espacios de nombres y como el cuadrado con miles de
+//!   atributos en un elemento. Se lee fuera del bucle de eventos
+//!   ([`off_runtime`]).
 //! - **Cada dirección que manda el servidor se resuelve contra la colección y
 //!   se rechaza si es de otro origen** —esquema, máquina y puerto— antes de
 //!   pedirla o guardarla ([`resolve_href`]). La credencial viaja sólo al origen
@@ -77,6 +79,14 @@ pub struct Limits {
     /// (los que están a la vista siguen siendo pocos). Lo que cuesta es cuántos
     /// hay a la vista a la vez, y eso no pasa de los distintos.
     pub max_xml_namespaces: usize,
+    /// Atributos de un mismo elemento, con sus declaraciones `xmlns`. Un
+    /// elemento DAV de verdad lleva de cero a tres, más sus `xmlns`: menos de
+    /// diez. `roxmltree` busca el repetido comparando cada atributo con todos
+    /// los anteriores del elemento, así que tarda como el cuadrado: sesenta
+    /// mil atributos vacíos —menos de seiscientos kilobytes— son siete
+    /// segundos en release, y con el tope del cuerpo, horas en un hilo que no
+    /// se puede cancelar.
+    pub max_xml_attributes: usize,
     /// Libretas por cuenta.
     pub max_address_books: usize,
     /// Tarjetas por libreta.
@@ -107,6 +117,7 @@ impl Limits {
         max_xml_nodes: 1_000_000,
         max_xml_depth: 64,
         max_xml_namespaces: 32,
+        max_xml_attributes: 64,
         max_address_books: 100,
         max_cards_per_book: 20_000,
         max_vcard_bytes: 512 * 1024,
@@ -631,8 +642,8 @@ pub async fn body_with_cap(
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
-/// Lee un documento, **sin DTD**, con tope de nodos, de profundidad y de
-/// espacios de nombres.
+/// Lee un documento, **sin DTD**, con tope de nodos, de profundidad, de
+/// espacios de nombres y de atributos por elemento.
 ///
 /// Un XML que no se entiende es un error y no una lista vacía: una respuesta
 /// cortada a la mitad —una conexión que se interrumpió, un servidor que
@@ -640,8 +651,9 @@ pub async fn body_with_cap(
 /// tiene nada».
 ///
 /// Antes de `roxmltree` pasa [`check_shape`], una lectura lineal que mira la
-/// profundidad y los espacios de nombres: son los dos topes que `roxmltree` no
-/// tiene y que un documento chico puede usar para tumbar o trabar el programa.
+/// profundidad, los espacios de nombres y los atributos de cada elemento: son
+/// los topes que `roxmltree` no tiene y que un documento chico puede usar para
+/// tumbar o trabar el programa.
 /// Es trabajo de CPU: quien lo llama desde el bucle de eventos lo hace con
 /// [`off_runtime`].
 pub fn parse_xml<'a>(xml: &'a str, limits: &Limits) -> Result<roxmltree::Document<'a>, DavError> {
@@ -682,6 +694,10 @@ where
 /// alcanza para un millón de elementos, que es el tope de nodos.
 const NAMESPACE_WORK_BUDGET: usize = 16_000_000;
 
+/// Lo que dice [`check_shape`] de un elemento con más atributos que
+/// [`Limits::max_xml_attributes`].
+const TOO_MANY_ATTRIBUTES: &str = "un elemento con demasiados atributos";
+
 /// Busca `needle` desde `from`, y devuelve dónde **termina**.
 fn end_of(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
     bytes
@@ -692,7 +708,8 @@ fn end_of(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
 }
 
 /// Mira la forma de un documento sin armarlo: cuántos niveles de anidado
-/// tiene y cuántos espacios de nombres distintos declara.
+/// tiene, cuántos espacios de nombres distintos declara y cuántos atributos
+/// lleva cada elemento.
 ///
 /// Una sola pasada por los bytes, sin recursión y sin guardar nada que crezca
 /// con el documento: la memoria es la de los espacios de nombres que ya se
@@ -702,9 +719,14 @@ fn end_of(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
 /// sola (`/>`), que no abre un nivel. Una DTD se rechaza acá mismo, que es lo
 /// que igual haría `roxmltree`.
 ///
+/// Los atributos se cuentan por su `=` fuera de comillas —todo atributo
+/// tiene uno, y un nombre de elemento no puede llevarlo—, así que cuentan
+/// también los que vienen pegados sin espacio (`a="1"b="2"`), y las
+/// declaraciones `xmlns` cuentan como uno más.
+///
 /// No valida el XML: eso lo hace `roxmltree` después. Lo que no entiende lo
 /// rechaza, y un documento bien formado nunca cae acá por algo que no sea uno
-/// de los dos topes.
+/// de los topes.
 pub fn check_shape(xml: &str, limits: &Limits) -> Result<(), &'static str> {
     let bytes = xml.as_bytes();
     let mut depth = 0usize;
@@ -742,6 +764,7 @@ pub fn check_shape(xml: &str, limits: &Limits) -> Result<(), &'static str> {
         let mut after_space = false;
         let mut last = 0u8;
         let mut declares = false;
+        let mut attributes = 0usize;
         loop {
             let &c = bytes.get(i).ok_or("una etiqueta sin cerrar")?;
             if let Some(q) = quote {
@@ -759,8 +782,18 @@ pub fn check_shape(xml: &str, limits: &Limits) -> Result<(), &'static str> {
                     i += 1;
                     continue;
                 }
+                b'=' => {
+                    attributes += 1;
+                    if attributes > limits.max_xml_attributes {
+                        return Err(TOO_MANY_ATTRIBUTES);
+                    }
+                }
                 _ if after_space => {
                     if let Some((declared, end)) = namespace_at(bytes, i)? {
+                        attributes += 1;
+                        if attributes > limits.max_xml_attributes {
+                            return Err(TOO_MANY_ATTRIBUTES);
+                        }
                         declares = true;
                         if !namespaces.contains(&declared) {
                             namespaces.push(declared);
@@ -1653,6 +1686,115 @@ mod tests {
             parse_multistatus(&document).unwrap().responses.len()
         });
         assert_eq!(count, 20_000);
+    }
+
+    /// Un `multistatus` con `declarations` espacios de nombres propios —además
+    /// de `d`— y `plain` atributos vacíos, pegados o con espacio.
+    fn with_attributes(declarations: usize, plain: usize, separator: &str) -> String {
+        let declared: String = (0..declarations)
+            .map(|i| format!(r#" xmlns:p{i}="u{i}""#))
+            .collect();
+        let attributes: String = (0..plain)
+            .map(|i| format!(r#"{separator}a{i}="""#))
+            .collect();
+        format!(r#"<d:multistatus xmlns:d="DAV:"{declared}{attributes}/>"#)
+    }
+
+    /// **Miles de atributos en un elemento no traban el programa.**
+    /// `roxmltree` busca el atributo repetido comparando cada uno con todos
+    /// los anteriores del elemento: sesenta mil atributos vacíos en el
+    /// `multistatus` son menos de seiscientos kilobytes y siete segundos en
+    /// release —mucho más en depuración—, y con el tope del cuerpo, horas de
+    /// CPU en un hilo que no se cancela. Tiene que rechazarse enseguida.
+    #[test]
+    fn un_elemento_con_miles_de_atributos_se_rechaza_enseguida() {
+        let xml = with_attributes(0, 60_000, " ");
+        assert!(xml.len() < 600 * 1024);
+
+        let result = finishes_within(std::time::Duration::from_secs(5), move || {
+            parse_xml(&xml, &Limits::DEFAULT).map(|_| ())
+        });
+        assert!(matches!(result, Err(DavError::BadXml(_))), "{result:?}");
+    }
+
+    /// El tope es justo, por elemento, y cuenta las declaraciones `xmlns` y
+    /// los atributos pegados sin espacio.
+    #[test]
+    fn el_tope_de_atributos_es_justo_y_cuenta_los_xmlns_y_los_pegados() {
+        let limit = Limits::DEFAULT.max_xml_attributes;
+        assert_eq!(limit, 64);
+
+        // `xmlns:d` más 63 atributos: 64 pasan, 65 no.
+        let fine = with_attributes(0, limit - 1, " ");
+        assert_eq!(check_shape(&fine, &Limits::DEFAULT), Ok(()));
+        assert!(parse_xml(&fine, &Limits::DEFAULT).is_ok());
+        let over = with_attributes(0, limit, " ");
+        assert_eq!(
+            check_shape(&over, &Limits::DEFAULT),
+            Err(TOO_MANY_ATTRIBUTES)
+        );
+        assert!(matches!(
+            parse_xml(&over, &Limits::DEFAULT),
+            Err(DavError::BadXml(_))
+        ));
+
+        // Las declaraciones cuentan: 1 + 30 `xmlns` + 33 atributos son 64.
+        let declared = with_attributes(30, limit - 31, " ");
+        assert_eq!(check_shape(&declared, &Limits::DEFAULT), Ok(()));
+        assert!(parse_xml(&declared, &Limits::DEFAULT).is_ok());
+        let declared_over = with_attributes(30, limit - 30, " ");
+        assert_eq!(
+            check_shape(&declared_over, &Limits::DEFAULT),
+            Err(TOO_MANY_ATTRIBUTES)
+        );
+
+        // Y los pegados sin espacio también, `xmlns` incluido.
+        let glued = with_attributes(0, limit - 1, "");
+        assert_eq!(check_shape(&glued, &Limits::DEFAULT), Ok(()));
+        let glued_over = with_attributes(0, limit, "");
+        assert_eq!(
+            check_shape(&glued_over, &Limits::DEFAULT),
+            Err(TOO_MANY_ATTRIBUTES)
+        );
+        let glued_xmlns = format!(
+            r#"<d:multistatus{}/>"#,
+            (0..=limit)
+                .map(|i| format!(r#"a{i}="1"xmlns:p{i}="u""#))
+                .collect::<String>()
+        );
+        assert_eq!(
+            check_shape(&glued_xmlns, &Limits::DEFAULT),
+            Err(TOO_MANY_ATTRIBUTES)
+        );
+
+        // El tope es de cada elemento, no del documento.
+        let one = (0..limit - 1)
+            .map(|i| format!(r#" a{i}="""#))
+            .collect::<String>();
+        let siblings = format!(r#"<d:x{one}/>"#).repeat(100);
+        let xml = format!(r#"<d:multistatus xmlns:d="DAV:">{siblings}</d:multistatus>"#);
+        assert_eq!(check_shape(&xml, &Limits::DEFAULT), Ok(()));
+        assert!(parse_xml(&xml, &Limits::DEFAULT).is_ok());
+    }
+
+    /// Lo que está entre comillas no es un atributo: un valor que trae
+    /// `a="x" b="y"` adentro, con comillas simples o dobles, cuenta uno.
+    #[test]
+    fn un_valor_con_atributos_adentro_de_las_comillas_no_cuenta() {
+        let limits = Limits {
+            max_xml_attributes: 3,
+            ..Limits::DEFAULT
+        };
+        let inside = r#"a="x" b="y" xmlns:p="u" c = "z""#.repeat(1000);
+        let xml = format!(
+            r#"<d:multistatus xmlns:d="DAV:" v='{inside}' w="{}"/>"#,
+            inside.replace('"', "'")
+        );
+        assert_eq!(check_shape(&xml, &limits), Ok(()));
+        assert!(parse_xml(&xml, &limits).is_ok());
+
+        let one_more = xml.replace("/>", r#" k=""/>"#);
+        assert_eq!(check_shape(&one_more, &limits), Err(TOO_MANY_ATTRIBUTES));
     }
 
     const SYNC: &str = r#"<?xml version="1.0"?>

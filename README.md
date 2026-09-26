@@ -759,7 +759,7 @@ sin perder nada. **Sólo lee**: el cliente no tiene ningún método de escritura
 
 Lo que llega de la red se lee como si lo hubiera escrito cualquiera: 16 MiB por
 respuesta; por XML un millón de nodos, 64 niveles, 32 espacios de nombres
-distintos y sin DTD, leído fuera del bucle de eventos; 100 libretas por cuenta,
+distintos, 64 atributos por elemento y sin DTD, leído fuera del bucle de eventos; 100 libretas por cuenta,
 20 000 tarjetas por libreta, 512 KiB por tarjeta y 1 GiB de tarjetas por
 cuenta; 50 correos, teléfonos y relaciones por contacto; y 10 minutos por vuelta
 de cada cuenta, para que una lenta no frene a las otras. Del `multiget` se
