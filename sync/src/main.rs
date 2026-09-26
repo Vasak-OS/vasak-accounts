@@ -77,6 +77,7 @@ mod store;
 mod store_api;
 mod tls;
 mod vcard;
+mod xdg;
 
 use std::collections::HashMap;
 use std::sync::Arc;

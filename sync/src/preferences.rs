@@ -64,17 +64,17 @@ pub struct Preferences {
 /// `XDG_CONFIG_HOME` y, si no está, `~/.config`, que es lo que dice el estándar
 /// y lo que ya hace `outbox.rs` con `XDG_DATA_HOME`.
 pub fn file_path() -> Option<PathBuf> {
-    // Por `dirs`, igual que `outbox.rs`. Acá no se escribe, pero una base relativa
-    // igual duele: se leería un archivo de preferencias de donde no está —o de
-    // donde haya uno que no es—, y quien llama no lo distingue de «no hay
-    // preferencias guardadas», así que se cae a las de por omisión sin decirlo.
+    // Por `dirs` y el filtro de `xdg.rs`, igual que `outbox.rs`. Acá no se
+    // escribe, pero una base relativa igual duele: se leería un archivo de
+    // preferencias de donde no está —o de donde haya uno que no es—, y quien
+    // llama no lo distingue de «no hay preferencias guardadas», así que se cae a
+    // las de por omisión sin decirlo.
     file_path_under(dirs::config_dir())
 }
 
 /// La misma decisión sin leer el entorno, para poder probarla.
 fn file_path_under(base: Option<PathBuf>) -> Option<PathBuf> {
-    let base = base.filter(|base| base.is_absolute())?;
-    Some(base.join("vasak-mail").join("preferencias.json"))
+    crate::xdg::path_under(base, "vasak-mail/preferencias.json")
 }
 
 /// Las preferencias de ahora mismo.
@@ -160,7 +160,7 @@ mod tests {
         // un fallo de la prueba.
         //
         // Lo que se comprueba entonces es el **cableado**: que `file_path()` sea
-        // exactamente `file_under` sobre el directorio del sistema. Vale igual
+        // exactamente `file_path_under` sobre el directorio del sistema. Vale igual
         // en una máquina sin `HOME`, donde las dos dan `None`, y falla si
         // alguien cambia de dónde sale la base. Envolverlo en un `if let` habría
         // sido peor: una prueba que puede pasar sin comprobar nada.

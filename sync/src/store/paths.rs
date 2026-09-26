@@ -31,9 +31,8 @@ use rustix::fs::{AtFlags, FileType, Mode, OFlags, CWD};
 use rustix::io::Errno;
 
 use super::StoreError;
+use crate::xdg::APP_DIR;
 
-/// La carpeta del servicio, la misma que ya usa la cola de salida.
-const APP_DIR: &str = "vasak-accounts-sync";
 /// Adentro, una carpeta por cuenta.
 const STORES_DIR: &str = "stores";
 /// El archivo de la base, dentro de la carpeta de su cuenta.
@@ -48,8 +47,8 @@ const MAX_ACCOUNT_ID_LEN: usize = 128;
 ///
 /// Sale de `dirs`, como la cola de salida y las preferencias: la regla del
 /// estándar —una `XDG_DATA_HOME` relativa o vacía se ignora— vive ahí y no en
-/// una copia más. `dirs` no filtra `HOME` por absoluta, así que esa mitad se
-/// mira acá, con el mismo criterio que `outbox.rs`.
+/// una copia más. `dirs` no filtra `HOME` por absoluta, así que esa mitad la
+/// mira `xdg.rs`, el mismo filtro que usan los otros dos.
 ///
 /// **Sin un lugar de repuesto.** La cola cae a `/tmp` cuando no hay base, porque
 /// perder un correo sin mandar es peor; una base cifrada en `/tmp` no gana nada
@@ -61,8 +60,7 @@ pub fn stores_root() -> Result<PathBuf, StoreError> {
 /// La misma decisión sin leer el entorno, para poder probarla: el entorno es
 /// global al proceso y las pruebas corren en paralelo.
 fn stores_root_under(base: Option<PathBuf>) -> Option<PathBuf> {
-    base.filter(|base| base.is_absolute())
-        .map(|base| base.join(APP_DIR).join(STORES_DIR))
+    crate::xdg::path_under(base, Path::new(APP_DIR).join(STORES_DIR))
 }
 
 /// El archivo con lo decidido por cuenta, en `$XDG_CONFIG_HOME`.
@@ -75,8 +73,7 @@ pub fn settings_file() -> Result<PathBuf, StoreError> {
 }
 
 fn settings_file_under(base: Option<PathBuf>) -> Option<PathBuf> {
-    base.filter(|base| base.is_absolute())
-        .map(|base| base.join(APP_DIR).join(SETTINGS_FILE))
+    crate::xdg::path_under(base, Path::new(APP_DIR).join(SETTINGS_FILE))
 }
 
 /// Comprueba que un identificador de cuenta se pueda usar como nombre de

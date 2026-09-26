@@ -178,29 +178,26 @@ impl Outgoing {
 /// En los datos del usuario, no en la caché: una caché se puede borrar entera
 /// sin avisar, y con ella se iría un correo sin mandar.
 pub fn outbox_dir() -> PathBuf {
-    // Por `dirs` y no leyendo el entorno acá: la regla —absoluta o nada, que el
-    // estándar pide y que de paso cubre la variable vacía, porque la cadena
-    // vacía tampoco es absoluta— vive en un solo lugar en vez de en una copia
-    // por programa.
+    // Por `dirs` y no leyendo el entorno acá, y con el filtro de `xdg.rs`: la
+    // regla —absoluta o nada, que el estándar pide y que de paso cubre la
+    // variable vacía— vive en un solo lugar en vez de en una copia por módulo.
     //
     // Antes esto filtraba `XDG_DATA_HOME` por absoluta y **no** `HOME`, así que
     // la mitad del agujero seguía abierta: con un `HOME` relativo la cola de
-    // salida se escribía bajo el directorio de trabajo del daemon. El filtro de
-    // acá cierra esa otra mitad, que es la que `dirs` no mira.
+    // salida se escribía bajo el directorio de trabajo del daemon. El filtro
+    // cierra esa otra mitad, que es la que `dirs` no mira.
     outbox_dir_under(dirs::data_dir())
 }
 
-/// La misma decisión sin leer el entorno.
+/// La misma decisión sin leer el entorno, para poder probarla.
 ///
-/// Aparte para poder probarla: el entorno es global al proceso y las pruebas
-/// corren en paralelo, así que una que escriba una variable decide al azar el
-/// resultado de otra.
+/// Sin base absoluta, `/tmp`: perder un correo sin mandar es peor que dejarlo
+/// ahí, en 0600. (El almacén no tiene repuesto, ver `store/paths.rs`.)
 fn outbox_dir_under(base: Option<PathBuf>) -> PathBuf {
-    let base = base
-        .filter(|base| base.is_absolute())
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-
-    base.join("vasak-accounts-sync/salientes")
+    crate::xdg::absolute_base(base)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(crate::xdg::APP_DIR)
+        .join("salientes")
 }
 
 /// La cola en el disco.
