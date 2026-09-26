@@ -4,10 +4,19 @@
 //!
 //! 1. El **nombre único** de quien llamó (`:1.42`), del encabezado del mensaje.
 //!    Lo pone el bus, así que no se puede inventar.
-//! 2. Su **pid**, con `GetConnectionUnixProcessID` del bus de sesión.
+//! 2. Su **pid** y su **pidfd**, con `GetConnectionCredentials` del bus de
+//!    sesión (`ProcessID` y `ProcessFD`). El pidfd lo toma el bus **al
+//!    conectar** —dbus-broker y dbus-daemon 1.15 en adelante—, así que
+//!    nombra al proceso que abrió la conexión aunque su pid lo tenga ahora
+//!    otro.
 //! 3. Su **momento de arranque**, de `/proc/<pid>/stat`
-//!    (`vasak_accounts_common::process`), para que un pid reciclado no herede
-//!    lo que se le concedió al anterior.
+//!    (`vasak_accounts_common::process`), para que el servicio de permisos
+//!    reconozca un pid reciclado entre esta pregunta y la suya. Y **después**
+//!    de leerlo, el pidfd tiene que seguir diciendo ese pid: si el proceso que
+//!    conectó ya terminó —y la conexión siguió viva en un hijo, o el pid lo
+//!    tomó otro—, el arranque leído es de otro proceso, y la respuesta es
+//!    `Failed`. Un bus que no da `ProcessFD` se juzga sólo por el pid, como
+//!    antes.
 //! 4. `CheckPermissionFor(pid, arranque, "store.contacts", cuenta)` en
 //!    `vasak-permissions`, en el bus del sistema. El sincronizador es un
 //!    delegado de ese servicio desde su 0.15.0: pregunta **por quien lo
@@ -46,6 +55,17 @@
 //! El permiso decide qué contesta **este servicio**, y le muestra a la persona
 //! quién pidió qué; no impide que un proceso suyo lea lo que es suyo.
 //!
+//! **Y la identidad por pid se puede heredar.** Un proceso abre la conexión,
+//! la deja en un hijo y hace `exec` de una aplicación que tiene el permiso
+//! —`/usr/bin/vasak-contacts`, detenida para que no se vea—. El pid, el
+//! momento de arranque y el pidfd siguen siendo los mismos, y
+//! `vasak-permissions` ve el ejecutable nuevo: el hijo lee con el permiso de
+//! otra aplicación, y el diario lo anota a nombre de ella. Con pids no tiene
+//! arreglo —el pidfd cierra el pid reciclado, no el `exec`—, y es la misma
+//! limitación que tienen el servicio de cuentas y `vasak-permissions`. Por eso
+//! esto es consentimiento: no impide que un proceso de la persona se haga
+//! pasar por otra de sus aplicaciones.
+//!
 //! ── El límite por llamante ──────────────────────────────────────────────────
 //!
 //! Los comandos que cambian algo (`ClearStore`, `SetStoreEnabled`,
@@ -67,6 +87,7 @@
 //!   borra nada, y dos aplicaciones que se abren a la vez lo piden las dos.
 
 use std::collections::{HashMap, VecDeque};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -140,11 +161,14 @@ impl Clock for SystemClock {
 /// permisos. Un rasgo para poder probar la caché y la fusión de pedidos con uno
 /// que cuenta cuántas veces le preguntaron.
 pub trait PermissionBackend: Send + Sync + 'static {
-    /// El pid del dueño de un nombre único del bus de sesión.
-    fn caller_pid(&self, unique_name: String) -> BoxFuture<'static, Result<u32, String>>;
+    /// El proceso que abrió la conexión de un nombre único del bus de sesión.
+    fn caller_process(
+        &self,
+        unique_name: String,
+    ) -> BoxFuture<'static, Result<CallerProcess, String>>;
 
-    /// El momento de arranque de un proceso.
-    fn start_time(&self, pid: u32) -> Result<u64, String>;
+    /// El momento de arranque de ese proceso, si sigue siendo él.
+    fn start_time(&self, caller: &CallerProcess) -> Result<u64, String>;
 
     /// `CheckPermissionFor`.
     fn check_permission_for(
@@ -154,6 +178,45 @@ pub trait PermissionBackend: Send + Sync + 'static {
         resource: String,
         detail: String,
     ) -> BoxFuture<'static, Result<bool, String>>;
+}
+
+/// El proceso que abrió una conexión, como lo da el bus.
+#[derive(Debug)]
+pub struct CallerProcess {
+    pub pid: u32,
+    /// El pidfd que tomó el bus al conectar (`ProcessFD`), si lo da.
+    pub pidfd: Option<OwnedFd>,
+}
+
+/// El pid al que apunta un pidfd, de `/proc/self/fdinfo`: `None` si el
+/// proceso ya terminó (el kernel dice `-1`) o si no se pudo leer.
+pub fn pidfd_pid(pidfd: &OwnedFd) -> Option<u32> {
+    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd())).ok()?;
+    let pid: i64 = info
+        .lines()
+        .find_map(|line| line.strip_prefix("Pid:"))?
+        .trim()
+        .parse()
+        .ok()?;
+    u32::try_from(pid).ok().filter(|pid| *pid > 0)
+}
+
+/// El momento de arranque de quien conectó: se lee de `/proc/<pid>/stat` y
+/// **después** se comprueba que el pidfd siga diciendo ese pid. Si el proceso
+/// estaba vivo después de leer, lo leído es suyo —un pid no se reusa mientras
+/// su dueño vive—; si ya no, es de otro, y no se pregunta.
+pub fn verified_start_time(caller: &CallerProcess) -> Result<u64, String> {
+    let start_time = vasak_accounts_common::process::process_start_time(caller.pid)
+        .map_err(|e| e.to_string())?;
+    if let Some(pidfd) = &caller.pidfd {
+        if pidfd_pid(pidfd) != Some(caller.pid) {
+            return Err(format!(
+                "el proceso que abrió la conexión ya no es el pid {}",
+                caller.pid
+            ));
+        }
+    }
+    Ok(start_time)
 }
 
 /// Lo que contestó el servicio de permisos, o que no contestó.
@@ -323,17 +386,17 @@ async fn ask(
     resource: String,
     detail: String,
 ) -> Verdict {
-    let pid = match backend.caller_pid(name).await {
-        Ok(pid) => pid,
+    let caller = match backend.caller_process(name).await {
+        Ok(caller) => caller,
         Err(e) => return Verdict::Failed(format!("no se supo el pid de quien llama: {e}")),
     };
-    let start_time = match backend.start_time(pid) {
+    let start_time = match backend.start_time(&caller) {
         Ok(start_time) => start_time,
         Err(e) => return Verdict::Failed(e),
     };
     match tokio::time::timeout(
         timeout,
-        backend.check_permission_for(pid, start_time, resource, detail),
+        backend.check_permission_for(caller.pid, start_time, resource, detail),
     )
     .await
     {
@@ -520,27 +583,43 @@ impl DbusPermissions {
 }
 
 impl PermissionBackend for DbusPermissions {
-    fn caller_pid(&self, unique_name: String) -> BoxFuture<'static, Result<u32, String>> {
+    fn caller_process(
+        &self,
+        unique_name: String,
+    ) -> BoxFuture<'static, Result<CallerProcess, String>> {
         let bus = self.bus.clone();
         async move {
-            let destination = bus.is_bus().then_some("org.freedesktop.DBus");
+            let destination = bus.is_bus().then_some(BUS_NAME);
             let reply = bus
                 .call_method(
                     destination,
                     "/org/freedesktop/DBus",
                     Some("org.freedesktop.DBus"),
-                    "GetConnectionUnixProcessID",
+                    "GetConnectionCredentials",
                     &(unique_name.as_str(),),
                 )
                 .await
                 .map_err(|e| e.to_string())?;
-            reply.body().deserialize::<u32>().map_err(|e| e.to_string())
+            let mut credentials: HashMap<String, zbus::zvariant::OwnedValue> =
+                reply.body().deserialize().map_err(|e| e.to_string())?;
+            let pid = credentials
+                .remove("ProcessID")
+                .and_then(|v| u32::try_from(v).ok())
+                .ok_or("el bus no dio el pid")?;
+            let pidfd = credentials
+                .remove("ProcessFD")
+                .and_then(|v| zbus::zvariant::Fd::try_from(v).ok())
+                .and_then(|fd| OwnedFd::try_from(fd).ok());
+            if pidfd.is_none() {
+                tracing::debug!("el bus no da ProcessFD: se juzga sólo por el pid");
+            }
+            Ok(CallerProcess { pid, pidfd })
         }
         .boxed()
     }
 
-    fn start_time(&self, pid: u32) -> Result<u64, String> {
-        vasak_accounts_common::process::process_start_time(pid).map_err(|e| e.to_string())
+    fn start_time(&self, caller: &CallerProcess) -> Result<u64, String> {
+        verified_start_time(caller)
     }
 
     fn check_permission_for(
@@ -660,20 +739,49 @@ pub(crate) mod tests {
         }
     }
 
-    /// El bus de sesión falso: de cada nombre único, su pid.
+    /// El bus de sesión falso: de cada nombre único, su pid. Da también el
+    /// pidfd, como dbus-broker: uno abierto en el momento sobre ese pid, o el
+    /// que diga `pidfds` para ese nombre.
     #[derive(Clone, Default)]
-    pub(crate) struct FakeBus(pub Arc<Mutex<HashMap<String, u32>>>);
+    pub(crate) struct FakeBus(
+        pub Arc<Mutex<HashMap<String, u32>>>,
+        pub Arc<Mutex<HashMap<String, Arc<OwnedFd>>>>,
+    );
 
     #[zbus::interface(name = "org.freedesktop.DBus")]
     impl FakeBus {
-        #[zbus(name = "GetConnectionUnixProcessID")]
-        async fn get_connection_unix_process_id(&self, name: String) -> zbus::fdo::Result<u32> {
-            self.0
+        async fn get_connection_credentials(
+            &self,
+            name: String,
+        ) -> zbus::fdo::Result<HashMap<String, zbus::zvariant::OwnedValue>> {
+            let pid = self
+                .0
                 .lock()
                 .unwrap()
                 .get(&name)
                 .copied()
-                .ok_or_else(|| zbus::fdo::Error::NameHasNoOwner(name))
+                .ok_or_else(|| zbus::fdo::Error::NameHasNoOwner(name.clone()))?;
+            let mut credentials = HashMap::new();
+            credentials.insert(
+                "ProcessID".to_string(),
+                zbus::zvariant::OwnedValue::from(pid),
+            );
+            let fixed = self.1.lock().unwrap().get(&name).cloned();
+            let pidfd = match fixed {
+                Some(fd) => fd.try_clone().ok(),
+                None => i32::try_from(pid)
+                    .ok()
+                    .and_then(rustix::process::Pid::from_raw)
+                    .and_then(|p| {
+                        rustix::process::pidfd_open(p, rustix::process::PidfdFlags::empty()).ok()
+                    }),
+            };
+            if let Some(pidfd) = pidfd {
+                let value = zbus::zvariant::OwnedValue::try_from(zbus::zvariant::Fd::from(pidfd))
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                credentials.insert("ProcessFD".to_string(), value);
+            }
+            Ok(credentials)
         }
     }
 
@@ -943,6 +1051,51 @@ pub(crate) mod tests {
         f.access = Arc::new(access);
         assert!(matches!(f.check(":1.7").await, Verdict::Failed(_)));
         assert_eq!(f.access.cached(Some(":1.7"), CONTACTS_RESOURCE), None);
+    }
+
+    /// El proceso que abrió la conexión terminó, y su pid lo tiene ahora otro
+    /// proceso vivo —acá, este mismo—: lo que se lea de `/proc/<pid>` es del
+    /// otro. El pidfd que tomó el bus al conectar lo dice, y no se pregunta
+    /// por nadie.
+    #[tokio::test]
+    async fn el_pid_de_una_conexion_heredada_no_se_juzga_por_otro_proceso() {
+        let f = AccessFixture::new(Answer::Allow).await;
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let child_pid = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
+        let gone =
+            rustix::process::pidfd_open(child_pid, rustix::process::PidfdFlags::empty()).unwrap();
+        child.wait().unwrap();
+        assert_eq!(pidfd_pid(&gone), None, "el proceso ya terminó");
+
+        f.bus
+            .0
+            .lock()
+            .unwrap()
+            .insert(":1.20".into(), std::process::id());
+        f.bus
+            .1
+            .lock()
+            .unwrap()
+            .insert(":1.20".into(), Arc::new(gone));
+        let verdict = f.check(":1.20").await;
+        assert!(
+            matches!(verdict, Verdict::Failed(_)),
+            "se juzgó a otro proceso por el pid de la conexión"
+        );
+        assert_eq!(f.permissions.calls(), 0);
+
+        // El mismo pid, con el pidfd del proceso que sigue vivo: se pregunta.
+        assert_eq!(f.check(":1.7").await, Verdict::Allowed);
+    }
+
+    #[test]
+    fn el_pidfd_de_este_proceso_dice_su_pid() {
+        let own = rustix::process::pidfd_open(
+            rustix::process::getpid(),
+            rustix::process::PidfdFlags::empty(),
+        )
+        .unwrap();
+        assert_eq!(pidfd_pid(&own), Some(std::process::id()));
     }
 
     #[test]

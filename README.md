@@ -765,7 +765,10 @@ de más de 256 bytes o de más de 8 palabras es `InvalidArgs`. Un contacto sin
 nada que mostrar se guarda pero no se lista.
 
 **El permiso de lectura.** Por cada lectura, el nombre único de quien llama, su
-pid (`GetConnectionUnixProcessID`) y su momento de arranque, y
+pid y su pidfd (`GetConnectionCredentials`: `ProcessID` y `ProcessFD`, que el
+bus toma al conectar), su momento de arranque —que se usa sólo si después de
+leerlo el pidfd sigue diciendo ese pid: si el proceso que conectó ya terminó y
+su pid lo tiene otro, no se pregunta por nadie—, y
 `CheckPermissionFor(pid, arranque, "store.contacts", cuenta)` en
 `vasak-permissions`: el sincronizador pregunta **en nombre de la aplicación**, y
 la decisión queda anotada contra ella. Sin permiso, `AccessDenied` y ningún
@@ -781,8 +784,15 @@ contactos, recién después de que el permiso dijo que sí.
 **Lo que el permiso no protege**, sin adornos: es consentimiento y visibilidad,
 no una frontera. La base es un archivo de la persona y su clave está en el
 llavero de la sesión, que se la da a cualquier proceso de ese usuario: un
-programa que no quiera preguntar puede ir directo. El permiso decide qué
-contesta este servicio y le deja ver a la persona quién pidió qué.
+programa que no quiera preguntar puede ir directo. Y **la identidad por pid se
+puede heredar**: un proceso abre la conexión, la deja en un hijo y hace `exec`
+de una aplicación que tiene el permiso; el pid, el arranque y el pidfd son los
+mismos, `vasak-permissions` ve el ejecutable de la otra, y el hijo lee con su
+permiso —y el diario lo anota a nombre de ella—. Con pids eso no tiene arreglo
+(el pidfd cierra el pid reciclado, no el `exec`), y es la misma limitación que
+tienen el servicio de cuentas y `vasak-permissions`. El permiso decide qué
+contesta este servicio y le deja ver a la persona quién pidió qué; no impide
+que un proceso de la persona se haga pasar por otra de sus aplicaciones.
 
 **Lo que ve cualquiera en `GetStatus`**: el estado del llavero y, por cuenta,
 el estado de su base (`locked`, `open`, `rebuilt`, `disabled`, `unavailable`) y
