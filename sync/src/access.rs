@@ -781,15 +781,15 @@ pub(crate) mod tests {
                     .unwrap();
             }
         };
-        // Tiempo para que la escucha se suscriba.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        emit(":1.8", "", ":1.8").await;
-        emit("ar.net.vasak.os.Contacts", ":1.8", "").await;
-        emit(":1.7", ":1.7", "").await;
-
+        // Se repite hasta que llega: la escucha se suscribe en su propia
+        // tarea, y lo que se mande antes no lo ve. Las dos que no son una
+        // salida van antes, así que si la de `:1.7` llegó, llegaron ellas.
         let forgotten = async {
             while f.access.cached(Some(":1.7"), CONTACTS_RESOURCE).is_some() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                emit(":1.8", "", ":1.8").await;
+                emit("ar.net.vasak.os.Contacts", ":1.8", "").await;
+                emit(":1.7", ":1.7", "").await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
         };
         tokio::time::timeout(Duration::from_secs(5), forgotten)
