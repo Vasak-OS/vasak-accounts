@@ -952,11 +952,19 @@ lectura con permiso enciende el calendario de todas.
 
 Cómo: la credencial con la capacidad `calendar`; los calendarios por
 `PROPFIND`; por cada uno `sync-collection` o ETag y `calendar-multiget` de a
-tandas; de a 500 objetos —y 20 000 ocurrencias— por transacción, con el token
-en el último lote. Con el llavero bloqueado no se pide ni se escribe nada. Los
-topes de la red son los de los contactos, con 100 calendarios por cuenta, 50 000
-objetos por calendario, 512 KiB por objeto, 1 GiB de iCalendar por cuenta y un
-millón de ocurrencias guardadas por cuenta.
+tandas; de a 500 objetos —y 20 000 ocurrencias y 20 000 recordatorios— por
+transacción, con el token en el último lote. Con el llavero bloqueado no se pide
+ni se escribe nada. Los topes de la red son los de los contactos, con 100
+calendarios por cuenta, 50 000 objetos por calendario, 512 KiB por objeto, 1 GiB
+de iCalendar por cuenta, y un millón de ocurrencias y un millón de
+recordatorios guardados por cuenta.
+
+**Lo que ocupa la base de una cuenta**, entonces: el iCalendar crudo (1 GiB como
+mucho); lo derivado para listar, que sale del crudo —el título de cada objeto y
+los de sus excepciones, guardados **una vez por objeto** y no en cada
+ocurrencia—, así que no pesa más que él; y unos 50 bytes por ocurrencia y otros
+tantos por recordatorio, con sus índices (medido). Unos 2,1 GiB en el peor
+caso.
 
 **Hace falta `vasak-permissions` 0.15.0 o posterior** también para el
 calendario: las anteriores no le dan al sincronizador `account.calendar` ni lo

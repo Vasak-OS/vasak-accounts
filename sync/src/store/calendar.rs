@@ -57,6 +57,10 @@ pub const WRITE_BATCH_BYTES: usize = 8 * 1024 * 1024;
 /// serían medio millón de filas en una transacción.
 pub const WRITE_BATCH_OCCURRENCES: usize = 20_000;
 
+/// Cuántos recordatorios entran en un lote: hasta diez por ocurrencia, así
+/// que el tope de ocurrencias solo dejaba pasar doscientos mil.
+pub const WRITE_BATCH_ALARMS: usize = 20_000;
+
 /// Cuántas series se vuelven a expandir por lote al correr la ventana.
 pub const SHIFT_BATCH_ROWS: usize = 100;
 
@@ -172,6 +176,9 @@ pub struct ObjectIndex {
     pub expansion: ExpansionState,
     /// El rango que cubren las ocurrencias guardadas, si es una serie.
     pub expanded: Option<Window>,
+    /// Los títulos de sus excepciones que no son el suyo, por su lugar: lo
+    /// que nombra `occurrences.title` ([`EventSeries::titles`]).
+    pub titles: Vec<(u32, String)>,
 }
 
 /// Un objeto para guardar: el crudo, lo derivado y sus ocurrencias.
@@ -199,6 +206,45 @@ impl ObjectOp {
             ObjectOp::Delete(_) => 0,
         }
     }
+
+    /// Cuántos recordatorios lleva.
+    pub fn alarms(&self) -> usize {
+        match self {
+            ObjectOp::Upsert(row) => alarm_rows(&row.occurrences),
+            ObjectOp::Delete(_) => 0,
+        }
+    }
+}
+
+/// Cuántas filas de `alarms` escriben unas ocurrencias.
+fn alarm_rows(occurrences: &[Occurrence]) -> usize {
+    occurrences.iter().map(|o| o.alarms.len()).sum()
+}
+
+/// Lo que le queda a una cuenta: bytes de iCalendar crudo, ocurrencias y
+/// recordatorios. Un lote se mide contra esto por su cambio neto, en su
+/// transacción.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CalendarRoom {
+    pub bytes: u64,
+    pub occurrences: u64,
+    pub alarms: u64,
+}
+
+impl CalendarRoom {
+    /// Sin tope: lo que no se mide —los bytes al correr la ventana— y las
+    /// pruebas.
+    pub const UNLIMITED: CalendarRoom = CalendarRoom {
+        bytes: u64::MAX,
+        occurrences: u64::MAX,
+        alarms: u64::MAX,
+    };
+
+    /// Si un cambio neto no entra.
+    fn exceeded_by(self, bytes: i64, occurrences: i64, alarms: i64) -> bool {
+        let over = |net: i64, room: u64| net > 0 && net as u64 > room;
+        over(bytes, self.bytes) || over(occurrences, self.occurrences) || over(alarms, self.alarms)
+    }
 }
 
 /// Dónde quedó un calendario al terminar: va con el último lote.
@@ -211,11 +257,12 @@ pub struct CalendarProgress {
 /// Cómo quedó un lote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CalendarApplied {
-    /// Escrito: cuánto cambiaron los bytes de iCalendar crudo y las
-    /// ocurrencias de la cuenta.
+    /// Escrito: cuánto cambiaron los bytes de iCalendar crudo, las
+    /// ocurrencias y los recordatorios de la cuenta.
     Written {
         net_bytes: i64,
         net_occurrences: i64,
+        net_alarms: i64,
     },
     /// No se escribió nada: la cuenta crecería más de lo que había lugar.
     OverCap,
@@ -283,6 +330,7 @@ fn empty_index() -> ObjectIndex {
         span: 0,
         expansion: ExpansionState::Complete,
         expanded: None,
+        titles: Vec::new(),
     }
 }
 
@@ -368,6 +416,11 @@ fn derive_event(
         span,
         expansion: state,
         expanded: recurring.then_some(window),
+        titles: series
+            .titles()
+            .into_iter()
+            .map(|(position, title)| (position, title.to_string()))
+            .collect(),
     };
     (index, expansion.occurrences)
 }
@@ -409,6 +462,7 @@ fn derive_task(task: &Component, document: &ical::Document) -> ObjectIndex {
         span: 0,
         expansion: ExpansionState::Complete,
         expanded: None,
+        titles: Vec::new(),
     }
 }
 
@@ -677,6 +731,16 @@ impl Store {
             .map_err(classify)
     }
 
+    /// Cuántos recordatorios hay guardados en la cuenta.
+    pub fn alarm_count(&self) -> Result<u64, StoreError> {
+        self.connection
+            .query_row("SELECT count(*) FROM alarms", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|count| count.max(0) as u64)
+            .map_err(classify)
+    }
+
     /// La ventana de la base, si ya se escribió algo del calendario.
     pub fn calendar_window(&self) -> Result<Option<Window>, StoreError> {
         read_window(&self.connection)
@@ -686,8 +750,8 @@ impl Store {
     /// calendario. Como `apply_contacts`: el calendario tiene que estar en esta
     /// base con el mismo `id` y dirección (si no, `Err(Missing)`), un objeto
     /// que ya estaba se reescribe en su lugar —mismo `id`—, y el lote se mide
-    /// contra lo que le queda a la cuenta: `room_bytes` de iCalendar crudo y
-    /// `room_occurrences` de ocurrencias, por el cambio neto.
+    /// contra lo que le queda a la cuenta (`room`: iCalendar crudo,
+    /// ocurrencias y recordatorios), por el cambio neto.
     ///
     /// **La ventana**: si la base no tiene, queda `window`, la del lote; si
     /// tiene otra, no se escribe nada ([`CalendarApplied::WindowMoved`]).
@@ -697,8 +761,7 @@ impl Store {
         ops: &[ObjectOp],
         window: Window,
         finish: Option<&CalendarProgress>,
-        room_bytes: u64,
-        room_occurrences: u64,
+        room: CalendarRoom,
     ) -> Result<CalendarApplied, StoreError> {
         if ops.len() > WRITE_BATCH_ROWS {
             return Err(StoreError::Sqlite(format!(
@@ -726,6 +789,7 @@ impl Store {
         let at = now_text();
         let mut net_bytes: i64 = 0;
         let mut net_occurrences: i64 = 0;
+        let mut net_alarms: i64 = 0;
         let mut changed = false;
         for op in ops {
             match op {
@@ -744,6 +808,7 @@ impl Store {
                         .map_err(classify)?;
                     if let Some((id, bytes)) = gone {
                         net_occurrences -= occurrences_of(&transaction, id)?;
+                        net_alarms -= alarms_of(&transaction, id)?;
                         transaction
                             .prepare_cached("DELETE FROM calendar_objects WHERE id = ?1")
                             .and_then(|mut s| s.execute([id]))
@@ -768,17 +833,17 @@ impl Store {
                     if let Some((id, bytes)) = before {
                         net_bytes -= bytes;
                         net_occurrences -= occurrences_of(&transaction, id)?;
+                        net_alarms -= alarms_of(&transaction, id)?;
                     }
                     net_bytes += row.raw_ical.len() as i64;
                     net_occurrences += row.occurrences.len() as i64;
+                    net_alarms += alarm_rows(&row.occurrences) as i64;
                     upsert_object(&transaction, calendar.id, row, &at)?;
                     changed = true;
                 }
             }
         }
-        if (net_bytes > 0 && net_bytes as u64 > room_bytes)
-            || (net_occurrences > 0 && net_occurrences as u64 > room_occurrences)
-        {
+        if room.exceeded_by(net_bytes, net_occurrences, net_alarms) {
             // Sin `commit`: al soltarse, la transacción se deshace entera.
             return Ok(CalendarApplied::OverCap);
         }
@@ -818,6 +883,7 @@ impl Store {
         Ok(CalendarApplied::Written {
             net_bytes,
             net_occurrences,
+            net_alarms,
         })
     }
 
@@ -860,8 +926,9 @@ impl Store {
     }
 
     /// Escribe un lote de series con la ventana `target` y, con `last`, deja
-    /// esa ventana en la base. Devuelve cuántas ocurrencias sumó (o restó) a la
-    /// cuenta, u `OverCap` sin escribir nada si no entran en `room`.
+    /// esa ventana en la base. Devuelve cuántas ocurrencias y recordatorios
+    /// sumó (o restó) a la cuenta, u `OverCap` sin escribir nada si no entran
+    /// en `room`.
     ///
     /// Una serie que no está como se la leyó —la reescribió la sincronización,
     /// o se borró— no se toca. Sube la generación sólo si cambió alguna fila.
@@ -870,11 +937,12 @@ impl Store {
         target: Window,
         shifts: &[SeriesShift],
         last: bool,
-        room: u64,
+        room: CalendarRoom,
         limits: &ExpansionLimits,
     ) -> Result<CalendarApplied, StoreError> {
         let transaction = self.connection.transaction().map_err(classify)?;
         let mut net: i64 = 0;
+        let mut net_alarms: i64 = 0;
         let mut changed = false;
         for shift in shifts {
             let current: Option<(Option<i64>, Option<i64>)> = transaction
@@ -891,6 +959,9 @@ impl Store {
             if current.is_none() || current != Some(expected.unwrap_or((None, None))) {
                 continue;
             }
+            // Los recordatorios se van con sus ocurrencias, por la cascada:
+            // se cuentan antes y después.
+            net_alarms -= alarms_of(&transaction, shift.id)?;
             let removed = if shift.replace_all {
                 transaction
                     .prepare_cached("DELETE FROM occurrences WHERE object_id = ?1")
@@ -922,6 +993,7 @@ impl Store {
                 net += 1;
                 changed = true;
             }
+            net_alarms += alarms_of(&transaction, shift.id)?;
             transaction
                 .prepare_cached(
                     "UPDATE calendar_objects SET expanded_from = ?2, expanded_to = ?3,
@@ -939,7 +1011,7 @@ impl Store {
                 })
                 .map_err(classify)?;
         }
-        if net > 0 && net as u64 > room {
+        if room.exceeded_by(0, net, net_alarms) {
             return Ok(CalendarApplied::OverCap);
         }
         if last {
@@ -957,6 +1029,7 @@ impl Store {
         Ok(CalendarApplied::Written {
             net_bytes: 0,
             net_occurrences: net,
+            net_alarms,
         })
     }
 }
@@ -991,6 +1064,14 @@ fn occurrences_of(transaction: &rusqlite::Transaction<'_>, id: i64) -> Result<i6
         .map_err(classify)
 }
 
+/// Los recordatorios de un objeto: por la clave primaria, que empieza por él.
+fn alarms_of(transaction: &rusqlite::Transaction<'_>, id: i64) -> Result<i64, StoreError> {
+    transaction
+        .prepare_cached("SELECT count(*) FROM alarms WHERE object_id = ?1")
+        .and_then(|mut s| s.query_row([id], |r| r.get(0)))
+        .map_err(classify)
+}
+
 fn insert_occurrence(
     transaction: &rusqlite::Transaction<'_>,
     object_id: i64,
@@ -1000,7 +1081,7 @@ fn insert_occurrence(
     transaction
         .prepare_cached(
             "INSERT INTO occurrences
-               (object_id, recurrence_id, calendar_id, starts_at, ends_at, all_day, summary)
+               (object_id, recurrence_id, calendar_id, starts_at, ends_at, all_day, title)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT (object_id, recurrence_id) DO NOTHING",
         )
@@ -1012,7 +1093,7 @@ fn insert_occurrence(
                 occurrence.start,
                 occurrence.end,
                 occurrence.all_day,
-                occurrence.summary
+                occurrence.title
             ])
         })
         .map_err(classify)?;
@@ -1102,6 +1183,19 @@ fn upsert_object(
         .map_err(classify)?;
     for occurrence in &row.occurrences {
         insert_occurrence(transaction, id, calendar_id, occurrence)?;
+    }
+    // Los títulos de las excepciones, una vez por objeto y no por ocurrencia.
+    transaction
+        .prepare_cached("DELETE FROM object_titles WHERE object_id = ?1")
+        .and_then(|mut s| s.execute([id]))
+        .map_err(classify)?;
+    for (position, summary) in &index.titles {
+        transaction
+            .prepare_cached(
+                "INSERT INTO object_titles (object_id, position, summary) VALUES (?1, ?2, ?3)",
+            )
+            .and_then(|mut s| s.execute(rusqlite::params![id, position, summary]))
+            .map_err(classify)?;
     }
     Ok(())
 }
@@ -1202,8 +1296,7 @@ pub(crate) mod tests {
                 ],
                 w,
                 None,
-                u64::MAX,
-                u64::MAX,
+                CalendarRoom::UNLIMITED,
             )
             .unwrap();
         let weeks = count(
@@ -1215,7 +1308,8 @@ pub(crate) mod tests {
             applied,
             CalendarApplied::Written {
                 net_bytes: (weekly("s", "20200106T090000Z").len() + old.len()) as i64,
-                net_occurrences: weeks + 1
+                net_occurrences: weeks + 1,
+                net_alarms: weeks
             }
         );
         let (from, to): (i64, i64) = store
@@ -1258,8 +1352,7 @@ pub(crate) mod tests {
                 ))],
                 w,
                 None,
-                u64::MAX,
-                u64::MAX,
+                CalendarRoom::UNLIMITED,
             )
             .unwrap();
         let single = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:s\r\nSUMMARY:Una vez\r\n\
@@ -1270,8 +1363,7 @@ pub(crate) mod tests {
                 &[ObjectOp::Upsert(object(href, single, w))],
                 w,
                 None,
-                u64::MAX,
-                u64::MAX,
+                CalendarRoom::UNLIMITED,
             )
             .unwrap();
         assert_eq!(count(&store, "SELECT count(*) FROM calendar_objects"), 1);
@@ -1285,8 +1377,7 @@ pub(crate) mod tests {
                 &[ObjectOp::Delete(href.into())],
                 w,
                 None,
-                u64::MAX,
-                u64::MAX,
+                CalendarRoom::UNLIMITED,
             )
             .unwrap();
         assert_eq!(count(&store, "SELECT count(*) FROM occurrences"), 0);
@@ -1305,7 +1396,7 @@ pub(crate) mod tests {
             end: w.end + 86_400,
         };
         store
-            .apply_calendar_objects(&cal, &[], w, None, u64::MAX, u64::MAX)
+            .apply_calendar_objects(&cal, &[], w, None, CalendarRoom::UNLIMITED)
             .unwrap();
         let row = ObjectOp::Upsert(object(
             "https://x/c/s.ics",
@@ -1319,15 +1410,23 @@ pub(crate) mod tests {
                     std::slice::from_ref(&row),
                     other,
                     None,
-                    u64::MAX,
-                    u64::MAX
+                    CalendarRoom::UNLIMITED
                 )
                 .unwrap(),
             CalendarApplied::WindowMoved
         );
         assert_eq!(
             store
-                .apply_calendar_objects(&cal, &[row], w, None, u64::MAX, 10)
+                .apply_calendar_objects(
+                    &cal,
+                    &[row],
+                    w,
+                    None,
+                    CalendarRoom {
+                        occurrences: 10,
+                        ..CalendarRoom::UNLIMITED
+                    }
+                )
                 .unwrap(),
             CalendarApplied::OverCap
         );
@@ -1397,8 +1496,7 @@ pub(crate) mod tests {
                 &[ObjectOp::Upsert(object("https://x/c/d.ics", daily, w))],
                 w,
                 None,
-                u64::MAX,
-                u64::MAX,
+                CalendarRoom::UNLIMITED,
             )
             .unwrap();
         let before = count(&store, "SELECT count(*) FROM occurrences");
@@ -1414,7 +1512,13 @@ pub(crate) mod tests {
         assert!(!shifts[0].replace_all);
         assert_eq!(shifts[0].added.len(), 10);
         store
-            .apply_window_shift(later, &shifts, true, u64::MAX, &ExpansionLimits::DEFAULT)
+            .apply_window_shift(
+                later,
+                &shifts,
+                true,
+                CalendarRoom::UNLIMITED,
+                &ExpansionLimits::DEFAULT,
+            )
             .unwrap();
 
         assert_eq!(count(&store, "SELECT count(*) FROM occurrences"), before);
@@ -1434,9 +1538,232 @@ pub(crate) mod tests {
 
         // Correrla otra vez a la misma no cambia nada.
         store
-            .apply_window_shift(later, &[], true, u64::MAX, &ExpansionLimits::DEFAULT)
+            .apply_window_shift(
+                later,
+                &[],
+                true,
+                CalendarRoom::UNLIMITED,
+                &ExpansionLimits::DEFAULT,
+            )
             .unwrap();
         assert!(store.take_changes().is_empty());
+    }
+
+    /// Un diario con tres recordatorios, desde 2020: tres filas de `alarms`
+    /// por cada una de sus unas mil cien veces en la ventana.
+    fn daily_with_alarms() -> &'static str {
+        "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:d\r\nSUMMARY:Diario\r\n\
+         DTSTART:20200101T120000Z\r\nRRULE:FREQ=DAILY\r\n\
+         BEGIN:VALARM\r\nTRIGGER:-PT5M\r\nEND:VALARM\r\n\
+         BEGIN:VALARM\r\nTRIGGER:-PT10M\r\nEND:VALARM\r\n\
+         BEGIN:VALARM\r\nTRIGGER:-PT15M\r\nEND:VALARM\r\n\
+         END:VEVENT\r\nEND:VCALENDAR\r\n"
+    }
+
+    /// **Una cuenta que pasa el tope de recordatorios no sigue escribiendo.**
+    /// Diez recordatorios por ocurrencia dejaban diez millones de filas por
+    /// cuenta con el tope de ocurrencias solo: los recordatorios tienen el
+    /// suyo, medido por el cambio neto en la misma transacción. Y reescribir el
+    /// objeto no cuenta dos veces los que reemplaza.
+    #[test]
+    fn una_cuenta_que_pasa_el_tope_de_recordatorios_no_sigue_escribiendo() {
+        let temp = TempDir::new("cal-tope-recordatorios");
+        let mut store = open_store(&temp);
+        let cal = calendar(&mut store, "https://x/c/");
+        let w = window();
+        let row = || ObjectOp::Upsert(object("https://x/c/d.ics", daily_with_alarms(), w));
+        let alarms = row().alarms();
+        assert_eq!(alarms, 3 * row().occurrences());
+        let room = |alarms: u64| CalendarRoom {
+            alarms,
+            ..CalendarRoom::UNLIMITED
+        };
+        assert_eq!(
+            store
+                .apply_calendar_objects(&cal, &[row()], w, None, room(alarms as u64 - 1))
+                .unwrap(),
+            CalendarApplied::OverCap
+        );
+        assert_eq!(count(&store, "SELECT count(*) FROM calendar_objects"), 0);
+        assert_eq!(count(&store, "SELECT count(*) FROM alarms"), 0);
+        assert!(matches!(
+            store
+                .apply_calendar_objects(&cal, &[row()], w, None, room(alarms as u64))
+                .unwrap(),
+            CalendarApplied::Written { net_alarms, .. } if net_alarms == alarms as i64
+        ));
+        assert_eq!(store.alarm_count().unwrap(), alarms as u64);
+        // Reescrito, el cambio neto es cero: entra aunque no quede lugar.
+        assert!(matches!(
+            store
+                .apply_calendar_objects(&cal, &[row()], w, None, room(0))
+                .unwrap(),
+            CalendarApplied::Written { net_alarms: 0, .. }
+        ));
+    }
+
+    /// Correr la ventana también mide los recordatorios que suma.
+    #[test]
+    fn correr_la_ventana_mide_los_recordatorios() {
+        let temp = TempDir::new("cal-correr-recordatorios");
+        let mut store = open_store(&temp);
+        let cal = calendar(&mut store, "https://x/c/");
+        let w = window();
+        store
+            .apply_calendar_objects(
+                &cal,
+                &[ObjectOp::Upsert(object(
+                    "https://x/c/d.ics",
+                    daily_with_alarms(),
+                    w,
+                ))],
+                w,
+                None,
+                CalendarRoom::UNLIMITED,
+            )
+            .unwrap();
+        let before = store.alarm_count().unwrap();
+        let later = Window::around(Utc.with_ymd_and_hms(2026, 10, 6, 15, 0, 0).unwrap());
+        let shifts: Vec<SeriesShift> = store
+            .stale_series(later, 0, SHIFT_BATCH_ROWS)
+            .unwrap()
+            .iter()
+            .map(|s| shift_series(s, later, &ExpansionLimits::DEFAULT))
+            .collect();
+        // Diez días que salen y diez que entran: el neto es cero, pero hay
+        // que tener lugar para los que entran antes de que salgan los otros.
+        let tight = CalendarRoom {
+            alarms: 0,
+            ..CalendarRoom::UNLIMITED
+        };
+        assert!(matches!(
+            store
+                .apply_window_shift(later, &shifts, true, tight, &ExpansionLimits::DEFAULT)
+                .unwrap(),
+            CalendarApplied::Written { net_alarms: 0, .. }
+        ));
+        assert_eq!(store.alarm_count().unwrap(), before);
+
+        // Una serie que quedó recortada se vuelve a expandir entera: suma
+        // todos sus recordatorios menos los que tenía, y con el lugar de uno
+        // menos no entra ni escribe nada.
+        let small = ExpansionLimits {
+            max_occurrences: 10,
+            ..ExpansionLimits::DEFAULT
+        };
+        let (index, occurrences) = derive_with_occurrences(daily_with_alarms(), later, &small);
+        assert_eq!(index.expansion, ExpansionState::Truncated);
+        store
+            .apply_calendar_objects(
+                &cal,
+                &[ObjectOp::Upsert(Box::new(ObjectRow {
+                    href: "https://x/c/d.ics".into(),
+                    etag: None,
+                    raw_ical: daily_with_alarms().into(),
+                    index,
+                    occurrences,
+                }))],
+                later,
+                None,
+                CalendarRoom::UNLIMITED,
+            )
+            .unwrap();
+        let before = store.alarm_count().unwrap();
+        assert_eq!(before, 30);
+        let next = Window::around(Utc.with_ymd_and_hms(2026, 10, 7, 15, 0, 0).unwrap());
+        let shifts: Vec<SeriesShift> = store
+            .stale_series(next, 0, SHIFT_BATCH_ROWS)
+            .unwrap()
+            .iter()
+            .map(|s| shift_series(s, next, &ExpansionLimits::DEFAULT))
+            .collect();
+        assert!(shifts[0].replace_all);
+        let added: u64 = shifts[0].added.iter().map(|o| o.alarms.len() as u64).sum();
+        let room = |alarms: u64| CalendarRoom {
+            alarms,
+            ..CalendarRoom::UNLIMITED
+        };
+        assert_eq!(
+            store
+                .apply_window_shift(
+                    next,
+                    &shifts,
+                    true,
+                    room(added - before - 1),
+                    &ExpansionLimits::DEFAULT
+                )
+                .unwrap(),
+            CalendarApplied::OverCap
+        );
+        assert_eq!(store.alarm_count().unwrap(), before);
+        assert!(matches!(
+            store
+                .apply_window_shift(
+                    next,
+                    &shifts,
+                    true,
+                    room(added - before),
+                    &ExpansionLimits::DEFAULT
+                )
+                .unwrap(),
+            CalendarApplied::Written { net_alarms, .. } if net_alarms == (added - before) as i64
+        ));
+        assert_eq!(store.alarm_count().unwrap(), added);
+    }
+
+    /// **Los títulos no se copian a cada ocurrencia.** Una `THISANDFUTURE`
+    /// con otro título de 1000 bytes en la primera vez de una serie por hora:
+    /// las cinco mil veces lo muestran, y la base guarda el título una vez —en
+    /// `object_titles`—, no cinco mil (5 MB por un objeto de 1 KB).
+    #[test]
+    fn los_titulos_no_se_copian_a_cada_ocurrencia() {
+        let temp = TempDir::new("cal-titulos");
+        let mut store = open_store(&temp);
+        let cal = calendar(&mut store, "https://x/c/");
+        let w = window();
+        let title = "x".repeat(1000);
+        let raw = format!(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:h\r\nSUMMARY:Cada hora\r\n\
+             DTSTART:20250927T000000Z\r\nDURATION:PT10M\r\nRRULE:FREQ=HOURLY\r\nEND:VEVENT\r\n\
+             BEGIN:VEVENT\r\nUID:h\r\nSUMMARY:{title}\r\n\
+             RECURRENCE-ID;RANGE=THISANDFUTURE:20250927T000000Z\r\n\
+             DTSTART:20250927T000000Z\r\nDURATION:PT10M\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        );
+        let size = |store: &Store| -> i64 {
+            store
+                .connection()
+                .query_row(
+                    "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let empty = size(&store);
+        store
+            .apply_calendar_objects(
+                &cal,
+                &[ObjectOp::Upsert(object("https://x/c/h.ics", &raw, w))],
+                w,
+                None,
+                CalendarRoom::UNLIMITED,
+            )
+            .unwrap();
+        let stored = count(&store, "SELECT count(*) FROM occurrences");
+        assert_eq!(stored, 5000);
+        assert_eq!(count(&store, "SELECT count(*) FROM object_titles"), 1);
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM occurrences o JOIN object_titles t \
+                  ON t.object_id = o.object_id AND t.position = o.title"
+            ),
+            stored
+        );
+        // Cinco mil ocurrencias con su índice son unos 300 KB; con el título
+        // en cada una, más de 5 MB.
+        let grown = size(&store) - empty;
+        assert!(grown < 1024 * 1024, "la base creció {grown} bytes");
     }
 
     /// Una serie que se reescribió mientras se expandía no se toca: la
@@ -1459,8 +1786,7 @@ pub(crate) mod tests {
                 ))],
                 w,
                 None,
-                u64::MAX,
-                u64::MAX,
+                CalendarRoom::UNLIMITED,
             )
             .unwrap();
         let later = Window {
@@ -1490,13 +1816,18 @@ pub(crate) mod tests {
                 &[ObjectOp::Upsert(object(href, daily, later))],
                 later,
                 None,
-                u64::MAX,
-                u64::MAX,
+                CalendarRoom::UNLIMITED,
             )
             .unwrap();
         let before = count(&store, "SELECT count(*) FROM occurrences");
         store
-            .apply_window_shift(later, &shifts, true, u64::MAX, &ExpansionLimits::DEFAULT)
+            .apply_window_shift(
+                later,
+                &shifts,
+                true,
+                CalendarRoom::UNLIMITED,
+                &ExpansionLimits::DEFAULT,
+            )
             .unwrap();
         assert_eq!(count(&store, "SELECT count(*) FROM occurrences"), before);
     }

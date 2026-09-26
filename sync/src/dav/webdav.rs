@@ -123,6 +123,9 @@ pub struct Limits {
     /// Ocurrencias guardadas por cuenta: lo que deja la expansión de todas las
     /// series en la ventana, con cada vez de cada evento que no se repite.
     pub max_account_occurrences: u64,
+    /// Recordatorios guardados por cuenta: hasta diez por ocurrencia, así que
+    /// sin un tope propio el de ocurrencias dejaba pasar diez millones.
+    pub max_account_alarms: u64,
     /// Cuánto puede durar la vuelta de una cuenta. Las cuentas van de a una:
     /// sin esto, un servidor lento —cuatrocientos `multiget` de treinta
     /// segundos por libreta— dejaba esperando horas a las otras y a cada
@@ -148,6 +151,7 @@ impl Limits {
         max_ical_bytes: 512 * 1024,
         max_account_ical_bytes: 1024 * 1024 * 1024,
         max_account_occurrences: 1_000_000,
+        max_account_alarms: 1_000_000,
         max_round: Duration::from_secs(10 * 60),
     };
 }

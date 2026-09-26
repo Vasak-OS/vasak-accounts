@@ -196,8 +196,14 @@ END;
 /// - `occurrences`: las veces de cada evento. **En una serie, las que empiezan
 ///   en la ventana** del almacén; en un evento que no se repite, todas. Una
 ///   excepción reemplaza su vez (misma clave, `recurrence_id`, el comienzo que
-///   tenía en la serie) y lleva su título si cambió. Con el calendario copiado
+///   tenía en la serie). Si su título no es el del objeto, `title` dice cuál
+///   de `object_titles` es —el número, no el texto: una `THISANDFUTURE` con
+///   otro título se lo pasa a todas las que le siguen, y copiarlo a cada una
+///   multiplicaba el título por las ocurrencias—. Con el calendario copiado
 ///   para filtrar sin ir al objeto. Con cascada desde el objeto.
+/// - `object_titles`: los títulos de las excepciones de un objeto que no son
+///   el suyo, por su lugar entre ellas. Uno por excepción como mucho, y cada
+///   uno salió del recurso: juntos no pesan más que `raw_ical`.
 /// - `alarms`: los disparos de los recordatorios de cada ocurrencia guardada,
 ///   en segundos UTC, para las notificaciones que vengan. Con cascada desde su
 ///   ocurrencia.
@@ -260,12 +266,19 @@ CREATE TABLE occurrences (
     starts_at     INTEGER NOT NULL,
     ends_at       INTEGER NOT NULL,
     all_day       INTEGER NOT NULL,
-    summary       TEXT,
+    title         INTEGER,
     PRIMARY KEY (object_id, recurrence_id)
 ) STRICT, WITHOUT ROWID;
 
 CREATE INDEX occurrences_by_start
     ON occurrences (starts_at, object_id, recurrence_id, ends_at, calendar_id);
+
+CREATE TABLE object_titles (
+    object_id INTEGER NOT NULL REFERENCES calendar_objects (id) ON DELETE CASCADE,
+    position  INTEGER NOT NULL,
+    summary   TEXT NOT NULL,
+    PRIMARY KEY (object_id, position)
+) STRICT, WITHOUT ROWID;
 
 CREATE TABLE alarms (
     object_id     INTEGER NOT NULL,
@@ -359,6 +372,7 @@ mod tests {
             "calendar_objects_by_due",
             "occurrences",
             "occurrences_by_start",
+            "object_titles",
             "alarms",
             "alarms_by_time",
         ] {
@@ -706,7 +720,8 @@ mod tests {
         id
     }
 
-    /// Un objeto con dos ocurrencias y un recordatorio en cada una.
+    /// Un objeto con dos ocurrencias y un recordatorio en cada una, y el
+    /// título de una excepción.
     fn insert_object(connection: &Connection, calendar: i64, href: &str) -> i64 {
         connection
             .execute(
@@ -735,6 +750,12 @@ mod tests {
                 )
                 .unwrap();
         }
+        connection
+            .execute(
+                "INSERT INTO object_titles (object_id, position, summary) VALUES (?1, 0, 'Otra')",
+                [id],
+            )
+            .unwrap();
         id
     }
 
@@ -801,6 +822,7 @@ mod tests {
         );
         assert_eq!(count(&connection, "SELECT count(*) FROM occurrences"), 2);
         assert_eq!(count(&connection, "SELECT count(*) FROM alarms"), 2);
+        assert_eq!(count(&connection, "SELECT count(*) FROM object_titles"), 1);
         assert_eq!(
             count(
                 &connection,
@@ -831,6 +853,7 @@ mod tests {
             .unwrap();
         assert_eq!(count(&connection, "SELECT count(*) FROM occurrences"), 0);
         assert_eq!(count(&connection, "SELECT count(*) FROM alarms"), 0);
+        assert_eq!(count(&connection, "SELECT count(*) FROM object_titles"), 0);
     }
 
     /// Un objeto es uno por calendario y dirección, y no hay objeto sin

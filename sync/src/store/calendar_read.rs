@@ -341,10 +341,11 @@ pub fn occurrences_sql(calendars: Option<&[i64]>, cursor: Option<&str>) -> Strin
         .unwrap_or_default();
     format!(
         "SELECT o.starts_at, o.object_id, o.recurrence_id, o.ends_at, o.all_day,
-                coalesce(o.summary, c.summary), o.calendar_id, k.color, c.zone
+                coalesce(t.summary, c.summary), o.calendar_id, k.color, c.zone
            FROM occurrences o
            JOIN calendar_objects c ON c.id = o.object_id
            JOIN calendars k ON k.id = o.calendar_id
+           LEFT JOIN object_titles t ON t.object_id = o.object_id AND t.position = o.title
           WHERE o.starts_at >= ? AND o.starts_at < ?
             AND (o.ends_at > ? OR (o.ends_at <= o.starts_at AND o.starts_at >= ?)){}{}
           ORDER BY o.starts_at, o.object_id, o.recurrence_id
@@ -514,7 +515,9 @@ pub fn account_occurrences(
                     occurrence.recurrence_id,
                     occurrence.end,
                     occurrence.all_day,
-                    occurrence.summary.unwrap_or_else(|| summary.clone()),
+                    parsed
+                        .title_of(&occurrence)
+                        .map_or_else(|| summary.clone(), str::to_string),
                     calendar,
                     color.clone(),
                     &zone,
@@ -910,7 +913,7 @@ fn fit_event(mut event: EventDetail, cap: usize) -> EventDetail {
 #[cfg(test)]
 mod tests {
     use super::super::calendar::tests::{at, calendar, object, weekly, window};
-    use super::super::calendar::ObjectOp;
+    use super::super::calendar::{CalendarRoom, ObjectOp};
     use super::super::contacts::tests::open_store;
     use super::super::paths::tests::TempDir;
     use super::super::Store;
@@ -925,7 +928,7 @@ mod tests {
             .map(|(href, raw)| ObjectOp::Upsert(object(href, raw, w)))
             .collect();
         store
-            .apply_calendar_objects(&cal, &ops, w, None, u64::MAX, u64::MAX)
+            .apply_calendar_objects(&cal, &ops, w, None, CalendarRoom::UNLIMITED)
             .unwrap();
         store
     }
@@ -1111,6 +1114,45 @@ mod tests {
         assert!(starts.windows(2).all(|w| w[1] - w[0] == 7 * 86_400));
     }
 
+    /// El título de una `THISANDFUTURE` llega a cada vez que le sigue, de lo
+    /// guardado —por `object_titles`— y de lo expandido en el momento.
+    #[test]
+    fn el_titulo_de_una_excepcion_llega_a_la_lista() {
+        let temp = TempDir::new("leer-titulo");
+        let raw = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:s\r\nSUMMARY:Semanal s\r\n\
+                   DTSTART:20260907T090000Z\r\nDURATION:PT1H\r\nRRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\n\
+                   BEGIN:VEVENT\r\nUID:s\r\nSUMMARY:Semanal corrida\r\n\
+                   RECURRENCE-ID;RANGE=THISANDFUTURE:20260914T090000Z\r\n\
+                   DTSTART:20260914T090000Z\r\nDURATION:PT1H\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let store = store_with(&temp, &[("https://x/c/s.ics", raw)]);
+        let list = |from: &str, to: &str| {
+            titles(
+                &account_occurrences(
+                    store.connection(),
+                    "cuenta",
+                    range(from, to),
+                    None,
+                    None,
+                    100,
+                    &ExpansionLimits::DEFAULT,
+                )
+                .unwrap(),
+            )
+        };
+        assert_eq!(
+            list("2026-09-01T00:00:00Z", "2026-09-22T00:00:00Z"),
+            vec![
+                ("2026-09-07T09:00:00+00:00".into(), "Semanal s".into()),
+                ("2026-09-14T09:00:00+00:00".into(), "Semanal corrida".into()),
+                ("2026-09-21T09:00:00+00:00".into(), "Semanal corrida".into()),
+            ]
+        );
+        assert_eq!(
+            list("2030-01-01T00:00:00Z", "2030-01-08T00:00:00Z"),
+            vec![("2030-01-07T09:00:00+00:00".into(), "Semanal corrida".into())]
+        );
+    }
+
     /// **La paginación no repite ni saltea** aunque entre algo entre páginas,
     /// y el cursor funciona también con lo expandido en el momento.
     #[test]
@@ -1165,8 +1207,7 @@ mod tests {
                         ],
                         w,
                         None,
-                        u64::MAX,
-                        u64::MAX,
+                        CalendarRoom::UNLIMITED,
                     )
                     .unwrap();
             }

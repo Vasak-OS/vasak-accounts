@@ -691,6 +691,45 @@ async fn una_cuenta_que_pasa_el_tope_de_ocurrencias_no_sigue_escribiendo() {
     assert_eq!(f.calendar_status().await["state"], "failed");
 }
 
+/// Una cuenta que pasaría el tope de recordatorios —diez por ocurrencia en un
+/// diario— tampoco escribe ese lote ni guarda el token, aunque sus
+/// ocurrencias entren.
+#[tokio::test]
+async fn una_cuenta_que_pasa_el_tope_de_recordatorios_no_sigue_escribiendo() {
+    let limits = Limits {
+        max_account_alarms: 1000,
+        ..Limits::DEFAULT
+    };
+    let f = Fixture::with(
+        "calendario-tope-recordatorios",
+        limits,
+        ExpansionLimits::DEFAULT,
+    )
+    .await;
+    let alarms: String = (1..=10)
+        .map(|m| format!("BEGIN:VALARM\r\nTRIGGER:-PT{m}M\r\nEND:VALARM\r\n"))
+        .collect();
+    f.server.put(
+        0,
+        "d.ics",
+        &format!(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:d\r\nSUMMARY:Diario\r\n\
+             DTSTART:20260901T080000Z\r\nDURATION:PT30M\r\nRRULE:FREQ=DAILY\r\n\
+             {alarms}END:VEVENT\r\nEND:VCALENDAR\r\n"
+        ),
+    );
+    let outcome = f.sync().await;
+    assert!(
+        matches!(outcome, CalendarOutcome::Failed(_)),
+        "{}",
+        outcome_kind(&outcome)
+    );
+    assert_eq!(f.count("SELECT count(*) FROM alarms").await, 0);
+    assert_eq!(f.count("SELECT count(*) FROM calendar_objects").await, 0);
+    assert_eq!(f.token(0).await, None);
+    assert_eq!(f.calendar_status().await["state"], "failed");
+}
+
 // ── La expansión y la ventana ───────────────────────────────────────────────
 
 /// **Una regla que se dispara no cuelga la vuelta ni llena la base**: una por

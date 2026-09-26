@@ -1325,8 +1325,7 @@ mod tests {
                         ],
                         w,
                         None,
-                        u64::MAX,
-                        u64::MAX,
+                        crate::store::calendar::CalendarRoom::UNLIMITED,
                     )?;
                     Ok(())
                 })

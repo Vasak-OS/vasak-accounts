@@ -45,9 +45,9 @@
 //!
 //! Los de los contactos, adaptados ([`Limits`]): calendarios por cuenta,
 //! objetos por calendario (mirado antes de escribir), el tamaño de un objeto,
-//! los bytes de iCalendar crudo y las ocurrencias guardadas de la cuenta —por
-//! el cambio neto de cada lote, medido en su transacción— y el plazo de la
-//! vuelta. Pasar uno de la cuenta corta la vuelta sin guardar el token.
+//! los bytes de iCalendar crudo, las ocurrencias y los recordatorios guardados
+//! de la cuenta —por el cambio neto de cada lote, medido en su transacción— y
+//! el plazo de la vuelta. Pasar uno de la cuenta corta la vuelta sin guardar el token.
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -65,8 +65,9 @@ use crate::dav_sync::{
 use crate::ical::recurrence::ExpansionLimits;
 use crate::store::calendar::{
     derive_with_occurrences, shift_series, CalendarApplied, CalendarListing, CalendarProgress,
-    ExpansionState, ObjectOp, ObjectRow, SeriesShift, StoredCalendar, Window, SHIFT_BATCH_ROWS,
-    WRITE_BATCH_BYTES, WRITE_BATCH_OCCURRENCES, WRITE_BATCH_ROWS,
+    CalendarRoom, ExpansionState, ObjectOp, ObjectRow, SeriesShift, StoredCalendar, Window,
+    SHIFT_BATCH_ROWS, WRITE_BATCH_ALARMS, WRITE_BATCH_BYTES, WRITE_BATCH_OCCURRENCES,
+    WRITE_BATCH_ROWS,
 };
 use crate::store::key::{KeyError, KeySource};
 use crate::store::lifecycle::{AreaState, StoreManager, CALENDAR_AREA};
@@ -171,6 +172,8 @@ struct Round {
     stored_bytes: u64,
     /// Las ocurrencias guardadas de la cuenta, igual.
     stored_occurrences: u64,
+    /// Y los recordatorios.
+    stored_alarms: u64,
     /// La ventana con la que se expande todo lo de esta vuelta.
     window: Window,
 }
@@ -314,17 +317,19 @@ impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
                 CalendarOutcome::Failed(shown)
             }
             Err(SyncError::AccountTooLarge) => {
-                let (bytes, occurrences) = (
+                let (bytes, occurrences, alarms) = (
                     self.limits.max_account_ical_bytes,
                     self.limits.max_account_occurrences,
+                    self.limits.max_account_alarms,
                 );
                 tracing::warn!(
-                    "'{account_id}': el calendario pasaría los {bytes} bytes o las {occurrences} \
-                     ocurrencias"
+                    "'{account_id}': el calendario pasaría los {bytes} bytes, las {occurrences} \
+                     ocurrencias o los {alarms} recordatorios"
                 );
                 let shown = format!(
-                    "el calendario de la cuenta pasa lo que se guarda ({bytes} bytes o \
-                     {occurrences} ocurrencias); no se guardó lo que faltaba"
+                    "el calendario de la cuenta pasa lo que se guarda ({bytes} bytes, \
+                     {occurrences} ocurrencias o {alarms} recordatorios); no se guardó lo que \
+                     faltaba"
                 );
                 self.set_status(account_id, AreaState::Failed, &shown).await;
                 CalendarOutcome::Failed(shown)
@@ -359,6 +364,7 @@ impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
             deadline: tokio::time::Instant::now() + self.limits.max_round,
             stored_bytes: 0,
             stored_occurrences: 0,
+            stored_alarms: 0,
             window,
         };
 
@@ -412,9 +418,17 @@ impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
         let stored = self
             .store(account_id, move |s| s.upsert_calendars(&listed))
             .await?;
-        (round.stored_bytes, round.stored_occurrences) = self
+        (
+            round.stored_bytes,
+            round.stored_occurrences,
+            round.stored_alarms,
+        ) = self
             .store(account_id, |s| {
-                Ok((s.calendar_raw_bytes()?, s.occurrence_count()?))
+                Ok((
+                    s.calendar_raw_bytes()?,
+                    s.occurrence_count()?,
+                    s.alarm_count()?,
+                ))
             })
             .await?;
 
@@ -568,37 +582,38 @@ impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
     ) -> Result<(), SyncError> {
         round.check_deadline()?;
         let ops = batch.take();
-        let room_bytes = self
-            .limits
-            .max_account_ical_bytes
-            .saturating_sub(round.stored_bytes);
-        let room_occurrences = self
-            .limits
-            .max_account_occurrences
-            .saturating_sub(round.stored_occurrences);
+        let room = CalendarRoom {
+            bytes: self
+                .limits
+                .max_account_ical_bytes
+                .saturating_sub(round.stored_bytes),
+            occurrences: self
+                .limits
+                .max_account_occurrences
+                .saturating_sub(round.stored_occurrences),
+            alarms: self
+                .limits
+                .max_account_alarms
+                .saturating_sub(round.stored_alarms),
+        };
         let calendar = stored.clone();
         let window = round.window;
         let applied = self
             .store(account_id, move |s| {
-                s.apply_calendar_objects(
-                    &calendar,
-                    &ops,
-                    window,
-                    finish.as_ref(),
-                    room_bytes,
-                    room_occurrences,
-                )
+                s.apply_calendar_objects(&calendar, &ops, window, finish.as_ref(), room)
             })
             .await?;
         match applied {
             CalendarApplied::Written {
                 net_bytes,
                 net_occurrences,
+                net_alarms,
             } => {
                 round.stored_bytes = round.stored_bytes.saturating_add_signed(net_bytes);
                 round.stored_occurrences = round
                     .stored_occurrences
                     .saturating_add_signed(net_occurrences);
+                round.stored_alarms = round.stored_alarms.saturating_add_signed(net_alarms);
             }
             CalendarApplied::OverCap => return Err(SyncError::AccountTooLarge),
             CalendarApplied::WindowMoved => return Err(SyncError::WindowMoved),
@@ -653,8 +668,21 @@ impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
             return false;
         }
         let deadline = tokio::time::Instant::now() + self.limits.max_round;
-        let mut room = match self.store(account_id, |s| s.occurrence_count()).await {
-            Ok(count) => self.limits.max_account_occurrences.saturating_sub(count),
+        let mut room = match self
+            .store(account_id, |s| {
+                Ok((s.occurrence_count()?, s.alarm_count()?))
+            })
+            .await
+        {
+            // Correr la ventana no cambia el crudo: los bytes no se miden.
+            Ok((occurrences, alarms)) => CalendarRoom {
+                occurrences: self
+                    .limits
+                    .max_account_occurrences
+                    .saturating_sub(occurrences),
+                alarms: self.limits.max_account_alarms.saturating_sub(alarms),
+                ..CalendarRoom::UNLIMITED
+            },
             Err(_) => return false,
         };
         let mut after = 0;
@@ -697,11 +725,17 @@ impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
                 .await
             {
                 Ok(CalendarApplied::Written {
-                    net_occurrences, ..
-                }) => room = room.saturating_add_signed(-net_occurrences),
+                    net_occurrences,
+                    net_alarms,
+                    ..
+                }) => {
+                    room.occurrences = room.occurrences.saturating_add_signed(-net_occurrences);
+                    room.alarms = room.alarms.saturating_add_signed(-net_alarms);
+                }
                 Ok(_) => {
                     tracing::warn!(
-                        "'{account_id}': correr la ventana pasaría el tope de ocurrencias"
+                        "'{account_id}': correr la ventana pasaría el tope de ocurrencias o de \
+                         recordatorios"
                     );
                     return true;
                 }
@@ -723,11 +757,13 @@ struct Batch {
     ops: Vec<ObjectOp>,
     bytes: usize,
     occurrences: usize,
+    alarms: usize,
 }
 
 impl Batch {
     fn push(&mut self, op: ObjectOp) {
         self.occurrences += op.occurrences();
+        self.alarms += op.alarms();
         self.bytes += match &op {
             ObjectOp::Upsert(row) => row.raw_ical.len(),
             ObjectOp::Delete(href) => href.len(),
@@ -739,11 +775,13 @@ impl Batch {
         self.ops.len() >= WRITE_BATCH_ROWS
             || self.bytes >= WRITE_BATCH_BYTES
             || self.occurrences >= WRITE_BATCH_OCCURRENCES
+            || self.alarms >= WRITE_BATCH_ALARMS
     }
 
     fn take(&mut self) -> Vec<ObjectOp> {
         self.bytes = 0;
         self.occurrences = 0;
+        self.alarms = 0;
         std::mem::take(&mut self.ops)
     }
 }

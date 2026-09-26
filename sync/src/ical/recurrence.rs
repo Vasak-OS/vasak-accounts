@@ -175,8 +175,12 @@ pub struct Occurrence {
     pub start: i64,
     pub end: i64,
     pub all_day: bool,
-    /// El título de una excepción, cuando no es el de la serie.
-    pub summary: Option<String>,
+    /// De qué excepción es el título, cuando no es el de la serie: su lugar
+    /// en [`EventSeries::titles`]. No el texto: una `THISANDFUTURE` con otro
+    /// título se lo pasa a todas las veces que le siguen, y copiarlo a cada
+    /// una multiplicaba el título por las ocurrencias —en la memoria y en la
+    /// base—.
+    pub title: Option<u32>,
     pub alarms: Vec<AlarmInstance>,
 }
 
@@ -210,6 +214,8 @@ struct Override {
     rid: i64,
     this_and_future: bool,
     instance: Instance,
+    /// Su lugar entre las excepciones, si su título no es el de la serie.
+    title: Option<u32>,
 }
 
 /// Una fecha que saca `EXDATE`.
@@ -702,17 +708,44 @@ impl EventSeries {
                     .param("RANGE")
                     .is_some_and(|r| r.eq_ignore_ascii_case("THISANDFUTURE")),
                 instance: instance_of(component, document, limits),
+                title: None,
             });
         }
         overrides.sort_by_key(|o| o.rid);
         // Dos excepciones de la misma vez: vale la primera.
         overrides.dedup_by_key(|o| o.rid);
+        let master_summary = master.as_ref().map(|m| m.instance.summary.as_str());
+        for (position, o) in overrides.iter_mut().enumerate() {
+            o.title =
+                (master_summary != Some(o.instance.summary.as_str())).then_some(position as u32);
+        }
 
         Some(Self {
             master,
             overrides,
             truncated,
         })
+    }
+
+    /// Los títulos de las excepciones que no llevan el de la serie, por su
+    /// lugar: lo que nombra [`Occurrence::title`]. Como mucho uno por
+    /// excepción, y cada uno salió del recurso, así que juntos no pesan más que
+    /// él.
+    pub fn titles(&self) -> Vec<(u32, &str)> {
+        self.overrides
+            .iter()
+            .filter_map(|o| Some((o.title?, o.instance.summary.as_str())))
+            .collect()
+    }
+
+    /// El título de una vez: el de su excepción, o `None` si es el de la
+    /// serie.
+    pub fn title_of(&self, occurrence: &Occurrence) -> Option<&str> {
+        let position = occurrence.title?;
+        self.overrides
+            .get(position as usize)
+            .filter(|o| o.title == Some(position))
+            .map(|o| o.instance.summary.as_str())
     }
 
     /// Si se repite: tiene regla o fechas sueltas. Una que no se repite tiene
@@ -808,14 +841,9 @@ impl EventSeries {
             start,
             end: o.instance.span.end_of(start),
             all_day: o.instance.start.as_ref().is_some_and(DateValue::is_date),
-            summary: self.summary_if_different(&o.instance).map(str::to_string),
+            title: o.title,
             alarms: Vec::new(),
         })
-    }
-
-    fn summary_if_different<'a>(&self, instance: &'a Instance) -> Option<&'a str> {
-        let master = self.master.as_ref().map(|m| m.instance.summary.as_str());
-        (master != Some(instance.summary.as_str())).then_some(instance.summary.as_str())
     }
 
     /// La expansión: las veces de la serie cuyo comienzo cae en `[lo, hi)`
@@ -917,7 +945,7 @@ impl EventSeries {
             start: i64,
             end: i64,
             all_day: bool,
-            summary: Option<&'a str>,
+            title: Option<u32>,
             source: &'a Instance,
         }
         let mut built: BTreeMap<i64, Built<'_>> = BTreeMap::new();
@@ -934,7 +962,7 @@ impl EventSeries {
                         start: *rid,
                         end: master.instance.span.end_of(*rid),
                         all_day,
-                        summary: None,
+                        title: None,
                         source: &master.instance,
                     },
                 );
@@ -958,7 +986,7 @@ impl EventSeries {
             .iter()
             .filter(|o| !o.instance.cancelled)
             .peekable();
-        let mut current: Option<(&Override, i64, Option<&str>)> = None;
+        let mut current: Option<(&Override, i64)> = None;
         for (rid, occurrence) in built.iter_mut() {
             while let Some(o) = pending.next_if(|o| o.rid <= *rid) {
                 let delta = self.override_start(o).saturating_sub(o.rid);
@@ -967,12 +995,12 @@ impl EventSeries {
                 } else {
                     delta
                 };
-                current = Some((o, delta, self.summary_if_different(&o.instance)));
+                current = Some((o, delta));
             }
-            if let Some((o, delta, summary)) = current {
+            if let Some((o, delta)) = current {
                 occurrence.start = rid.saturating_add(delta);
                 occurrence.end = o.instance.span.end_of(occurrence.start);
-                occurrence.summary = summary;
+                occurrence.title = o.title;
                 occurrence.source = &o.instance;
             }
         }
@@ -989,7 +1017,7 @@ impl EventSeries {
                     start,
                     end: o.instance.span.end_of(start),
                     all_day: o.instance.start.as_ref().is_some_and(DateValue::is_date),
-                    summary: self.summary_if_different(&o.instance),
+                    title: o.title,
                     source: &o.instance,
                 },
             );
@@ -1003,7 +1031,7 @@ impl EventSeries {
                 start: b.start,
                 end: b.end,
                 all_day: b.all_day,
-                summary: b.summary.map(str::to_string),
+                title: b.title,
                 alarms: alarms_for(b.source, b.start, b.end, rid, self.first_rid()),
             })
             .collect();
@@ -1221,8 +1249,8 @@ mod tests {
         let moved = &e.occurrences[1];
         assert_eq!(moved.recurrence_id, at("2026-01-12T10:00:00Z"));
         assert_eq!(moved.end - moved.start, 7200);
-        assert_eq!(moved.summary.as_deref(), Some("Reunión movida"));
-        assert_eq!(e.occurrences[0].summary, None);
+        assert_eq!(s.title_of(moved), Some("Reunión movida"));
+        assert_eq!(s.title_of(&e.occurrences[0]), None);
     }
 
     /// `THISANDFUTURE`: desde esa vez en adelante la serie se corre lo mismo
@@ -1767,15 +1795,12 @@ mod tests {
         let last = e.occurrences.last().unwrap();
         assert_eq!(last.start - last.recurrence_id, 30);
         assert_eq!(
-            last.summary.as_deref(),
+            series(&many_this_and_future()).title_of(last),
             Some(format!("t{:04}", 499).repeat(160).as_str())
         );
         // Una del medio, la de la excepción 200.
         let middle = &e.occurrences[200];
-        assert_eq!(
-            middle.summary.as_deref(),
-            Some("t0200".repeat(160).as_str())
-        );
+        assert_eq!(middle.title, Some(200));
     }
 
     /// Una `THISANDFUTURE` cancelada se lleva todas las que siguen, también
@@ -1796,7 +1821,8 @@ mod tests {
             RECURRENCE-ID;RANGE=THISANDFUTURE:20260202T100000Z\r\n\
             DTSTART:20260202T120000Z\r\nEND:VEVENT\r\n\
             END:VCALENDAR\r\n";
-        let e = series(ical).materialize(
+        let s = series(ical);
+        let e = s.materialize(
             at("2026-01-01T00:00:00Z"),
             at("2027-01-01T00:00:00Z"),
             &ExpansionLimits::DEFAULT,
@@ -1810,8 +1836,9 @@ mod tests {
                 "2026-02-02T12:00:00+00:00",
             ]
         );
-        assert_eq!(e.occurrences[0].summary, None);
-        assert_eq!(e.occurrences[2].summary.as_deref(), Some("Clase corrida"));
+        assert_eq!(s.title_of(&e.occurrences[0]), None);
+        assert_eq!(s.title_of(&e.occurrences[2]), Some("Clase corrida"));
+        assert_eq!(s.title_of(&e.occurrences[3]), Some("Otra"));
     }
 
     /// **Mil `EXDATE` de día no multiplican el costo.** Una fecha sin hora
