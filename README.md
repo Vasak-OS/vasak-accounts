@@ -686,10 +686,20 @@ Encendido por omisión. Lo que la persona decide por cuenta vive en
 **primero la clave y después los archivos**; con el llavero bloqueado se borran
 los archivos y la clave en el primer desbloqueo. Una base vaciada o apagada
 **nunca vuelve con la clave vieja**: aunque el llavero diga que la borró, la
-cuenta queda anotada hasta tener una clave nueva guardada. La base de una cuenta
-que ya no está en `ListAccounts` se borra, pero sólo si `ListAccounts` respondió
-bien: un servicio que no contesta no quiere decir que la persona no tenga
-cuentas.
+cuenta queda anotada hasta tener una clave nueva guardada.
+
+La base de una cuenta que ya no está —archivos, clave y lo decidido en
+`stores.json`— se borra recién cuando **falta en dos `ListAccounts` que
+respondieron bien, separados por lo menos por una vuelta del bucle principal**
+(cinco minutos). Un listado que falla no cuenta ni a favor ni en contra: un
+servicio que no contesta no quiere decir que la persona no tenga cuentas. Y uno
+solo que contesta bien y vacío tampoco alcanza: el servicio de cuentas lo hace
+cuando le falta `accounts.json`, y dos seguidos en el mismo segundo —una ráfaga
+de `AccountsChanged`— salen del mismo estado. Si la cuenta reaparece en
+cualquier listado bueno, la sospecha se olvida. Vive en memoria: después de
+reiniciar el sync hace falta confirmar de nuevo. Una cuenta quitada después de
+vaciarla o apagarla sale también de la lista de claves por borrar, pero sólo
+con el llavero desbloqueado y la clave vieja comprobada fuera.
 
 Borrar bajo `stores/` no sigue enlaces: `vasak-accounts-sync/` y `stores/` se
 abren con `O_NOFOLLOW` y todo se borra relativo a ese descriptor, sin

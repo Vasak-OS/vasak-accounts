@@ -15,7 +15,7 @@
 //! Respuestas en JSON, como `AccountsSync`.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use zbus::interface;
 use zbus::object_server::SignalContext;
@@ -232,12 +232,16 @@ impl<K: KeySource> StoreService<K> {
     /// Lo que hay que hacer cada vez que se leen las cuentas.
     ///
     /// En una tarea aparte: el llavero puede tardar en contestar, y el bucle
-    /// que atiende el correo no tiene por qué esperarlo.
+    /// que atiende el correo no tiene por qué esperarlo. El momento se toma
+    /// **acá**, al llegar la respuesta, y no cuando la tarea consigue la
+    /// cerradura: es lo que mide la confirmación de una cuenta que se fue, y
+    /// una espera por el llavero no puede acortar ni estirar la vuelta.
     pub fn accounts_listed(&self, listing: AccountListing) {
         let manager = Arc::clone(&self.manager);
         let emitter = self.emitter.clone();
+        let arrived = Instant::now();
         tokio::spawn(async move {
-            if manager.accounts_listed(listing).await {
+            if manager.accounts_listed(listing, arrived).await {
                 let _ = StoreApi::<K>::status_changed(&emitter).await;
             }
         });
@@ -299,7 +303,10 @@ mod tests {
             }),
         ));
         manager
-            .accounts_listed(listing_from(&Ok(vec![account("cuenta", false)])))
+            .accounts_listed(
+                listing_from(&Ok(vec![account("cuenta", false)])),
+                Instant::now(),
+            )
             .await;
 
         let (server_end, client_end) = tokio::net::UnixStream::pair().unwrap();
