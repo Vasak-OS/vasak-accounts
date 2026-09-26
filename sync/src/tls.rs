@@ -21,18 +21,18 @@ use tokio_rustls::TlsConnector;
 /// Si no hay ninguno se falla en vez de seguir: un conector sin raíces rechaza
 /// cualquier servidor, y el error que da —«certificado desconocido»— manda a
 /// buscar el problema en el servidor de la persona cuando está en su equipo.
-pub fn conector() -> Result<TlsConnector, String> {
-    let mut raices = RootCertStore::empty();
-    for certificado in rustls_native_certs::load_native_certs().certs {
-        let _ = raices.add(certificado);
+pub fn connector() -> Result<TlsConnector, String> {
+    let mut roots = RootCertStore::empty();
+    for cert in rustls_native_certs::load_native_certs().certs {
+        let _ = roots.add(cert);
     }
-    if raices.is_empty() {
+    if roots.is_empty() {
         return Err("no hay certificados de confianza instalados en el equipo".into());
     }
 
     Ok(TlsConnector::from(Arc::new(
         ClientConfig::builder()
-            .with_root_certificates(raices)
+            .with_root_certificates(roots)
             .with_no_client_auth(),
     )))
 }
@@ -46,6 +46,6 @@ mod tests {
     /// y es mejor enterarse acá que en el diario de alguien.
     #[test]
     fn el_equipo_tiene_certificados_de_confianza() {
-        assert!(conector().is_ok());
+        assert!(connector().is_ok());
     }
 }

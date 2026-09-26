@@ -501,7 +501,7 @@ Publica en `ar.net.vasak.os.AccountsSync` (bus de sesión):
 | `ListMessages(account_id)` | Los últimos 200 mensajes: quién, qué asunto, cuándo, leído o no. Sin cuerpos. |
 | `GetMessage(account_id, uid)` | El texto, si se cortó, si trae adjuntos, y lo que hace falta para responderlo. |
 | `MarkRead(account_id, uid)` | Marca un mensaje como leído **en el servidor**. |
-| `SendMessage(account_id, borrador)` | Pone un mensaje en la cola de salida. Devuelve su identificador. |
+| `SendMessage(account_id, draft, not_before)` | Pone un mensaje en la cola de salida. Devuelve su identificador. |
 | `ListOutbox` | Lo que está esperando salir, y lo que se trabó. |
 | `DiscardOutgoing(id)` | Saca un mensaje de la cola sin mandarlo. |
 

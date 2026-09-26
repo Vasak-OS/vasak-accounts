@@ -19,60 +19,68 @@
 /// no contemple, que es justamente la propiedad que se busca.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "campo", content = "valor")]
-pub enum Termino {
+pub enum Term {
     /// En el remitente.
-    De(String),
+    #[serde(rename = "de")]
+    Sender(String),
     /// En el destinatario.
-    Para(String),
-    Asunto(String),
+    #[serde(rename = "para")]
+    Recipient(String),
+    #[serde(rename = "asunto")]
+    Subject(String),
     /// En el cuerpo del mensaje.
-    Cuerpo(String),
+    #[serde(rename = "cuerpo")]
+    Body(String),
     /// En cualquier parte: encabezados y cuerpo.
-    Cualquiera(String),
+    #[serde(rename = "cualquiera")]
+    Any(String),
     /// Sin leer.
-    SinLeer,
+    #[serde(rename = "sin_leer")]
+    Unread,
     /// Destacado.
-    Destacado,
+    #[serde(rename = "destacado")]
+    Flagged,
     /// Desde una fecha, en el formato de IMAP: `1-Jan-2026`.
-    Desde(String),
+    #[serde(rename = "desde")]
+    Since(String),
 }
 
 /// Cómo se le manda un texto al servidor.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Trozo {
+pub enum Chunk {
     /// Va tal cual en la línea del comando.
-    Literal(String),
+    Inline(String),
     /// Va como literal de IMAP: `{N}\r\n` y después los bytes, en otra línea.
     ///
     /// Hace falta cuando el texto tiene bytes que no son ASCII. Un «reunión»
     /// entre comillas contra un servidor que asume US-ASCII no encuentra nada.
-    Cadena(String),
+    Literal(String),
 }
 
 /// La palabra clave de IMAP de cada término.
-fn clave(termino: &Termino) -> &'static str {
-    match termino {
-        Termino::De(_) => "FROM",
-        Termino::Para(_) => "TO",
-        Termino::Asunto(_) => "SUBJECT",
-        Termino::Cuerpo(_) => "BODY",
-        Termino::Cualquiera(_) => "TEXT",
-        Termino::SinLeer => "UNSEEN",
-        Termino::Destacado => "FLAGGED",
-        Termino::Desde(_) => "SINCE",
+fn search_key(term: &Term) -> &'static str {
+    match term {
+        Term::Sender(_) => "FROM",
+        Term::Recipient(_) => "TO",
+        Term::Subject(_) => "SUBJECT",
+        Term::Body(_) => "BODY",
+        Term::Any(_) => "TEXT",
+        Term::Unread => "UNSEEN",
+        Term::Flagged => "FLAGGED",
+        Term::Since(_) => "SINCE",
     }
 }
 
 /// El texto que acompaña al término, si lleva alguno.
-fn texto(termino: &Termino) -> Option<&str> {
-    match termino {
-        Termino::De(t)
-        | Termino::Para(t)
-        | Termino::Asunto(t)
-        | Termino::Cuerpo(t)
-        | Termino::Cualquiera(t)
-        | Termino::Desde(t) => Some(t),
-        Termino::SinLeer | Termino::Destacado => None,
+fn term_text(term: &Term) -> Option<&str> {
+    match term {
+        Term::Sender(t)
+        | Term::Recipient(t)
+        | Term::Subject(t)
+        | Term::Body(t)
+        | Term::Any(t)
+        | Term::Since(t) => Some(t),
+        Term::Unread | Term::Flagged => None,
     }
 }
 
@@ -81,22 +89,22 @@ fn texto(termino: &Termino) -> Option<&str> {
 /// Se comprueba y no se confía: una fecha es lo único que va **sin comillas** en
 /// el comando, así que es el único lugar por donde un texto cualquiera podría
 /// llegar a la sintaxis. Lo que no tiene esa forma se descarta.
-fn es_fecha(valor: &str) -> bool {
-    let mut partes = valor.split('-');
-    let (Some(dia), Some(mes), Some(anio), None) =
-        (partes.next(), partes.next(), partes.next(), partes.next())
+fn is_imap_date(value: &str) -> bool {
+    let mut parts = value.split('-');
+    let (Some(day), Some(month), Some(year), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
     else {
         return false;
     };
 
-    const MESES: [&str; 12] = [
+    const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
-    (1..=2).contains(&dia.len())
-        && dia.chars().all(|c| c.is_ascii_digit())
-        && MESES.contains(&mes)
-        && anio.len() == 4
-        && anio.chars().all(|c| c.is_ascii_digit())
+    (1..=2).contains(&day.len())
+        && day.chars().all(|c| c.is_ascii_digit())
+        && MONTHS.contains(&month)
+        && year.len() == 4
+        && year.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Arma el criterio de `SEARCH` a partir de lo que se pidió.
@@ -107,54 +115,54 @@ fn es_fecha(valor: &str) -> bool {
 /// Devuelve los trozos y no una cadena porque los textos que no son ASCII
 /// tienen que viajar como literales, o sea en líneas aparte: la conversión a
 /// bytes la hace quien escribe en el socket.
-pub fn armar(terminos: &[Termino]) -> Vec<Trozo> {
-    let mut trozos = Vec::new();
+pub fn build_criteria(terms: &[Term]) -> Vec<Chunk> {
+    let mut chunks = Vec::new();
 
-    for termino in terminos {
-        let clave = clave(termino);
-        match texto(termino) {
-            None => trozos.push(Trozo::Literal(clave.to_string())),
+    for term in terms {
+        let key = search_key(term);
+        match term_text(term) {
+            None => chunks.push(Chunk::Inline(key.to_string())),
             Some("") => {
                 // Un término vacío no acota nada y `SUBJECT ""` hace que algunos
                 // servidores contesten un error. Se saltea.
                 continue;
             }
-            Some(valor) => {
-                if matches!(termino, Termino::Desde(_)) {
-                    if !es_fecha(valor) {
+            Some(value) => {
+                if matches!(term, Term::Since(_)) {
+                    if !is_imap_date(value) {
                         continue;
                     }
-                    trozos.push(Trozo::Literal(format!("{clave} {valor}")));
+                    chunks.push(Chunk::Inline(format!("{key} {value}")));
                     continue;
                 }
-                trozos.push(Trozo::Literal(clave.to_string()));
-                if valor.is_ascii() {
-                    trozos.push(Trozo::Literal(entrecomillar(valor)));
+                chunks.push(Chunk::Inline(key.to_string()));
+                if value.is_ascii() {
+                    chunks.push(Chunk::Inline(quote_string(value)));
                 } else {
-                    trozos.push(Trozo::Cadena(valor.to_string()));
+                    chunks.push(Chunk::Literal(value.to_string()));
                 }
             }
         }
     }
 
-    trozos
+    chunks
 }
 
 /// Una cadena de IMAP: entre comillas, con `\` y `"` escapados.
-fn entrecomillar(valor: &str) -> String {
-    let mut salida = String::with_capacity(valor.len() + 2);
-    salida.push('"');
-    for c in valor.chars() {
+fn quote_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
         if c == '"' || c == '\\' {
-            salida.push('\\');
+            out.push('\\');
         }
         // Los saltos de línea no pueden ir en una cadena de IMAP, ni escapados:
         // partirían el comando en dos. Se reemplazan por un espacio, que para
         // buscar da lo mismo y no cambia la sintaxis.
-        salida.push(if c == '\r' || c == '\n' { ' ' } else { c });
+        out.push(if c == '\r' || c == '\n' { ' ' } else { c });
     }
-    salida.push('"');
-    salida
+    out.push('"');
+    out
 }
 
 /// Los UID que devolvió un `SEARCH`.
@@ -162,11 +170,10 @@ fn entrecomillar(valor: &str) -> String {
 /// La respuesta es `* SEARCH 1 3 7`. Lo que no sea un número se descarta: hay
 /// servidores que agregan cosas al final, y un número que no se entiende es
 /// peor que uno que falta.
-pub fn uids_de_search(linea: &str) -> Option<Vec<u32>> {
-    let resto = tras_search(linea)?;
+pub fn search_uids(line: &str) -> Option<Vec<u32>> {
+    let rest = after_search(line)?;
     Some(
-        resto
-            .split_whitespace()
+        rest.split_whitespace()
             .filter_map(|t| t.parse().ok())
             .collect(),
     )
@@ -178,15 +185,15 @@ pub fn uids_de_search(linea: &str) -> Option<Vec<u32>> {
 /// espacio o el final, `* SEARCHING 1` pasa por una respuesta de `SEARCH` con un
 /// resultado. Es la misma clase de error que el de las etiquetas, que ya tiene
 /// su prueba en `imap.rs`.
-pub fn tras_search(linea: &str) -> Option<&str> {
-    let sin_asterisco = linea.strip_prefix("* ")?;
-    let mayusculas = sin_asterisco.to_ascii_uppercase();
-    if !mayusculas.starts_with("SEARCH") {
+pub fn after_search(line: &str) -> Option<&str> {
+    let after_star = line.strip_prefix("* ")?;
+    let upper = after_star.to_ascii_uppercase();
+    if !upper.starts_with("SEARCH") {
         return None;
     }
-    let resto = &sin_asterisco["SEARCH".len()..];
-    if resto.is_empty() || resto.starts_with(' ') {
-        Some(resto)
+    let rest = &after_star["SEARCH".len()..];
+    if rest.is_empty() || rest.starts_with(' ') {
+        Some(rest)
     } else {
         None
     }
@@ -202,20 +209,20 @@ mod tests {
     fn el_texto_no_puede_cambiar_el_comando() {
         // Palabras clave del protocolo adentro del término: van entre comillas y
         // el servidor las lee como texto, no como criterio.
-        let trozos = armar(&[Termino::Asunto("UNSEEN OR FROM jefe".into())]);
+        let chunks = build_criteria(&[Term::Subject("UNSEEN OR FROM jefe".into())]);
         assert_eq!(
-            trozos,
+            chunks,
             vec![
-                Trozo::Literal("SUBJECT".into()),
-                Trozo::Literal("\"UNSEEN OR FROM jefe\"".into()),
+                Chunk::Inline("SUBJECT".into()),
+                Chunk::Inline("\"UNSEEN OR FROM jefe\"".into()),
             ]
         );
     }
 
     #[test]
     fn las_comillas_y_las_barras_se_escapan() {
-        let trozos = armar(&[Termino::De(r#"el "jefe" \ raro"#.into())]);
-        assert_eq!(trozos[1], Trozo::Literal(r#""el \"jefe\" \\ raro""#.into()));
+        let chunks = build_criteria(&[Term::Sender(r#"el "jefe" \ raro"#.into())]);
+        assert_eq!(chunks[1], Chunk::Inline(r#""el \"jefe\" \\ raro""#.into()));
     }
 
     /// Un salto de línea partiría el comando en dos, y la segunda mitad sería
@@ -223,43 +230,43 @@ mod tests {
     /// IMAP, así que se reemplazan.
     #[test]
     fn un_salto_de_linea_no_parte_el_comando() {
-        let trozos = armar(&[Termino::Asunto("hola\r\na1 LOGOUT".into())]);
-        let Trozo::Literal(cadena) = &trozos[1] else {
+        let chunks = build_criteria(&[Term::Subject("hola\r\na1 LOGOUT".into())]);
+        let Chunk::Inline(chain) = &chunks[1] else {
             panic!("tendría que ser literal");
         };
-        assert!(!cadena.contains('\r'));
-        assert!(!cadena.contains('\n'));
+        assert!(!chain.contains('\r'));
+        assert!(!chain.contains('\n'));
     }
 
     /// Sin esto, buscar «reunión» contra un servidor que asume US-ASCII no
     /// encuentra nada o falla con `BADCHARSET`.
     #[test]
     fn lo_que_no_es_ascii_viaja_como_literal() {
-        let trozos = armar(&[Termino::Asunto("reunión".into())]);
-        assert_eq!(trozos[0], Trozo::Literal("SUBJECT".into()));
-        assert_eq!(trozos[1], Trozo::Cadena("reunión".into()));
+        let chunks = build_criteria(&[Term::Subject("reunión".into())]);
+        assert_eq!(chunks[0], Chunk::Inline("SUBJECT".into()));
+        assert_eq!(chunks[1], Chunk::Literal("reunión".into()));
     }
 
     #[test]
     fn los_que_no_llevan_texto_van_solos() {
         assert_eq!(
-            armar(&[Termino::SinLeer, Termino::Destacado]),
+            build_criteria(&[Term::Unread, Term::Flagged]),
             vec![
-                Trozo::Literal("UNSEEN".into()),
-                Trozo::Literal("FLAGGED".into()),
+                Chunk::Inline("UNSEEN".into()),
+                Chunk::Inline("FLAGGED".into()),
             ]
         );
     }
 
     #[test]
     fn varios_terminos_se_juntan() {
-        let trozos = armar(&[Termino::SinLeer, Termino::De("ana".into())]);
+        let chunks = build_criteria(&[Term::Unread, Term::Sender("ana".into())]);
         assert_eq!(
-            trozos,
+            chunks,
             vec![
-                Trozo::Literal("UNSEEN".into()),
-                Trozo::Literal("FROM".into()),
-                Trozo::Literal("\"ana\"".into()),
+                Chunk::Inline("UNSEEN".into()),
+                Chunk::Inline("FROM".into()),
+                Chunk::Inline("\"ana\"".into()),
             ]
         );
     }
@@ -268,7 +275,7 @@ mod tests {
     /// por donde un texto cualquiera podría llegar a la sintaxis.
     #[test]
     fn una_fecha_que_no_es_una_fecha_se_descarta() {
-        for mala in [
+        for bad in [
             "ayer",
             "1-Jan-2026 OR ALL",
             "1-Ene-2026",
@@ -279,18 +286,18 @@ mod tests {
             "1 Jan 2026",
         ] {
             assert!(
-                armar(&[Termino::Desde(mala.into())]).is_empty(),
-                "pasó: {mala:?}"
+                build_criteria(&[Term::Since(bad.into())]).is_empty(),
+                "pasó: {bad:?}"
             );
         }
 
         assert_eq!(
-            armar(&[Termino::Desde("1-Jan-2026".into())]),
-            vec![Trozo::Literal("SINCE 1-Jan-2026".into())]
+            build_criteria(&[Term::Since("1-Jan-2026".into())]),
+            vec![Chunk::Inline("SINCE 1-Jan-2026".into())]
         );
         assert_eq!(
-            armar(&[Termino::Desde("28-Feb-2026".into())]),
-            vec![Trozo::Literal("SINCE 28-Feb-2026".into())]
+            build_criteria(&[Term::Since("28-Feb-2026".into())]),
+            vec![Chunk::Inline("SINCE 28-Feb-2026".into())]
         );
     }
 
@@ -298,37 +305,37 @@ mod tests {
     /// «nada» no acota nada.
     #[test]
     fn un_termino_vacio_se_saltea() {
-        assert!(armar(&[Termino::Asunto(String::new())]).is_empty());
+        assert!(build_criteria(&[Term::Subject(String::new())]).is_empty());
         assert_eq!(
-            armar(&[Termino::Asunto(String::new()), Termino::SinLeer]),
-            vec![Trozo::Literal("UNSEEN".into())]
+            build_criteria(&[Term::Subject(String::new()), Term::Unread]),
+            vec![Chunk::Inline("UNSEEN".into())]
         );
     }
 
     #[test]
     fn sin_terminos_no_hay_criterio() {
-        assert!(armar(&[]).is_empty());
+        assert!(build_criteria(&[]).is_empty());
     }
 
     #[test]
     fn los_uids_salen_de_la_respuesta() {
-        assert_eq!(uids_de_search("* SEARCH 1 3 7"), Some(vec![1, 3, 7]));
-        assert_eq!(uids_de_search("* search 42"), Some(vec![42]));
+        assert_eq!(search_uids("* SEARCH 1 3 7"), Some(vec![1, 3, 7]));
+        assert_eq!(search_uids("* search 42"), Some(vec![42]));
         // Sin resultados: la línea viene igual, vacía.
-        assert_eq!(uids_de_search("* SEARCH"), Some(vec![]));
+        assert_eq!(search_uids("* SEARCH"), Some(vec![]));
         // Lo que no se entiende se descarta en vez de adivinarse.
-        assert_eq!(uids_de_search("* SEARCH 1 dos 3"), Some(vec![1, 3]));
+        assert_eq!(search_uids("* SEARCH 1 dos 3"), Some(vec![1, 3]));
     }
 
     #[test]
     fn lo_que_no_es_una_respuesta_de_search_se_descarta() {
-        for otra in [
+        for another in [
             "* 12 EXISTS",
             "a1 OK SEARCH completado",
             "",
             "* SEARCHING 1",
         ] {
-            assert!(uids_de_search(otra).is_none(), "{otra:?}");
+            assert!(search_uids(another).is_none(), "{another:?}");
         }
     }
 }
