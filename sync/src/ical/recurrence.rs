@@ -63,7 +63,7 @@
 //!   como «el mismo reloj al día siguiente».
 //! - Los recordatorios con `REPEAT` se guardan una vez, no repetidos.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{NaiveDate, NaiveDateTime, TimeZone, Utc};
@@ -808,14 +808,14 @@ impl EventSeries {
             start,
             end: o.instance.span.end_of(start),
             all_day: o.instance.start.as_ref().is_some_and(DateValue::is_date),
-            summary: self.summary_if_different(&o.instance),
+            summary: self.summary_if_different(&o.instance).map(str::to_string),
             alarms: Vec::new(),
         })
     }
 
-    fn summary_if_different(&self, instance: &Instance) -> Option<String> {
+    fn summary_if_different<'a>(&self, instance: &'a Instance) -> Option<&'a str> {
         let master = self.master.as_ref().map(|m| m.instance.summary.as_str());
-        (master != Some(instance.summary.as_str())).then(|| instance.summary.clone())
+        (master != Some(instance.summary.as_str())).then_some(instance.summary.as_str())
     }
 
     /// La expansión: las veces de la serie cuyo comienzo cae en `[lo, hi)`
@@ -839,11 +839,11 @@ impl EventSeries {
         // que cae adentro recién después de correrla.
         let mut shift: i64 = 0;
         for o in self.overrides.iter().filter(|o| o.this_and_future) {
-            let delta = self.override_start(o).saturating_sub(o.rid).abs();
-            if delta > limits.max_shift_seconds {
+            let delta = self.override_start(o).saturating_sub(o.rid).unsigned_abs();
+            if delta > limits.max_shift_seconds.unsigned_abs() {
                 expansion.truncated = true;
             } else {
-                shift = shift.max(delta);
+                shift = shift.max(delta as i64);
             }
         }
         let shifting = shift > 0 || self.overrides.iter().any(|o| o.this_and_future);
@@ -892,15 +892,22 @@ impl EventSeries {
                     base.insert(*utc, *wall);
                 }
             }
+            // Una fecha sin hora en una serie con hora saca todas las veces de
+            // ese día, en el reloj de la serie: todas juntas en una pasada, y
+            // no una pasada por fecha —mil `EXDATE` por cinco mil veces—.
+            let mut days = HashSet::new();
             for exclusion in &master.exdates {
                 match exclusion {
                     Exclusion::Instant(excluded) => {
                         base.remove(excluded);
                     }
-                    // Una fecha sin hora en una serie con hora saca todas las
-                    // veces de ese día, en el reloj de la serie.
-                    Exclusion::Day(day) => base.retain(|_, wall| wall.date() != *day),
+                    Exclusion::Day(day) => {
+                        days.insert(*day);
+                    }
                 }
+            }
+            if !days.is_empty() {
+                base.retain(|_, wall| !days.contains(&wall.date()));
             }
         }
 
@@ -910,7 +917,7 @@ impl EventSeries {
             start: i64,
             end: i64,
             all_day: bool,
-            summary: Option<String>,
+            summary: Option<&'a str>,
             source: &'a Instance,
         }
         let mut built: BTreeMap<i64, Built<'_>> = BTreeMap::new();
@@ -933,24 +940,39 @@ impl EventSeries {
                 );
             }
         }
-        // Las excepciones que corren la serie desde una vez en adelante, en
-        // orden: una posterior manda sobre las veces que siguen a ella.
-        for o in self.overrides.iter().filter(|o| o.this_and_future) {
-            if o.instance.cancelled {
-                built.retain(|rid, _| *rid < o.rid);
-                continue;
+        // Las excepciones que corren la serie desde una vez en adelante: una
+        // posterior manda sobre las veces que siguen a ella, así que a cada
+        // vez le toca **la última que empieza en ella o antes**. Se aplica en
+        // una sola pasada, con un puntero que avanza, y no una pasada por
+        // excepción —quinientas por seis mil veces—. Una cancelada se lleva
+        // todas las que siguen, también las que otra posterior habría corrido.
+        let this_and_future: Vec<&Override> = self
+            .overrides
+            .iter()
+            .filter(|o| o.this_and_future)
+            .collect();
+        if let Some(cut) = this_and_future.iter().find(|o| o.instance.cancelled) {
+            drop(built.split_off(&cut.rid));
+        }
+        let mut pending = this_and_future
+            .iter()
+            .filter(|o| !o.instance.cancelled)
+            .peekable();
+        let mut current: Option<(&Override, i64, Option<&str>)> = None;
+        for (rid, occurrence) in built.iter_mut() {
+            while let Some(o) = pending.next_if(|o| o.rid <= *rid) {
+                let delta = self.override_start(o).saturating_sub(o.rid);
+                let delta = if delta.unsigned_abs() > limits.max_shift_seconds.unsigned_abs() {
+                    0
+                } else {
+                    delta
+                };
+                current = Some((o, delta, self.summary_if_different(&o.instance)));
             }
-            let delta = self.override_start(o).saturating_sub(o.rid);
-            let delta = if delta.abs() > limits.max_shift_seconds {
-                0
-            } else {
-                delta
-            };
-            let summary = self.summary_if_different(&o.instance);
-            for (rid, occurrence) in built.range_mut(o.rid..) {
+            if let Some((o, delta, summary)) = current {
                 occurrence.start = rid.saturating_add(delta);
                 occurrence.end = o.instance.span.end_of(occurrence.start);
-                occurrence.summary = summary.clone();
+                occurrence.summary = summary;
                 occurrence.source = &o.instance;
             }
         }
@@ -981,7 +1003,7 @@ impl EventSeries {
                 start: b.start,
                 end: b.end,
                 all_day: b.all_day,
-                summary: b.summary,
+                summary: b.summary.map(str::to_string),
                 alarms: alarms_for(b.source, b.start, b.end, rid, self.first_rid()),
             })
             .collect();
@@ -1686,6 +1708,150 @@ mod tests {
                 "{text}: {most} fechas en un período, la cota dice {bound}"
             );
         }
+    }
+
+    /// Una serie por minuto con quinientas excepciones `THISANDFUTURE`, cada
+    /// una con otro título de 800 bytes: el objeto pesa unos 470 KB.
+    fn many_this_and_future() -> String {
+        let start = at("2025-09-27T00:00:00Z");
+        let stamp = |t: i64| {
+            super::super::rfc3339(t)
+                .replace(['-', ':'], "")
+                .replace("+0000", "Z")
+        };
+        let mut ical = format!(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:s\r\nSUMMARY:serie\r\n\
+             DTSTART:{}\r\nDURATION:PT1M\r\nRRULE:FREQ=MINUTELY\r\nEND:VEVENT\r\n",
+            stamp(start)
+        );
+        for i in 0..500 {
+            let rid = start + i * 60;
+            let title: String = format!("t{i:04}").repeat(160);
+            ical.push_str(&format!(
+                "BEGIN:VEVENT\r\nUID:s\r\nSUMMARY:{title}\r\n\
+                 RECURRENCE-ID;RANGE=THISANDFUTURE:{}\r\nDTSTART:{}\r\n\
+                 DURATION:PT1M\r\nEND:VEVENT\r\n",
+                stamp(rid),
+                stamp(rid + 30)
+            ));
+        }
+        ical.push_str("END:VCALENDAR\r\n");
+        ical
+    }
+
+    /// **Muchas excepciones que corren la serie terminan en plazo.** Cada
+    /// `THISANDFUTURE` le copiaba su título a todas las veces que le seguían:
+    /// quinientas por seis mil, 0,69 s en release (el doble del plazo) y sin
+    /// mirar el plazo. En una pasada es lineal. Y lo que da sigue siendo lo
+    /// mismo: la última vez lleva el título y el corrimiento de la última
+    /// excepción.
+    #[test]
+    fn muchas_excepciones_que_corren_la_serie_terminan_en_plazo() {
+        let ical = many_this_and_future();
+        assert!(ical.len() < 512 * 1024);
+        let s = series(&ical);
+        let e = finishes_within(StdDuration::from_secs(60), move || {
+            let started = Instant::now();
+            let e = s.materialize(
+                at("2025-09-26T00:00:00Z"),
+                at("2028-09-26T00:00:00Z"),
+                &ExpansionLimits::DEFAULT,
+            );
+            (e, started.elapsed())
+        });
+        let (e, took) = e;
+        assert!(
+            took < ExpansionLimits::DEFAULT.max_time,
+            "la expansión tardó {took:?}"
+        );
+        let last = e.occurrences.last().unwrap();
+        assert_eq!(last.start - last.recurrence_id, 30);
+        assert_eq!(
+            last.summary.as_deref(),
+            Some(format!("t{:04}", 499).repeat(160).as_str())
+        );
+        // Una del medio, la de la excepción 200.
+        let middle = &e.occurrences[200];
+        assert_eq!(
+            middle.summary.as_deref(),
+            Some("t0200".repeat(160).as_str())
+        );
+    }
+
+    /// Una `THISANDFUTURE` cancelada se lleva todas las que siguen, también
+    /// las que una posterior habría corrido —queda sólo la vez que esa
+    /// posterior nombra, como toda excepción—; y una anterior corre sólo hasta
+    /// ella. Lo mismo que daba la pasada por excepción.
+    #[test]
+    fn una_thisandfuture_cancelada_se_lleva_las_que_siguen() {
+        let ical = "BEGIN:VCALENDAR\r\n\
+            BEGIN:VEVENT\r\nUID:s\r\nSUMMARY:Clase\r\nDTSTART:20260105T100000Z\r\n\
+            RRULE:FREQ=WEEKLY;COUNT=6\r\nEND:VEVENT\r\n\
+            BEGIN:VEVENT\r\nUID:s\r\nSUMMARY:Clase corrida\r\n\
+            RECURRENCE-ID;RANGE=THISANDFUTURE:20260112T100000Z\r\n\
+            DTSTART:20260112T110000Z\r\nEND:VEVENT\r\n\
+            BEGIN:VEVENT\r\nUID:s\r\nRECURRENCE-ID;RANGE=THISANDFUTURE:20260126T100000Z\r\n\
+            DTSTART:20260126T100000Z\r\nSTATUS:CANCELLED\r\nEND:VEVENT\r\n\
+            BEGIN:VEVENT\r\nUID:s\r\nSUMMARY:Otra\r\n\
+            RECURRENCE-ID;RANGE=THISANDFUTURE:20260202T100000Z\r\n\
+            DTSTART:20260202T120000Z\r\nEND:VEVENT\r\n\
+            END:VCALENDAR\r\n";
+        let e = series(ical).materialize(
+            at("2026-01-01T00:00:00Z"),
+            at("2027-01-01T00:00:00Z"),
+            &ExpansionLimits::DEFAULT,
+        );
+        assert_eq!(
+            starts(&e),
+            vec![
+                "2026-01-05T10:00:00+00:00",
+                "2026-01-12T11:00:00+00:00",
+                "2026-01-19T11:00:00+00:00",
+                "2026-02-02T12:00:00+00:00",
+            ]
+        );
+        assert_eq!(e.occurrences[0].summary, None);
+        assert_eq!(e.occurrences[2].summary.as_deref(), Some("Clase corrida"));
+    }
+
+    /// **Mil `EXDATE` de día no multiplican el costo.** Una fecha sin hora
+    /// saca todas las veces de ese día: una pasada por fecha eran mil pasadas
+    /// por las cinco mil veces de una serie por minuto (80 ms en release, un
+    /// tercio del plazo, sin mirarlo).
+    #[test]
+    fn mil_exdate_de_dia_no_multiplican_el_costo() {
+        let first = chrono::NaiveDate::from_ymd_opt(2025, 10, 7).unwrap();
+        let days: Vec<String> = (0..1000)
+            .map(|i| {
+                (first + chrono::Duration::days(i))
+                    .format("%Y%m%d")
+                    .to_string()
+            })
+            .collect();
+        let s = series(&event(&format!(
+            "DTSTART:20250927T000000Z\r\nDURATION:PT1M\r\nRRULE:FREQ=MINUTELY\r\n\
+             EXDATE;VALUE=DATE:{}\r\n",
+            days.join(",")
+        )));
+        let (e, took) = finishes_within(StdDuration::from_secs(60), move || {
+            let started = Instant::now();
+            let e = s.materialize(
+                at("2025-09-26T00:00:00Z"),
+                at("2028-09-26T00:00:00Z"),
+                &ExpansionLimits::DEFAULT,
+            );
+            (e, started.elapsed())
+        });
+        assert!(
+            took < ExpansionLimits::DEFAULT.max_time,
+            "la expansión tardó {took:?}"
+        );
+        // Las de los diez primeros días quedan; las de los días sacados, no.
+        assert!(!e.occurrences.is_empty());
+        assert!(e
+            .occurrences
+            .iter()
+            .all(|o| o.start < at("2025-10-07T00:00:00Z")));
     }
 
     /// **El plazo se mira en cada fecha.** Una regla diaria que casi nunca da
