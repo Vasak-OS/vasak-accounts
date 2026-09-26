@@ -15,7 +15,7 @@
 //! ── Por qué `auth_self_keep` y no la contraseña de administrador ────────────
 //!
 //! Es tu cuenta, no una configuración del equipo: no hace falta ser
-//! administrador para sacar tu propio correo. Y `keep` recuerda la reply un
+//! administrador para sacar tu propio correo. Y `keep` recuerda la respuesta un
 //! rato, así que borrar tres cuentas seguidas pregunta una vez y no tres.
 
 use std::collections::HashMap;
@@ -63,7 +63,7 @@ pub async fn authorize_removal(
     let (authorized, _challenge, _details): (bool, bool, HashMap<String, String>) = reply
         .body()
         .deserialize()
-        .map_err(|e| FdoError::Failed(format!("reply inválida de polkit: {e}")))?;
+        .map_err(|e| FdoError::Failed(format!("respuesta inválida de polkit: {e}")))?;
 
     if authorized {
         return Ok(());
