@@ -514,4 +514,32 @@ mod tests {
             assert_eq!(from_utf7(&to_utf7(name)), name, "{name:?}");
         }
     }
+
+    /// `ListMailboxes`: cada casilla con las claves que lee `vasak-mail`, y el
+    /// uso con los valores de siempre —la ventana compara contra ellos—.
+    #[test]
+    fn una_casilla_conserva_las_claves_y_los_usos_del_bus() {
+        let mailbox =
+            mailbox_from_list(r#"* LIST (\HasNoChildren \Trash) "/" "Papelera""#).unwrap();
+        let json = serde_json::to_value(&mailbox).unwrap();
+        assert_eq!(
+            crate::test_support::json_keys(&json),
+            ["nombre", "ruta", "seleccionable", "separador", "uso"]
+        );
+        assert_eq!(json["uso"], "papelera");
+        assert_eq!(json["separador"], "/");
+
+        for (role, wire) in [
+            (MailboxRole::Inbox, "entrada"),
+            (MailboxRole::Sent, "enviados"),
+            (MailboxRole::Drafts, "borradores"),
+            (MailboxRole::Trash, "papelera"),
+            (MailboxRole::Spam, "spam"),
+            (MailboxRole::Archive, "archivo"),
+            (MailboxRole::All, "todo"),
+            (MailboxRole::Other, "ninguno"),
+        ] {
+            assert_eq!(serde_json::to_value(role).unwrap(), wire, "{role:?}");
+        }
+    }
 }

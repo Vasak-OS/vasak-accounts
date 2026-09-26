@@ -470,4 +470,17 @@ mod tests {
             assert_eq!(accepted_type(other), None, "{other:?}");
         }
     }
+
+    /// `FetchImage`: el tipo y el contenido, con las claves que lee
+    /// `vasak-mail`.
+    #[test]
+    fn una_imagen_conserva_las_claves_del_bus() {
+        let image = Image {
+            content_type: "image/png".into(),
+            base64: "aG9sYQ==".into(),
+        };
+        let json = serde_json::to_value(&image).unwrap();
+        assert_eq!(crate::test_support::json_keys(&json), ["base64", "tipo"]);
+        assert_eq!(json["tipo"], "image/png");
+    }
 }

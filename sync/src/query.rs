@@ -338,4 +338,40 @@ mod tests {
             assert!(search_uids(another).is_none(), "{another:?}");
         }
     }
+
+    /// `SearchMessages` recibe los términos como JSON que arma la ventana, con
+    /// `campo` y `valor`: cada nombre de antes sigue llegando al término que
+    /// era.
+    #[test]
+    fn los_terminos_se_leen_con_los_nombres_del_bus() {
+        let terms: Vec<Term> = serde_json::from_str(
+            r#"[
+                {"campo": "de", "valor": "ana"},
+                {"campo": "para", "valor": "juan"},
+                {"campo": "asunto", "valor": "hola"},
+                {"campo": "cuerpo", "valor": "factura"},
+                {"campo": "cualquiera", "valor": "todo"},
+                {"campo": "sin_leer"},
+                {"campo": "destacado"},
+                {"campo": "desde", "valor": "1-Sep-2026"}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            terms,
+            [
+                Term::Sender("ana".into()),
+                Term::Recipient("juan".into()),
+                Term::Subject("hola".into()),
+                Term::Body("factura".into()),
+                Term::Any("todo".into()),
+                Term::Unread,
+                Term::Flagged,
+                Term::Since("1-Sep-2026".into()),
+            ]
+        );
+
+        // Y un nombre en inglés no es un término: la ventana no lo manda.
+        assert!(serde_json::from_str::<Term>(r#"{"campo": "sender", "valor": "x"}"#).is_err());
+    }
 }

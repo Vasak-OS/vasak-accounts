@@ -2092,4 +2092,18 @@ mod tests {
         );
         assert!(pending.is_empty());
     }
+
+    /// `MoveMessage` y `DeleteMessage` contestan uno de dos textos, y son los
+    /// de siempre.
+    #[test]
+    fn como_termino_un_movimiento_se_dice_como_antes() {
+        assert_eq!(
+            serde_json::to_string(&MoveOutcome::Complete).unwrap(),
+            "\"entero\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MoveOutcome::OldCopyKept).unwrap(),
+            "\"sin_borrar_el_viejo\""
+        );
+    }
 }

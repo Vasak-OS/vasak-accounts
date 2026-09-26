@@ -1308,4 +1308,44 @@ mod tests {
         assert_eq!(listed[1].part, "3");
         assert_eq!(listed[1].content_type, "image/png");
     }
+
+    /// `SendMessage` recibe el borrador como lo arma `vasak-mail`, con las
+    /// claves de siempre. Y en la cola de salida se guarda con esas mismas.
+    #[test]
+    fn un_borrador_se_lee_y_se_escribe_con_las_claves_del_bus() {
+        let wire = r#"{
+            "para": ["juan@otro.com"], "cc": ["eva@otro.com"], "asunto": "Hola",
+            "cuerpo": "Buenas.", "en_respuesta_a": "<r@x>", "referencias": ["<r@x>"],
+            "adjuntos": [{"nombre": "x.pdf", "tipo": "", "contenido": "aG9sYQ==", "bytes": 4}]
+        }"#;
+        let draft: Draft = serde_json::from_str(wire).unwrap();
+        assert_eq!(draft.to, ["juan@otro.com"]);
+        assert_eq!(draft.cc, ["eva@otro.com"]);
+        assert_eq!(draft.subject, "Hola");
+        assert_eq!(draft.body, "Buenas.");
+        assert_eq!(draft.in_reply_to, "<r@x>");
+        assert_eq!(draft.references, ["<r@x>"]);
+        assert_eq!(draft.attachments[0].name, "x.pdf");
+        assert_eq!(draft.attachments[0].content, "aG9sYQ==");
+
+        let json = serde_json::to_value(&draft).unwrap();
+        assert_eq!(
+            crate::test_support::json_keys(&json),
+            [
+                "adjuntos",
+                "asunto",
+                "cc",
+                "cuerpo",
+                "de",
+                "en_respuesta_a",
+                "nombre",
+                "para",
+                "referencias"
+            ]
+        );
+        assert_eq!(
+            crate::test_support::json_keys(&json["adjuntos"][0]),
+            ["contenido", "nombre", "tipo"]
+        );
+    }
 }

@@ -702,8 +702,6 @@ impl Service {
         uid: u32,
         part: String,
     ) -> zbus::fdo::Result<String> {
-        use base64::Engine;
-
         let (broker, account) = self.account(&account_id).await?;
         let reader = self.reader(&account_id).await;
         let mut reader = reader.lock().await;
@@ -713,14 +711,8 @@ impl Service {
             .await
             .map_err(zbus::fdo::Error::Failed)?;
 
-        // Con el aviso adentro y no como un segundo método: quien guarda el
-        // archivo tiene que enterarse en el mismo momento en que lo recibe, o
-        // guarda uno cortado creyendo que está entero.
-        serde_json::to_string(&serde_json::json!({
-            "contenido": base64::engine::general_purpose::STANDARD.encode(&bytes),
-            "recortado": truncated,
-        }))
-        .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
+        serde_json::to_string(&attachment_reply(&bytes, truncated))
+            .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
     }
 
     /// Trae una imagen de un mensaje, cuando la persona la pidió.
@@ -1005,24 +997,7 @@ impl Service {
             .and_then(|c| c.all())
             .map_err(zbus::fdo::Error::Failed)?;
 
-        // Se agrega si está esperando su hora, que no es un campo del archivo
-        // sino una pregunta sobre el reloj. Calcularlo acá y no en la ventana
-        // deja la regla —vacío, ilegible, o ya pasó— en un solo lugar; hacerlo
-        // en los dos es tener dos reglas que se pueden separar.
-        let now = chrono::Utc::now();
-        let view: Vec<_> = queued
-            .into_iter()
-            .map(|outgoing| {
-                let waiting = outgoing.is_scheduled(now);
-                let mut json = serde_json::to_value(outgoing).unwrap_or_default();
-                if let Some(object) = json.as_object_mut() {
-                    object.insert("esperando_su_hora".into(), waiting.into());
-                }
-                json
-            })
-            .collect();
-
-        serde_json::to_string(&view)
+        serde_json::to_string(&outbox::view(queued, chrono::Utc::now()))
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
     }
 
@@ -1172,15 +1147,7 @@ async fn flush_outbox(service: &Service) -> bool {
     let now = chrono::Utc::now();
     let mut changed = false;
 
-    for mut outgoing in queued {
-        if outgoing.state == outbox::DeliveryState::Stuck {
-            continue;
-        }
-        // Todavía no le toca: la espera crece con cada intento fallido.
-        if !outgoing.is_due(now) {
-            continue;
-        }
-
+    for mut outgoing in outbox::ready_to_send(queued, now) {
         match send_one(service, &outgoing).await {
             Ok(()) => {
                 tracing::info!("mensaje {} entregado", outgoing.id);
@@ -1489,6 +1456,20 @@ enum SessionEnd {
     Rejected(String),
     /// Se cortó, se cayó la red, el servidor se reinició. Se reconecta.
     Dropped(String),
+}
+
+/// Lo que contesta `GetAttachment`: el contenido en base64 y si se cortó.
+///
+/// Con el aviso adentro y no como un segundo método: quien guarda el archivo
+/// tiene que enterarse en el mismo momento en que lo recibe, o guarda uno
+/// cortado creyendo que está entero.
+fn attachment_reply(bytes: &[u8], truncated: bool) -> serde_json::Value {
+    use base64::Engine;
+
+    serde_json::json!({
+        "contenido": base64::engine::general_purpose::STANDARD.encode(bytes),
+        "recortado": truncated,
+    })
 }
 
 /// Lo más grande que se baja de un adjunto.
@@ -1892,6 +1873,26 @@ fn sent_by(
     matches!((sender, owner), (Some(sender), Some(owner)) if sender == owner)
 }
 
+/// Lo que comparten las pruebas de la forma del JSON.
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// Las claves de un objeto JSON, ordenadas.
+    ///
+    /// Lo que va por el bus y lo que queda en el disco se lee desde afuera de
+    /// este proceso —`vasak-mail`, o una versión anterior de este servicio—,
+    /// así que un campo renombrado en Rust tiene que seguir saliendo con el
+    /// nombre de antes. Estas pruebas comparan la lista entera: una clave que
+    /// cambia, sobra o falta rompe acá y no en la ventana de alguien.
+    pub(crate) fn json_keys(value: &serde_json::Value) -> Vec<String> {
+        let mut keys: Vec<String> = value
+            .as_object()
+            .map(|object| object.keys().cloned().collect())
+            .unwrap_or_default();
+        keys.sort();
+        keys
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2021,5 +2022,98 @@ mod tests {
         // No se normaliza: el servidor distingue mayúsculas en todo lo que no
         // sea `INBOX`, y «sent» puede ser otra carpeta distinta de «Sent».
         assert_eq!(mailbox_or_inbox("[Gmail]/Sent Mail"), "[Gmail]/Sent Mail");
+    }
+
+    /// `MailboxStatus` por cuenta, con las claves que lee `vasak-mail`.
+    #[test]
+    fn el_estado_de_una_cuenta_conserva_las_claves_del_bus() {
+        let summary = AccountSummary {
+            account_id: "a".into(),
+            display_name: "Trabajo".into(),
+            status: imap::MailboxStatus {
+                messages: 120,
+                unread: 3,
+            },
+            error: String::new(),
+        };
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(
+            test_support::json_keys(&json),
+            [
+                "account_id",
+                "display_name",
+                "error",
+                "mensajes",
+                "sin_leer"
+            ]
+        );
+        assert_eq!(json["mensajes"], 120);
+        assert_eq!(json["sin_leer"], 3);
+    }
+
+    /// `GetMessage`: el mensaje abierto, con el adjunto, el formato y lo que
+    /// hace falta para responder —aplanado— con las claves de siempre.
+    #[test]
+    fn un_mensaje_abierto_conserva_las_claves_del_bus() {
+        let opened = OpenedMessage {
+            text: "Hola".into(),
+            truncated: true,
+            attachments: vec![attachments::Attachment {
+                part: "2".into(),
+                name: "x.pdf".into(),
+                content_type: "application/pdf".into(),
+            }],
+            formatted: Some(html::Sanitized {
+                html: "<p>Hola</p>".into(),
+                blocked_images: 1,
+                truncated: false,
+            }),
+            reply: message::ReplyInfo {
+                message_id: "<a@b>".into(),
+                references: vec!["<a@b>".into()],
+                reply_to: "ana@x.com".into(),
+                name: "Ana".into(),
+            },
+        };
+        let json = serde_json::to_value(&opened).unwrap();
+        assert_eq!(
+            test_support::json_keys(&json),
+            [
+                "adjuntos",
+                "con_formato",
+                "message_id",
+                "nombre",
+                "recortado",
+                "referencias",
+                "responder_a",
+                "texto"
+            ]
+        );
+        assert_eq!(
+            test_support::json_keys(&json["adjuntos"][0]),
+            ["nombre", "parte", "tipo"]
+        );
+        assert_eq!(
+            test_support::json_keys(&json["con_formato"]),
+            ["html", "imagenes_bloqueadas", "recortado"]
+        );
+
+        // Sin HTML, `con_formato` va igual, en `null`: la ventana lo mira.
+        let plain = OpenedMessage {
+            formatted: None,
+            ..opened
+        };
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json["con_formato"].is_null());
+    }
+
+    /// `GetAttachment`: el contenido y si se cortó, en las dos claves que lee
+    /// `vasak-mail` para guardar el archivo.
+    #[test]
+    fn un_adjunto_bajado_conserva_las_claves_del_bus() {
+        let json = attachment_reply(b"hola", true);
+        assert_eq!(test_support::json_keys(&json), ["contenido", "recortado"]);
+        assert_eq!(json["contenido"], "aG9sYQ==");
+        assert_eq!(json["recortado"], true);
     }
 }

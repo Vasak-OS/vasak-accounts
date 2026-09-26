@@ -192,4 +192,23 @@ mod tests {
         }
         assert_eq!(file_path_under(None), None);
     }
+
+    /// Lo que escribe la ventana en `vasak-mail/preferencias.json`: la clave y
+    /// los tres valores son los de siempre, y los nombres de Rust en inglés no
+    /// se leen.
+    #[test]
+    fn las_preferencias_se_leen_con_los_nombres_de_la_ventana() {
+        for (wire, detail) in [
+            ("cuenta", NotificationDetail::Account),
+            ("remitente", NotificationDetail::Sender),
+            ("remitente_y_asunto", NotificationDetail::SenderAndSubject),
+        ] {
+            let raw = format!(r#"{{"detalle_del_aviso": "{wire}"}}"#);
+            assert_eq!(parse(&raw).notification_detail, detail, "{wire}");
+        }
+        assert_eq!(
+            parse(r#"{"notification_detail": "sender"}"#).notification_detail,
+            NotificationDetail::Account
+        );
+    }
 }

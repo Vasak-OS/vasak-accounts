@@ -1607,4 +1607,49 @@ mod tests {
         raw.extend_from_slice(b"<p>P\xE9rez</p>");
         assert_eq!(html_part(&raw).as_deref(), Some("<p>Pérez</p>"));
     }
+
+    /// `ListMessages` y `SearchMessages`: cada resumen con las claves que lee
+    /// `vasak-mail`.
+    #[test]
+    fn un_resumen_conserva_las_claves_del_bus() {
+        let summary = summary_from(
+            42,
+            "From: Ana <ana@x.com>\r\nSubject: Hola\r\n",
+            true,
+            false,
+        );
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(
+            crate::test_support::json_keys(&json),
+            [
+                "asunto",
+                "con_adjuntos",
+                "de",
+                "direccion",
+                "fecha",
+                "sin_leer",
+                "uid"
+            ]
+        );
+        assert_eq!(json["de"], "Ana");
+        assert_eq!(json["direccion"], "ana@x.com");
+
+        // Y el de antes se sigue leyendo: el resumen también es `Deserialize`.
+        let back: MessageSummary = serde_json::from_value(json).unwrap();
+        assert_eq!(back, summary);
+    }
+
+    /// Lo que hace falta para responder va aplanado en `GetMessage`, con sus
+    /// cuatro claves.
+    #[test]
+    fn lo_de_responder_conserva_las_claves_del_bus() {
+        let info = reply_info(b"Message-ID: <a@b>\r\nFrom: Ana <ana@x.com>\r\n\r\nHola");
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(
+            crate::test_support::json_keys(&json),
+            ["message_id", "nombre", "referencias", "responder_a"]
+        );
+        assert_eq!(json["responder_a"], "ana@x.com");
+        assert_eq!(json["nombre"], "Ana");
+    }
 }

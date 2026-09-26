@@ -341,6 +341,39 @@ fn read_outgoing(path: &Path) -> Option<Outgoing> {
     }
 }
 
+/// Lo que el despachador intenta mandar en esta vuelta, en el orden de la cola.
+///
+/// Se saltean los trabados —hace falta que la persona haga algo— y los que
+/// todavía no les toca: la espera crece con cada intento fallido, y un
+/// programado espera su hora.
+pub fn ready_to_send(queued: Vec<Outgoing>, now: chrono::DateTime<chrono::Utc>) -> Vec<Outgoing> {
+    queued
+        .into_iter()
+        .filter(|outgoing| outgoing.state != DeliveryState::Stuck && outgoing.is_due(now))
+        .collect()
+}
+
+/// Lo que contesta `ListOutbox`: cada mensaje como está en el archivo, más
+/// `esperando_su_hora`.
+///
+/// Se agrega si está esperando su hora, que no es un campo del archivo sino una
+/// pregunta sobre el reloj. Calcularlo acá y no en la ventana deja la regla
+/// —vacío, ilegible, o ya pasó— en un solo lugar; hacerlo en los dos es tener
+/// dos reglas que se pueden separar.
+pub fn view(queued: Vec<Outgoing>, now: chrono::DateTime<chrono::Utc>) -> Vec<serde_json::Value> {
+    queued
+        .into_iter()
+        .map(|outgoing| {
+            let waiting = outgoing.is_scheduled(now);
+            let mut json = serde_json::to_value(outgoing).unwrap_or_default();
+            if let Some(object) = json.as_object_mut() {
+                object.insert("esperando_su_hora".into(), waiting.into());
+            }
+            json
+        })
+        .collect()
+}
+
 /// Un identificador para un mensaje de la cola.
 ///
 /// Empieza con la hora en microsegundos para que ordenar por nombre sea ordenar
@@ -711,5 +744,149 @@ mod tests {
                 "una base de {relative:?} no tiene que usarse"
             );
         }
+    }
+
+    /// La forma en el disco, y en `ListOutbox`, que la manda tal cual.
+    ///
+    /// Los campos de Rust están en inglés y los del archivo no cambiaron: un
+    /// mensaje encolado por esta versión lo tiene que poder leer la anterior
+    /// —si alguien vuelve atrás el paquete— y `vasak-mail` lo lee por el bus.
+    /// Un renombre que se olvide del `rename` rompe acá y no en la cola de
+    /// alguien.
+    #[test]
+    fn un_mensaje_encolado_conserva_las_claves_del_archivo() {
+        let mut o = outgoing("0001");
+        o.draft.attachments.push(crate::compose::Attachment {
+            name: "x.pdf".into(),
+            content_type: "application/pdf".into(),
+            content: "aG9sYQ==".into(),
+        });
+        let json = serde_json::to_value(&o).unwrap();
+        assert_eq!(
+            crate::test_support::json_keys(&json),
+            [
+                "account_id",
+                "borrador",
+                "estado",
+                "fecha",
+                "id",
+                "identificador",
+                "intentos",
+                "programado_para",
+                "proximo_intento",
+                "ultimo_error"
+            ]
+        );
+        assert_eq!(
+            crate::test_support::json_keys(&json["borrador"]),
+            [
+                "adjuntos",
+                "asunto",
+                "cc",
+                "cuerpo",
+                "de",
+                "en_respuesta_a",
+                "nombre",
+                "para",
+                "referencias"
+            ]
+        );
+        assert_eq!(
+            crate::test_support::json_keys(&json["borrador"]["adjuntos"][0]),
+            ["contenido", "nombre", "tipo"]
+        );
+        assert_eq!(json["estado"], "pendiente");
+
+        o.state = DeliveryState::Stuck;
+        assert_eq!(serde_json::to_value(&o).unwrap()["estado"], "trabado");
+    }
+
+    /// Un archivo de la versión anterior con **todos** los campos se lee
+    /// entero: ninguno cae en su valor por omisión porque cambió de nombre.
+    #[test]
+    fn un_mensaje_de_antes_con_todos_los_campos_se_lee_entero() {
+        let old = r#"{
+            "id": "0001",
+            "account_id": "cuenta",
+            "borrador": {
+                "de": "ana@ejemplo.com", "nombre": "Ana", "para": ["juan@otro.com"],
+                "cc": ["eva@otro.com"], "asunto": "Hola", "cuerpo": "Buenas.",
+                "en_respuesta_a": "<r@x>", "referencias": ["<r@x>"],
+                "adjuntos": [{"nombre": "x.pdf", "tipo": "application/pdf", "contenido": "aG9sYQ=="}]
+            },
+            "identificador": "<x@ejemplo.com>",
+            "fecha": "Thu, 10 Sep 2026 12:00:00 +0000",
+            "intentos": 3,
+            "estado": "trabado",
+            "ultimo_error": "el servidor no contestó",
+            "programado_para": "2026-09-12T09:00:00Z",
+            "proximo_intento": "2026-09-12T09:30:00Z"
+        }"#;
+        let o: Outgoing = serde_json::from_str(old).unwrap();
+
+        assert_eq!(o.draft.from, "ana@ejemplo.com");
+        assert_eq!(o.draft.name, "Ana");
+        assert_eq!(o.draft.to, ["juan@otro.com"]);
+        assert_eq!(o.draft.cc, ["eva@otro.com"]);
+        assert_eq!(o.draft.subject, "Hola");
+        assert_eq!(o.draft.body, "Buenas.");
+        assert_eq!(o.draft.in_reply_to, "<r@x>");
+        assert_eq!(o.draft.references, ["<r@x>"]);
+        assert_eq!(o.draft.attachments[0].name, "x.pdf");
+        assert_eq!(o.draft.attachments[0].content_type, "application/pdf");
+        assert_eq!(o.draft.attachments[0].content, "aG9sYQ==");
+        assert_eq!(o.message_id, "<x@ejemplo.com>");
+        assert_eq!(o.date, "Thu, 10 Sep 2026 12:00:00 +0000");
+        assert_eq!(o.attempts, 3);
+        assert_eq!(o.state, DeliveryState::Stuck);
+        assert_eq!(o.last_error, "el servidor no contestó");
+        assert_eq!(o.scheduled_for, "2026-09-12T09:00:00Z");
+        assert_eq!(o.next_attempt, "2026-09-12T09:30:00Z");
+
+        // Y escrito de nuevo, es el mismo archivo.
+        let again: serde_json::Value = serde_json::to_value(&o).unwrap();
+        let original: serde_json::Value = serde_json::from_str(old).unwrap();
+        assert_eq!(again, original);
+    }
+
+    /// `ListOutbox` suma `esperando_su_hora` a las claves del archivo.
+    #[test]
+    fn la_lista_de_salida_suma_si_espera_su_hora() {
+        let now = chrono::Utc::now();
+        let mut later = outgoing("0002");
+        later.scheduled_for = (now + chrono::Duration::hours(3)).to_rfc3339();
+
+        let listed = view(vec![outgoing("0001"), later], now);
+        let keys = crate::test_support::json_keys(&listed[0]);
+        assert!(keys.contains(&"esperando_su_hora".to_string()), "{keys:?}");
+        assert_eq!(keys.len(), 11, "{keys:?}");
+        assert_eq!(listed[0]["esperando_su_hora"], false);
+        assert_eq!(listed[1]["esperando_su_hora"], true);
+    }
+
+    /// Lo que sale en una vuelta: ni los trabados ni los que esperan, y en el
+    /// orden de la cola.
+    #[test]
+    fn en_cada_vuelta_salen_los_que_ya_les_toca() {
+        let now = chrono::Utc::now();
+        let mut stuck = outgoing("0002");
+        stuck.state = DeliveryState::Stuck;
+        let mut waiting = outgoing("0003");
+        waiting.record_failure("el servidor no contestó".into(), now);
+        let mut scheduled = outgoing("0004");
+        scheduled.scheduled_for = (now + chrono::Duration::hours(1)).to_rfc3339();
+
+        let ready = ready_to_send(
+            vec![
+                outgoing("0001"),
+                stuck,
+                waiting,
+                scheduled,
+                outgoing("0005"),
+            ],
+            now,
+        );
+        let ids: Vec<&str> = ready.iter().map(|o| o.id.as_str()).collect();
+        assert_eq!(ids, ["0001", "0005"]);
     }
 }
