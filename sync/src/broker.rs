@@ -11,9 +11,9 @@
 
 use serde::Deserialize;
 
-const SERVICE: &str = "ar.net.vasak.os.AccountManager";
-const PATH: &str = "/ar/net/vasak/os/AccountManager";
-const INTERFACE: &str = "ar.net.vasak.os.AccountManager";
+pub(crate) const SERVICE: &str = "ar.net.vasak.os.AccountManager";
+pub(crate) const PATH: &str = "/ar/net/vasak/os/AccountManager";
+pub(crate) const INTERFACE: &str = "ar.net.vasak.os.AccountManager";
 
 /// El resumen de una cuenta, tal como lo devuelve `ListAccounts`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
