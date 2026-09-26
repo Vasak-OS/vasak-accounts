@@ -21,6 +21,8 @@ const ACCOUNT: &str = "cuenta";
 
 struct CredentialState {
     result: Result<DavCredential, CredentialError>,
+    /// La de una cuenta en particular, antes que `result`.
+    per_account: std::collections::HashMap<String, DavCredential>,
     calls: usize,
     asked: Vec<&'static str>,
 }
@@ -41,13 +43,16 @@ impl FakeCredentials {
 impl CredentialSource for FakeCredentials {
     async fn credential(
         &self,
-        _account_id: &str,
+        account_id: &str,
         capability: &'static str,
     ) -> Result<DavCredential, CredentialError> {
         let mut state = self.0.lock().unwrap();
         state.calls += 1;
         state.asked.push(capability);
-        state.result.clone()
+        match state.per_account.get(account_id) {
+            Some(credential) => Ok(credential.clone()),
+            None => state.result.clone(),
+        }
     }
 }
 
@@ -117,6 +122,7 @@ impl Fixture {
                 secret: Zeroizing::new("la-clave".into()),
                 auth: AuthKind::Password,
             }),
+            per_account: std::collections::HashMap::new(),
             calls: 0,
             asked: Vec::new(),
         })));
@@ -1207,4 +1213,324 @@ async fn un_objeto_pedido_que_no_vuelve_no_deja_guardar_el_token() {
     let report = f.synced().await;
     assert_eq!((report.fetched, report.missing), (1, 0));
     assert_eq!(f.summaries().await, vec!["Arroba", "Dos", "Uno"]);
+}
+
+// ── Las protecciones, por el camino del calendario (N10) ────────────────────
+//
+// Las protecciones compartidas se probaban sólo con los contactos, pero el
+// calendario tiene su propio `execute`, su `fetch_objects` y su `rows_from`:
+// una regresión ahí no la veía nadie.
+
+/// Un objeto que no entra en la respuesta no traba el calendario: la tanda se
+/// parte en dos hasta aislarlo, ése se saltea y los demás entran.
+#[tokio::test]
+async fn un_objeto_que_no_entra_se_saltea_y_los_demas_entran() {
+    let limits = Limits {
+        max_body_bytes: 64 * 1024,
+        ..Limits::DEFAULT
+    };
+    let f = Fixture::with("calendario-objeto-enorme", limits, ExpansionLimits::DEFAULT).await;
+    for i in 0..8 {
+        f.server.put(
+            0,
+            &format!("{i}.ics"),
+            &event(&format!("e{i}"), &format!("Evento {i}"), "20260928T140000Z"),
+        );
+    }
+    let huge = format!(
+        "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:h\r\nSUMMARY:Enorme\r\n\
+         DTSTART:20260928T140000Z\r\nDESCRIPTION:{}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        "d".repeat(80 * 1024)
+    );
+    f.server.put(0, "enorme.ics", &huge);
+
+    let report = f.synced().await;
+    assert_eq!((report.fetched, report.too_large), (8, 1));
+    assert_eq!(f.count("SELECT count(*) FROM calendar_objects").await, 8);
+    assert!(
+        f.server
+            .requests()
+            .iter()
+            .filter(|r| r.is_multiget())
+            .count()
+            > 1,
+        "la tanda no se partió"
+    );
+    // Uno que no entra no falta: volvió, y era de más. El token se guarda.
+    assert_eq!(f.token(0).await, Some(f.server_token()));
+}
+
+/// Una cuenta con más calendarios que el tope no guarda nada de ellos.
+#[tokio::test]
+async fn una_cuenta_que_pasa_el_tope_de_calendarios_no_se_guarda() {
+    let limits = Limits {
+        max_calendars: 2,
+        ..Limits::DEFAULT
+    };
+    let f = Fixture::with(
+        "calendario-tope-calendarios",
+        limits,
+        ExpansionLimits::DEFAULT,
+    )
+    .await;
+    f.server.add_collection("/dav/ana/b/", "B");
+    f.server.add_collection("/dav/ana/c/", "C");
+    f.server
+        .put(0, "a.ics", &event("a", "Uno", "20260928T140000Z"));
+
+    let CalendarOutcome::Failed(detail) = f.sync().await else {
+        panic!("tenía que fallar");
+    };
+    assert!(detail.contains("más de 2 calendarios"), "{detail}");
+    assert_eq!(f.count("SELECT count(*) FROM calendars").await, 0);
+    assert!(!f.server.requests().iter().any(|r| r.is_sync_collection()));
+}
+
+/// Un calendario de más objetos que el tope falla **antes de ningún
+/// `multiget`**, sin escribir nada.
+#[tokio::test]
+async fn un_calendario_que_pasa_el_tope_de_objetos_no_se_pide() {
+    let limits = Limits {
+        max_objects_per_calendar: 5,
+        ..Limits::DEFAULT
+    };
+    let f = Fixture::with("calendario-tope-objetos", limits, ExpansionLimits::DEFAULT).await;
+    for i in 0..6 {
+        f.server.put(
+            0,
+            &format!("{i}.ics"),
+            &event(&format!("e{i}"), "Evento", "20260928T140000Z"),
+        );
+    }
+
+    let CalendarOutcome::Failed(detail) = f.sync().await else {
+        panic!("tenía que fallar");
+    };
+    assert!(detail.contains("más de 5 eventos y tareas"), "{detail}");
+    assert_eq!(f.count("SELECT count(*) FROM calendar_objects").await, 0);
+    assert!(!f.server.requests().iter().any(|r| r.is_multiget()));
+    assert_eq!(f.token(0).await, None);
+}
+
+/// **Un `multiget` que trae objetos no pedidos no los guarda**, y uno pedido
+/// que viene repetido vale una vez: el primero. El servidor suma a cada
+/// respuesta dos objetos de la misma colección que nadie pidió y una segunda
+/// copia del pedido, con otro título.
+#[tokio::test]
+async fn un_multiget_que_trae_objetos_no_pedidos_no_los_guarda() {
+    let f = Fixture::new("calendario-no-pedidos").await;
+    f.server
+        .put(0, "uno.ics", &event("u", "Uno", "20260928T140000Z"));
+    let response = |name: &str, summary: &str| {
+        format!(
+            "<d:response><d:href>/dav/ana/personal/{name}</d:href><d:propstat><d:prop>\
+             <d:getetag>\"i\"</d:getetag><c:calendar-data>{}</c:calendar-data></d:prop>\
+             <d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>",
+            event(name, summary, "20260929T140000Z")
+        )
+    };
+    f.server.state().extra_multiget_xml = [
+        response("intruso0.ics", "Intruso 0"),
+        response("intruso1.ics", "Intruso 1"),
+        response("uno.ics", "Repetido"),
+    ]
+    .concat();
+
+    let report = f.synced().await;
+    assert_eq!((report.fetched, report.unrequested), (1, 3));
+    assert_eq!(f.summaries().await, vec!["Uno"]);
+    assert_eq!(
+        f.count("SELECT count(*) FROM calendar_objects WHERE href LIKE '%intruso%'")
+            .await,
+        0
+    );
+}
+
+/// **Un `507` que no avanza el token no borra ni guarda nada.** Con el token
+/// vencido, la carga completa vuelve cortada —un objeto y un `507`— y el
+/// pedido siguiente vuelve cortado con el mismo token: tomarlo como completo
+/// borraba lo guardado que no llegó en la parte cortada.
+#[tokio::test]
+async fn un_507_que_no_avanza_el_token_no_borra_ni_guarda_nada() {
+    let f = Fixture::new("calendario-507").await;
+    for (name, summary) in [("a.ics", "Uno"), ("b.ics", "Dos"), ("c.ics", "Tres")] {
+        f.server
+            .put(0, name, &event(name, summary, "20260928T140000Z"));
+    }
+    f.synced().await;
+    let old = f.token(0).await.unwrap();
+
+    {
+        let mut state = f.server.state();
+        state.min_valid_token = state.version + 1;
+        state.truncate_sync = Some(1);
+    }
+    f.server
+        .put(0, "d.ics", &event("d", "Cuatro", "20260928T140000Z"));
+
+    let outcome = f.sync().await;
+    assert_eq!(outcome_kind(&outcome), "Failed");
+    assert_eq!(f.summaries().await, vec!["Dos", "Tres", "Uno"]);
+    assert_eq!(f.count("SELECT count(*) FROM occurrences").await, 3);
+    assert_eq!(f.token(0).await, Some(old));
+    let syncs = f
+        .server
+        .requests()
+        .iter()
+        .filter(|r| r.is_sync_collection())
+        .count();
+    assert_eq!(syncs, 1 + 3, "el vencido, la completa y la que no avanzó");
+}
+
+/// **Un calendario ya guardado que vuelve con otro origen no se borra.** El
+/// servidor deja de listarlo con su dirección y lo lista con la de otro
+/// nombre de máquina: mientras el listado traiga alguno de otro origen, esa
+/// vuelta no borra ningún calendario ni lo suyo. (`una_direccion_de_otro_\
+/// origen_no_se_pide_ni_se_guarda` mira uno **nuevo**.)
+#[tokio::test]
+async fn un_calendario_que_vuelve_con_otro_origen_no_se_borra() {
+    let f = Fixture::new("calendario-vuelve-otro-origen").await;
+    let work = f.server.add_collection("/dav/ana/trabajo/", "Trabajo");
+    f.server
+        .put(0, "a.ics", &event("a", "Personal", "20260928T140000Z"));
+    f.server.put(
+        work,
+        "b.ics",
+        &event("b", "Del trabajo", "20260929T140000Z"),
+    );
+    f.synced().await;
+    assert_eq!(f.count("SELECT count(*) FROM calendars").await, 2);
+
+    {
+        let mut state = f.server.state();
+        state.collections.remove(work);
+        state.extra_listing_xml = "<d:response><d:href>https://alias.ejemplo.com/dav/ana/\
+             trabajo/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/>\
+             <c:calendar/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status>\
+             </d:propstat></d:response>"
+            .into();
+    }
+    let report = f.synced().await;
+    assert_eq!(report.foreign, 1);
+    assert_eq!(report.removed, 0);
+    assert_eq!(f.count("SELECT count(*) FROM calendars").await, 2);
+    assert_eq!(f.summaries().await, vec!["Del trabajo", "Personal"]);
+    assert_eq!(f.count("SELECT count(*) FROM occurrences").await, 2);
+
+    // Con el listado limpio, el que falta sí se borra, con lo suyo.
+    f.server.state().extra_listing_xml.clear();
+    f.synced().await;
+    assert_eq!(f.count("SELECT count(*) FROM calendars").await, 1);
+    assert_eq!(f.summaries().await, vec!["Personal"]);
+}
+
+/// **Una cuenta lenta no frena a las otras** en el calendario: un servidor
+/// que no contesta se corta por el plazo de la vuelta —fallida, sin guardar
+/// nada— y la otra cuenta se sincroniza.
+#[tokio::test]
+async fn una_cuenta_lenta_no_frena_a_las_otras_en_el_calendario() {
+    let temp = TempDir::new("calendario-lenta");
+    let keys = FakeKeys::default();
+    let manager = Arc::new(StoreManager::new(
+        keys.clone(),
+        Ok(Locations {
+            stores: temp.0.join("data/stores"),
+            settings: temp.0.join("config/stores.json"),
+        }),
+    ));
+    let listed = |id: &str| ListedAccount {
+        id: id.into(),
+        display_name: id.into(),
+        capabilities: vec!["calendar".into()],
+        needs_reauth: false,
+    };
+    manager
+        .accounts_listed(
+            AccountListing::Listed(vec![listed("lenta"), listed("rapida")]),
+            Instant::now(),
+        )
+        .await;
+    for id in ["lenta", "rapida"] {
+        assert!(manager
+            .activate_area(CALENDAR_AREA, id, Consent::Granted)
+            .await
+            .unwrap());
+    }
+
+    let slow = FakeDav::start_caldav().await;
+    slow.put(0, "a.ics", &event("a", "Lenta", "20260928T140000Z"));
+    slow.state().stall = true;
+    let fast = FakeDav::start_caldav().await;
+    fast.put(0, "z.ics", &event("z", "Rápida", "20260928T140000Z"));
+    let credential = |server: &FakeDav| DavCredential {
+        home: server.home_url(),
+        username: "ana".into(),
+        secret: Zeroizing::new("la-clave".into()),
+        auth: AuthKind::Password,
+    };
+    let credentials = FakeCredentials(Arc::new(std::sync::Mutex::new(CredentialState {
+        result: Err(CredentialError::Failed("no se esperaba".into())),
+        per_account: [
+            ("lenta".to_string(), credential(&slow)),
+            ("rapida".to_string(), credential(&fast)),
+        ]
+        .into(),
+        calls: 0,
+        asked: Vec::new(),
+    })));
+    let limits = Limits {
+        max_round: Duration::from_millis(500),
+        ..Limits::DEFAULT
+    };
+    let now = TODAY;
+    let scheduler = CalendarScheduler::new(
+        CalendarSync::new(
+            Arc::clone(&manager),
+            credentials,
+            limits,
+            HttpPolicy::plain_loopback(),
+            Arc::new(|| {}),
+        )
+        .with_clock(Arc::new(move || Utc.timestamp_opt(now, 0).unwrap())),
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), scheduler.run_due(Instant::now()))
+        .await
+        .expect("la cuenta lenta frenó a la otra");
+
+    let status = serde_json::to_value(manager.status().await).unwrap();
+    let area = |id: &str| {
+        status["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["account_id"] == id)
+            .unwrap()["calendar"]
+            .clone()
+    };
+    assert_eq!(area("lenta")["state"], "failed");
+    assert!(
+        area("lenta")["detail"].as_str().unwrap().contains("tardó"),
+        "{}",
+        area("lenta")
+    );
+    assert_eq!(area("rapida")["state"], "synced");
+    let count = |id: &'static str| {
+        let manager = Arc::clone(&manager);
+        async move {
+            manager
+                .with_store(id, |store| {
+                    Ok(store
+                        .connection()
+                        .query_row("SELECT count(*) FROM calendar_objects", [], |r| {
+                            r.get::<_, i64>(0)
+                        })
+                        .unwrap())
+                })
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(count("rapida").await, 1);
+    assert_eq!(count("lenta").await, 0);
 }
