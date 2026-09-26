@@ -85,4 +85,21 @@ mod tests {
             assert!(!capability.as_id().is_empty());
         }
     }
+
+    /// El momento de arranque vive en `vasak-accounts-common`, con sus
+    /// pruebas, y acá no queda ninguna copia: dos lecturas de `/proc` son dos
+    /// lecturas que se separan.
+    #[test]
+    fn el_momento_de_arranque_vive_en_common_y_no_aca() {
+        let here = include_str!("permissions.rs");
+        let polkit = include_str!("polkit.rs");
+        for (name, source) in [("permissions.rs", here), ("polkit.rs", polkit)] {
+            for copy in [
+                concat!("fn ", "process_start_time"),
+                concat!("fn ", "parse_start_time"),
+            ] {
+                assert!(!source.contains(copy), "{name} tiene su propia copia");
+            }
+        }
+    }
 }
