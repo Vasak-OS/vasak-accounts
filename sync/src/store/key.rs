@@ -655,10 +655,6 @@ fn account_attributes(account_id: &str) -> HashMap<&str, &str> {
     HashMap::from([(SCHEMA_ATTRIBUTE, SCHEMA), (ACCOUNT_ATTRIBUTE, account_id)])
 }
 
-/// Separa «no hay llavero» de «está bloqueado» de «falló».
-///
-/// Importa por lo que se hace después: ninguno de los tres es «no hay clave»,
-/// y ninguno lleva a borrar ni a generar nada.
 /// Si un error de `Properties.Get` quiere decir «esa propiedad no existe acá»:
 /// una respuesta que el llavero da siempre igual, y no una falla pasajera.
 fn lacks_property(error_name: &str) -> bool {
@@ -675,6 +671,10 @@ fn lacks_property(error_name: &str) -> bool {
     })
 }
 
+/// Separa «no hay llavero» de «está bloqueado» de «falló».
+///
+/// Importa por lo que se hace después: ninguno de los tres es «no hay clave»,
+/// y ninguno lleva a borrar ni a generar nada.
 fn classify(method: &str, error: zbus::Error) -> KeyError {
     if let zbus::Error::MethodError(name, detail, _) = &error {
         let name = name.as_str();
