@@ -897,7 +897,11 @@ de cada cuenta, para que una lenta no frene a las otras. Del `multiget` se
 guarda sólo lo que se pidió. Los errores que se ven en el estado tienen texto
 fijo: lo que mandó el servidor va sólo al diario, recortado. Sólo `https`, sin
 seguir redirecciones, y **una dirección de otro origen que la cuenta no se pide
-ni se guarda**: la credencial va sólo al servidor de la cuenta.
+ni se guarda**: la credencial va sólo al servidor de la cuenta. Y como un
+servidor mal configurado —un alias, `www.`, un proxy— puede pasar a contestar
+todo con otro nombre de máquina, **un listado que trae alguna de otro origen no
+borra nada** en esa vuelta: ni libretas ni tarjetas (ni calendarios ni
+objetos), y la colección no se da por al día hasta que el listado vuelva limpio.
 
 **Hace falta `vasak-permissions` 0.15.0 o posterior**, para las dos puntas. Las
 anteriores no le dan al sincronizador `account.contacts` —el área se ve

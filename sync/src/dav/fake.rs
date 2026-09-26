@@ -106,6 +106,11 @@ pub struct FakeState {
     pub truncate_sync: Option<usize>,
     /// No contestar nunca: el pedido se lee, se anota y se queda esperando.
     pub stall: bool,
+    /// Si está, el `sync-collection` y el `PROPFIND` de una colección
+    /// escriben la dirección de cada recurso entera, con este origen delante
+    /// (`https://otro:1/dav/ana/personal/a.ics`): un servidor mal configurado
+    /// que contesta con otro nombre de máquina.
+    pub resource_origin: Option<String>,
 }
 
 #[derive(Clone)]
@@ -164,6 +169,7 @@ impl FakeDav {
             multiget_href: None,
             truncate_sync: None,
             stall: false,
+            resource_origin: None,
         }));
 
         let shared = Arc::clone(&state);
@@ -464,9 +470,10 @@ fn answer(state: &mut FakeState, request: &RecordedRequest) -> (u16, String) {
                     "<d:resourcetype><d:collection/>{kind}</d:resourcetype>"
                 ))
             ));
+            let origin = state.resource_origin.clone().unwrap_or_default();
             for (name, card) in &book.resources {
                 xml.push_str(&format!(
-                    "<d:response><d:href>{}{name}</d:href>{}</d:response>",
+                    "<d:response><d:href>{origin}{}{name}</d:href>{}</d:response>",
                     book.path,
                     ok(&format!(
                         "<d:resourcetype/><d:getetag>{}</d:getetag>",
@@ -504,6 +511,7 @@ fn answer(state: &mut FakeState, request: &RecordedRequest) -> (u16, String) {
                     }
                 }
             };
+            let origin = state.resource_origin.clone().unwrap_or_default();
             let mut xml = String::from(head);
             let changed = book
                 .resources
@@ -512,7 +520,7 @@ fn answer(state: &mut FakeState, request: &RecordedRequest) -> (u16, String) {
                 .take(state.truncate_sync.unwrap_or(usize::MAX));
             for (name, card) in changed {
                 xml.push_str(&format!(
-                    "<d:response><d:href>{}{name}</d:href>{}</d:response>",
+                    "<d:response><d:href>{origin}{}{name}</d:href>{}</d:response>",
                     book.path,
                     ok(&format!(
                         "<d:getetag>{}</d:getetag>",
@@ -524,7 +532,7 @@ fn answer(state: &mut FakeState, request: &RecordedRequest) -> (u16, String) {
                 for (name, version) in &book.removed {
                     if *version > n {
                         xml.push_str(&format!(
-                            "<d:response><d:href>{}{name}</d:href>\
+                            "<d:response><d:href>{origin}{}{name}</d:href>\
                              <d:status>HTTP/1.1 404 Not Found</d:status></d:response>",
                             book.path
                         ));

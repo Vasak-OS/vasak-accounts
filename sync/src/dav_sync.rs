@@ -12,7 +12,9 @@
 //! - **el plan de una colección** ([`plan_collection`]): `sync-collection`
 //!   desde el token —sin token, la carga inicial; vencido, la completa; un
 //!   `507` que no avanza, error—, o `PROPFIND` de los ETag si el servidor no
-//!   lo sabe, con el tope de recursos por colección mirado antes de escribir;
+//!   lo sabe, con el tope de recursos por colección mirado antes de escribir.
+//!   Un listado que trae recursos de otro origen no borra nada y no deja la
+//!   colección al día ([`Plan::foreign`]);
 //! - y cuándo le toca a cada cuenta ([`DavScheduler`]).
 //!
 //! Salió de `contacts_sync.rs` sin cambiar lo que hace: las pruebas de los
@@ -172,6 +174,26 @@ pub struct Plan {
     pub token: Option<String>,
     /// El `getctag` con que se termina la colección.
     pub ctag: Option<String>,
+    /// Recursos que el listado de esta colección —las diferencias o los
+    /// ETag— trajo con una dirección de otro origen. **Con alguno, el plan no
+    /// borra nada** y la colección no se da por al día: quien lo ejecuta no
+    /// guarda ni el token ni el `getctag` ([`Plan::settles`]).
+    ///
+    /// Un servidor que pasa a contestar las direcciones con otro nombre de
+    /// máquina —un alias, `www.`, un proxy mal configurado— hacía que todo lo
+    /// guardado «no viniera», y la carga completa o el camino por ETag lo
+    /// borraban mientras durara el error (N6 del #55; la nota 1 del #52). Es lo
+    /// que el N2 del #52 hizo con las colecciones, un nivel más abajo.
+    pub foreign: usize,
+}
+
+impl Plan {
+    /// Si la colección queda al día con este plan: se puede guardar su token y
+    /// su `getctag`. No, si el listado trajo recursos de otro origen: lo que
+    /// traían no se pidió, y con el token nuevo no volvería a venir.
+    pub fn settles(&self) -> bool {
+        self.foreign == 0
+    }
 }
 
 /// Lo que hizo el plan, para el informe de la vuelta.
@@ -213,7 +235,7 @@ pub async fn plan_collection(
         Some(plan) => Ok(plan),
         None => {
             counters.by_etag = true;
-            plan_by_etag(client, collection, local, cap, deadline).await
+            plan_by_etag(client, collection, local, cap, deadline, counters).await
         }
     }
 }
@@ -233,6 +255,7 @@ async fn plan_by_token(
     let mut full = token.is_none();
     let mut changed: BTreeMap<String, (url::Url, Option<String>)> = BTreeMap::new();
     let mut removed: BTreeSet<String> = BTreeSet::new();
+    let mut foreign = 0;
     let mut rounds = 0;
 
     loop {
@@ -259,9 +282,11 @@ async fn plan_by_token(
                 full = true;
                 changed.clear();
                 removed.clear();
+                foreign = 0;
             }
             webdav::SyncCollection::Delta(delta) => {
                 counters.foreign += delta.foreign;
+                foreign += delta.foreign;
                 merge_delta(
                     &mut changed,
                     &mut removed,
@@ -301,6 +326,15 @@ async fn plan_by_token(
                 .cloned(),
         );
     }
+    if foreign > 0 {
+        // Lo que vino de otro origen no se sabe qué era: lo que «no vino»
+        // puede estar ahí. Esta vuelta no borra nada de la colección.
+        tracing::warn!(
+            "las diferencias de una colección trajeron {foreign} recursos de otro origen; no se \
+             borra nada de ella en esta vuelta"
+        );
+        delete.clear();
+    }
     let fetch = to_fetch(changed.into_values(), local);
     check_total(local, &delete, &fetch, cap)?;
 
@@ -310,6 +344,7 @@ async fn plan_by_token(
         delete,
         token,
         ctag: collection.ctag.map(str::to_string),
+        foreign,
     }))
 }
 
@@ -320,8 +355,10 @@ async fn plan_by_etag(
     local: &HashMap<String, Option<String>>,
     cap: CollectionCap,
     deadline: tokio::time::Instant,
+    counters: &mut PlanCounters,
 ) -> Result<Plan, RoundError> {
-    let mut listed = net(deadline, webdav::list_etags(client, collection.href)).await?;
+    let (mut listed, foreign) = net(deadline, webdav::list_etags(client, collection.href)).await?;
+    counters.foreign += foreign;
     if listed.len() > cap.max {
         return Err(cap.exceeded());
     }
@@ -329,8 +366,11 @@ async fn plan_by_etag(
     // uno.
     let mut present = BTreeSet::new();
     listed.retain(|(u, _)| present.insert(href_key(u)));
+    // Con alguno de otro origen, lo que «no está» puede ser ése: no se borra
+    // nada (ver [`Plan::foreign`]).
     let delete: Vec<String> = local
         .keys()
+        .filter(|_| foreign == 0)
         .filter(|href| !present.contains(*href))
         .cloned()
         .collect();
@@ -341,6 +381,7 @@ async fn plan_by_etag(
         delete,
         token: None,
         ctag: collection.ctag.map(str::to_string),
+        foreign,
     })
 }
 

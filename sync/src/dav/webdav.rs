@@ -1206,8 +1206,13 @@ pub fn etags_query() -> String {
         .to_string()
 }
 
-/// El ETag de cada recurso de una colección.
-pub async fn list_etags(client: &DavClient, collection: &url::Url) -> Result<Etags, DavError> {
+/// El ETag de cada recurso de una colección, y cuántos se descartaron por
+/// venir con una dirección de otro origen: con alguno, el listado no dice
+/// qué falta.
+pub async fn list_etags(
+    client: &DavClient,
+    collection: &url::Url,
+) -> Result<(Etags, usize), DavError> {
     let reply = client
         .request(Method::Propfind, collection, "1", etags_query())
         .await?;
@@ -1218,7 +1223,7 @@ pub async fn list_etags(client: &DavClient, collection: &url::Url) -> Result<Eta
     if foreign > 0 {
         tracing::warn!("se descartaron {foreign} recursos con dirección de otro servidor");
     }
-    Ok(etags)
+    Ok((etags, foreign))
 }
 
 /// El cuerpo de un `207`, o el estado como error.

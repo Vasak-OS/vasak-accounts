@@ -530,6 +530,7 @@ impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
         plan: Plan,
         round: &mut Round,
     ) -> Result<(), SyncError> {
+        let settles = plan.settles();
         let mut batch = Batch::default();
         round.report.removed += plan.delete.len();
         for href in plan.delete {
@@ -572,12 +573,14 @@ impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
             }
         }
 
-        // El último lote, aunque esté vacío: es el que guarda el token.
-        let progress = CalendarProgress {
+        // El último lote, aunque esté vacío: es el que guarda el token. Salvo
+        // que el listado haya traído objetos de otro origen: lo traído se
+        // escribe, pero el calendario no queda al día (ver `Plan::foreign`).
+        let progress = settles.then_some(CalendarProgress {
             token: plan.token,
             ctag: plan.ctag,
-        };
-        self.write(account_id, stored, &mut batch, Some(progress), round)
+        });
+        self.write(account_id, stored, &mut batch, progress, round)
             .await
     }
 

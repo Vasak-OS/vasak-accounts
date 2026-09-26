@@ -675,6 +675,62 @@ async fn una_libreta_que_vuelve_con_otro_origen_no_se_borra() {
     assert_eq!(f.names().await, vec!["Ana"]);
 }
 
+/// **N6** (la nota 1 de integridad del #52): **una tarjeta que vuelve con otro
+/// origen no se borra.** El N2 cubrió las libretas; esto es un nivel más
+/// abajo. Con el token vencido, la carga completa trae las mismas tres con la
+/// dirección entera de otro servidor: se descartan —no se piden— y lo guardado
+/// que «no vino» se borraba (3 → 0). Ahora la vuelta no borra nada de la
+/// libreta y no guarda el token nuevo; tampoco por ETag. Cuando el servidor
+/// vuelve a contestar bien, la libreta queda al día.
+#[tokio::test]
+async fn una_tarjeta_que_vuelve_con_otro_origen_no_se_borra() {
+    let f = Fixture::new("contactos-tarjeta-otro-origen").await;
+    f.server.put(0, "ana.vcf", &card("1", "Ana", "ana@x.com"));
+    f.server
+        .put(0, "juan.vcf", &card("2", "Juan", "juan@x.com"));
+    f.server.put(0, "zoe.vcf", &card("3", "Zoe", "zoe@x.com"));
+    f.synced().await;
+    let old = f.token(0).await.unwrap();
+
+    {
+        let mut state = f.server.state();
+        state.min_valid_token = state.version + 1;
+        state.resource_origin = Some("https://alias.ejemplo.com".into());
+    }
+    // Una nueva mientras tanto: el token del servidor avanza, y la nueva
+    // también viene de otro origen.
+    f.server.put(0, "eva.vcf", &card("4", "Eva", "eva@x.com"));
+    let before = f.server.requests().len();
+    let report = f.synced().await;
+    assert_eq!((report.full_resyncs, report.foreign), (1, 4));
+    assert_eq!(report.removed, 0);
+    assert_eq!(f.names().await, vec!["Ana", "Juan", "Zoe"]);
+    assert_ne!(f.server_token(), old);
+    assert_eq!(f.token(0).await, Some(old.clone()), "se guardó el token");
+    assert!(!f.requests_since(before).iter().any(|r| r.is_multiget()));
+
+    // Por ETag, igual.
+    f.server.state().collections[0].supports_sync = false;
+    let report = f.synced().await;
+    assert_eq!(
+        (report.etag_books, report.foreign, report.removed),
+        (1, 4, 0)
+    );
+    assert_eq!(f.names().await, vec!["Ana", "Juan", "Zoe"]);
+
+    // Y cuando vuelve a contestar bien, lo que de verdad se fue se borra.
+    {
+        let mut state = f.server.state();
+        state.collections[0].supports_sync = true;
+        state.resource_origin = None;
+    }
+    f.server.remove(0, "zoe.vcf");
+    let report = f.synced().await;
+    assert_eq!((report.foreign, report.removed, report.fetched), (0, 1, 1));
+    assert_eq!(f.names().await, vec!["Ana", "Eva", "Juan"]);
+    assert_eq!(f.token(0).await, Some(f.server_token()));
+}
+
 // ── El llavero ──────────────────────────────────────────────────────────────
 
 /// **Con el llavero bloqueado no se pide nada a nadie**: ni la credencial al

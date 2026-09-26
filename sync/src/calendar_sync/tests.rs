@@ -1061,3 +1061,82 @@ async fn una_tanda_del_calendario_no_retiene_lo_que_pasa_el_tope() {
     assert_eq!(f.summaries().await, vec!["Chico"]);
     assert_eq!(f.token(0).await, Some(f.server_token()));
 }
+
+// ── Lo que vuelve con otro origen (N6) ──────────────────────────────────────
+
+/// **N6**: **un objeto que vuelve con otro origen no se borra.** Con el token
+/// vencido, la carga completa trae los mismos tres con la dirección entera de
+/// otro servidor: se descartan sin pedirlos, y lo guardado que «no vino» se
+/// borraba (medido en la segunda pasada: 3 → 0, con las ocurrencias). Ahora
+/// esa vuelta no borra nada del calendario ni guarda el token; tampoco por
+/// ETag, ni en unas diferencias con un cambio de otro origen, que no se
+/// pierde: vuelve a venir cuando el servidor contesta bien.
+#[tokio::test]
+async fn un_objeto_que_vuelve_con_otro_origen_no_se_borra() {
+    let f = Fixture::new("calendario-objeto-otro-origen").await;
+    f.server
+        .put(0, "a.ics", &event("a", "Uno", "20260928T140000Z"));
+    f.server
+        .put(0, "b.ics", &event("b", "Dos", "20260929T140000Z"));
+    f.server
+        .put(0, "c.ics", &event("c", "Tres", "20260930T140000Z"));
+    f.synced().await;
+    let old = f.token(0).await.unwrap();
+    let occurrences = f.count("SELECT count(*) FROM occurrences").await;
+    assert_eq!(occurrences, 3);
+
+    {
+        let mut state = f.server.state();
+        state.min_valid_token = state.version + 1;
+        state.resource_origin = Some("https://alias.ejemplo.com".into());
+    }
+    // Uno nuevo mientras tanto: el token del servidor avanza, y el nuevo
+    // también viene de otro origen.
+    f.server
+        .put(0, "d.ics", &event("d", "Cuatro", "20261001T140000Z"));
+    let before = f.server.requests().len();
+    let report = f.synced().await;
+    assert_eq!((report.full_resyncs, report.foreign), (1, 4));
+    assert_ne!(f.server_token(), old);
+    assert_eq!(report.removed, 0);
+    assert_eq!(f.summaries().await, vec!["Dos", "Tres", "Uno"]);
+    assert_eq!(f.count("SELECT count(*) FROM occurrences").await, 3);
+    assert_eq!(f.token(0).await, Some(old.clone()), "se guardó el token");
+    assert!(!f.requests_since(before).iter().any(|r| r.is_multiget()));
+
+    // Por ETag, igual.
+    f.server.state().collections[0].supports_sync = false;
+    let report = f.synced().await;
+    assert_eq!(
+        (report.etag_calendars, report.foreign, report.removed),
+        (1, 4, 0)
+    );
+    assert_eq!(f.summaries().await, vec!["Dos", "Tres", "Uno"]);
+
+    // Vuelve a contestar bien: queda al día, y lo que se fue se borra.
+    {
+        let mut state = f.server.state();
+        state.collections[0].supports_sync = true;
+        state.resource_origin = None;
+    }
+    f.server.remove(0, "c.ics");
+    let report = f.synced().await;
+    assert_eq!((report.foreign, report.removed, report.fetched), (0, 1, 1));
+    assert_eq!(f.summaries().await, vec!["Cuatro", "Dos", "Uno"]);
+    let token = f.token(0).await.unwrap();
+    assert_eq!(token, f.server_token());
+
+    // Unas diferencias con un cambio de otro origen: no se guarda el token, y
+    // el cambio llega cuando el servidor vuelve a contestar bien.
+    f.server
+        .put(0, "a.ics", &event("a", "Uno cambiado", "20260928T140000Z"));
+    f.server.state().resource_origin = Some("https://alias.ejemplo.com".into());
+    let report = f.synced().await;
+    assert_eq!((report.foreign, report.fetched), (1, 0));
+    assert_eq!(f.token(0).await, Some(token));
+    f.server.state().resource_origin = None;
+    let report = f.synced().await;
+    assert_eq!(report.fetched, 1);
+    assert_eq!(f.summaries().await, vec!["Cuatro", "Dos", "Uno cambiado"]);
+    assert_eq!(f.token(0).await, Some(f.server_token()));
+}

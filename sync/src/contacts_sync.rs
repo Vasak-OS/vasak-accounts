@@ -471,6 +471,7 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
         plan: Plan,
         round: &mut Round,
     ) -> Result<(), SyncError> {
+        let settles = plan.settles();
         let mut pending: Vec<ContactOp> = Vec::new();
         let mut pending_bytes = 0;
         round.report.removed += plan.delete.len();
@@ -504,12 +505,14 @@ impl<K: KeySource, C: CredentialSource> ContactsSync<K, C> {
             }
         }
 
-        // El último lote, aunque esté vacío: es el que guarda el token.
-        let progress = BookProgress {
+        // El último lote, aunque esté vacío: es el que guarda el token. Salvo
+        // que el listado haya traído tarjetas de otro origen: lo traído se
+        // escribe, pero la libreta no queda al día (ver `Plan::foreign`).
+        let progress = settles.then_some(BookProgress {
             token: plan.token,
             ctag: plan.ctag,
-        };
-        self.write(account_id, stored, &mut pending, Some(progress), round)
+        });
+        self.write(account_id, stored, &mut pending, progress, round)
             .await
     }
 
