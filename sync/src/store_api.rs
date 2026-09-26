@@ -46,7 +46,7 @@ use crate::dav::webdav::{HttpPolicy, Limits};
 use crate::store::contacts_read::{self, Cursor, InvalidArgument};
 use crate::store::key::{self, KeyError, KeySource, SecretServiceKeys};
 use crate::store::lifecycle::{
-    AccountListing, ListedAccount, Locations, Status, StoreManager, CONTACTS_AREA,
+    AccountListing, Consent, ListedAccount, Locations, Status, StoreManager, CONTACTS_AREA,
 };
 use crate::store::{paths, StoreError};
 
@@ -166,14 +166,21 @@ impl<K: KeySource> StoreApi<K> {
         account_id: String,
     ) -> zbus::fdo::Result<()> {
         self.admit_control(&header, &account_id).await?;
+        // Si hace falta preguntar se mira acá, pero **encender lo decide
+        // `activate_contacts`** con lo que haya en ese momento, y sin un «sí»
+        // no enciende: si la cuenta cambia en el medio —un `ListAccounts`
+        // mientras se pasa la tabla—, no se enciende nada sin permiso, y el
+        // próximo `RequestSync` pregunta.
+        let mut consent = Consent::NotAsked;
         if let Ok(account) = self.manager.contacts_account(&account_id).await {
             if account.syncable && !account.active {
                 self.authorize(&header, &account.display_name).await?;
+                consent = Consent::Granted;
             }
         }
         let result = self.manager.request_sync(&account_id).await;
         if result.is_ok() {
-            match self.manager.activate_contacts(&account_id).await {
+            match self.manager.activate_contacts(&account_id, consent).await {
                 Ok(true) => self.ask_for_sync(&account_id),
                 Ok(false) => {}
                 Err(e) => tracing::warn!("no se pudo encender el área de contactos: {e}"),
@@ -368,7 +375,11 @@ impl<K: KeySource> StoreApi<K> {
             .map_err(to_fdo)?;
         self.authorize(header, &account.display_name).await?;
         if !account.active && account.syncable {
-            match self.manager.activate_contacts(account_id).await {
+            match self
+                .manager
+                .activate_contacts(account_id, Consent::Granted)
+                .await
+            {
                 Ok(true) => self.ask_for_sync(account_id),
                 Ok(false) => {}
                 Err(e) => tracing::warn!("no se pudo encender el área de contactos: {e}"),
@@ -999,6 +1010,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(api.access.permissions.calls(), asked);
+    }
+
+    /// La carrera de `RequestSync`: decide si pregunta con una mirada —la
+    /// cuenta pide reautenticarse, así que no se encendería y no pregunta— y
+    /// mientras pasa la tabla llega un `ListAccounts` en que ya no lo pide.
+    /// Encender lo decide recién `activate_contacts`, y sin un «sí» no
+    /// enciende: el área queda apagada y nadie preguntó nada.
+    #[tokio::test]
+    async fn pedir_una_vuelta_no_enciende_los_contactos_si_la_cuenta_cambia_en_el_medio() {
+        let mut stale = with_contacts("cuenta");
+        stale.needs_reauth = true;
+        let mut api = Api::new("api-carrera", vec![stale], Answer::Allow).await;
+        let (client, _service) = api.client(":1.7").await;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        api.keys.state().pin_gate = Some(Arc::clone(&gate));
+
+        let request = tokio::spawn({
+            let client = client.clone();
+            async move { call_unit(&client, "RequestSync", &("cuenta",)).await }
+        });
+        // La vuelta de `RequestSync` quedó detenida con la cerradura tomada.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while api.keys.state().pins_waiting == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("la vuelta no llegó al llavero");
+        // Llega el listado nuevo y espera su turno, antes que el encendido.
+        let relist = tokio::spawn({
+            let manager = Arc::clone(&api.manager);
+            async move {
+                manager
+                    .accounts_listed(
+                        listing_from(&Ok(vec![with_contacts("cuenta")])),
+                        Instant::now(),
+                    )
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        gate.add_permits(100);
+
+        request.await.unwrap().unwrap();
+        relist.await.unwrap();
+        assert!(
+            api.manager
+                .contacts_account("cuenta")
+                .await
+                .is_ok_and(|a| a.syncable),
+            "la cuenta ya se podía sincronizar cuando se encendía"
+        );
+        assert!(
+            !api.settings().is_active("cuenta", CONTACTS_AREA),
+            "se encendió sin preguntar"
+        );
+        assert_eq!(api.access.permissions.calls(), 0);
+        assert!(api.pending.try_recv().is_err());
     }
 
     /// **Sin permiso, ningún dato**, en las cuatro lecturas: `AccessDenied`, y

@@ -584,6 +584,16 @@ pub struct StoreManager<K: KeySource> {
     changes: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<StoreChange>>>,
 }
 
+/// Si quien pide encender un área dio su permiso para leerla
+/// ([`StoreManager::activate_contacts`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Consent {
+    /// Se le preguntó `store.<área>` y dijo que sí.
+    Granted,
+    /// No se le preguntó: un área apagada no se enciende.
+    NotAsked,
+}
+
 /// Lo que [`StoreManager::contacts_account`] sabe de una cuenta con contactos.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContactsAccount {
@@ -899,11 +909,24 @@ impl<K: KeySource> StoreManager<K> {
 
     /// Enciende el área de contactos de una cuenta, si tiene contactos que
     /// sincronizar. Queda anotado en `stores.json`, así que sigue encendida
-    /// después de reiniciar. Devuelve si hay contactos que sincronizar.
+    /// después de reiniciar. Devuelve si hay contactos que sincronizar con el
+    /// área encendida.
     ///
-    /// Es lo que hace `RequestSync`: una cuenta de sólo correo no enciende nada
-    /// y tampoco es un error.
-    pub async fn activate_contacts(&self, account_id: &str) -> Result<bool, StoreError> {
+    /// **Encender pide `consent`**: sólo con [`Consent::Granted`] —quien llama
+    /// preguntó `store.contacts` y le dijeron que sí— un área apagada se
+    /// enciende. Con [`Consent::NotAsked`], una encendida sigue y una apagada
+    /// queda así. La decisión se toma acá, con la misma cerradura con que se
+    /// enciende: `RequestSync` miraba primero si hacía falta preguntar y
+    /// encendía después, y un `ListAccounts` en el medio —la cuenta que deja
+    /// de pedir reautenticarse, o que suma contactos— la encendía sin que
+    /// nadie hubiera preguntado.
+    ///
+    /// Una cuenta de sólo correo no enciende nada y tampoco es un error.
+    pub async fn activate_contacts(
+        &self,
+        account_id: &str,
+        consent: Consent,
+    ) -> Result<bool, StoreError> {
         paths::validate_account_id(account_id)?;
         let inner = self.inner.lock().await;
         Self::require_listed(&inner, account_id)?;
@@ -912,15 +935,19 @@ impl<K: KeySource> StoreManager<K> {
         }
         let locations = self.locations()?;
         let mut settings = StoreSettings::load(&locations.settings)?;
-        if !settings.is_active(account_id, CONTACTS_AREA) {
-            settings
-                .accounts
-                .entry(account_id.to_string())
-                .or_default()
-                .active_areas
-                .insert(CONTACTS_AREA.to_string());
-            settings.save(&locations.settings)?;
+        if settings.is_active(account_id, CONTACTS_AREA) {
+            return Ok(true);
         }
+        if consent != Consent::Granted {
+            return Ok(false);
+        }
+        settings
+            .accounts
+            .entry(account_id.to_string())
+            .or_default()
+            .active_areas
+            .insert(CONTACTS_AREA.to_string());
+        settings.save(&locations.settings)?;
         Ok(true)
     }
 
@@ -3043,7 +3070,11 @@ mod tests {
         let status = serde_json::to_value(f.manager.status().await).unwrap();
         assert_eq!(status["accounts"][0]["contacts"]["state"], "off");
 
-        assert!(f.manager.activate_contacts("cuenta").await.unwrap());
+        assert!(f
+            .manager
+            .activate_contacts("cuenta", Consent::Granted)
+            .await
+            .unwrap());
         assert_eq!(f.manager.contacts_targets().await, vec!["cuenta"]);
         assert!(f.settings().is_active("cuenta", CONTACTS_AREA));
         let status = serde_json::to_value(f.manager.status().await).unwrap();
@@ -3057,17 +3088,59 @@ mod tests {
         assert_eq!(again.contacts_targets().await, vec!["cuenta"]);
     }
 
+    /// Sin permiso, un área apagada no se enciende aunque la cuenta tenga
+    /// contactos que sincronizar; una que ya estaba encendida sigue, y dice
+    /// que hay contactos.
+    #[tokio::test]
+    async fn encender_sin_permiso_no_enciende_aunque_la_cuenta_cambie() {
+        let f = Fixture::new("area-sin-permiso");
+        let mut stale = account("cuenta", &["contacts"]);
+        stale.needs_reauth = true;
+        f.list(AccountListing::Listed(vec![stale])).await;
+        // La cuenta deja de pedir reautenticarse: ahora sí se encendería.
+        f.list(with_contacts(&["cuenta"])).await;
+
+        assert!(!f
+            .manager
+            .activate_contacts("cuenta", Consent::NotAsked)
+            .await
+            .unwrap());
+        assert!(!f.settings().is_active("cuenta", CONTACTS_AREA));
+        assert!(f.manager.contacts_targets().await.is_empty());
+
+        assert!(f
+            .manager
+            .activate_contacts("cuenta", Consent::Granted)
+            .await
+            .unwrap());
+        assert!(
+            f.manager
+                .activate_contacts("cuenta", Consent::NotAsked)
+                .await
+                .unwrap(),
+            "encendida, sigue encendida sin volver a preguntar"
+        );
+    }
+
     /// Una cuenta sin contactos no enciende nada ni es un error, y en el estado
     /// no aparece el área.
     #[tokio::test]
     async fn una_cuenta_sin_contactos_no_enciende_nada() {
         let f = Fixture::new("area-sin-contactos");
         f.list(listing(&["cuenta"])).await;
-        assert!(!f.manager.activate_contacts("cuenta").await.unwrap());
+        assert!(!f
+            .manager
+            .activate_contacts("cuenta", Consent::Granted)
+            .await
+            .unwrap());
         assert!(!f.settings().is_active("cuenta", CONTACTS_AREA));
         let status = serde_json::to_value(f.manager.status().await).unwrap();
         assert!(status["accounts"][0].get("contacts").is_none());
-        assert!(f.manager.activate_contacts("otra").await.is_err());
+        assert!(f
+            .manager
+            .activate_contacts("otra", Consent::Granted)
+            .await
+            .is_err());
     }
 
     /// Una cuenta que pide reautenticarse conserva su base, pero sus contactos
@@ -3076,7 +3149,10 @@ mod tests {
     async fn una_cuenta_que_pide_reautenticarse_no_sincroniza_contactos() {
         let f = Fixture::new("area-reautenticar");
         f.list(with_contacts(&["cuenta"])).await;
-        f.manager.activate_contacts("cuenta").await.unwrap();
+        f.manager
+            .activate_contacts("cuenta", Consent::Granted)
+            .await
+            .unwrap();
         let mut stale = account("cuenta", &["contacts"]);
         stale.needs_reauth = true;
         f.list(AccountListing::Listed(vec![stale])).await;
@@ -3095,7 +3171,10 @@ mod tests {
     async fn apagar_la_base_no_olvida_el_area() {
         let f = Fixture::new("area-apagada");
         f.list(with_contacts(&["cuenta"])).await;
-        f.manager.activate_contacts("cuenta").await.unwrap();
+        f.manager
+            .activate_contacts("cuenta", Consent::Granted)
+            .await
+            .unwrap();
 
         f.manager.set_enabled("cuenta", false).await.unwrap();
         assert!(f.settings().is_active("cuenta", CONTACTS_AREA));

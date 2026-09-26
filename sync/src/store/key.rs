@@ -757,6 +757,11 @@ pub(crate) mod fake {
         /// Cuántas veces `pin_collection` falla antes de contestar: un
         /// `Created` que no llegó.
         pub fail_pins: usize,
+        /// Si está, cada `pin_collection` espera un permiso de acá: una vuelta
+        /// de la tabla detenida a mitad de camino, con la cerradura tomada.
+        pub pin_gate: Option<Arc<tokio::sync::Semaphore>>,
+        /// Cuántos `pin_collection` están esperando en `pin_gate`.
+        pub pins_waiting: usize,
     }
 
     #[derive(Clone, Default)]
@@ -770,6 +775,12 @@ pub(crate) mod fake {
 
     impl KeySource for FakeKeys {
         async fn pin_collection(&self) -> Result<String, KeyError> {
+            let gate = self.state().pin_gate.clone();
+            if let Some(gate) = gate {
+                self.state().pins_waiting += 1;
+                gate.acquire().await.unwrap().forget();
+                self.state().pins_waiting -= 1;
+            }
             let mut state = self.state();
             if state.unavailable {
                 return Err(KeyError::Unavailable("sin llavero".into()));

@@ -10,7 +10,7 @@ use super::*;
 use crate::dav::fake::{card, FakeDav, RecordedRequest};
 use crate::dav::webdav::AuthKind;
 use crate::store::key::fake::FakeKeys;
-use crate::store::lifecycle::{AccountListing, ListedAccount, Locations};
+use crate::store::lifecycle::{AccountListing, Consent, ListedAccount, Locations};
 use crate::store::paths::tests::TempDir;
 
 const ACCOUNT: &str = "cuenta";
@@ -107,7 +107,10 @@ impl Fixture {
                 Instant::now(),
             )
             .await;
-        assert!(manager.activate_contacts(ACCOUNT).await.unwrap());
+        assert!(manager
+            .activate_contacts(ACCOUNT, Consent::Granted)
+            .await
+            .unwrap());
 
         let server = FakeDav::start().await;
         let credentials = FakeCredentials(Arc::new(std::sync::Mutex::new(CredentialState {
@@ -1295,8 +1298,14 @@ async fn una_cuenta_lenta_no_frena_a_las_otras() {
             Instant::now(),
         )
         .await;
-    assert!(manager.activate_contacts("lenta").await.unwrap());
-    assert!(manager.activate_contacts("rapida").await.unwrap());
+    assert!(manager
+        .activate_contacts("lenta", Consent::Granted)
+        .await
+        .unwrap());
+    assert!(manager
+        .activate_contacts("rapida", Consent::Granted)
+        .await
+        .unwrap());
 
     let slow = FakeDav::start().await;
     slow.put(0, "ana.vcf", &card("1", "Ana", "ana@x.com"));
