@@ -2932,6 +2932,46 @@ mod tests {
         assert_eq!(f.manager.inner.lock().await.wanted.len(), 2);
     }
 
+    /// Y el tercer camino por el que puede llegar un «no te puedo decir qué
+    /// cuentas tenés»: **el marcador que no se pudo escribir**. Es el que cerró la
+    /// puerta de atrás del hallazgo de review —sin él, el demonio seguía con una
+    /// base sin marcador y la próxima pérdida del directorio se leía como
+    /// instalación nueva, o sea como lista vacía—.
+    ///
+    /// Va por el mismo camino que los otros dos: `Failed` es `Failed`, y el
+    /// podador no lleva la cuenta de los fallos.
+    #[tokio::test]
+    async fn un_marcador_que_no_se_pudo_escribir_tampoco_poda_nada() {
+        let f = Fixture::new("marcador-sin-escribir");
+        f.list(listing(&["correo", "calendario"])).await;
+
+        let respuesta: Result<Vec<crate::broker::Account>, crate::broker::BrokerError> =
+            Err(crate::broker::BrokerError::Failed(
+                "Error al cargar cuentas: no se pudo leer \
+                 /var/lib/vasak-accounts/.instalado-1000: \
+                 /var/lib/vasak-accounts/.instalado-1000 ya existe y no es un archivo: \
+                 no se adopta como marcador"
+                    .into(),
+            ));
+
+        for _ in 0..3 {
+            f.list(listing_from(&respuesta)).await;
+            f.advance(PRUNE_CONFIRMATION);
+        }
+        f.list(listing_from(&respuesta)).await;
+        f.advance(PRUNE_CONFIRMATION);
+        f.list(listing_from(&respuesta)).await;
+
+        for cuenta in ["correo", "calendario"] {
+            assert!(
+                f.paths(cuenta).db_exists().unwrap(),
+                "un marcador que no se pudo escribir borró la base de {cuenta}",
+            );
+        }
+        assert!(f.keys.state().deleted.is_empty());
+        assert_eq!(f.manager.inner.lock().await.wanted.len(), 2);
+    }
+
     /// Y lo del otro lado, que es lo que la poda **sí** tiene que hacer: dos
     /// listados buenos que no la nombran, separados por una vuelta, borran su
     /// base. Sin esta, la de arriba no probaría nada: podría no podar porque la

@@ -280,21 +280,68 @@ fn marker_for(directory: &Path) -> Option<PathBuf> {
     Some(directory.with_file_name(format!("{MARKER_PREFIX}{nombre}")))
 }
 
-/// Deja el marcador puesto. Un archivo de largo cero y 0600, como los tokens.
-fn write_marker(marker: &Path) -> std::io::Result<()> {
-    std::fs::OpenOptions::new()
+/// Deja el marcador puesto, **sin seguir enlaces**.
+///
+/// El demonio corre **como root**, así que escribir por un enlace simbólico en
+/// esta ruta es escritura arbitraria como root: el contenido caería donde el
+/// enlace apunte, y además quedaría con 0600 de root encima. Es la misma clase
+/// de problema que la cola de salida y que la poda del almacén.
+///
+/// Por eso no se abre con `OpenOptions::open`, que sigue el enlace. Se abre con
+/// **`create_new`**, que es `O_CREAT | O_EXCL` y **no sigue un enlace final**:
+/// si ya hay algo con ese nombre —un symlink, un archivo, una carpeta— falla con
+/// `AlreadyExists` en vez de escribir por encima. Es el `O_NOFOLLOW` de este
+/// caso, sin sin traer la constante de plataforma.
+///
+/// Y si algo estaba ahí, **sólo se adopta si es un archivo regular**: un symlink
+/// no se sigue y no se adopta en silencio. No se mira el dueño porque la carpeta
+/// que lo contiene es de root y no hay otro programa que pueda escribir ahí;
+/// lo que importa es el **tipo**, que es lo que decide si lo que hay es el
+/// marcador o una entrada de la que se valió otro.
+fn write_marker(marker: &Path) -> Result<(), StorageError> {
+    let sits = |source: std::io::Error| StorageError::Unreadable {
+        path: marker.to_path_buf(),
+        source,
+    };
+
+    match std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(false)
+        .create_new(true)
         .mode(0o600)
         .open(marker)
-        .map(|_| ())
+    {
+        Ok(_) => return Ok(()),
+        // Ya había algo con ese nombre: se mira qué es antes de adoptarlo.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(source) => return Err(sits(source)),
+    }
+
+    match std::fs::symlink_metadata(marker) {
+        Ok(meta) if meta.file_type().is_file() => Ok(()),
+        Ok(_) => Err(sits(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "{} ya existe y no es un archivo: no se adopta como marcador",
+                marker.display()
+            ),
+        ))),
+        Err(source) => Err(sits(source)),
+    }
 }
 
 /// Si el marcador está, sin confundir «no está» con «no se pudo saber».
+///
+/// **`symlink_metadata` y no `metadata`**, y por la misma razón que
+/// [`write_marker`]: este archivo decide si se pierde una cuenta, así que se
+/// pregunta por **la entrada del directorio**, no por lo que haya detrás. Con
+/// `metadata`, un symlink a cualquier archivo existente respondería que hay
+/// marcador — y peor, uno apuntando a `/dev/null` contestaría que sí sin haber
+/// persistido nada. Un symlink tampoco cuenta como marcador: lo que hay en ese
+/// nombre no es nuestro, y [`write_marker`] va a fallar al poner el de verdad.
 fn marker_exists(marker: &Path) -> Result<bool, StorageError> {
-    match std::fs::metadata(marker) {
-        Ok(_) => Ok(true),
+    match std::fs::symlink_metadata(marker) {
+        Ok(meta) if meta.file_type().is_file() => Ok(true),
+        Ok(_) => Ok(false),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(source) => Err(StorageError::Unreadable {
             path: marker.to_path_buf(),
@@ -404,23 +451,28 @@ impl AccountDatabase {
         // instalación nueva y una vieja que todavía no lo tenía. Así, la
         // próxima vez que el directorio falte, el hueco se ve.
         //
-        // Si no se puede escribir, **no se corta el servicio**: el padre
-        // debería ser de root y escribible, pero una instalación restaurada
-        // desde un montaje de sólo lectura puede no serlo, y en ese caso lo
-        // que cambia es que la próxima pérdida del directorio se va a leer como
-        // una instalación nueva — el comportamiento de siempre, no uno nuevo.
-        // Un directorio de la persona que no se puede leer ya da error por
-        // `directory_existed` y por el `load`, y eso no se toca.
+        // **Si no se puede, es un error, y no se sigue.**
+        //
+        // La tentación es avisar en el diario y seguir, y parece inofensiva: el
+        // padre es de root, y si no fuera escribible `create_dir_all` de arriba
+        // ya habría fallado. Pero esa es justo la falsa tranquilidad. Lo que
+        // queda es un symlink colgante en el nombre del marcador o un disco
+        // lleno — `ENOSPC` — y en los dos casos **no** es un estado degradado
+        // pero en servicio: es un estado en el que el demonio acaba de no poder
+        // registrar que esta cuenta existe. Si se sigue, la próxima pérdida del
+        // directorio se lee como instalación nueva, la carga contesta lista
+        // vacía, y el podador borra las bases locales y la clave. Eso es
+        // exactamente el bug de `vasak-accounts#56`, reintroducido por la puerta
+        // de atrás: el marcador tiene que ser **fail closed**.
+        //
+        // Y el error no deja a nadie a la vista: el sincronizador trata un
+        // `ListAccounts` fallido como `AccountListing::Failed`, que es
+        // «no borrar nada». Lo que se pierde es la lista de cuentas en
+        // Configuración, y eso se arregla mirando el diario; lo que se gana es
+        // que no haya dos listados vacíos que borren el correo de la persona.
         if let Some(marker) = marker {
             if !marcado {
-                if let Err(e) = write_marker(&marker) {
-                    tracing::warn!(
-                        "no se pudo dejar el marcador {}: {e}. \
-                         La próxima vez que falte el directorio se verá como una \
-                         instalación nueva",
-                        marker.display(),
-                    );
-                }
+                write_marker(&marker)?;
             }
         }
 
@@ -1087,6 +1139,139 @@ mod tests {
             "se recreó el directorio perdido",
         );
 
+        borrar_base_de_prueba(&dir);
+    }
+
+    /// **Un symlink en el nombre del marcador no se sigue, y es un error.**
+    ///
+    /// El demonio corre **como root**: escribir por un enlace en
+    /// `/var/lib/vasak-accounts/` es escritura arbitraria como root, y el
+    /// contenido además quedaría con 0600 de root encima. Es la misma clase de
+    /// problema que la cola de salida y que la poda del almacén, y es la misma
+    /// solución: abrir sin seguir enlaces.
+    ///
+    /// Acá lo que se garantiza es que el archivo de la otra punta **no existe**: se
+    /// abre con `create_new`, que es `O_CREAT | O_EXCL` y no sigue un enlace
+    /// final, así que en vez de escribir por él falla.
+    #[test]
+    fn un_symlink_en_el_marcador_no_se_sigue_ni_se_adopta() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        AccountDatabase::in_directory(dir.clone()).unwrap();
+        let marcador = marker_for(&dir).unwrap();
+        // Lo que dejó la apertura, afuera: ahora le ponemos un symlink encima.
+        let _ = std::fs::remove_file(&marcador);
+
+        // A donde apunta el symlink: un archivo de otra cuenta, digamos.
+        let objetivo = dir.with_file_name(format!(
+            "ajeno-{}",
+            dir.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&objetivo, "esto no es un marcador").unwrap();
+        std::os::unix::fs::symlink(&objetivo, &marcador).unwrap();
+
+        let error = match AccountDatabase::in_directory(dir.clone()) {
+            Err(error) => error,
+            Ok(_) => panic!("un symlink en el nombre del marcador no se adopta en silencio"),
+        };
+        assert!(
+            matches!(error, StorageError::Unreadable { .. }),
+            "se esperaba Unreadable, vino {error:?}",
+        );
+        assert!(error.to_string().contains("no es un archivo"), "{error}");
+
+        // Y lo importante: lo que estaba del otro lado no se tocó.
+        assert_eq!(
+            std::fs::read_to_string(&objetivo).unwrap(),
+            "esto no es un marcador",
+            "se escribió por el symlink",
+        );
+        // Ni se lo volvió a crear encima como si fuera nuestro.
+        assert!(
+            std::fs::symlink_metadata(&marcador)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "el symlink se reemplazó en vez de fallar",
+        );
+
+        let _ = std::fs::remove_file(&objetivo);
+        borrar_base_de_prueba(&dir);
+    }
+
+    /// `marker_exists` pregunta por **la entrada del directorio**, no por lo que
+    /// haya detrás. Con `metadata`, un symlink a cualquier archivo existente
+    /// respondería que hay marcador — y uno a `/dev/null` contestaría que sí sin
+    /// haber persistido nada, que es peor: la cuenta se daría por perdida
+    /// solapada y sin registro.
+    #[test]
+    fn un_symlink_no_cuenta_como_marcador() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        AccountDatabase::in_directory(dir.clone()).unwrap();
+        let marcador = marker_for(&dir).unwrap();
+        let _ = std::fs::remove_file(&marcador);
+
+        let objetivo = dir.with_file_name(format!(
+            "existente-{}",
+            dir.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&objetivo, "soy un archivo cualquiera").unwrap();
+        std::os::unix::fs::symlink(&objetivo, &marcador).unwrap();
+
+        assert!(
+            !marker_exists(&marcador).unwrap(),
+            "un symlink se contó como marcador",
+        );
+        // Y un archivo de verdad sí cuenta.
+        let _ = std::fs::remove_file(&marcador);
+        std::fs::write(&marcador, "").unwrap();
+        assert!(marker_exists(&marcador).unwrap());
+        // Y una carpeta con el nombre del marcador tampoco.
+        let _ = std::fs::remove_file(&marcador);
+        std::fs::create_dir(&marcador).unwrap();
+        assert!(!marker_exists(&marcador).unwrap());
+
+        let _ = std::fs::remove_file(&objetivo);
+        borrar_base_de_prueba(&dir);
+    }
+
+    /// **El marcador no se puede escribir → error, no una lista vacía.**
+    ///
+    /// Este es el punto por el que la versión anterior **fallaba abierto**:
+    /// avisaba en el diario y seguía con una base sin marcador, así que la
+    /// próxima pérdida del directorio se leía como instalación nueva y la lista
+    /// volvía a salir vacía. Con un symlink en el nombre se llega a ese estado
+    /// sin perder nada: `create_dir_all` del directorio sí funciona.
+    ///
+    /// La única forma de provocar que el marcador no se pueda escribir en una
+    /// carpeta normal es ocuparle el nombre con algo que no es un archivo —un
+    /// symlink—, que es lo que hace esta prueba.
+    #[test]
+    fn si_el_marcador_no_se_puede_escribir_da_error_y_no_una_lista_vacia() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        AccountDatabase::in_directory(dir.clone()).unwrap();
+        let marcador = marker_for(&dir).unwrap();
+        let _ = std::fs::remove_file(&marcador);
+
+        let dir_inexistente = dir.with_file_name(format!(
+            "colgado-{}",
+            dir.file_name().unwrap().to_string_lossy()
+        ));
+        std::os::unix::fs::symlink(&dir_inexistente, &marcador).unwrap();
+
+        let error = match AccountDatabase::in_directory(dir.clone()) {
+            Err(error) => error,
+            Ok(_) => panic!("sin marcador no se sigue: el hueco volvería a abrirse"),
+        };
+        assert!(
+            matches!(error, StorageError::Unreadable { .. }),
+            "{error:?}"
+        );
+
+        // Y el mensaje dice qué pasó, que es lo que va a leer el diario.
+        let mensaje = error.to_string();
+        assert!(mensaje.contains(marcador.to_str().unwrap()), "{mensaje}");
+
+        let _ = std::fs::remove_file(&marcador);
         borrar_base_de_prueba(&dir);
     }
 
