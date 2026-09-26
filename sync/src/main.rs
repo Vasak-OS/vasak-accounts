@@ -29,10 +29,11 @@
 //! nada de lo que escribió un desconocido. Ese parser llegó con la aplicación de
 //! correo y vive en `mensaje.rs`, con su propia discusión escrita arriba.
 //!
-//! Prepara además una base **cifrada y vacía** por cuenta —el almacén local de
-//! `store/`, con su estado en `ar.net.vasak.os.AccountsStore`—. Todavía no
-//! guarda nada de nadie: lo que dicen los dos párrafos que siguen sigue siendo
-//! cierto hasta que el correo pase al almacén.
+//! Prepara además una base **cifrada** por cuenta —el almacén local de
+//! `store/`, con su estado en `ar.net.vasak.os.AccountsStore`— y guarda ahí los
+//! **contactos** de las cuentas que los piden (`contacts_sync.rs`). El correo
+//! todavía no pasa por ahí: lo que dicen los dos párrafos que siguen sigue
+//! siendo cierto hasta que pase.
 //!
 //! **La lista vive en memoria, no en un archivo.** Un caché en disco guardaría el
 //! remitente y el asunto de todo el correo de la persona en texto plano, para

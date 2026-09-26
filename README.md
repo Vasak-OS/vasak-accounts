@@ -415,10 +415,16 @@ vasak-accounts/
         ├── broker.rs        # le pide al servicio, como cualquier aplicación
         ├── imap.rs          # lo justo para contar el correo sin leer
         ├── store_api.rs     # ar.net.vasak.os.AccountsStore: estado y control
+        ├── contacts_sync.rs # los contactos de cada cuenta al almacén, y cuándo
+        ├── vcard.rs         # leer una vCard (2.1, 3.0 y 4.0), sin escribir
+        ├── dav/             # hablar con servidores DAV, sólo lectura
+        │   ├── webdav.rs     # la credencial, el cliente, multistatus, sync-collection
+        │   └── carddav.rs    # libretas, ETag y addressbook-multiget
         └── store/           # el almacén local cifrado, una base por cuenta
             ├── key.rs        # la clave en el llavero (Secret Service)
             ├── paths.rs      # dónde vive cada base, y con qué permisos
             ├── migrations.rs # el esquema, versión por versión
+            ├── contacts.rs   # los contactos en la base, de a lotes
             └── lifecycle.rs  # cuándo se crea, se abre, se cierra y se borra
 ```
 
@@ -645,11 +651,12 @@ horas, no un error.
 
 El sync prepara una base **SQLCipher** por cuenta, en
 `$XDG_DATA_HOME/vasak-accounts-sync/stores/<account_id>/store.db` (carpeta 0700,
-archivos 0600, reaplicados en cada apertura). **Hoy está vacía**: tiene su clave,
-su esquema v1 —dónde quedó la sincronización y una bitácora con tope de mil
-filas— y su ciclo de vida, y nada de nadie adentro. Los contactos, el calendario y
-el correo llegan después, de a uno (`vasak-accounts#23`). Mientras tanto la lista
-de mensajes sigue en memoria, como dice arriba.
+archivos 0600, reaplicados en cada apertura). Tiene su clave, dónde quedó la
+sincronización de cada colección, una bitácora con tope de mil filas y su ciclo
+de vida. **Desde la 0.15.0 guarda los contactos** de las cuentas que los piden
+(ver abajo), **cifrados en reposo** como todo lo demás de la base. El calendario
+y el correo llegan después, de a uno (`vasak-accounts#23`); mientras tanto la
+lista de mensajes sigue en memoria, como dice arriba.
 
 La clave son 32 bytes al azar guardados en el llavero de la sesión (Secret
 Service, esquema `ar.net.vasak.os.AccountsStore`), y se le pasan a SQLCipher
@@ -720,10 +727,46 @@ del mismo nombre de bus:
 | `GetStatus` | El llavero y, por cuenta, `locked`, `open`, `rebuilt`, `disabled` o `unavailable`, con el motivo y `size_bytes`. |
 | `SetStoreEnabled(account_id, enabled)` | Enciende o apaga. Apagar borra. Sólo cuentas del último `ListAccounts` bueno. |
 | `ClearStore(account_id)` | Borra y, si está encendida, la vuelve a crear vacía con otra clave. Sólo cuentas del último `ListAccounts` bueno. |
-| `RequestSync(account_id)` | Deja lista la base de esa cuenta. |
+| `RequestSync(account_id)` | Deja lista la base de esa cuenta y, si tiene contactos, enciende esa área y la sincroniza ya. |
 
 Y la señal `StatusChanged`, sin detalle. Nada de esto lee lo guardado, así que no
-pide permiso; el permiso llega con la primera lectura.
+pide permiso; el permiso llega con la primera lectura (el próximo paso de
+`vasak-accounts#23`: hoy no hay ningún método que devuelva contactos).
+
+#### Los contactos
+
+Qué se guarda: por cada libreta de la cuenta, **cada vCard tal como vino del
+servidor** —ésa es la fuente de verdad— y, derivados de ella sólo para ordenar
+y buscar, el nombre, los correos, los teléfonos y un índice de búsqueda sin
+acentos. Además la dirección y el ETag de cada tarjeta y el `sync-token` de cada
+libreta, para traer después sólo lo que cambió. Nada de eso sale de la base
+todavía, y `GetStatus` sólo dice en qué está el área (`off`, `pending`,
+`syncing`, `synced`, `unavailable`, `failed`), sin datos ni direcciones.
+
+Cuándo: el área de contactos de una cuenta **se enciende la primera vez que
+alguien pide un `RequestSync`** de esa cuenta, queda anotada en `stores.json` y
+desde ahí se sincroniza sola **cada hora**, además de con cada `RequestSync`.
+Con el llavero bloqueado **no se pide nada** —ni la credencial ni un solo pedido
+al servidor— y no se escribe nada; si se bloquea a mitad de camino, lo que llegó
+no se escribe.
+
+Cómo: la credencial se pide al servicio de cuentas con la capacidad `contacts`,
+como cualquier aplicación. Las libretas por `PROPFIND`; por cada una
+`sync-collection` (RFC 6578) desde el token guardado, y por ETag si el servidor
+no lo sabe. Todo de a 500 contactos por transacción, con el token nuevo en la
+misma transacción que el último lote: si algo se corta, la próxima vuelta repite
+sin perder nada. **Sólo lee**: el cliente no tiene ningún método de escritura.
+
+Lo que llega de la red se lee como si lo hubiera escrito cualquiera: 16 MiB por
+respuesta, un millón de nodos por XML y sin DTD, 100 libretas por cuenta, 20 000
+tarjetas por libreta, 512 KiB por tarjeta, 50 correos, teléfonos y relaciones
+por contacto. Sólo `https`, sin seguir redirecciones, y **una dirección de otro
+origen que la cuenta no se pide ni se guarda**: la credencial va sólo al
+servidor de la cuenta.
+
+**Hace falta `vasak-permissions` 0.15.0 o posterior.** Las anteriores no le dan
+al sincronizador `account.contacts`; con ellas el área se ve `unavailable` y no
+se reintenta hasta la hora siguiente.
 
 ## Nextcloud: el único que no hay que configurar
 
@@ -856,6 +899,7 @@ No caduca, no depende de ningún registro y no cuesta nada.
 | Nextcloud Login Flow v2 | ✅ |
 | Prueba de conexión al registrar IMAP/SMTP | ⛔ falta |
 | CalDAV/CardDAV con autodescubrimiento | ⛔ falta |
+| Contactos en el almacén local cifrado (`vasak-accounts-sync`) | ✅ |
 | Contador de correo sin leer (`vasak-accounts-sync`) | ✅ |
 | IMAP IDLE, para que avise en vez de preguntar | ✅ |
 | Caché de mensajes para la aplicación de correo | ⛔ falta (y a propósito: no existe la app) |
