@@ -784,7 +784,11 @@ leerlo el pidfd sigue diciendo ese pid: si el proceso que conectó ya terminó y
 su pid lo tiene otro, no se pregunta por nadie—, y
 `CheckPermissionFor(pid, arranque, "store.contacts", cuenta)` en
 `vasak-permissions`: el sincronizador pregunta **en nombre de la aplicación**, y
-la decisión queda anotada contra ella. Sin permiso, `AccessDenied` y ningún
+la decisión queda anotada contra ella. Una conexión **sin** `ProcessFD` tampoco
+pasa si el bus lo da —para la conexión del sincronizador o para cualquier otra
+ya vista—: dbus-broker acepta así la de un proceso que terminó antes de que la
+aceptara, y su pid puede ser de otro. Sólo un bus que no lo da nunca se juzga
+por el pid. El pidfd se suelta apenas se comprobó, antes de la pregunta. Sin permiso, `AccessDenied` y ningún
 dato. La respuesta —sí o no— se guarda **30 segundos por nombre único**, y se
 olvida cuando ese nombre se va del bus; dos pedidos a la vez de la misma
 aplicación son una sola pregunta. Un error del servicio de permisos no se

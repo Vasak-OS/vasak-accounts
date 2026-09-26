@@ -15,8 +15,11 @@
 //!    de leerlo, el pidfd tiene que seguir diciendo ese pid: si el proceso que
 //!    conectó ya terminó —y la conexión siguió viva en un hijo, o el pid lo
 //!    tomó otro—, el arranque leído es de otro proceso, y la respuesta es
-//!    `Failed`. Un bus que no da `ProcessFD` se juzga sólo por el pid, como
-//!    antes.
+//!    `Failed`. Una conexión sin `ProcessFD` también es `Failed` si el bus lo
+//!    da —lo dio para la conexión propia o para cualquier otra—: dbus-broker
+//!    acepta sin pidfd la de un proceso que terminó antes del `accept`. Sólo
+//!    un bus que no lo da nunca se juzga por el pid, como antes. El pidfd se
+//!    suelta apenas se comprobó, antes de la pregunta.
 //! 4. `CheckPermissionFor(pid, arranque, "store.contacts", cuenta)` en
 //!    `vasak-permissions`, en el bus del sistema. El sincronizador es un
 //!    delegado de ese servicio desde su 0.15.0: pregunta **por quien lo
@@ -424,9 +427,14 @@ async fn ask(
         Ok(start_time) => start_time,
         Err(e) => return Verdict::Failed(e),
     };
+    // El pidfd ya dijo lo que tenía que decir: se suelta antes de la pregunta,
+    // que puede durar lo que tarde la persona en el diálogo. Si no, cada
+    // pregunta abierta se lleva un descriptor hasta que vuelve.
+    let pid = caller.pid;
+    drop(caller);
     match tokio::time::timeout(
         timeout,
-        backend.check_permission_for(caller.pid, start_time, resource, detail),
+        backend.check_permission_for(pid, start_time, resource, detail),
     )
     .await
     {
@@ -687,6 +695,47 @@ fn departed_name(message: &zbus::Message, expected_sender: Option<&str>) -> Opti
 pub struct DbusPermissions {
     bus: zbus::Connection,
     permissions: Arc<tokio::sync::OnceCell<zbus::Connection>>,
+    /// El nombre único de este proceso en el bus de sesión: preguntando por
+    /// él se sabe si el bus da `ProcessFD`.
+    own_name: Option<String>,
+    pidfds: Arc<PidfdSupport>,
+}
+
+/// Si el bus da `ProcessFD`: todavía no se sabe, no lo da, o lo da.
+///
+/// **«Lo da» no vuelve atrás.** Alcanza con haberlo visto una vez —para la
+/// conexión propia o para la de cualquiera—: desde ahí, una conexión sin
+/// pidfd no es un bus viejo sino una a la que el bus no se lo pudo tomar.
+/// dbus-broker la acepta igual cuando `SO_PEERPIDFD` dice que el proceso ya
+/// terminó (`peer_new_with_fd`): conectar, dejarle el socket a un hijo y
+/// terminar antes del `accept` deja una conexión sin `ProcessFD`, y juzgarla
+/// por el pid sería juzgar a quien lo tenga ahora.
+#[derive(Default)]
+struct PidfdSupport(std::sync::atomic::AtomicU8);
+
+impl PidfdSupport {
+    const UNKNOWN: u8 = 0;
+    const ABSENT: u8 = 1;
+    const PRESENT: u8 = 2;
+
+    fn get(&self) -> u8 {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn seen(&self) {
+        self.0
+            .store(Self::PRESENT, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Sólo si todavía no se sabía: un «lo da» que llegó en el medio gana.
+    fn absent(&self) {
+        let _ = self.0.compare_exchange(
+            Self::UNKNOWN,
+            Self::ABSENT,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+    }
 }
 
 impl DbusPermissions {
@@ -694,20 +743,59 @@ impl DbusPermissions {
     /// primera vez que hace falta, y si falla se vuelve a intentar en la
     /// próxima pregunta.
     pub fn new(bus: zbus::Connection) -> Self {
+        let own_name = bus.unique_name().map(|name| name.to_string());
         Self {
             bus,
             permissions: Arc::new(tokio::sync::OnceCell::new()),
+            own_name,
+            pidfds: Arc::default(),
         }
     }
 
-    /// Con las dos conexiones ya hechas: las pruebas, punto a punto.
+    /// Con las dos conexiones ya hechas y el nombre propio que daría el bus:
+    /// las pruebas, punto a punto.
     #[cfg(test)]
-    pub fn withconnections(bus: zbus::Connection, permissions: zbus::Connection) -> Self {
+    pub fn withconnections(
+        bus: zbus::Connection,
+        permissions: zbus::Connection,
+        own_name: &str,
+    ) -> Self {
         Self {
             bus,
             permissions: Arc::new(tokio::sync::OnceCell::new_with(Some(permissions))),
+            own_name: Some(own_name.to_string()),
+            pidfds: Arc::default(),
         }
     }
+}
+
+/// `ProcessID` y `ProcessFD` de un nombre único, como los da el bus.
+async fn connection_credentials(
+    bus: &zbus::Connection,
+    unique_name: &str,
+) -> Result<(u32, Option<OwnedFd>), String> {
+    let destination = bus.is_bus().then_some(BUS_NAME);
+    let reply = bus
+        .call_method(
+            destination,
+            "/org/freedesktop/DBus",
+            Some("org.freedesktop.DBus"),
+            "GetConnectionCredentials",
+            &(unique_name,),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut credentials: HashMap<String, zbus::zvariant::OwnedValue> =
+        reply.body().deserialize().map_err(|e| e.to_string())?;
+    let pid = credentials
+        .remove("ProcessID")
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or("el bus no dio el pid")?;
+    let pidfd = credentials
+        .remove("ProcessFD")
+        .and_then(|v| zbus::zvariant::Fd::try_from(v).ok())
+        .and_then(|fd| OwnedFd::try_from(fd).ok());
+    Ok((pid, pidfd))
 }
 
 impl PermissionBackend for DbusPermissions {
@@ -716,32 +804,32 @@ impl PermissionBackend for DbusPermissions {
         unique_name: String,
     ) -> BoxFuture<'static, Result<CallerProcess, String>> {
         let bus = self.bus.clone();
+        let own_name = self.own_name.clone();
+        let pidfds = Arc::clone(&self.pidfds);
         async move {
-            let destination = bus.is_bus().then_some(BUS_NAME);
-            let reply = bus
-                .call_method(
-                    destination,
-                    "/org/freedesktop/DBus",
-                    Some("org.freedesktop.DBus"),
-                    "GetConnectionCredentials",
-                    &(unique_name.as_str(),),
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-            let mut credentials: HashMap<String, zbus::zvariant::OwnedValue> =
-                reply.body().deserialize().map_err(|e| e.to_string())?;
-            let pid = credentials
-                .remove("ProcessID")
-                .and_then(|v| u32::try_from(v).ok())
-                .ok_or("el bus no dio el pid")?;
-            let pidfd = credentials
-                .remove("ProcessFD")
-                .and_then(|v| zbus::zvariant::Fd::try_from(v).ok())
-                .and_then(|fd| OwnedFd::try_from(fd).ok());
-            if pidfd.is_none() {
-                tracing::debug!("el bus no da ProcessFD: se juzga sólo por el pid");
+            let (pid, pidfd) = connection_credentials(&bus, &unique_name).await?;
+            if pidfd.is_some() {
+                pidfds.seen();
+                return Ok(CallerProcess { pid, pidfd });
             }
-            Ok(CallerProcess { pid, pidfd })
+            // Sin pidfd para quien llama: se juzga sólo por el pid **nada más
+            // si el bus no los da nunca**. Si no se sabe todavía, se pregunta
+            // por la conexión propia.
+            if pidfds.get() == PidfdSupport::UNKNOWN {
+                let own = own_name.ok_or("no se sabe el nombre propio en el bus")?;
+                match connection_credentials(&bus, &own).await? {
+                    (_, Some(_)) => pidfds.seen(),
+                    (_, None) => pidfds.absent(),
+                }
+            }
+            if pidfds.get() == PidfdSupport::PRESENT {
+                return Err(
+                    "el bus da ProcessFD y no lo dio para quien llama: no se la juzga por el pid"
+                        .into(),
+                );
+            }
+            tracing::debug!("el bus no da ProcessFD: se juzga sólo por el pid");
+            Ok(CallerProcess { pid, pidfd: None })
         }
         .boxed()
     }
@@ -869,11 +957,13 @@ pub(crate) mod tests {
 
     /// El bus de sesión falso: de cada nombre único, su pid. Da también el
     /// pidfd, como dbus-broker: uno abierto en el momento sobre ese pid, o el
-    /// que diga `pidfds` para ese nombre.
+    /// que diga el segundo campo para ese nombre; a los nombres del tercero,
+    /// ninguno.
     #[derive(Clone, Default)]
     pub(crate) struct FakeBus(
         pub Arc<Mutex<HashMap<String, u32>>>,
         pub Arc<Mutex<HashMap<String, Arc<OwnedFd>>>>,
+        pub Arc<Mutex<std::collections::HashSet<String>>>,
     );
 
     #[zbus::interface(name = "org.freedesktop.DBus")]
@@ -894,6 +984,9 @@ pub(crate) mod tests {
                 "ProcessID".to_string(),
                 zbus::zvariant::OwnedValue::from(pid),
             );
+            if self.2.lock().unwrap().contains(&name) {
+                return Ok(credentials);
+            }
             let fixed = self.1.lock().unwrap().get(&name).cloned();
             let pidfd = match fixed {
                 Some(fd) => fd.try_clone().ok(),
@@ -912,6 +1005,9 @@ pub(crate) mod tests {
             Ok(credentials)
         }
     }
+
+    /// El nombre único del sincronizador en el bus falso.
+    pub(crate) const SYNC_NAME: &str = ":1.1";
 
     async fn pair(
         path: &str,
@@ -950,7 +1046,12 @@ pub(crate) mod tests {
             let permissions = FakePermissions::new(answer);
             let bus = FakeBus::default();
             // Quien llama en las pruebas es este mismo proceso: su momento de
-            // arranque se lee de verdad.
+            // arranque se lee de verdad. Y el sincronizador también:
+            // `SYNC_NAME`, con su pidfd, así que el bus los da.
+            bus.0
+                .lock()
+                .unwrap()
+                .insert(SYNC_NAME.into(), std::process::id());
             bus.0
                 .lock()
                 .unwrap()
@@ -970,6 +1071,7 @@ pub(crate) mod tests {
                 Arc::new(DbusPermissions::withconnections(
                     bus_client.clone(),
                     permissions_client.clone(),
+                    SYNC_NAME,
                 )),
                 Arc::clone(&clock) as Arc<dyn Clock>,
             ));
@@ -1172,6 +1274,7 @@ pub(crate) mod tests {
             Arc::new(DbusPermissions::withconnections(
                 f.connections[1].clone(),
                 f.connections[3].clone(),
+                SYNC_NAME,
             )),
             Arc::clone(&f.clock) as Arc<dyn Clock>,
         )
@@ -1224,6 +1327,120 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(pidfd_pid(&own), Some(std::process::id()));
+    }
+
+    /// El bus da `ProcessFD` —para el sincronizador— y no para quien llama:
+    /// es una conexión cuyo proceso ya no estaba cuando el bus la aceptó, y
+    /// su pid puede ser de otro. No se la juzga por el pid.
+    #[tokio::test]
+    async fn sin_pidfd_en_un_bus_que_los_da_no_se_pregunta() {
+        let f = AccessFixture::new(Answer::Allow).await;
+        f.bus
+            .0
+            .lock()
+            .unwrap()
+            .insert(":1.20".into(), std::process::id());
+        f.bus.2.lock().unwrap().insert(":1.20".into());
+        assert!(matches!(f.check(":1.20").await, Verdict::Failed(_)));
+        assert_eq!(f.permissions.calls(), 0);
+    }
+
+    /// Alcanza con haber visto un pidfd de cualquiera: aunque el bus no dé el
+    /// del sincronizador, da los de otros, y una conexión sin él no se juzga
+    /// por el pid.
+    #[tokio::test]
+    async fn un_pidfd_visto_antes_basta_para_exigirlo() {
+        let f = AccessFixture::new(Answer::Allow).await;
+        f.bus.2.lock().unwrap().insert(SYNC_NAME.into());
+        assert_eq!(f.check(":1.7").await, Verdict::Allowed);
+        f.bus
+            .0
+            .lock()
+            .unwrap()
+            .insert(":1.20".into(), std::process::id());
+        f.bus.2.lock().unwrap().insert(":1.20".into());
+        assert!(matches!(f.check(":1.20").await, Verdict::Failed(_)));
+        assert_eq!(f.permissions.calls(), 1);
+    }
+
+    /// Un bus que no da `ProcessFD` nunca —ni para el sincronizador— se juzga
+    /// sólo por el pid, como antes.
+    #[tokio::test]
+    async fn en_un_bus_que_nunca_da_pidfd_se_juzga_por_el_pid() {
+        let f = AccessFixture::new(Answer::Allow).await;
+        f.bus
+            .2
+            .lock()
+            .unwrap()
+            .extend([SYNC_NAME.to_string(), ":1.7".to_string()]);
+        assert_eq!(f.check(":1.7").await, Verdict::Allowed);
+        assert_eq!(f.permissions.calls(), 1);
+    }
+
+    /// Un backend sin D-Bus que dice si el pidfd de quien llama sigue abierto
+    /// en el momento de preguntar. El «pidfd» es una punta de un par de
+    /// sockets: cuando se suelta, la otra lee el final.
+    struct PidfdProbe {
+        caller_end: Mutex<Option<std::os::unix::net::UnixStream>>,
+        other_end: std::os::unix::net::UnixStream,
+        open_while_asking: Mutex<Option<bool>>,
+    }
+
+    impl PermissionBackend for PidfdProbe {
+        fn caller_process(&self, _: String) -> BoxFuture<'static, Result<CallerProcess, String>> {
+            let pidfd = self.caller_end.lock().unwrap().take().map(OwnedFd::from);
+            async move {
+                Ok(CallerProcess {
+                    pid: std::process::id(),
+                    pidfd,
+                })
+            }
+            .boxed()
+        }
+
+        fn start_time(&self, _: &CallerProcess) -> Result<u64, String> {
+            Ok(1)
+        }
+
+        fn check_permission_for(
+            &self,
+            _: u32,
+            _: u64,
+            _: String,
+            _: String,
+        ) -> BoxFuture<'static, Result<bool, String>> {
+            use std::io::Read;
+            let mut buffer = [0u8; 1];
+            let open = !matches!((&self.other_end).read(&mut buffer), Ok(0));
+            *self.open_while_asking.lock().unwrap() = Some(open);
+            async { Ok(true) }.boxed()
+        }
+    }
+
+    /// El pidfd se suelta apenas se comprobó el arranque: la pregunta puede
+    /// durar lo que tarde la persona, y no se lleva un descriptor mientras.
+    #[tokio::test]
+    async fn el_pidfd_se_suelta_antes_de_preguntar() {
+        let (caller_end, other_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        other_end.set_nonblocking(true).unwrap();
+        let probe = Arc::new(PidfdProbe {
+            caller_end: Mutex::new(Some(caller_end)),
+            other_end,
+            open_while_asking: Mutex::new(None),
+        });
+        let access = Access::new(
+            Arc::clone(&probe) as Arc<dyn PermissionBackend>,
+            FakeClock::new() as Arc<dyn Clock>,
+        );
+        assert_eq!(
+            access.check(Some(":1.7"), CONTACTS_RESOURCE, "x").await,
+            Verdict::Allowed
+        );
+        assert_eq!(
+            *probe.open_while_asking.lock().unwrap(),
+            Some(false),
+            "el pidfd seguía abierto durante la pregunta"
+        );
     }
 
     #[test]
