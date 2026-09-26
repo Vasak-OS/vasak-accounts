@@ -758,11 +758,15 @@ misma transacción que el último lote: si algo se corta, la próxima vuelta rep
 sin perder nada. **Sólo lee**: el cliente no tiene ningún método de escritura.
 
 Lo que llega de la red se lee como si lo hubiera escrito cualquiera: 16 MiB por
-respuesta, un millón de nodos por XML y sin DTD, 100 libretas por cuenta, 20 000
-tarjetas por libreta, 512 KiB por tarjeta, 50 correos, teléfonos y relaciones
-por contacto. Sólo `https`, sin seguir redirecciones, y **una dirección de otro
-origen que la cuenta no se pide ni se guarda**: la credencial va sólo al
-servidor de la cuenta.
+respuesta; por XML un millón de nodos, 64 niveles, 32 espacios de nombres
+distintos y sin DTD, leído fuera del bucle de eventos; 100 libretas por cuenta,
+20 000 tarjetas por libreta, 512 KiB por tarjeta y 1 GiB de tarjetas por
+cuenta; 50 correos, teléfonos y relaciones por contacto; y 10 minutos por vuelta
+de cada cuenta, para que una lenta no frene a las otras. Del `multiget` se
+guarda sólo lo que se pidió. Los errores que se ven en el estado tienen texto
+fijo: lo que mandó el servidor va sólo al diario, recortado. Sólo `https`, sin
+seguir redirecciones, y **una dirección de otro origen que la cuenta no se pide
+ni se guarda**: la credencial va sólo al servidor de la cuenta.
 
 **Hace falta `vasak-permissions` 0.15.0 o posterior.** Las anteriores no le dan
 al sincronizador `account.contacts`; con ellas el área se ve `unavailable` y no
