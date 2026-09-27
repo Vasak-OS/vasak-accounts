@@ -1031,7 +1031,7 @@ pub(crate) mod fake {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
@@ -1100,7 +1100,7 @@ mod tests {
     const COLLECTION_PATH: &str = "/org/freedesktop/secrets/collection/login";
 
     #[derive(Default)]
-    struct FakeKeyring {
+    pub(crate) struct FakeKeyring {
         locked: bool,
         /// Que la colección se bloquee en el momento de buscar: `SearchItems`
         /// ya contesta vacío, aunque `Locked` se haya leído `false` antes.
@@ -1121,7 +1121,9 @@ mod tests {
         alias_reads: u32,
     }
 
-    type Shared = Arc<Mutex<FakeKeyring>>;
+    /// Lo que el llavero falso y su estado comparten. `pub(crate)` para que las
+    /// pruebas de `store_api` puedan usar el mismo llavero de verdad.
+    pub(crate) type Shared = Arc<Mutex<FakeKeyring>>;
 
     struct FakeService(Shared);
 
@@ -1311,7 +1313,12 @@ mod tests {
     }
 
     /// Levanta el llavero falso y devuelve el cliente de verdad conectado a él.
-    async fn fake_keyring() -> (SecretServiceKeys, zbus::Connection, Shared) {
+    ///
+    /// `pub(crate)` porque `store_api::watch_keyring` sólo existe para el
+    /// cliente de `org.freedesktop.secrets` de verdad, y la prueba de esa
+    /// cadena necesita el mismo llavero falso: sin él, el espectador no se
+    /// puede ni escribir. Ver `el_aviso_que_manda_el_llavero_cierra_la_base`.
+    pub(crate) async fn fake_keyring() -> (SecretServiceKeys, zbus::Connection, Shared) {
         let shared = Shared::default();
         let (server_end, client_end) = tokio::net::UnixStream::pair().unwrap();
         let guid = zbus::Guid::generate();
@@ -1335,6 +1342,48 @@ mod tests {
             server.unwrap(),
             shared,
         )
+    }
+
+    /// Bloquea el llavero y **avisa**, en ese orden, como `vasak-keyring` al
+    /// bloquear: primero cambia `Locked` y después manda el `PropertiesChanged`.
+    ///
+    /// El orden es el que importa y por eso está en un solo lugar: si el aviso
+    /// saliera antes del cambio, quien reacciona todavía leería el llavero
+    /// desbloqueado, cerraría bases por otra cosa y la prueba probaría un
+    /// imposible. Lo usa también la prueba de `store_api::watch_keyring`, que
+    /// necesita que el aviso llegue de verdad por el hilo.
+    pub(crate) async fn lock_and_announce(
+        server: &zbus::Connection,
+        shared: &Shared,
+    ) -> zbus::Result<()> {
+        shared.lock().unwrap().locked = true;
+        announce_locked(server).await
+    }
+
+    /// Lo mismo al revés: desbloquea y avisa, como `vasak-keyring` al
+    /// desbloquear. El orden importa igual, y por el motivo contrario: un aviso
+    /// de vuelta antes del cambio no reabrió nada.
+    pub(crate) async fn unlock_and_announce(
+        server: &zbus::Connection,
+        shared: &Shared,
+    ) -> zbus::Result<()> {
+        shared.lock().unwrap().locked = false;
+        announce_locked(server).await
+    }
+
+    /// El `PropertiesChanged` de `Locked` de la colección, tal cual lo manda el
+    /// llavero. Separado del cambio de estado para que los dos helpers de arriba
+    /// no puedan mandarlo antes de cambiarlo.
+    async fn announce_locked(server: &zbus::Connection) -> zbus::Result<()> {
+        let iface = server
+            .object_server()
+            .interface::<_, FakeCollection>(COLLECTION_PATH)
+            .await
+            .expect("la colección del llavero falso");
+        let collection = iface.get().await;
+        let enviado = collection.locked_changed(iface.signal_context()).await;
+        drop(collection);
+        enviado
     }
 
     /// La identidad de la colección es su ruta y su `Created`, y una vez
