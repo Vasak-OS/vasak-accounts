@@ -1014,14 +1014,24 @@ impl StoreService<SecretServiceKeys> {
 
     /// Escucha los cambios de `Locked` del llavero y vuelve a pasar la tabla.
     ///
-    /// Es lo que abre las bases al iniciar sesión, cuando el llavero se
-    /// desbloquea después de que este servicio arrancó. Lo contrario —que se
-    /// bloquee— **no es inmediato**: `vasak-keyring` no avisa al bloquear, así
-    /// que lo levanta la revisión de cada cinco minutos, y hasta entonces —hasta
-    /// 300 segundos— la base sigue abierta con su clave en memoria.
+    /// Con los dos sentidos: abre las bases cuando el llavero se desbloquea al
+    /// iniciar sesión, y **las cierra cuando se bloquea**. `vasak-keyring` avisa
+    /// de los dos
+    /// (`Vasak-OS/vasak-keyring#25`); antes sólo del desbloqueo, así que el
+    /// bloqueo lo levantaba la revisión de cada cinco minutos y, hasta entonces
+    /// —hasta 300 segundos— la base seguía abierta con la clave en memoria.
+    ///
+    /// Polling nocerraba esa ventana, la acotaba: son 300 segundos, no
+    /// «hasta que la persona vuelva a abrir la aplicación». El aviso es lo que
+    /// la cierra, y la revisión por reloj queda como red para el aviso que no
+    /// llega —un llavero que se va sin cerrar nada, por ejemplo—, no como el
+    /// mecanismo.
     ///
     /// Sólo cuentan los avisos del dueño de `org.freedesktop.secrets`, y cada
-    /// uno espera [`SETTLE`] antes de reaccionar.
+    /// uno espera [`SETTLE`] antes de reaccionar. Reaccionar es
+    /// [`StoreManager::refresh`], que con el llavero bloqueado cierra bases y
+    /// lectores: es idempotente, y por eso dos señales del mismo bloqueo —o de
+    /// dos colecciones bloqueadas a la vez— no rompen nada.
     fn watch_keyring(&self) {
         use futures_util::{FutureExt, StreamExt};
 

@@ -687,16 +687,23 @@ le pide que se desbloquee: con el llavero bloqueado no se hace nada y se espera.
 | desbloqueado | está | no está | la base, con esa clave |
 | desbloqueado | no está | está | se rehace vacía, se anota y el estado lo dice |
 | desbloqueado | está | no abre | igual |
-| se bloquea | — | abierta | se cierra, en la próxima revisión o la próxima lectura |
+| se bloquea | — | abierta | se cierra, en el acto, al aviso |
 
-El cierre al bloquear **no es inmediato**: `vasak-keyring` avisa al desbloquear
-pero no al bloquear, así que lo nota la revisión de cada cinco minutos, o antes
-cualquier lectura o lote de escritura, que releen el llavero cada vez. Hasta
-300 segundos después de bloquear, una base que nadie usa sigue abierta y
-SQLCipher tiene su clave en memoria. Por eso el proceso no deja volcados de memoria (`LimitCORE=0`
-en la unidad y `PR_SET_DUMPABLE` en cero al arrancar), y la clave llega a
-SQLCipher por `sqlite3_key_v2` desde memoria que se borra, sin pasar por el
-texto de un `PRAGMA`.
+El cierre al bloquear **es inmediato**, desde que `vasak-keyring` avisa del cambio
+de `Locked` (`Vasak-OS/vasak-keyring#25`): el sincronizador está suscrito al
+`PropertiesChanged` y pasa la tabla, que cierra la base y sus conexiones de
+lectura. Antes sólo avisaba del desbloqueo, así que el bloqueo lo levantaba la
+revisión de cada cinco minutos, y **hasta 300 segundos después de bloquear una
+base que nadie usa seguía abierta con la clave en memoria**.
+
+La revisión por reloj sigue ahí, pero como red del aviso que no llega —un
+llavero que se reinicia, por ejemplo— y no como el mecanismo. Y una lectura o un
+lote de escritura que se topen con el bloqueo cierran también, por las dudas.
+
+El resto de la defensa es la misma de siempre: el proceso no deja volcados de
+memoria (`LimitCORE=0` en la unidad y `PR_SET_DUMPABLE` en cero al arrancar), y
+la clave llega a SQLCipher por `sqlite3_key_v2` desde memoria que se borra, sin
+pasar por el texto de un `PRAGMA`.
 
 **Lo que el cifrado protege, y lo que no.** Protege en reposo: el disco robado,
 la copia de seguridad, otra cuenta del equipo. No protege contra un proceso que
