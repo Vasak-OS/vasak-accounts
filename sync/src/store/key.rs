@@ -31,7 +31,10 @@
 //!
 //! Y tampoco se llama nunca a `Unlock`: abriría un diálogo al arrancar la sesión,
 //! que es justo cuando nadie lo pidió. Con el llavero bloqueado se espera el
-//! `PropertiesChanged` de `Locked`.
+//! `PropertiesChanged` de `Locked`, que `vasak-keyring` manda **en los dos
+//! sentidos** desde que lo arregló (`Vasak-OS/vasak-keyring#25`): sin el del
+//! bloqueo, la clave de la base seguía en memoria hasta la revisión de cada
+//! cinco minutos.
 //!
 //! ── Por qué un cliente propio ───────────────────────────────────────────────
 //!
@@ -762,17 +765,29 @@ fn lacks_property(error_name: &str) -> bool {
 ///
 /// Importa por lo que se hace después: ninguno de los tres es «no hay clave»,
 /// y ninguno lleva a borrar ni a generar nada.
+///
+/// **El bloqueo se lee por el nombre del error y nunca por su texto.**
+/// `org.freedesktop.Secret.Error.IsLocked` es el nombre del estándar y lo
+/// contesta `vasak-keyring` (`Vasak-OS/vasak-keyring#25`); antes contestaba
+/// `Failed` con el motivo escrito adentro, en español o en inglés según el
+/// método, y por eso esta función miraba si el texto traía `"locked"` o
+/// `"bloquead"`. Eso era leer el idioma del servidor para decidir un estado del
+/// llavero, y era una cadena de comparaciones que tenía que crecer con cada
+/// frase que el servidor escribiera.
+/// Un llavero viejo —uno anterior a esa versión— que todavía conteste `Failed`
+/// se lee como `Failed`, y **eso está bien**: los dos casos hacen lo mismo, que
+/// es nada. En [`StoreManager::run`](super::lifecycle) un `Locked` y un `Failed`
+/// del llavero cierran las bases y no borran ni generan nada; lo único que
+/// cambia es la etiqueta que se publica —«bloqueado» o «no disponible» con el
+/// texto del error—, y con un llavero viejo esa etiqueta es menos fina, no
+/// distinta. Por eso no se deja el arreglo por texto como compatibilidad: dos
+/// caminos para lo mismo, y el que funciona en todas las versiones es el
+/// estándar.
 fn classify(method: &str, error: zbus::Error) -> KeyError {
     if let zbus::Error::MethodError(name, detail, _) = &error {
         let name = name.as_str();
         let detail = detail.clone().unwrap_or_default();
-        // `IsLocked` es el nombre del estándar. `vasak-keyring` contesta
-        // `Failed` con el motivo en el texto —en inglés o en español según el
-        // método—, así que también se mira eso. Equivocarse acá sólo cambia lo
-        // que dice el estado: ninguno de los dos casos borra ni genera nada.
-        let lowered = detail.to_lowercase();
-        if name.ends_with(".IsLocked") || lowered.contains("locked") || lowered.contains("bloquead")
-        {
+        if name.ends_with(".IsLocked") {
             return KeyError::Locked;
         }
         if name.ends_with(".ServiceUnknown")
@@ -1016,7 +1031,7 @@ pub(crate) mod fake {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
@@ -1085,7 +1100,7 @@ mod tests {
     const COLLECTION_PATH: &str = "/org/freedesktop/secrets/collection/login";
 
     #[derive(Default)]
-    struct FakeKeyring {
+    pub(crate) struct FakeKeyring {
         locked: bool,
         /// Que la colección se bloquee en el momento de buscar: `SearchItems`
         /// ya contesta vacío, aunque `Locked` se haya leído `false` antes.
@@ -1106,7 +1121,9 @@ mod tests {
         alias_reads: u32,
     }
 
-    type Shared = Arc<Mutex<FakeKeyring>>;
+    /// Lo que el llavero falso y su estado comparten. `pub(crate)` para que las
+    /// pruebas de `store_api` puedan usar el mismo llavero de verdad.
+    pub(crate) type Shared = Arc<Mutex<FakeKeyring>>;
 
     struct FakeService(Shared);
 
@@ -1197,10 +1214,21 @@ mod tests {
             let path = {
                 let mut state = self.0.lock().unwrap();
                 if state.locked {
-                    // El texto de `vasak-keyring` para esto, en español.
-                    return Err(zbus::fdo::Error::Failed(
-                        "el llavero está bloqueado: no hay contraseña maestra en memoria".into(),
-                    ));
+                    // **Acá debería ir `org.freedesktop.Secret.Error.IsLocked`**, que
+                    // es lo que contesta `vasak-keyring` desde que lo arregló
+                    // (`Vasak-OS/vasak-keyring#25`), y no se puede: el macro
+                    // `#[interface]` de zbus 4 sólo sabe armar
+                    // `org.freedesktop.DBus.Error.*`, y llegar al nombre del
+                    // estándar exige escribir el `Interface` a mano.
+                    // `Vasak-OS/vasak-accounts#58` es el que lo destraba.
+                    //
+                    // Mientras tanto el texto va **a propósito sin las palabras que
+                    // el cliente miraba**: si el llavero falso las dijera, una
+                    // prueba en verde probaría que el texto se adivina, que es
+                    // justo lo que dejó de hacer [`classify`]. La respuesta
+                    // exacta la fija la prueba de [`classify`], que no necesita
+                    // bus; lo que este llavero falso sostiene es el resto.
+                    return Err(zbus::fdo::Error::Failed("no se puede escribir".into()));
                 }
                 if replace {
                     state.items.retain(|_, (a, _)| a != &attributes);
@@ -1249,7 +1277,11 @@ mod tests {
         async fn get_secret(&self, session: OwnedObjectPath) -> zbus::fdo::Result<(Secret,)> {
             let state = self.0.lock().unwrap();
             if state.locked {
-                return Err(zbus::fdo::Error::Failed("collection is locked".into()));
+                // Como en `create_item`: el nombre del estándar no se puede
+                // formar con el macro de zbus 4 (ver
+                // `Vasak-OS/vasak-accounts#58`), y el texto va sin las palabras
+                // que el cliente dejó de adivinar.
+                return Err(zbus::fdo::Error::Failed("no se puede leer".into()));
             }
             let (_, value) = state
                 .items
@@ -1281,7 +1313,12 @@ mod tests {
     }
 
     /// Levanta el llavero falso y devuelve el cliente de verdad conectado a él.
-    async fn fake_keyring() -> (SecretServiceKeys, zbus::Connection, Shared) {
+    ///
+    /// `pub(crate)` porque `store_api::watch_keyring` sólo existe para el
+    /// cliente de `org.freedesktop.secrets` de verdad, y la prueba de esa
+    /// cadena necesita el mismo llavero falso: sin él, el espectador no se
+    /// puede ni escribir. Ver `el_aviso_que_manda_el_llavero_cierra_la_base`.
+    pub(crate) async fn fake_keyring() -> (SecretServiceKeys, zbus::Connection, Shared) {
         let shared = Shared::default();
         let (server_end, client_end) = tokio::net::UnixStream::pair().unwrap();
         let guid = zbus::Guid::generate();
@@ -1305,6 +1342,48 @@ mod tests {
             server.unwrap(),
             shared,
         )
+    }
+
+    /// Bloquea el llavero y **avisa**, en ese orden, como `vasak-keyring` al
+    /// bloquear: primero cambia `Locked` y después manda el `PropertiesChanged`.
+    ///
+    /// El orden es el que importa y por eso está en un solo lugar: si el aviso
+    /// saliera antes del cambio, quien reacciona todavía leería el llavero
+    /// desbloqueado, cerraría bases por otra cosa y la prueba probaría un
+    /// imposible. Lo usa también la prueba de `store_api::watch_keyring`, que
+    /// necesita que el aviso llegue de verdad por el hilo.
+    pub(crate) async fn lock_and_announce(
+        server: &zbus::Connection,
+        shared: &Shared,
+    ) -> zbus::Result<()> {
+        shared.lock().unwrap().locked = true;
+        announce_locked(server).await
+    }
+
+    /// Lo mismo al revés: desbloquea y avisa, como `vasak-keyring` al
+    /// desbloquear. El orden importa igual, y por el motivo contrario: un aviso
+    /// de vuelta antes del cambio no reabrió nada.
+    pub(crate) async fn unlock_and_announce(
+        server: &zbus::Connection,
+        shared: &Shared,
+    ) -> zbus::Result<()> {
+        shared.lock().unwrap().locked = false;
+        announce_locked(server).await
+    }
+
+    /// El `PropertiesChanged` de `Locked` de la colección, tal cual lo manda el
+    /// llavero. Separado del cambio de estado para que los dos helpers de arriba
+    /// no puedan mandarlo antes de cambiarlo.
+    async fn announce_locked(server: &zbus::Connection) -> zbus::Result<()> {
+        let iface = server
+            .object_server()
+            .interface::<_, FakeCollection>(COLLECTION_PATH)
+            .await
+            .expect("la colección del llavero falso");
+        let collection = iface.get().await;
+        let enviado = collection.locked_changed(iface.signal_context()).await;
+        drop(collection);
+        enviado
     }
 
     /// La identidad de la colección es su ruta y su `Created`, y una vez
@@ -1513,15 +1592,108 @@ mod tests {
 
         shared.lock().unwrap().locked = true;
         assert!(keys.is_locked().await.unwrap());
-        // Guardar con el llavero bloqueado falla, y como bloqueo.
-        assert_eq!(
-            keys.store("otra", &StoreKey::generate().unwrap()).await,
-            Err(KeyError::Locked)
+        // Guardar con el llavero bloqueado **no guarda nada**, que es lo que
+        // importa y es independiente de la versión del llavero: el bloqueo se ve
+        // por `Locked` antes de escribir, y si la escritura se rechaza, la clave
+        // no queda. El *nombre* con el que se rechaza lo fija
+        // `el_bloqueo_se_lee_por_el_nombre_del_error`; este llavero falso no
+        // puede dar el del estándar (ver `Vasak-OS/vasak-accounts#58`).
+        assert!(
+            keys.store("otra", &StoreKey::generate().unwrap())
+                .await
+                .is_err(),
+            "con el llavero bloqueado no se puede guardar"
+        );
+        assert!(
+            !shared.lock().unwrap().items.is_empty(),
+            "la que había sigue ahí"
         );
 
         shared.lock().unwrap().locked = false;
         assert!(!keys.is_locked().await.unwrap());
-        assert!(keys.find("cuenta").await.unwrap().is_some());
+        assert!(
+            keys.find("cuenta").await.unwrap().is_some(),
+            "la que había se sigue leyendo"
+        );
+        assert_eq!(
+            keys.find("otra").await,
+            Ok(None),
+            "y lo que se quiso guardar con el llavero bloqueado no se guardó"
+        );
+    }
+
+    /// El bloqueo se lee por el **nombre** del error y no por su texto. Esta es
+    /// la prueba que lo fija, y no necesita bus: el nombre es una cadena y el
+    /// resto del camino es una función.
+    ///
+    /// Sin el fix, el segundo caso daba `Locked`: el texto de un `Failed`
+    /// cualquiera se leía como bloqueo, y eso es decidir el estado del llavero
+    /// leyendo lo que escribió el servidor, en el idioma del servidor.
+    #[test]
+    fn el_bloqueo_se_lee_por_el_nombre_del_error() {
+        let fallo = |nombre: &str, detalle: &str| {
+            zbus::Error::MethodError(
+                nombre
+                    .to_string()
+                    .try_into()
+                    .expect("nombre de error válido"),
+                Some(detalle.to_string()),
+                zbus::Message::method("/", "Miembro")
+                    .expect("mensaje")
+                    .build(&())
+                    .expect("mensaje"),
+            )
+        };
+
+        // El nombre del estándar, que es lo que contesta `vasak-keyring`.
+        assert_eq!(
+            classify(
+                "GetSecret",
+                fallo("org.freedesktop.Secret.Error.IsLocked", "bloqueado")
+            ),
+            KeyError::Locked,
+            "el nombre del estándar es un bloqueo, diga lo que diga el texto"
+        );
+        assert_eq!(
+            classify(
+                "CreateItem",
+                fallo("org.freedesktop.Secret.Error.IsLocked", "")
+            ),
+            KeyError::Locked,
+            "y también con el texto vacío"
+        );
+
+        // Un `Failed` no es un bloqueo, **pase lo que pase su texto**.
+        for detalle in [
+            "el llavero está bloqueado: no hay contraseña maestra en memoria",
+            "collection is locked",
+            "LOCKED",
+            "bloqueada la escritura",
+        ] {
+            assert_eq!(
+                classify("CreateItem", fallo("org.freedesktop.DBus.Error.Failed", detalle)),
+                KeyError::Failed(format!("CreateItem: {detalle}")),
+                "un `Failed` cuyo texto habla de un bloqueo se lee como fallo: el texto lo escribe \
+                 el servidor y no es un estado del llavero"
+            );
+        }
+
+        // Y los nombres que sí son «no hay llavero» siguen siéndolo.
+        for nombre in [
+            "org.freedesktop.DBus.Error.ServiceUnknown",
+            "org.freedesktop.DBus.Error.NameHasNoOwner",
+            "org.freedesktop.DBus.Error.NoReply",
+            "org.freedesktop.DBus.Error.UnknownObject",
+            "org.freedesktop.DBus.Error.UnknownMethod",
+        ] {
+            assert!(
+                matches!(
+                    classify("ReadAlias", fallo(nombre, "")),
+                    KeyError::Unavailable(_)
+                ),
+                "{nombre} es que no hay llavero"
+            );
+        }
     }
 
     /// `vasak-keyring` sin la contraseña en memoria contesta `SearchItems`

@@ -1928,7 +1928,7 @@ impl<K: KeySource> StoreManager<K> {
     }
 
     #[cfg(test)]
-    async fn is_open(&self, account_id: &str) -> bool {
+    pub(crate) async fn is_open(&self, account_id: &str) -> bool {
         self.inner
             .lock()
             .await
@@ -4015,6 +4015,104 @@ mod tests {
         release_tx.send(()).unwrap();
         writer.await.unwrap().unwrap();
         assert_eq!(count(Arc::clone(&f)).await, Ok(1));
+    }
+
+    /// `refresh` con el llavero bloqueado **cierra la base en el acto**, y no en
+    /// la revisión de cada cinco minutos.
+    ///
+    /// Esto es lo que hace [`StoreManager::refresh`] cuando el llavero está
+    /// bloqueado, y el reloj va con `tokio::time::pause()`: sin avanzar el
+    /// tiempo, el reloj de las revisiones —`POLL_INTERVAL`, 300 segundos— **no
+    /// puede** ser el que cerró esto.
+    ///
+    /// Lo que **no** prueba, y por eso el nombre no dice «el aviso»: que la
+    /// señal llegue a `refresh`. Acá se cambia el estado del llavero falso y se
+    /// llama a `refresh` a mano, así que pasaría igual si `store_api::watch_keyring`
+    /// dejara de reaccionar al bloqueo, que es el otro tramo de la cadena y sí
+    /// tiene su prueba, en `el_aviso_que_manda_el_llavero_cierra_la_base` de
+    /// `store_api`: allí el `PropertiesChanged` de `Locked` viaja por el bus y
+    /// el espectador es lo único que cierra la base.
+    ///
+    /// Y lo que importa no es sólo que se cierre: es que la clave salga de la
+    /// memoria. SQLCipher la borra al cerrar, y `StoreKey` vivía en un
+    /// `Zeroizing` que se borró al abrir.
+    #[tokio::test(start_paused = true)]
+    async fn refresh_con_el_bloqueo_cierra_la_base_sin_esperar_la_revision() {
+        let f = Fixture::new("refresh-bloqueo");
+        f.list(listing(&["cuenta"])).await;
+        let base = f.paths("cuenta").db.clone();
+        assert!(f.manager.is_open("cuenta").await, "la base está abierta");
+        assert!(
+            f.manager.reader_pool("cuenta").is_some(),
+            "y tiene lectores"
+        );
+        assert_eq!(f.state("cuenta").await, StoreState::Open);
+        assert!(f.key("cuenta").is_some(), "la clave se puede volver a leer");
+
+        // El llavero pasa a bloqueado y se llama a `refresh`, que es lo que
+        // `store_api::watch_keyring` hace con cada aviso. La señal en sí no
+        // viaja por acá: la prueba de eso es la del espectador, en `store_api`.
+        f.keys.state().locked = true;
+        assert!(f.manager.refresh().await, "el estado cambió");
+        f.manager.status().await;
+
+        assert_eq!(
+            f.state("cuenta").await,
+            StoreState::Locked,
+            "al bloquear, la base queda bloqueada y no «abierta con un error»"
+        );
+        assert!(
+            !f.manager.is_open("cuenta").await,
+            "la conexión se suelta: la clave de SQLCipher se va con ella"
+        );
+        assert!(
+            f.manager.reader_pool("cuenta").is_none(),
+            "los lectores se cierran también, o la base queda viva por otro lado"
+        );
+        assert!(base.exists(), "el archivo queda: bloquear no borra nada");
+
+        // Y sin volver a pedir nada más. El reloj de las revisiones no corrió.
+        assert_eq!(
+            f.state("cuenta").await,
+            StoreState::Locked,
+            "y sigue bloqueada"
+        );
+    }
+
+    /// Un `refresh` repetido no rompe nada. Al llavero se le pueden llegar
+    /// varias señales del mismo bloqueo, y también una cuando la base ya estaba
+    /// cerrada, que es lo que pasa con dos colecciones bloqueadas en el mismo
+    /// instante: una sola pasada por la tabla, y dos cuentas.
+    ///
+    /// Como la anterior, esto es `refresh` y no la señal que lo dispara: el
+    /// idempotente que se prueba es el de `refresh`.
+    #[tokio::test(start_paused = true)]
+    async fn refresh_repetido_con_el_bloqueo_no_rompe_nada() {
+        let f = Fixture::new("refresh-repetido");
+        f.list(listing(&["cuenta-a", "cuenta-b"])).await;
+        assert!(f.manager.is_open("cuenta-a").await);
+        assert!(f.manager.is_open("cuenta-b").await);
+
+        f.keys.state().locked = true;
+        // El primero cambia el estado; los que siguen ya no encuentran nada que
+        // cambiar, y no tienen que encontrar un error tampoco.
+        assert!(f.manager.refresh().await, "el primero abre y cierra");
+        for intento in 0..3 {
+            assert!(
+                !f.manager.refresh().await,
+                "el {intento} ya no tenía nada que cambiar"
+            );
+            assert_eq!(f.state("cuenta-a").await, StoreState::Locked);
+            assert_eq!(f.state("cuenta-b").await, StoreState::Locked);
+            assert!(!f.manager.is_open("cuenta-a").await);
+            assert!(!f.manager.is_open("cuenta-b").await);
+        }
+
+        // Volver a abrir es lo de siempre, y no deja cuentas a medias.
+        f.keys.state().locked = false;
+        f.manager.refresh().await;
+        assert!(f.manager.is_open("cuenta-a").await);
+        assert!(f.manager.is_open("cuenta-b").await);
     }
 
     /// Con el llavero bloqueado, leer no da nada: error claro, y los lectores

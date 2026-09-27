@@ -86,3 +86,9 @@ vasak-accounts-common.workspace = true
 # el bus—: el permiso de lectura se decide por el remitente, y sin nombre no
 # hay remitente. No suma ninguna crate.
 zbus = { workspace = true, features = ["p2p", "bus-impl"] }
+# El reloj de tokio en modo pausado, que es lo que permite demostrar que una
+# base se cierra **sin** que corran los 300 segundos de la revisión
+# (`start_paused`, en `lifecycle.rs`). `full` no trae `test-util`, y no se
+# agrega a las dependencias normales porque eso también entra en el binario que
+# se instala; acá sólo se suma para las pruebas.
+tokio = { workspace = true, features = ["test-util"] }
