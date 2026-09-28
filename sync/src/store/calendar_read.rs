@@ -704,15 +704,23 @@ fn expand_into(
         );
         top.insert(at, item);
     }
-        // Si la página se llenó antes de terminar la serie, hay más resultados
-        // de los que caben en la página actual: eso también es truncamiento.
-        let page_full = !top.admits(&position(
-            account_id,
-            expansion.occurrences.last().map(|o| o.start).unwrap_or(query.range.to),
-            source.object,
-            expansion.occurrences.last().map(|o| o.recurrence_id).unwrap_or(0),
-        ));
-        expansion.truncated || page_full
+    // Si la página se llenó antes de terminar la serie, hay más resultados
+    // de los que caben en la página actual: eso también es truncamiento.
+    let page_full = !top.admits(&position(
+        account_id,
+        expansion
+            .occurrences
+            .last()
+            .map(|o| o.start)
+            .unwrap_or(query.range.to),
+        source.object,
+        expansion
+            .occurrences
+            .last()
+            .map(|o| o.recurrence_id)
+            .unwrap_or(0),
+    ));
+    expansion.truncated || page_full
 }
 
 /// Las veces de los eventos de una cuenta que se ven en `range`, después de
