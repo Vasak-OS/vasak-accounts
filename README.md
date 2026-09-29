@@ -941,6 +941,13 @@ serie se borra lo que quedó afuera y se expande lo que entró, desde lo guardad
 `ListOccurrences` de un rango fuera de la ventana **expande en el momento**, con
 topes; lo que queda afuera por un tope vuelve con `truncated: true`.
 
+**`truncated` marca sólo lo que quedó afuera de verdad**: un tope de la
+expansión, una serie que la página llena antes de terminar —de sus veces, y de
+las que siguen—, el plazo o el tope de series por consulta. Una serie que en el
+rango pedido **no da ninguna vez** —porque terminó, o porque su regla no cae
+adentro— no marca nada: no hay nada que se haya quedado afuera, y el que pagina
+por `next_cursor` tiene que poder terminar sin pedir páginas de más.
+
 **Las repeticiones** se expanden con `rrule` en el reloj de pared de la zona del
 evento —un semanal a las 9:00 de Madrid sigue a las 9:00 de Madrid después del
 cambio de hora—, con `RDATE`, `EXDATE`, las excepciones (`RECURRENCE-ID`,
