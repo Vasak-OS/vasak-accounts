@@ -104,7 +104,7 @@ async fn caller_pid_and_uid(
         .sender()
         .ok_or_else(|| FdoError::Failed("Sender no presente en la cabecera".into()))?;
 
-    tracing::debug!("Nombre único del emitter: {}", sender);
+    tracing::debug!("Nombre único del emisor: {}", sender);
 
     let dbus_proxy = DBusProxy::new(connection)
         .await
@@ -1293,6 +1293,70 @@ mod tests {
             include_str!("../dbus/ar.net.vasak.os.AccountManager.txt"),
             "la interfaz cambió; si es a propósito, esto es lo que hay ahora:\n{surface}"
         );
+    }
+
+    /// Sin remitente no hay a quién atribuir el pedido, y **ningún** método que
+    /// cambia algo o da un secreto sigue adelante: todos contestan `Failed`
+    /// antes de tocar la base, el catálogo o la red.
+    ///
+    /// Por una conexión punto a punto, donde los mensajes llegan sin
+    /// remitente: es el caso de un llamante que no se pudo identificar. Pasa
+    /// además por cada método con su firma de verdad, así que también dice que
+    /// siguen contestando por el bus con los argumentos que mandan sus clientes.
+    #[tokio::test]
+    async fn sin_identidad_del_llamante_ningun_metodo_sigue_adelante() {
+        const PATH: &str = "/ar/net/vasak/os/AccountManager";
+        const INTERFACE: &str = "ar.net.vasak.os.AccountManager";
+        let (_server, client) =
+            vasak_accounts_common::introspection::serve_p2p(PATH, AccountManager::default())
+                .await
+                .unwrap();
+        // Cada método con los argumentos de su firma; lo que valen no importa,
+        // porque ninguno tiene que llegar a mirarlos.
+        async fn refused<B>(client: &zbus::Connection, method: &str, body: &B)
+        where
+            B: serde::Serialize + zbus::zvariant::DynamicType,
+        {
+            let result = client
+                .call_method(None::<&str>, PATH, Some(INTERFACE), method, body)
+                .await;
+            let Err(zbus::Error::MethodError(name, detail, _)) = result else {
+                panic!("{method} siguió adelante sin saber quién llama: {result:?}");
+            };
+            assert_eq!(
+                name.as_str(),
+                "org.freedesktop.DBus.Error.Failed",
+                "{method}"
+            );
+            assert!(
+                detail.as_deref().unwrap_or_default().contains("Sender"),
+                "{method} tiene que frenar en la identidad: {detail:?}"
+            );
+        }
+
+        refused(&client, "Ping", &()).await;
+        refused(
+            &client,
+            "SetProviderCredentials",
+            &("google", "id", "secreto"),
+        )
+        .await;
+        refused(&client, "ClearProviderCredentials", &("google",)).await;
+        refused(
+            &client,
+            "CompleteAuth",
+            &("pedido", "codigo", "estado", "Trabajo"),
+        )
+        .await;
+        refused(&client, "PollNextcloudLogin", &("pedido",)).await;
+        refused(
+            &client,
+            "RegisterAccount",
+            &("Trabajo", "custom", "{}", "{}"),
+        )
+        .await;
+        refused(&client, "RemoveAccount", &("cuenta",)).await;
+        refused(&client, "GetAccessToken", &("cuenta", "email")).await;
     }
 
     #[test]

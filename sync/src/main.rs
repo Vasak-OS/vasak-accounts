@@ -1985,6 +1985,84 @@ mod tests {
         );
     }
 
+    /// Lo que se rechaza por los argumentos se rechaza **antes** de buscar la
+    /// cuenta, el servidor o la cola: con `InvalidArgs`, que es lo que
+    /// `vasak-mail` muestra como «revisá lo que pusiste», y sin tocar nada.
+    /// Por el bus, con la firma de cada método tal como la llama `vasak-mail`.
+    #[tokio::test]
+    async fn los_argumentos_invalidos_se_rechazan_por_el_bus_sin_tocar_nada() {
+        const PATH: &str = "/ar/net/vasak/os/AccountsSync";
+        const INTERFACE: &str = "ar.net.vasak.os.AccountsSync";
+        let (_server, client) =
+            vasak_accounts_common::introspection::serve_p2p(PATH, Service::default())
+                .await
+                .unwrap();
+        let invalid_args = |result: zbus::Result<zbus::Message>, what: &str| {
+            let Err(zbus::Error::MethodError(name, _, _)) = result else {
+                panic!("{what}: se esperaba un rechazo: {result:?}");
+            };
+            assert_eq!(
+                name.as_str(),
+                "org.freedesktop.DBus.Error.InvalidArgs",
+                "{what}"
+            );
+        };
+
+        invalid_args(
+            client
+                .call_method(
+                    None::<&str>,
+                    PATH,
+                    Some(INTERFACE),
+                    "MoveMessage",
+                    &("cuenta", "INBOX", 1u32, " "),
+                )
+                .await,
+            "mover sin destino",
+        );
+        invalid_args(
+            client
+                .call_method(
+                    None::<&str>,
+                    PATH,
+                    Some(INTERFACE),
+                    "SendMessage",
+                    &("cuenta", "{}", "mañana"),
+                )
+                .await,
+            "una hora que no se entiende",
+        );
+        invalid_args(
+            client
+                .call_method(
+                    None::<&str>,
+                    PATH,
+                    Some(INTERFACE),
+                    "DiscardOutgoing",
+                    &("../../algo",),
+                )
+                .await,
+            "un identificador con barras",
+        );
+
+        // Mover a donde ya está no es un error, ni algo que haya que pedirle al
+        // servidor: contesta sin buscar la cuenta.
+        let reply: String = client
+            .call_method(
+                None::<&str>,
+                PATH,
+                Some(INTERFACE),
+                "MoveMessage",
+                &("cuenta", "", 1u32, "INBOX"),
+            )
+            .await
+            .unwrap()
+            .body()
+            .deserialize()
+            .unwrap();
+        assert_eq!(reply, "entero");
+    }
+
     /// Después de arrancar, el proceso no es volcable. (Deja así al proceso de
     /// las pruebas, que no pierde nada: sólo sus propios volcados.)
     #[test]

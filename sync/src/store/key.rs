@@ -1125,21 +1125,50 @@ pub(crate) mod tests {
     /// pruebas de `store_api` puedan usar el mismo llavero de verdad.
     pub(crate) type Shared = Arc<Mutex<FakeKeyring>>;
 
-    /// Los errores del estándar de Secret Service, con su propio prefijo.
-    /// `#[interface]` arma la respuesta con el nombre de cada variante, así que
-    /// `IsLocked` sale como `org.freedesktop.Secret.Error.IsLocked`, igual que
-    /// en `vasak-keyring`. Los demás siguen siendo los de `org.freedesktop.DBus`.
-    #[derive(Debug, zbus::DBusError)]
-    #[zbus(prefix = "org.freedesktop.Secret.Error")]
+    /// Lo que contesta el llavero falso cuando algo falla: el bloqueo con el
+    /// nombre del estándar de Secret Service,
+    /// `org.freedesktop.Secret.Error.IsLocked`, igual que `vasak-keyring`, y el
+    /// resto con los de `org.freedesktop.DBus`.
+    ///
+    /// `DBusError` escrito a mano y no derivado: el derivado de zbus contesta
+    /// su variante de errores propios siempre como `org.freedesktop.zbus.Error`,
+    /// y un `InvalidArgs` dejaría de llamarse así.
+    #[derive(Debug)]
     enum SecretError {
-        #[zbus(error)]
-        ZBus(zbus::Error),
+        Fdo(zbus::fdo::Error),
         IsLocked(String),
+    }
+
+    impl zbus::DBusError for SecretError {
+        fn create_reply(&self, call: &zbus::message::Header<'_>) -> zbus::Result<zbus::Message> {
+            match self {
+                Self::Fdo(error) => error.create_reply(call),
+                Self::IsLocked(detail) => {
+                    zbus::Message::error(call, self.name())?.build(&(detail.as_str(),))
+                }
+            }
+        }
+
+        fn name(&self) -> zbus::names::ErrorName<'_> {
+            match self {
+                Self::Fdo(error) => error.name(),
+                Self::IsLocked(_) => zbus::names::ErrorName::from_static_str_unchecked(
+                    "org.freedesktop.Secret.Error.IsLocked",
+                ),
+            }
+        }
+
+        fn description(&self) -> Option<&str> {
+            match self {
+                Self::Fdo(error) => error.description(),
+                Self::IsLocked(detail) => Some(detail),
+            }
+        }
     }
 
     impl From<zbus::fdo::Error> for SecretError {
         fn from(error: zbus::fdo::Error) -> Self {
-            Self::ZBus(error.into())
+            Self::Fdo(error)
         }
     }
 
@@ -1734,6 +1763,38 @@ pub(crate) mod tests {
         assert_eq!(name.as_str(), "org.freedesktop.Secret.Error.IsLocked");
 
         shared.lock().unwrap().locked = false;
+        keys.close_session(&session).await;
+    }
+
+    /// Los errores que no son del estándar de Secret Service siguen saliendo
+    /// con el nombre de `org.freedesktop.DBus`: el prefijo propio es sólo para
+    /// `IsLocked`.
+    #[tokio::test]
+    async fn los_demas_errores_del_llavero_falso_siguen_siendo_los_de_dbus() {
+        let (keys, _server, _shared) = fake_keyring().await;
+        let session = keys.open_session().await.unwrap();
+        let secret = Secret {
+            session: session.clone(),
+            parameters: Vec::new(),
+            value: Vec::new(),
+            content_type: "text/plain".into(),
+        };
+        let properties: HashMap<&str, Value<'_>> = HashMap::new();
+        let error = keys
+            .connection
+            .call_method(
+                None::<&str>,
+                COLLECTION_PATH,
+                Some(COLLECTION_IFACE),
+                "CreateItem",
+                &(properties, &secret, true),
+            )
+            .await
+            .unwrap_err();
+        let zbus::Error::MethodError(name, _, _) = error else {
+            panic!("se esperaba un error de método: {error:?}");
+        };
+        assert_eq!(name.as_str(), "org.freedesktop.DBus.Error.InvalidArgs");
         keys.close_session(&session).await;
     }
 
