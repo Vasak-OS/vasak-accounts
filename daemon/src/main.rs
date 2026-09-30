@@ -18,7 +18,7 @@ use zbus::fdo::Error as FdoError;
 use zbus::interface;
 use zbus::message::Header;
 use zbus::names::BusName;
-use zbus::object_server::SignalContext;
+use zbus::object_server::SignalEmitter;
 
 /// Decides whether `caller` may use `capability` on `account_id`.
 ///
@@ -104,7 +104,7 @@ async fn caller_pid_and_uid(
         .sender()
         .ok_or_else(|| FdoError::Failed("Sender no presente en la cabecera".into()))?;
 
-    tracing::debug!("Nombre único del emisor: {}", sender);
+    tracing::debug!("Nombre único del emitter: {}", sender);
 
     let dbus_proxy = DBusProxy::new(connection)
         .await
@@ -320,7 +320,7 @@ impl AccountManager {
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
-        #[zbus(signal_context)] emisor: SignalContext<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         provider_id: String,
         client_id: String,
         client_secret: String,
@@ -368,7 +368,7 @@ impl AccountManager {
         .map_err(|e| FdoError::Failed(e.to_string()))?;
 
         tracing::info!("credenciales propias guardadas para '{provider_id}' (uid {uid})");
-        Self::accounts_changed(&emisor, uid).await?;
+        Self::accounts_changed(&emitter, uid).await?;
         Ok(())
     }
 
@@ -382,7 +382,7 @@ impl AccountManager {
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
-        #[zbus(signal_context)] emisor: SignalContext<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         provider_id: String,
     ) -> zbus::fdo::Result<()> {
         let (_caller, uid) = caller_identity(connection, &header).await?;
@@ -391,7 +391,7 @@ impl AccountManager {
             .map_err(|e| FdoError::Failed(e.to_string()))?;
 
         tracing::info!("credenciales propias de '{provider_id}' borradas (uid {uid})");
-        Self::accounts_changed(&emisor, uid).await?;
+        Self::accounts_changed(&emitter, uid).await?;
         Ok(())
     }
 
@@ -505,7 +505,7 @@ impl AccountManager {
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
-        #[zbus(signal_context)] emisor: SignalContext<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         request_id: String,
         code: String,
         state: String,
@@ -591,7 +591,7 @@ impl AccountManager {
             "cuenta '{account_id}' conectada a '{}' (uid {uid})",
             proveedor.id
         );
-        Self::accounts_changed(&emisor, uid).await?;
+        Self::accounts_changed(&emitter, uid).await?;
         Ok(account_id)
     }
 
@@ -670,7 +670,7 @@ impl AccountManager {
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
-        #[zbus(signal_context)] emisor: SignalContext<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         request_id: String,
     ) -> zbus::fdo::Result<String> {
         let (_caller, uid) = caller_identity(connection, &header).await?;
@@ -703,7 +703,7 @@ impl AccountManager {
             "cuenta '{account_id}' conectada a {} (uid {uid})",
             flujo.server
         );
-        Self::accounts_changed(&emisor, uid).await?;
+        Self::accounts_changed(&emitter, uid).await?;
 
         Ok(serde_json::json!({ "status": "done", "account_id": account_id }).to_string())
     }
@@ -746,7 +746,7 @@ impl AccountManager {
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
-        #[zbus(signal_context)] emisor: SignalContext<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         display_name: String,
         provider_type: String,
         capabilities_json: String,
@@ -782,7 +782,7 @@ impl AccountManager {
         }
 
         tracing::info!("Cuenta '{account_id}' registrada para el usuario {uid}");
-        Self::accounts_changed(&emisor, uid).await?;
+        Self::accounts_changed(&emitter, uid).await?;
         Ok(account_id)
     }
 
@@ -810,7 +810,7 @@ impl AccountManager {
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
-        #[zbus(signal_context)] emisor: SignalContext<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         account_id: String,
     ) -> zbus::fdo::Result<String> {
         let (caller, uid) = caller_identity(connection, &header).await?;
@@ -838,7 +838,7 @@ impl AccountManager {
             .map_err(|e| FdoError::Failed(format!("Error al borrar los secretos: {e}")))?;
 
         if borrada {
-            Self::accounts_changed(&emisor, uid).await?;
+            Self::accounts_changed(&emitter, uid).await?;
         }
 
         let (revocada, detalle) = match revocacion {
@@ -883,7 +883,7 @@ impl AccountManager {
     /// Releer sólo una deja la pantalla mostrando un proveedor apagado que ya
     /// está listo, o al revés.
     #[zbus(signal)]
-    async fn accounts_changed(emisor: &SignalContext<'_>, uid: u32) -> zbus::Result<()>;
+    async fn accounts_changed(emitter: &SignalEmitter<'_>, uid: u32) -> zbus::Result<()>;
 
     /// Método `GetAccessToken` — un access_token **válido** para la cuenta y
     /// capacidad indicadas, refrescándolo si hace falta.
@@ -891,7 +891,7 @@ impl AccountManager {
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
-        #[zbus(signal_context)] emisor: SignalContext<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         account_id: String,
         capability: String,
     ) -> zbus::fdo::Result<String> {
@@ -906,7 +906,7 @@ impl AccountManager {
                 // Pasa cuando la persona la reconecta, y sin esto la pantalla
                 // seguiría diciendo que hay algo que arreglar.
                 if marcar_reauth(uid, &account_id, false)? {
-                    Self::accounts_changed(&emisor, uid).await?;
+                    Self::accounts_changed(&emitter, uid).await?;
                 }
                 Ok(token)
             }
@@ -916,7 +916,7 @@ impl AccountManager {
             Err(protocols::oauth2::TokenError::Revoked(detalle)) => {
                 tracing::warn!("'{account_id}' necesita reautenticación: {detalle}");
                 if marcar_reauth(uid, &account_id, true)? {
-                    Self::accounts_changed(&emisor, uid).await?;
+                    Self::accounts_changed(&emitter, uid).await?;
                 }
                 Err(FdoError::Failed(format!(
                     "hay que volver a conectar la cuenta: {detalle}"
@@ -1263,6 +1263,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Lo que ven los clientes de `AccountManager` no cambia sin querer.**
+    ///
+    /// Los nombres, las firmas y las señales, leídos del `Introspect` que
+    /// contesta el objeto de verdad, contra `dbus/ar.net.vasak.os.AccountManager.txt`.
+    /// El archivo se escribió con la salida de zbus 4, antes de subir a la 5
+    /// (`Vasak-OS/vasak-accounts#58`): la ventana de cuentas, el sincronizador y
+    /// cada aplicación que pide un token hablan esta interfaz, y un salto del
+    /// andamiaje de D-Bus no lo dice en ninguna otra prueba. Cambiarla a
+    /// propósito es cambiar también ese archivo, en el mismo PR.
+    #[tokio::test]
+    async fn la_interfaz_de_cuentas_no_cambia_para_sus_clientes() {
+        const PATH: &str = "/ar/net/vasak/os/AccountManager";
+        let (_server, client) =
+            vasak_accounts_common::introspection::serve_p2p(PATH, AccountManager::default())
+                .await
+                .unwrap();
+        let xml = vasak_accounts_common::introspection::introspect(&client, PATH)
+            .await
+            .unwrap();
+        let surface = vasak_accounts_common::introspection::interface_surface(
+            &xml,
+            "ar.net.vasak.os.AccountManager",
+        )
+        .expect("el objeto publica la interfaz");
+        assert_eq!(
+            surface,
+            include_str!("../dbus/ar.net.vasak.os.AccountManager.txt"),
+            "la interfaz cambió; si es a propósito, esto es lo que hay ahora:\n{surface}"
+        );
+    }
 
     #[test]
     fn una_lista_de_capacidades_se_interpreta() {

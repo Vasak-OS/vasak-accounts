@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use zbus::interface;
 use zbus::message::Header;
-use zbus::object_server::SignalContext;
+use zbus::object_server::SignalEmitter;
 
 use serde::Serialize;
 
@@ -138,7 +138,7 @@ impl<K: KeySource> StoreApi<K> {
     async fn set_store_enabled(
         &self,
         #[zbus(header)] header: Header<'_>,
-        #[zbus(signal_context)] emitter: SignalContext<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         account_id: String,
         enabled: bool,
     ) -> zbus::fdo::Result<()> {
@@ -166,7 +166,7 @@ impl<K: KeySource> StoreApi<K> {
     async fn clear_store(
         &self,
         #[zbus(header)] header: Header<'_>,
-        #[zbus(signal_context)] emitter: SignalContext<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         account_id: String,
     ) -> zbus::fdo::Result<()> {
         self.admit_control(&header, &account_id, ControlAction::Clear)
@@ -202,7 +202,7 @@ impl<K: KeySource> StoreApi<K> {
     async fn request_sync(
         &self,
         #[zbus(header)] header: Header<'_>,
-        #[zbus(signal_context)] emitter: SignalContext<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         account_id: String,
     ) -> zbus::fdo::Result<()> {
         self.admit_control(&header, &account_id, ControlAction::Sync)
@@ -575,7 +575,7 @@ impl<K: KeySource> StoreApi<K> {
     ///
     /// Sin detalle: quien la recibe vuelve a leer `GetStatus`.
     #[zbus(signal)]
-    async fn status_changed(emitter: &SignalContext<'_>) -> zbus::Result<()>;
+    async fn status_changed(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
 
     /// Señal `Changed` — un lote cambió lo guardado de un área (`contacts`,
     /// `calendar`) de una cuenta. Una por lote que cambió algo; ninguna por un
@@ -583,7 +583,7 @@ impl<K: KeySource> StoreApi<K> {
     /// sale, si cambió lo que se ve.
     #[zbus(signal)]
     async fn changed(
-        emitter: &SignalContext<'_>,
+        emitter: &SignalEmitter<'_>,
         area: &str,
         account_id: &str,
         generation: u64,
@@ -921,7 +921,7 @@ pub fn listing_from(result: &Result<Vec<broker::Account>, BrokerError>) -> Accou
 /// El almacén andando: la interfaz publicada y el llavero escuchado.
 pub struct StoreService<K: KeySource> {
     manager: Arc<StoreManager<K>>,
-    emitter: SignalContext<'static>,
+    emitter: SignalEmitter<'static>,
 }
 
 impl StoreService<SecretServiceKeys> {
@@ -1091,7 +1091,7 @@ impl<K: KeySource> StoreService<K> {
                 },
             )
             .await?;
-        let emitter = SignalContext::new(connection, PATH)?.to_owned();
+        let emitter = SignalEmitter::new(connection, PATH)?.to_owned();
         Ok(Self { manager, emitter })
     }
 
@@ -1195,6 +1195,34 @@ mod tests {
         let ids: Vec<&str> = accounts.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b"]);
         assert_eq!(accounts[1].capabilities, vec!["email"]);
+    }
+
+    /// **Lo que ven los clientes de `AccountsStore` no cambia sin querer.**
+    ///
+    /// Los nombres, las firmas y las señales, leídos del `Introspect` que
+    /// contesta el objeto de verdad, contra `dbus/ar.net.vasak.os.AccountsStore.txt`.
+    /// El archivo se escribió con la salida de zbus 4, antes de subir a la 5
+    /// (`Vasak-OS/vasak-accounts#58`): un salto del andamiaje de D-Bus no dice
+    /// en ninguna otra prueba si una interfaz sigue igual para quien la usa.
+    /// Cambiar la interfaz a propósito es cambiar también ese archivo, en el
+    /// mismo PR, y avisar a los clientes.
+    #[tokio::test]
+    async fn la_interfaz_del_almacen_no_cambia_para_sus_clientes() {
+        let mut api = Api::new("introspeccion", Vec::new(), Answer::Allow).await;
+        let (client, _service) = api.client(":1.20").await;
+        let xml = vasak_accounts_common::introspection::introspect(&client, PATH)
+            .await
+            .unwrap();
+        let surface = vasak_accounts_common::introspection::interface_surface(
+            &xml,
+            "ar.net.vasak.os.AccountsStore",
+        )
+        .expect("el objeto publica la interfaz");
+        assert_eq!(
+            surface,
+            include_str!("../dbus/ar.net.vasak.os.AccountsStore.txt"),
+            "la interfaz cambió; si es a propósito, esto es lo que hay ahora:\n{surface}"
+        );
     }
 
     /// La interfaz entera, con el llavero falso y un `vasak-permissions` falso,

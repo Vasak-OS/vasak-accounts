@@ -19,13 +19,13 @@ resolver = "2"
 members = ["common", "daemon", "sync"]
 
 [workspace.package]
-version = "0.17.5"
+version = "0.17.6"
 edition = "2021"
 authors = ["Vasak Group", "Joaquin (Pato) Decima"]
 license = "GPL-3.0-only"
 
 [workspace.dependencies]
-zbus = { version = "4", features = ["tokio"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -36,6 +36,9 @@ url = "2"
 # Lo que comparten los dos binarios: identificar a un proceso y preguntarle
 # al servicio de permisos por él. Ver `common/src/lib.rs`.
 vasak-accounts-common = { path = "common" }
+# El XML de CardDAV en el sync, y el de `Introspect` en las pruebas que fijan las
+# interfaces de D-Bus (ver `common/src/introspection.rs`).
+roxmltree = "0.21"
 # rustls y no native-tls: es Rust puro, así que el TLS no suma bibliotecas
 # compartidas. El paquete sí enlaza una desde el almacén local del sync:
 # SQLCipher cifra con la `libcrypto.so.3` del sistema (paquete `openssl`), y
@@ -51,12 +54,6 @@ opt-level = 2
 # explicar es algo que nadie se anima a tocar. Cada una dice qué rompe y cuándo
 # deja de estar acá.
 [workspace.metadata.vasak.bibliotecasAtrasadas]
-zbus = """4 → 5. Salto mayor del andamiaje de D-Bus: cambian los tipos de las \
-señales (SignalContext → SignalEmitter), los proxies y las macros, en los dos \
-binarios a la vez. Condición de salida: un PR propio, sin otro trabajo mezclado, \
-que verifique a mano cada interfaz —AccountManager en el bus del sistema, con la \
-identidad del llamante por pidfd; AccountsSync y AccountsStore en el de sesión— \
-y el cliente del llavero de store/key.rs contra vasak-keyring."""
 reqwest = """0.12 → 0.13. Choca con oauth2 5.0.0, la última publicada, que pide \
 reqwest ^0.12: el demonio le pasa su propio reqwest::Client a request_async, y \
 con dos reqwest distintos ese tipo no coincide. El sync podría subir solo, pero \
