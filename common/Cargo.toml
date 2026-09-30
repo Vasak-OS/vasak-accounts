@@ -11,9 +11,21 @@ publish = false
 # Para hablar con `vasak-permissions`. El mismo zbus del espacio de trabajo: no
 # suma ninguna crate al candado.
 zbus.workspace = true
+# Para leer el XML de `Introspect` en las pruebas que fijan cada interfaz. Sólo
+# con la función `introspection`; ver `src/introspection.rs`.
+roxmltree = { workspace = true, optional = true }
+# Las dos puntas de la conexión punto a punto en la que se publica la interfaz.
+tokio = { workspace = true, optional = true }
+
+[features]
+# La superficie de una interfaz de D-Bus, para las pruebas de los dos binarios.
+# La piden sus `dev-dependencies`: no entra en ningún binario que se instala.
+introspection = ["dep:roxmltree", "dep:tokio", "zbus/p2p"]
 
 [dev-dependencies]
 # Un servicio de permisos falso del otro lado de una conexión punto a punto,
 # sin `dbus-daemon`.
 tokio.workspace = true
 zbus = { workspace = true, features = ["p2p"] }
+# Las pruebas de `src/introspection.rs`, que corren sin la función.
+roxmltree.workspace = true

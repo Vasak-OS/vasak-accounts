@@ -64,7 +64,7 @@ rustix = { version = "1", features = ["fs", "process"] }
 # lectura, sin ninguna biblioteca compartida; rechaza la DTD por omisión, que es
 # lo que cierra las entidades externas y las expansiones en cadena. Es la misma
 # que usaba `vasak-contacts`, de donde viene el parser. Ver `dav/webdav.rs`.
-roxmltree = "0.21"
+roxmltree.workspace = true
 # Las repeticiones de los eventos del calendario (`RRULE`, RFC 5545). Rust puro,
 # sin ninguna biblioteca compartida; se le da la hora de pared y la zona la
 # pone `ical/timezones.rs`, y sus topes no alcanzan solos: ver
@@ -80,6 +80,9 @@ chrono-tz = "0.10"
 vasak-accounts-common.workspace = true
 
 [dev-dependencies]
+# Leer la superficie de `AccountsSync` y `AccountsStore` desde su `Introspect`,
+# para las pruebas que las fijan. Ver `common/src/introspection.rs`.
+vasak-accounts-common = { workspace = true, features = ["introspection"] }
 # Las conexiones punto a punto de zbus, para probar el cliente del llavero y la
 # interfaz del almacén contra un servidor falso, sin `dbus-daemon`. Con
 # `bus-impl`, que sólo habilita ponerle nombre único a una punta —lo que haría

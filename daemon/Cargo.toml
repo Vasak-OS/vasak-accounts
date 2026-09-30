@@ -30,3 +30,10 @@ url.workspace = true
 # compartidos con el sincronizador. Ver `common/`.
 vasak-accounts-common.workspace = true
 
+[dev-dependencies]
+# Leer la superficie de `AccountManager` desde su `Introspect`, para la prueba
+# que la fija. Ver `common/src/introspection.rs`.
+vasak-accounts-common = { workspace = true, features = ["introspection"] }
+# Servir la interfaz del otro lado de una conexión punto a punto, sin
+# `dbus-daemon`.
+zbus = { workspace = true, features = ["p2p"] }

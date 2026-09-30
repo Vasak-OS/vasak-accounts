@@ -871,7 +871,7 @@ impl PermissionBackend for DbusPermissions {
 pub(crate) mod tests {
     use std::collections::HashMap;
 
-    use zbus::object_server::SignalContext;
+    use zbus::object_server::SignalEmitter;
 
     use super::*;
 
@@ -1226,7 +1226,7 @@ pub(crate) mod tests {
         let emit = |name: &'static str, old: &'static str, new: &'static str| {
             let server = f.bus_server.clone();
             async move {
-                let context = SignalContext::new(&server, "/org/freedesktop/DBus").unwrap();
+                let context = SignalEmitter::new(&server, "/org/freedesktop/DBus").unwrap();
                 server
                     .emit_signal(
                         None::<&str>,

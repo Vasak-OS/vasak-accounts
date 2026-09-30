@@ -1125,6 +1125,53 @@ pub(crate) mod tests {
     /// pruebas de `store_api` puedan usar el mismo llavero de verdad.
     pub(crate) type Shared = Arc<Mutex<FakeKeyring>>;
 
+    /// Lo que contesta el llavero falso cuando algo falla: el bloqueo con el
+    /// nombre del estándar de Secret Service,
+    /// `org.freedesktop.Secret.Error.IsLocked`, igual que `vasak-keyring`, y el
+    /// resto con los de `org.freedesktop.DBus`.
+    ///
+    /// `DBusError` escrito a mano y no derivado: el derivado de zbus contesta
+    /// su variante de errores propios siempre como `org.freedesktop.zbus.Error`,
+    /// y un `InvalidArgs` dejaría de llamarse así.
+    #[derive(Debug)]
+    enum SecretError {
+        Fdo(zbus::fdo::Error),
+        IsLocked(String),
+    }
+
+    impl zbus::DBusError for SecretError {
+        fn create_reply(&self, call: &zbus::message::Header<'_>) -> zbus::Result<zbus::Message> {
+            match self {
+                Self::Fdo(error) => error.create_reply(call),
+                Self::IsLocked(detail) => {
+                    zbus::Message::error(call, self.name())?.build(&(detail.as_str(),))
+                }
+            }
+        }
+
+        fn name(&self) -> zbus::names::ErrorName<'_> {
+            match self {
+                Self::Fdo(error) => error.name(),
+                Self::IsLocked(_) => zbus::names::ErrorName::from_static_str_unchecked(
+                    "org.freedesktop.Secret.Error.IsLocked",
+                ),
+            }
+        }
+
+        fn description(&self) -> Option<&str> {
+            match self {
+                Self::Fdo(error) => error.description(),
+                Self::IsLocked(detail) => Some(detail),
+            }
+        }
+    }
+
+    impl From<zbus::fdo::Error> for SecretError {
+        fn from(error: zbus::fdo::Error) -> Self {
+            Self::Fdo(error)
+        }
+    }
+
     struct FakeService(Shared);
 
     #[zbus::interface(name = "org.freedesktop.Secret.Service")]
@@ -1205,7 +1252,7 @@ pub(crate) mod tests {
             properties: HashMap<String, OwnedValue>,
             mut secret: Secret,
             replace: bool,
-        ) -> zbus::fdo::Result<(OwnedObjectPath, OwnedObjectPath)> {
+        ) -> Result<(OwnedObjectPath, OwnedObjectPath), SecretError> {
             let attributes: HashMap<String, String> = properties
                 .get("org.freedesktop.Secret.Item.Attributes")
                 .and_then(|v| v.try_clone().ok())
@@ -1214,21 +1261,13 @@ pub(crate) mod tests {
             let path = {
                 let mut state = self.0.lock().unwrap();
                 if state.locked {
-                    // **Acá debería ir `org.freedesktop.Secret.Error.IsLocked`**, que
-                    // es lo que contesta `vasak-keyring` desde que lo arregló
-                    // (`Vasak-OS/vasak-keyring#25`), y no se puede: el macro
-                    // `#[interface]` de zbus 4 sólo sabe armar
-                    // `org.freedesktop.DBus.Error.*`, y llegar al nombre del
-                    // estándar exige escribir el `Interface` a mano.
-                    // `Vasak-OS/vasak-accounts#58` es el que lo destraba.
-                    //
-                    // Mientras tanto el texto va **a propósito sin las palabras que
-                    // el cliente miraba**: si el llavero falso las dijera, una
-                    // prueba en verde probaría que el texto se adivina, que es
-                    // justo lo que dejó de hacer [`classify`]. La respuesta
-                    // exacta la fija la prueba de [`classify`], que no necesita
-                    // bus; lo que este llavero falso sostiene es el resto.
-                    return Err(zbus::fdo::Error::Failed("no se puede escribir".into()));
+                    // Lo mismo que contesta `vasak-keyring` desde
+                    // `Vasak-OS/vasak-keyring#25`: el nombre del estándar. El
+                    // texto va **a propósito sin las palabras que el cliente
+                    // miraba**: si el llavero falso las dijera, una prueba en
+                    // verde no distinguiría entre leer el nombre y adivinar por
+                    // el texto, que es justo lo que dejó de hacer [`classify`].
+                    return Err(SecretError::IsLocked("no se puede escribir".into()));
                 }
                 if replace {
                     state.items.retain(|_, (a, _)| a != &attributes);
@@ -1274,14 +1313,12 @@ pub(crate) mod tests {
 
     #[zbus::interface(name = "org.freedesktop.Secret.Item")]
     impl FakeItem {
-        async fn get_secret(&self, session: OwnedObjectPath) -> zbus::fdo::Result<(Secret,)> {
+        async fn get_secret(&self, session: OwnedObjectPath) -> Result<(Secret,), SecretError> {
             let state = self.0.lock().unwrap();
             if state.locked {
-                // Como en `create_item`: el nombre del estándar no se puede
-                // formar con el macro de zbus 4 (ver
-                // `Vasak-OS/vasak-accounts#58`), y el texto va sin las palabras
-                // que el cliente dejó de adivinar.
-                return Err(zbus::fdo::Error::Failed("no se puede leer".into()));
+                // Como en `create_item`: el nombre del estándar, y el texto sin
+                // las palabras que el cliente dejó de adivinar.
+                return Err(SecretError::IsLocked("no se puede leer".into()));
             }
             let (_, value) = state
                 .items
@@ -1381,9 +1418,9 @@ pub(crate) mod tests {
             .await
             .expect("la colección del llavero falso");
         let collection = iface.get().await;
-        let enviado = collection.locked_changed(iface.signal_context()).await;
+        let sent = collection.locked_changed(iface.signal_emitter()).await;
         drop(collection);
-        enviado
+        sent
     }
 
     /// La identidad de la colección es su ruta y su `Created`, y una vez
@@ -1592,17 +1629,13 @@ pub(crate) mod tests {
 
         shared.lock().unwrap().locked = true;
         assert!(keys.is_locked().await.unwrap());
-        // Guardar con el llavero bloqueado **no guarda nada**, que es lo que
-        // importa y es independiente de la versión del llavero: el bloqueo se ve
-        // por `Locked` antes de escribir, y si la escritura se rechaza, la clave
-        // no queda. El *nombre* con el que se rechaza lo fija
-        // `el_bloqueo_se_lee_por_el_nombre_del_error`; este llavero falso no
-        // puede dar el del estándar (ver `Vasak-OS/vasak-accounts#58`).
-        assert!(
-            keys.store("otra", &StoreKey::generate().unwrap())
-                .await
-                .is_err(),
-            "con el llavero bloqueado no se puede guardar"
+        // Guardar con el llavero bloqueado **no guarda nada**, y se avisa como
+        // bloqueo: el llavero falso contesta `CreateItem` con el nombre del
+        // estándar, como `vasak-keyring`, y el cliente lo lee por el nombre.
+        assert_eq!(
+            keys.store("otra", &StoreKey::generate().unwrap()).await,
+            Err(KeyError::Locked),
+            "con el llavero bloqueado no se puede guardar, y se dice por qué"
         );
         assert!(
             !shared.lock().unwrap().items.is_empty(),
@@ -1631,14 +1664,11 @@ pub(crate) mod tests {
     /// leyendo lo que escribió el servidor, en el idioma del servidor.
     #[test]
     fn el_bloqueo_se_lee_por_el_nombre_del_error() {
-        let fallo = |nombre: &str, detalle: &str| {
+        let failure = |name: &str, detail: &str| {
             zbus::Error::MethodError(
-                nombre
-                    .to_string()
-                    .try_into()
-                    .expect("nombre de error válido"),
-                Some(detalle.to_string()),
-                zbus::Message::method("/", "Miembro")
+                name.to_string().try_into().expect("nombre de error válido"),
+                Some(detail.to_string()),
+                zbus::Message::method_call("/", "Member")
                     .expect("mensaje")
                     .build(&())
                     .expect("mensaje"),
@@ -1649,7 +1679,7 @@ pub(crate) mod tests {
         assert_eq!(
             classify(
                 "GetSecret",
-                fallo("org.freedesktop.Secret.Error.IsLocked", "bloqueado")
+                failure("org.freedesktop.Secret.Error.IsLocked", "bloqueado")
             ),
             KeyError::Locked,
             "el nombre del estándar es un bloqueo, diga lo que diga el texto"
@@ -1657,29 +1687,29 @@ pub(crate) mod tests {
         assert_eq!(
             classify(
                 "CreateItem",
-                fallo("org.freedesktop.Secret.Error.IsLocked", "")
+                failure("org.freedesktop.Secret.Error.IsLocked", "")
             ),
             KeyError::Locked,
             "y también con el texto vacío"
         );
 
         // Un `Failed` no es un bloqueo, **pase lo que pase su texto**.
-        for detalle in [
+        for detail in [
             "el llavero está bloqueado: no hay contraseña maestra en memoria",
             "collection is locked",
             "LOCKED",
             "bloqueada la escritura",
         ] {
             assert_eq!(
-                classify("CreateItem", fallo("org.freedesktop.DBus.Error.Failed", detalle)),
-                KeyError::Failed(format!("CreateItem: {detalle}")),
+                classify("CreateItem", failure("org.freedesktop.DBus.Error.Failed", detail)),
+                KeyError::Failed(format!("CreateItem: {detail}")),
                 "un `Failed` cuyo texto habla de un bloqueo se lee como fallo: el texto lo escribe \
                  el servidor y no es un estado del llavero"
             );
         }
 
         // Y los nombres que sí son «no hay llavero» siguen siéndolo.
-        for nombre in [
+        for name in [
             "org.freedesktop.DBus.Error.ServiceUnknown",
             "org.freedesktop.DBus.Error.NameHasNoOwner",
             "org.freedesktop.DBus.Error.NoReply",
@@ -1688,12 +1718,84 @@ pub(crate) mod tests {
         ] {
             assert!(
                 matches!(
-                    classify("ReadAlias", fallo(nombre, "")),
+                    classify("ReadAlias", failure(name, "")),
                     KeyError::Unavailable(_)
                 ),
-                "{nombre} es que no hay llavero"
+                "{name} es que no hay llavero"
             );
         }
+    }
+
+    /// El rechazo de un llavero bloqueado viaja con el nombre del estándar,
+    /// `org.freedesktop.Secret.Error.IsLocked`, y el cliente lo lee como
+    /// bloqueo **por el bus**, no sólo en [`classify`]: es lo que el macro de
+    /// zbus 4 no dejaba armar del lado del servidor falso.
+    #[tokio::test]
+    async fn el_rechazo_por_bloqueo_viaja_con_el_nombre_del_estandar() {
+        let (keys, _server, shared) = fake_keyring().await;
+        keys.store("cuenta", &StoreKey::generate().unwrap())
+            .await
+            .unwrap();
+        let item = shared.lock().unwrap().items.keys().next().unwrap().clone();
+        let session = keys.open_session().await.unwrap();
+
+        shared.lock().unwrap().locked = true;
+        let reply: Result<(Secret,), KeyError> = keys
+            .call(item.as_str(), ITEM_IFACE, "GetSecret", &(&session,))
+            .await;
+        assert_eq!(reply.err(), Some(KeyError::Locked));
+
+        // Y el nombre, tal cual llega, sin pasar por el cliente.
+        let error = keys
+            .connection
+            .call_method(
+                None::<&str>,
+                item.as_str(),
+                Some(ITEM_IFACE),
+                "GetSecret",
+                &(&session,),
+            )
+            .await
+            .unwrap_err();
+        let zbus::Error::MethodError(name, _, _) = error else {
+            panic!("se esperaba un error de método: {error:?}");
+        };
+        assert_eq!(name.as_str(), "org.freedesktop.Secret.Error.IsLocked");
+
+        shared.lock().unwrap().locked = false;
+        keys.close_session(&session).await;
+    }
+
+    /// Los errores que no son del estándar de Secret Service siguen saliendo
+    /// con el nombre de `org.freedesktop.DBus`: el prefijo propio es sólo para
+    /// `IsLocked`.
+    #[tokio::test]
+    async fn los_demas_errores_del_llavero_falso_siguen_siendo_los_de_dbus() {
+        let (keys, _server, _shared) = fake_keyring().await;
+        let session = keys.open_session().await.unwrap();
+        let secret = Secret {
+            session: session.clone(),
+            parameters: Vec::new(),
+            value: Vec::new(),
+            content_type: "text/plain".into(),
+        };
+        let properties: HashMap<&str, Value<'_>> = HashMap::new();
+        let error = keys
+            .connection
+            .call_method(
+                None::<&str>,
+                COLLECTION_PATH,
+                Some(COLLECTION_IFACE),
+                "CreateItem",
+                &(properties, &secret, true),
+            )
+            .await
+            .unwrap_err();
+        let zbus::Error::MethodError(name, _, _) = error else {
+            panic!("se esperaba un error de método: {error:?}");
+        };
+        assert_eq!(name.as_str(), "org.freedesktop.DBus.Error.InvalidArgs");
+        keys.close_session(&session).await;
     }
 
     /// `vasak-keyring` sin la contraseña en memoria contesta `SearchItems`
@@ -1761,7 +1863,7 @@ pub(crate) mod tests {
         iface
             .get()
             .await
-            .locked_changed(iface.signal_context())
+            .locked_changed(iface.signal_emitter())
             .await
             .unwrap();
 
