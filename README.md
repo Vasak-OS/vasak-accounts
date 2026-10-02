@@ -363,7 +363,38 @@ Todo bajo `/var/lib/vasak-accounts/<uid>/`, un directorio por persona en modo
 
 Los dos se escriben creándolos ya en 0600 y renombrándolos encima del anterior,
 así un token nunca queda un instante legible por todo el mundo ni un corte a
-mitad de escritura deja medio archivo donde estaban las credenciales.
+mitad de escritura deja medio archivo donde estaban las credenciales. El
+temporal es único por escritura, así que dos pedidos a la vez no mezclan lo que
+escriben.
+
+**El directorio nunca existe sin `accounts.json`.** Quien lo crea —abrir la
+base, guardar un `client_id` propio con `SetProviderCredentials` o guardar un
+secreto— escribe `[]` en el mismo paso, y esa primera escritura nunca reemplaza
+un archivo que ya esté. Por eso un directorio que existe y no tiene
+`accounts.json` se trata siempre como una **pérdida**: `ListAccounts` contesta
+error y no una lista vacía, y el sincronizador no borra nada
+([#56](https://github.com/Vasak-OS/vasak-accounts/issues/56)).
+
+#### Salir a mano del error «no se pudo leer accounts.json»
+
+Las versiones hasta la 0.17.6 dejaban ese estado en equipos **sin ninguna
+cuenta**: la segunda vez que se abría la pantalla de cuentas aparecía el error, y
+no se iba ([#66](https://github.com/Vasak-OS/vasak-accounts/issues/66)). El
+servicio no lo arregla solo porque no hay forma de distinguirlo, mirando el
+disco, de alguien que sí tuvo cuentas y perdió el archivo — y equivocarse ahí
+borra las copias locales de correo, calendario y contactos.
+
+Si la persona **nunca conectó una cuenta** en ese equipo, se sale creando el
+archivo vacío, como root (cambiar `1000` por su uid):
+
+```sh
+sudo install -m 0600 -o root -g root /dev/null /var/lib/vasak-accounts/1000/accounts.json
+echo '[]' | sudo tee /var/lib/vasak-accounts/1000/accounts.json >/dev/null
+```
+
+Si tuvo cuentas, **no**: hay que recuperar `accounts.json` de una copia de
+seguridad. Escribir `[]` encima hace que el sincronizador borre las bases
+locales de esas cuentas.
 
 **No están cifrados, y es una decisión.** Una clave que el servicio pueda leer
 solo tiene que estar guardada al lado de lo que protege, y eso no compra nada

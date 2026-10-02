@@ -421,9 +421,7 @@ pub struct UserCredentials {
 }
 
 impl UserCredentials {
-    /// También lo lee `storage`: es lo único que puede haber en el directorio
-    /// de alguien que nunca tuvo cuentas.
-    pub(crate) const FILE_NAME: &'static str = "providers.json";
+    const FILE_NAME: &'static str = "providers.json";
 
     fn path(uid: u32) -> PathBuf {
         crate::storage::AccountDatabase::directory_for(uid).join(Self::FILE_NAME)
@@ -471,7 +469,7 @@ impl UserCredentials {
         // marcador y con `[]` en `accounts.json`.
         //
         // Y si lo que encuentra es un `accounts.json` perdido, falla y no se
-        // escribe nada: ver `prepare_user_directory_for_write`.
+        // escribe nada al lado: ver `prepare_user_directory_for_write`.
         crate::storage::prepare_user_directory_for_write(directory)
             .map_err(|e| CatalogError::Io(format!("{}: {e}", directory.display())))?;
 
@@ -600,6 +598,13 @@ mod tests {
         dir
     }
 
+    /// El directorio de una persona, **sin crearlo**: lo prepara
+    /// `store_in`. Uno vacío creado a mano es, desde `vasak-accounts#66`, un
+    /// directorio sin `accounts.json`, y ahí no se guarda nada.
+    fn new_user_directory() -> PathBuf {
+        std::env::temp_dir().join(uuid::Uuid::new_v4().to_string())
+    }
+
     fn cargar(directorio: &Path) -> HashMap<String, Provider> {
         let mut catalogo = HashMap::new();
         merge_directory(directorio, &mut catalogo).unwrap();
@@ -702,7 +707,7 @@ mod tests {
     /// que el proveedor pase a estar listo.
     #[test]
     fn las_credenciales_propias_completan_un_proveedor() {
-        let dir = temp_dir();
+        let dir = new_user_directory();
         UserCredentials::store_in(
             &dir,
             "google",
@@ -777,7 +782,7 @@ mod tests {
 
     #[test]
     fn se_pueden_quitar_sin_tocar_las_de_otro_proveedor() {
-        let dir = temp_dir();
+        let dir = new_user_directory();
         for id in ["google", "microsoft"] {
             UserCredentials::store_in(
                 &dir,
@@ -806,7 +811,7 @@ mod tests {
     fn el_archivo_de_credenciales_es_solo_para_su_dueno() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = temp_dir();
+        let dir = new_user_directory();
         UserCredentials::store_in(
             &dir,
             "google",

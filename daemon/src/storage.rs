@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -392,6 +392,19 @@ pub enum AccountsFile {
 /// la próxima apertura encuentra el archivo y lo vuelve a intentar; al revés,
 /// quedaría marcador sin archivo, que es el estado roto.
 pub fn prepare_user_directory(directory: &Path) -> Result<AccountsFile, StorageError> {
+    // **Una preparación por vez.** El demonio atiende varios pedidos de D-Bus a
+    // la vez, y lo de abajo es mirar y después escribir: sin esto, un pedido
+    // puede ver que el directorio no existe, otro crearlo con su marcador, y el
+    // primero leer después el marcador y contestar «el directorio se perdió»
+    // — o ver el directorio ya creado, todavía sin `accounts.json`, y contestar
+    // que falta. Son unas pocas llamadas al sistema, así que un candado de todo
+    // el proceso no se nota. Envenenado no importa: no protege datos en
+    // memoria, sólo ordena.
+    static PREPARING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _turn = PREPARING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     // Antes de crearla, y preguntando por el motivo: `Path::exists()`
     // devuelve `false` también cuando lo que falló fue un permiso o el
     // disco, así que un directorio al que no se puede leer se confunde con
@@ -439,27 +452,34 @@ pub fn prepare_user_directory(directory: &Path) -> Result<AccountsFile, StorageE
 
     let accounts_path = directory.join(AccountDatabase::FILE_NAME);
     let state = if !directory_existed {
-        // Recién creado: no hay nada que perder, y es el momento de dejar el
-        // archivo para que la próxima apertura no lo eche de menos.
-        write_private(&accounts_path, b"[]")?;
+        // Recién creado: es el momento de dejar el archivo para que la
+        // próxima apertura no lo eche de menos. **Sin pisar nada**: otro pedido
+        // del mismo uid pudo haber pasado por acá al mismo tiempo y hasta
+        // haber guardado ya una cuenta (ver [`create_private_new`]).
+        create_private_new(&accounts_path, b"[]")?;
         AccountsFile::Present
     } else {
         match std::fs::symlink_metadata(&accounts_path) {
             // Cualquier cosa con ese nombre —también un symlink o una
             // carpeta— la juzga `load`, que la lee. Acá no se pisa nada.
             Ok(_) => AccountsFile::Present,
+            // **Un directorio que ya estaba y no tiene el archivo es una
+            // pérdida, siempre.** No se intenta adivinar si «nunca tuvo
+            // cuentas»: desde este cambio, quien crea el directorio escribe
+            // `[]` en el mismo paso, así que el estado no lo produce el
+            // demonio; y para los que quedaron así antes (`vasak-accounts#66`)
+            // no hay ninguna señal inequívoca que los separe de una pérdida
+            // —una cuenta sin secretos que pierde `accounts.json` deja el
+            // mismo directorio—. Equivocarse es la poda de `#56`, así que se
+            // falla cerrado y la salida es a mano: ver el README.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if never_held_accounts(directory)? {
-                    tracing::warn!(
-                        "{} no estaba en un directorio que nunca tuvo cuentas \
-                         (vasak-accounts#66); se escribe vacío",
-                        accounts_path.display()
-                    );
-                    write_private(&accounts_path, b"[]")?;
-                    AccountsFile::Present
-                } else {
-                    AccountsFile::Missing
-                }
+                tracing::warn!(
+                    "falta {} en un directorio que ya existía: no se contesta \
+                     lista vacía. Si esta persona nunca tuvo cuentas, crearlo a \
+                     mano con `[]` (root, 0600); ver el README",
+                    accounts_path.display()
+                );
+                AccountsFile::Missing
             }
             Err(source) => {
                 return Err(StorageError::Unreadable {
@@ -505,14 +525,10 @@ pub fn prepare_user_directory(directory: &Path) -> Result<AccountsFile, StorageE
 /// Lo mismo, para quien va a **escribir al lado** de las cuentas sin leerlas:
 /// las credenciales de un proveedor y el almacén de secretos.
 ///
-/// Un `accounts.json` que falta es un error también para ellos, y no por
-/// prolijidad: [`never_held_accounts`] decide mirando que la última escritura
-/// del directorio haya sido de un archivo que no es de una cuenta. Si después
-/// de perder `accounts.json` se pudiera guardar un `client_id`, esa escritura
-/// dejaría el directorio con cara de recién estrenado, y la apertura siguiente
-/// lo «recuperaría» con una lista vacía: la poda de `#56` por otra puerta. Así
-/// que, perdido el archivo, al lado no se escribe nada hasta que alguien lo
-/// resuelva.
+/// Un `accounts.json` que falta es un error también para ellos: al lado de una
+/// pérdida no se escribe nada hasta que alguien la mire. Si no, un `client_id`
+/// guardado encima de un directorio roto lo dejaría con cara de sano y movería
+/// las fechas que quien lo revise a mano puede necesitar.
 pub fn prepare_user_directory_for_write(directory: &Path) -> Result<(), StorageError> {
     match prepare_user_directory(directory)? {
         AccountsFile::Present => Ok(()),
@@ -520,95 +536,11 @@ pub fn prepare_user_directory_for_write(directory: &Path) -> Result<(), StorageE
             path: directory.join(AccountDatabase::FILE_NAME),
             source: std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                "falta en un directorio que tuvo cuentas; no se escribe nada al \
+                "falta en un directorio que ya existía; no se escribe nada al \
                  lado hasta que se resuelva",
             ),
         }),
     }
-}
-
-/// Lo único que puede haber en el directorio de alguien **que nunca tuvo
-/// cuentas**, además de `accounts.json`: sus credenciales propias de proveedor.
-/// No son de ninguna cuenta —son el `client_id` con el que se va a conectar
-/// una— y antes de `#66` las escribía `SetProviderCredentials` creando el
-/// directorio sin el archivo de cuentas.
-const NON_ACCOUNT_FILES: [&str; 1] = [crate::providers::UserCredentials::FILE_NAME];
-
-/// **Si un directorio sin `accounts.json` es de alguien que nunca tuvo
-/// cuentas**, que es la salida para los equipos que ya quedaron en el estado de
-/// `vasak-accounts#66`.
-///
-/// La pregunta es delicada porque la respuesta equivocada es la de `#56`: decir
-/// que sí a un archivo perdido le contesta lista vacía al sincronizador, y a
-/// los cinco minutos el podador borra el correo, el calendario y los
-/// contactos. Por eso sólo dice que sí cuando **las dos** cosas se cumplen, y
-/// ante cualquier duda —un archivo de más, un sistema de archivos que no sabe
-/// la fecha de creación— dice que no y el error sigue:
-///
-/// 1. **No hay nada que sea de una cuenta.** Se mira lo que hay, no lo que
-///    falta: la lista es de lo que se acepta ([`NON_ACCOUNT_FILES`]). Un
-///    `secrets.json` —aunque esté vacío—, un `accounts.tmp` de una escritura
-///    cortada o cualquier archivo desconocido alcanzan para decir que no.
-///
-/// 2. **Desde la última escritura nuestra no se sacó nada.** El punto 1 no
-///    alcanza solo: `RegisterAccount` acepta una cuenta sin secretos, así que
-///    alguien que tuvo una así y perdió `accounts.json` tiene un directorio
-///    vacío, igual que alguien que nunca tuvo nada. Lo que los separa es el
-///    tiempo de modificación del directorio, que cambia **cada vez que se
-///    agrega o se quita una entrada**: borrar `accounts.json` lo mueve. Si nunca
-///    se escribió nada adentro, el `mtime` del directorio es igual a su fecha
-///    de creación; si lo único que se escribió fue `providers.json`, es igual
-///    al `ctime` de ese archivo (el `rename` que lo deja en su lugar pone las
-///    dos marcas con el mismo instante). Un `mtime` posterior es una entrada
-///    que se fue, y eso es una pérdida.
-///
-/// Lo que queda afuera, y por qué se acepta: un directorio vacío que es punto
-/// de montaje de un disco que no montó tendría las mismas fechas que uno
-/// recién creado. Nada en VasakOS monta un disco en el directorio de una
-/// persona; si alguien lo hace a mano, el problema de `#56` ya lo tenía con el
-/// directorio padre.
-fn never_held_accounts(directory: &Path) -> Result<bool, StorageError> {
-    let unreadable = |source: std::io::Error| StorageError::Unreadable {
-        path: directory.to_path_buf(),
-        source,
-    };
-
-    let directory_meta = std::fs::symlink_metadata(directory).map_err(unreadable)?;
-    if !directory_meta.file_type().is_dir() {
-        return Ok(false);
-    }
-
-    // El instante de la última escritura nuestra que se acepta.
-    let mut last_known_write = None;
-    for entry in std::fs::read_dir(directory).map_err(unreadable)? {
-        let entry = entry.map_err(unreadable)?;
-        let name = entry.file_name();
-        if !NON_ACCOUNT_FILES.iter().any(|known| name == **known) {
-            return Ok(false);
-        }
-        // `DirEntry::metadata` no sigue enlaces: un symlink con ese nombre no
-        // es nuestro y no cuenta.
-        let meta = entry.metadata().map_err(unreadable)?;
-        if !meta.file_type().is_file() {
-            return Ok(false);
-        }
-        last_known_write = Some((meta.ctime(), meta.ctime_nsec()));
-    }
-
-    let reference = match last_known_write {
-        Some(instant) => instant,
-        // Vacío: la referencia es cuándo se creó. Sin fecha de creación no hay
-        // con qué comparar, y se dice que no.
-        None => match directory_meta.created() {
-            Ok(created) => match created.duration_since(std::time::UNIX_EPOCH) {
-                Ok(since) => (since.as_secs() as i64, i64::from(since.subsec_nanos())),
-                Err(_) => return Ok(false),
-            },
-            Err(_) => return Ok(false),
-        },
-    };
-
-    Ok((directory_meta.mtime(), directory_meta.mtime_nsec()) <= reference)
 }
 
 impl AccountDatabase {
@@ -903,31 +835,74 @@ impl SecretStore {
     }
 }
 
+/// Un temporal **propio de este intento**, al lado de `path`.
+///
+/// Antes era siempre `<nombre>.tmp`, compartido: dos escrituras concurrentes
+/// del mismo archivo —dos pedidos de D-Bus del mismo uid, que el demonio
+/// atiende a la vez— truncaban y escribían el mismo temporal, y lo que llegaba
+/// al `rename` podía ser una mezcla de las dos. Con un nombre por intento cada
+/// una escribe el suyo, y lo que queda en su lugar es una de las dos entera.
+/// Empieza con punto para no confundirse con un dato al listar el directorio.
+fn unique_temp_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    path.with_file_name(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()))
+}
+
+/// El temporal con los datos, creado 0600 y **sin seguir enlaces**:
+/// `create_new` es `O_CREAT | O_EXCL`, y el nombre es nuevo, así que nadie pudo
+/// dejar nada esperando ahí.
+fn write_temp(temp: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(temp)?;
+    file.write_all(data).and_then(|_| file.sync_all())
+}
+
 /// Writes a file only its owner can read, replacing it in one step.
 ///
 /// Created 0600 from the start rather than fixed up afterwards, so a token is
 /// never briefly world-readable; and renamed into place so an interrupted write
 /// cannot leave a half-written file where the credentials used to be.
+///
+/// El temporal es único por escritura: ver [`unique_temp_path`].
 pub fn write_private(path: &std::path::Path, data: &[u8]) -> Result<(), StorageError> {
-    use std::io::Write;
-
-    let temp = path.with_extension("tmp");
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&temp)?;
-
-    let written = file.write_all(data).and_then(|_| file.sync_all());
-    drop(file);
-
-    match written.and_then(|_| std::fs::rename(&temp, path)) {
+    let temp = unique_temp_path(path);
+    match write_temp(&temp, data).and_then(|_| std::fs::rename(&temp, path)) {
         Ok(()) => Ok(()),
         Err(error) => {
             let _ = std::fs::remove_file(&temp);
             Err(StorageError::Io(error))
         }
+    }
+}
+
+/// Escribe un archivo privado **sólo si no hay ninguno con ese nombre**.
+///
+/// Es la escritura inicial de `accounts.json`. Con `write_private` —que
+/// reemplaza— había una carrera: dos pedidos del mismo uid ven a la vez que el
+/// directorio no existía, uno guarda una cuenta, y el `rename` del `[]` del otro
+/// la pisa sin error. Acá el temporal (único) se **enlaza** en su lugar con
+/// `hard_link`, que es `link(2)`: falla con `AlreadyExists` si ya hay algo con
+/// ese nombre —archivo, carpeta o symlink, sin seguirlo— y nunca reemplaza.
+/// Y `AlreadyExists` no es un error: es que otro llegó primero, y lo que
+/// dejó es lo que se lee.
+///
+/// Devuelve si lo creó esta llamada.
+fn create_private_new(path: &Path, data: &[u8]) -> Result<bool, StorageError> {
+    let temp = unique_temp_path(path);
+    let linked = write_temp(&temp, data).and_then(|_| std::fs::hard_link(&temp, path));
+    let _ = std::fs::remove_file(&temp);
+    match linked {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(StorageError::Io(error)),
     }
 }
 
@@ -1177,11 +1152,6 @@ pub(crate) mod tests {
 
         // El disco no montó, o algo se lo llevó.
         std::fs::remove_file(dir.join("accounts.json")).unwrap();
-        // Y pasa el tiempo: una pérdida de verdad llega después de la última
-        // escritura, y eso es lo que el directorio registra. Sin esto, crear y
-        // borrar en el mismo tic del reloj del sistema de archivos se parece a
-        // un directorio que nunca se tocó (ver `never_held_accounts`).
-        touch_directory_later(&dir);
 
         let mut otra = AccountDatabase::in_directory(dir.clone()).unwrap();
         let error = otra
@@ -1533,11 +1503,6 @@ pub(crate) mod tests {
         db.load().unwrap();
         db.add(sample_account()).unwrap();
         std::fs::remove_file(dir.join("accounts.json")).unwrap();
-        // Y pasa el tiempo: una pérdida de verdad llega después de la última
-        // escritura, y eso es lo que el directorio registra. Sin esto, crear y
-        // borrar en el mismo tic del reloj del sistema de archivos se parece a
-        // un directorio que nunca se tocó (ver `never_held_accounts`).
-        touch_directory_later(&dir);
 
         let mut otra = AccountDatabase::in_directory(dir.clone()).unwrap();
         let mensaje = otra.load().unwrap_err().to_string();
@@ -1557,11 +1522,6 @@ pub(crate) mod tests {
         db.load().unwrap();
         db.add(sample_account()).unwrap();
         std::fs::remove_file(dir.join("accounts.json")).unwrap();
-        // Y pasa el tiempo: una pérdida de verdad llega después de la última
-        // escritura, y eso es lo que el directorio registra. Sin esto, crear y
-        // borrar en el mismo tic del reloj del sistema de archivos se parece a
-        // un directorio que nunca se tocó (ver `never_held_accounts`).
-        touch_directory_later(&dir);
 
         // Esto es lo que hace `open_db`, que es el arranque de `ListAccounts`: el
         // error se traduce a un error de D-Bus y `ListAccounts` no llega a armar
@@ -1578,24 +1538,12 @@ pub(crate) mod tests {
 
     // -----------------------------------------------------------------------
     // vasak-accounts#66: el directorio nunca queda sin `accounts.json` por
-    // culpa nuestra, y lo que ya quedó así sale sin reabrir #56.
+    // culpa nuestra, y lo que ya quedó así falla cerrado.
     // -----------------------------------------------------------------------
 
     /// Un directorio nuevo en una carpeta de prueba, sin crearlo.
     fn new_directory() -> PathBuf {
         std::env::temp_dir().join(uuid::Uuid::new_v4().to_string())
-    }
-
-    /// Mueve el `mtime` del directorio al futuro: lo que hace el paso del
-    /// tiempo entre que se escribió algo y que algo se lo llevó. Sin esto, una
-    /// prueba que crea y borra en el mismo instante del reloj del sistema de
-    /// archivos no se distingue de un directorio que nunca se tocó.
-    fn touch_directory_later(directory: &Path) {
-        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
-        std::fs::File::open(directory)
-            .unwrap()
-            .set_modified(later)
-            .unwrap();
     }
 
     /// El estado que dejaba la versión anterior: el directorio y el marcador,
@@ -1615,27 +1563,42 @@ pub(crate) mod tests {
         );
     }
 
+    fn open_and_load(dir: &Path) -> Result<AccountDatabase, StorageError> {
+        let mut db = AccountDatabase::in_directory(dir.to_path_buf())?;
+        db.load()?;
+        Ok(db)
+    }
+
+    /// Ningún temporal tiene que quedar al lado: el de cada escritura es único
+    /// y se borra al terminar.
+    fn temp_files_in(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect()
+    }
+
     /// **El caso de #66.** La primera apertura creaba el directorio y contestaba
     /// vacío; la segunda encontraba el directorio sin archivo y daba error para
     /// siempre. La prueba de antes abría una sola vez.
     #[test]
-    fn abrir_dos_veces_un_directorio_nuevo_carga_vacio_las_dos_veces() {
+    fn abrir_tres_veces_un_directorio_nuevo_carga_vacio_las_tres_veces() {
         let dir = new_directory();
 
         for vez in 1..=3 {
-            let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
-            db.load()
+            let db = open_and_load(&dir)
                 .unwrap_or_else(|e| panic!("apertura {vez}: no tenía que fallar: {e}"));
             assert!(db.is_empty());
         }
 
         // Y el archivo queda escrito como lo escribe `save()`: `[]`, 0600, y
-        // sin el temporal al lado.
+        // sin temporales al lado.
         let accounts = dir.join("accounts.json");
         assert_eq!(std::fs::read_to_string(&accounts).unwrap(), "[]");
         let mode = std::fs::metadata(&accounts).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
-        assert!(!dir.join("accounts.tmp").exists());
+        assert!(temp_files_in(&dir).is_empty(), "{:?}", temp_files_in(&dir));
 
         remove_test_database(&dir);
     }
@@ -1659,9 +1622,7 @@ pub(crate) mod tests {
         assert!(dir.join("accounts.json").exists());
         assert!(marker_for(&dir).unwrap().exists());
         for _ in 0..2 {
-            let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
-            db.load()
-                .expect("sin cuentas, la lista es vacía y no un error");
+            let db = open_and_load(&dir).expect("sin cuentas, la lista es vacía y no un error");
             assert!(db.is_empty());
         }
 
@@ -1675,51 +1636,55 @@ pub(crate) mod tests {
         SecretStore::store_secret_in(&dir, "acct-1", "access", "token").unwrap();
 
         assert!(dir.join("accounts.json").exists());
-        let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
-        db.load().unwrap();
+        open_and_load(&dir).unwrap();
 
         remove_test_database(&dir);
     }
 
-    /// **La salida para los equipos que ya están en el estado de #66**: un
-    /// directorio vacío que nunca se tocó desde que se creó es de alguien que
-    /// nunca tuvo cuentas. Se escribe `[]` y se sigue — y desde ahí es un
-    /// directorio como cualquier otro.
+    /// **Lo que ya quedó roto falla cerrado.** Un directorio vacío con marcador
+    /// es lo que dejaba #66, pero también lo que deja una cuenta sin secretos
+    /// que pierde `accounts.json`: no hay cómo separarlos sin adivinar, y
+    /// adivinar mal es la poda de #56. No se escribe `[]`.
+    ///
+    /// Y la salida a mano que documenta el README funciona: `[]` con 0600.
     #[test]
-    fn el_estado_de_66_sin_rastros_se_recupera() {
+    fn el_estado_de_66_falla_cerrado_y_sale_con_el_paso_a_mano() {
         let dir = issue_66_state();
 
         for _ in 0..2 {
-            let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
-            db.load()
-                .expect("un directorio que nunca tuvo cuentas se recupera");
-            assert!(db.is_empty());
+            assert_unreadable(open_and_load(&dir).map(|_| ()));
         }
-        assert_eq!(
-            std::fs::read_to_string(dir.join("accounts.json")).unwrap(),
-            "[]"
+        assert!(
+            !dir.join("accounts.json").exists(),
+            "se escribió una lista vacía sin saber si hubo cuentas"
         );
+
+        // El paso del README.
+        std::fs::write(dir.join("accounts.json"), "[]").unwrap();
+        std::fs::set_permissions(
+            dir.join("accounts.json"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let db = open_and_load(&dir).expect("con el archivo puesto a mano, carga");
+        assert!(db.is_empty());
 
         remove_test_database(&dir);
     }
 
-    /// Lo mismo cuando el directorio lo había creado `SetProviderCredentials`:
-    /// lo único adentro es `providers.json`, que no es de ninguna cuenta.
+    /// Lo mismo cuando lo que hay adentro es sólo `providers.json`: tampoco
+    /// prueba que no haya habido cuentas.
     #[test]
-    fn el_estado_de_66_con_solo_credenciales_de_proveedor_se_recupera() {
+    fn el_estado_de_66_con_credenciales_de_proveedor_tambien_falla_cerrado() {
         let dir = issue_66_state();
-        // Como lo escribía la versión anterior: temporal y `rename`.
         write_private(
             &dir.join("providers.json"),
             br#"{"google":{"client_id":"x"}}"#,
         )
         .unwrap();
 
-        let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
-        db.load()
-            .expect("las credenciales de proveedor no son una cuenta");
-        assert!(db.is_empty());
-        // Y no se las tocó.
+        assert_unreadable(open_and_load(&dir).map(|_| ()));
+        assert!(!dir.join("accounts.json").exists());
         assert!(std::fs::read_to_string(dir.join("providers.json"))
             .unwrap()
             .contains("client_id"));
@@ -1727,91 +1692,44 @@ pub(crate) mod tests {
         remove_test_database(&dir);
     }
 
-    /// Un `secrets.json` al lado es un rastro de cuenta: el error de #56 sigue,
-    /// y no se escribe nada.
+    /// Un `secrets.json` al lado: el error de #56 sigue, y no se escribe nada.
     #[test]
     fn con_secretos_al_lado_falta_accounts_json_sigue_siendo_error() {
         let dir = issue_66_state();
         write_private(&dir.join("secrets.json"), br#"{"acct-1":{"access":"t"}}"#).unwrap();
 
-        assert_unreadable(AccountDatabase::in_directory(dir.clone()).and_then(|mut db| db.load()));
-        assert!(
-            !dir.join("accounts.json").exists(),
-            "se escribió una lista vacía encima de una pérdida"
-        );
-
-        // Y lo mismo con uno vacío: lo deja así `forget_account` al borrar la
-        // última cuenta, así que también dice que hubo cuentas.
-        write_private(&dir.join("secrets.json"), b"{}").unwrap();
-        assert_unreadable(AccountDatabase::in_directory(dir.clone()).and_then(|mut db| db.load()));
-
-        remove_test_database(&dir);
-    }
-
-    /// Cualquier cosa fuera de la lista de lo aceptado es un rastro: acá, el
-    /// temporal de una escritura de cuentas que se cortó.
-    #[test]
-    fn un_archivo_desconocido_al_lado_sigue_siendo_error() {
-        let dir = issue_66_state();
-        std::fs::write(dir.join("accounts.tmp"), "[{\"id\":\"a\"}]").unwrap();
-
-        assert_unreadable(AccountDatabase::in_directory(dir.clone()).and_then(|mut db| db.load()));
+        assert_unreadable(open_and_load(&dir).map(|_| ()));
         assert!(!dir.join("accounts.json").exists());
 
         remove_test_database(&dir);
     }
 
-    /// **El caso que el punto 1 solo no cubre**: una cuenta sin secretos
-    /// —`RegisterAccount` lo permite— que pierde `accounts.json` deja un
-    /// directorio vacío, igual que el de alguien sin cuentas. Lo que delata la
-    /// pérdida es que el directorio se modificó después de crearse.
+    /// Una cuenta sin secretos —`RegisterAccount` lo permite— que pierde
+    /// `accounts.json` deja un directorio vacío, igual al de #66. Es el caso
+    /// que hace imposible recuperar este último sin adivinar.
     #[test]
     fn una_cuenta_sin_secretos_que_pierde_accounts_json_sigue_siendo_error() {
         let dir = new_directory();
-        let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
-        db.load().unwrap();
+        let mut db = open_and_load(&dir).unwrap();
         db.add(sample_account()).unwrap();
 
         std::fs::remove_file(dir.join("accounts.json")).unwrap();
-        touch_directory_later(&dir);
         assert!(std::fs::read_dir(&dir).unwrap().next().is_none());
 
-        assert_unreadable(AccountDatabase::in_directory(dir.clone()).and_then(|mut db| db.load()));
+        assert_unreadable(open_and_load(&dir).map(|_| ()));
         assert!(!dir.join("accounts.json").exists());
 
         remove_test_database(&dir);
     }
 
-    /// Lo mismo con `providers.json` al lado: lo que cuenta es que el
-    /// directorio cambió **después** de la última escritura de ese archivo.
-    #[test]
-    fn credenciales_de_proveedor_y_una_perdida_posterior_siguen_siendo_error() {
-        let dir = issue_66_state();
-        write_private(&dir.join("providers.json"), b"{}").unwrap();
-        // Una cuenta que se escribió y se perdió después.
-        std::fs::write(dir.join("accounts.json"), "[]").unwrap();
-        std::fs::remove_file(dir.join("accounts.json")).unwrap();
-        touch_directory_later(&dir);
-
-        assert_unreadable(AccountDatabase::in_directory(dir.clone()).and_then(|mut db| db.load()));
-        assert!(!dir.join("accounts.json").exists());
-
-        remove_test_database(&dir);
-    }
-
-    /// **Con `accounts.json` perdido, al lado no se escribe nada.** Si guardar un
-    /// `client_id` funcionara, esa escritura dejaría el directorio con la cara
-    /// de uno recién estrenado —la última modificación sería la de
-    /// `providers.json`— y la apertura siguiente lo recuperaría con una lista
-    /// vacía: la poda de #56 por otra puerta.
+    /// **Con `accounts.json` perdido, al lado no se escribe nada**: ni
+    /// credenciales de proveedor ni secretos. Y la pérdida se sigue viendo.
     #[test]
     fn con_accounts_json_perdido_no_se_guardan_credenciales_ni_secretos() {
         let dir = new_directory();
-        let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
-        db.load().unwrap();
+        let mut db = open_and_load(&dir).unwrap();
         db.add(sample_account()).unwrap();
         std::fs::remove_file(dir.join("accounts.json")).unwrap();
-        touch_directory_later(&dir);
 
         let credentials = crate::providers::UserCredentials::store_in(
             &dir,
@@ -1830,16 +1748,15 @@ pub(crate) mod tests {
         assert!(SecretStore::store_secret_in(&dir, "acct-1", "access", "t").is_err());
         assert!(!dir.join("secrets.json").exists());
 
-        // Y la pérdida se sigue viendo.
-        assert_unreadable(AccountDatabase::in_directory(dir.clone()).and_then(|mut db| db.load()));
+        assert_unreadable(open_and_load(&dir).map(|_| ()));
 
         remove_test_database(&dir);
     }
 
     /// Un symlink en el nombre de `accounts.json` no es «no hay archivo»: no se
-    /// recupera, y sobre todo no se escribe por él — el demonio es root.
+    /// reemplaza, y sobre todo no se escribe por él — el demonio es root.
     #[test]
-    fn un_symlink_colgante_en_accounts_json_no_se_recupera_ni_se_sigue() {
+    fn un_symlink_colgante_en_accounts_json_no_se_reemplaza_ni_se_sigue() {
         let dir = issue_66_state();
         let target = dir.with_file_name(format!(
             "destino-{}",
@@ -1847,8 +1764,122 @@ pub(crate) mod tests {
         ));
         std::os::unix::fs::symlink(&target, dir.join("accounts.json")).unwrap();
 
-        assert_unreadable(AccountDatabase::in_directory(dir.clone()).and_then(|mut db| db.load()));
+        assert_unreadable(open_and_load(&dir).map(|_| ()));
         assert!(!target.exists(), "se escribió por el symlink");
+
+        // Y la escritura inicial tampoco lo pisa ni lo sigue.
+        assert!(!create_private_new(&dir.join("accounts.json"), b"[]").unwrap());
+        assert!(!target.exists(), "se escribió por el symlink");
+        assert!(std::fs::symlink_metadata(dir.join("accounts.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        remove_test_database(&dir);
+    }
+
+    /// **La escritura inicial nunca reemplaza.** Es lo que cierra la carrera
+    /// entre dos pedidos del mismo uid: si otro ya guardó una cuenta, el `[]`
+    /// de éste no la pisa. Con `write_private` —que hace `rename`— la cuenta se
+    /// perdía sin error.
+    #[test]
+    fn la_escritura_inicial_no_pisa_un_accounts_json_existente() {
+        let dir = new_directory();
+        let mut db = open_and_load(&dir).unwrap();
+        let id = db.add(sample_account()).unwrap();
+        let path = dir.join("accounts.json");
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        assert!(
+            !create_private_new(&path, b"[]").unwrap(),
+            "dijo que lo creó, y ya había uno"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert!(open_and_load(&dir).unwrap().get(&id).is_some());
+        assert!(temp_files_in(&dir).is_empty(), "{:?}", temp_files_in(&dir));
+
+        remove_test_database(&dir);
+    }
+
+    /// La carrera de verdad, con hilos: muchos pedidos abren a la vez un
+    /// directorio que no existe, y uno guarda una cuenta apenas abre. La
+    /// cuenta tiene que estar al final, en todas las vueltas.
+    #[test]
+    fn abrir_a_la_vez_desde_muchos_hilos_no_pisa_la_cuenta_guardada() {
+        const THREADS: usize = 8;
+        for _ in 0..200 {
+            let dir = new_directory();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+            let handles: Vec<_> = (0..THREADS)
+                .map(|n| {
+                    let dir = dir.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        let mut db = AccountDatabase::in_directory(dir).unwrap();
+                        if n == 0 {
+                            db.load().unwrap();
+                            Some(db.add(sample_account()).unwrap())
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect();
+            let ids: Vec<String> = handles
+                .into_iter()
+                .filter_map(|h| h.join().unwrap())
+                .collect();
+
+            let db = open_and_load(&dir).expect("después de la carrera, carga");
+            assert!(
+                db.get(&ids[0]).is_some(),
+                "una apertura concurrente pisó la cuenta recién guardada"
+            );
+            assert!(temp_files_in(&dir).is_empty(), "{:?}", temp_files_in(&dir));
+            remove_test_database(&dir);
+        }
+    }
+
+    /// Dos escrituras a la vez del mismo archivo dejan **una de las dos
+    /// entera**. Con el temporal compartido de antes (`<nombre>.tmp`) las dos
+    /// truncaban y escribían el mismo archivo, y lo que se renombraba podía ser
+    /// una mezcla.
+    #[test]
+    fn dos_escrituras_a_la_vez_dejan_una_entera() {
+        let dir = new_directory();
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("secrets.json");
+        let payloads = [vec![b'a'; 1 << 20], vec![b'b'; 1 << 19]];
+
+        for _ in 0..30 {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let handles: Vec<_> = payloads
+                .iter()
+                .cloned()
+                .map(|data| {
+                    let path = path.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        // Una puede perder la carrera del `rename` contra la
+                        // otra; lo que importa es lo que queda.
+                        let _ = write_private(&path, &data);
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            let written = std::fs::read(&path).unwrap();
+            assert!(
+                payloads.contains(&written),
+                "quedó una mezcla de {} bytes",
+                written.len()
+            );
+        }
+        assert!(temp_files_in(&dir).is_empty(), "{:?}", temp_files_in(&dir));
 
         remove_test_database(&dir);
     }
@@ -2052,10 +2083,11 @@ pub(crate) mod tests {
         assert!(!cuentas[0].needs_reauth);
     }
 
+    /// Sin crearlo: lo crea el almacén al guardar, por el mismo camino que la
+    /// base. Un directorio vacío creado a mano es, desde #66, un directorio
+    /// sin `accounts.json`, y ahí no se escribe nada.
     fn temp_dir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        new_directory()
     }
 
     #[test]
@@ -2091,7 +2123,7 @@ pub(crate) mod tests {
             & 0o777;
         assert_eq!(mode, 0o600);
         assert!(
-            !dir.join("secrets.tmp").exists(),
+            temp_files_in(&dir).is_empty(),
             "no temporary file should be left holding a token"
         );
 
