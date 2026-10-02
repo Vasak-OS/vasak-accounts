@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -260,8 +260,8 @@ const MARKER_PREFIX: &str = ".instalado-";
 
 /// El marcador de un directorio: **un archivo al lado**, no adentro.
 ///
-/// `directory_existed` dice si el directorio estaba cuando se abrió la base, y
-/// no alcanza. Si el directorio entero desaparece —el disco no montó, alguien
+/// `directory_existed` —en [`prepare_user_directory`]— dice si el directorio
+/// estaba cuando se abrió la base, y no alcanza. Si el directorio entero desaparece —el disco no montó, alguien
 /// limpió `/var/lib`, un sistema de archivos se rehízo— la próxima vez
 /// `in_directory` lo **vuelve a crear** y `directory_existed` vuelve a decir
 /// `false`, exactamente igual que en la primera instalación. De ahí sale una
@@ -271,7 +271,7 @@ const MARKER_PREFIX: &str = ".instalado-";
 /// que ningún programa de la sesión puede tocar— así que sobrevive a la pérdida
 /// del directorio. Un archivo de largo cero: no dice nada, sólo está o no está.
 ///
-/// **No reemplaza a `directory_existed`**: son las dos mitades. El campo dice
+/// **No reemplaza a `directory_existed`**: son las dos mitades. Ése dice
 /// si el directorio estaba en esta llamada; el marcador dice si existió alguna
 /// vez. Un directorio que aparece por primera vez no tiene marcador y no es un
 /// error; uno que desaparece teniendo marcador sí lo es.
@@ -356,15 +356,259 @@ fn marker_exists(marker: &Path) -> Result<bool, StorageError> {
 
 pub struct AccountDatabase {
     path: PathBuf,
-    /// Si el directorio de la persona **ya existía** al abrir su base.
-    ///
-    /// Es lo que separa «todavía no hay cuentas» de «el archivo que las guardaba
-    /// no está», que por la respuesta se confunden. Borrar la última cuenta
-    /// nunca borra el archivo: [`AccountDatabase::remove`] escribe `[]` en él.
-    /// Así que un directorio que ya estaba y no tiene `accounts.json` no es una
-    /// cuenta nueva, es algo que se llevó el archivo o que no se puede leer.
-    directory_existed: bool,
     pub accounts: Vec<Account>,
+}
+
+/// Lo que [`prepare_user_directory`] encontró en el lugar de `accounts.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountsFile {
+    /// Hay algo con ese nombre. Si es el archivo y se puede leer lo decide
+    /// [`AccountDatabase::load`], que es quien lo lee.
+    Present,
+    /// No hay nada, en un directorio que ya tenía datos y en el que algo dice
+    /// que hubo cuentas: es una pérdida, no una persona sin cuentas.
+    Missing,
+}
+
+/// El directorio de una persona, listo para usar: creado si faltaba, con el
+/// marcador al lado y **con `accounts.json` adentro**.
+///
+/// **Todo lo que crea el directorio pasa por acá**: la base de cuentas, las
+/// credenciales propias de un proveedor (`SetProviderCredentials`) y el almacén
+/// de secretos. Antes cada uno lo creaba por su cuenta con `create_dir_all`, y
+/// ninguno escribía `accounts.json` — sólo `save()` lo hacía, y una lectura no
+/// guarda. Así quedaba un directorio que existe, con marcador y sin archivo,
+/// que es justo lo que la guardia de `vasak-accounts#56` lee como «el archivo
+/// se perdió»: desde la segunda llamada, toda persona sin cuentas veía
+/// «no se pudo leer accounts.json» para siempre (`vasak-accounts#66`).
+///
+/// La regla ahora es que **el directorio nunca existe sin `accounts.json` por
+/// culpa nuestra**: el que lo crea escribe `[]` en el mismo paso, con la misma
+/// escritura privada y atómica que `save()`. Con eso, «directorio sin archivo»
+/// vuelve a significar una sola cosa —que algo se lo llevó— y la guardia de
+/// `#56` queda igual de estricta.
+///
+/// `accounts.json` se escribe **antes** que el marcador: si el marcador falla,
+/// la próxima apertura encuentra el archivo y lo vuelve a intentar; al revés,
+/// quedaría marcador sin archivo, que es el estado roto.
+pub fn prepare_user_directory(directory: &Path) -> Result<AccountsFile, StorageError> {
+    // Antes de crearla, y preguntando por el motivo: `Path::exists()`
+    // devuelve `false` también cuando lo que falló fue un permiso o el
+    // disco, así que un directorio al que no se puede leer se confunde con
+    // uno que todavía no se creó — y esa confusión es la mitad del problema
+    // que `load` resuelve.
+    let directory_existed = match std::fs::metadata(directory) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(source) => {
+            return Err(StorageError::Unreadable {
+                path: directory.to_path_buf(),
+                source,
+            });
+        }
+    };
+
+    // Y la otra mitad, la de afuera del directorio: alguien que ya tuvo
+    // cuentas y a quien le desapareció el directorio entero. Sin esto,
+    // `create_dir_all` de abajo lo volvería a crear y quedaría
+    // indistinguible de una instalación nueva.
+    let marker = marker_for(directory);
+    let marked = match &marker {
+        Some(marker) => marker_exists(marker)?,
+        // Un directorio sin nombre —la raíz itself— no tiene dónde dejar el
+        // marcador: se comporta como hasta ahora.
+        None => false,
+    };
+    if marked && !directory_existed {
+        return Err(StorageError::Unreadable {
+            path: directory.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "el directorio no está, pero {} dice que existió; \
+                     no se lo vuelve a crear en silencio",
+                    marker.expect("marked implica que hay marcador").display()
+                ),
+            ),
+        });
+    }
+
+    std::fs::create_dir_all(directory)?;
+    // 0700: the listing alone says which accounts exist.
+    let _ = std::fs::set_permissions(directory, PermissionsExt::from_mode(0o700));
+
+    let accounts_path = directory.join(AccountDatabase::FILE_NAME);
+    let state = if !directory_existed {
+        // Recién creado: no hay nada que perder, y es el momento de dejar el
+        // archivo para que la próxima apertura no lo eche de menos.
+        write_private(&accounts_path, b"[]")?;
+        AccountsFile::Present
+    } else {
+        match std::fs::symlink_metadata(&accounts_path) {
+            // Cualquier cosa con ese nombre —también un symlink o una
+            // carpeta— la juzga `load`, que la lee. Acá no se pisa nada.
+            Ok(_) => AccountsFile::Present,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if never_held_accounts(directory)? {
+                    tracing::warn!(
+                        "{} no estaba en un directorio que nunca tuvo cuentas \
+                         (vasak-accounts#66); se escribe vacío",
+                        accounts_path.display()
+                    );
+                    write_private(&accounts_path, b"[]")?;
+                    AccountsFile::Present
+                } else {
+                    AccountsFile::Missing
+                }
+            }
+            Err(source) => {
+                return Err(StorageError::Unreadable {
+                    path: accounts_path,
+                    source,
+                });
+            }
+        }
+    };
+
+    // El marcador se deja puesto en los dos caminos en que puede faltar: una
+    // instalación nueva y una vieja que todavía no lo tenía. Así, la
+    // próxima vez que el directorio falte, el hueco se ve.
+    //
+    // **Si no se puede, es un error, y no se sigue.**
+    //
+    // La tentación es avisar en el diario y seguir, y parece inofensiva: el
+    // padre es de root, y si no fuera escribible `create_dir_all` de arriba
+    // ya habría fallado. Pero esa es justo la falsa tranquilidad. Lo que
+    // queda es un symlink colgante en el nombre del marcador o un disco
+    // lleno — `ENOSPC` — y en los dos casos **no** es un estado degradado
+    // pero en servicio: es un estado en el que el demonio acaba de no poder
+    // registrar que esta cuenta existe. Si se sigue, la próxima pérdida del
+    // directorio se lee como instalación nueva, la carga contesta lista
+    // vacía, y el podador borra las bases locales y la clave. Eso es
+    // exactamente el bug de `vasak-accounts#56`, reintroducido por la puerta
+    // de atrás: el marcador tiene que ser **fail closed**.
+    //
+    // Y el error no deja a nadie a la vista: el sincronizador trata un
+    // `ListAccounts` fallido como `AccountListing::Failed`, que es
+    // «no borrar nada». Lo que se pierde es la lista de cuentas en
+    // Configuración, y eso se arregla mirando el diario; lo que se gana es
+    // que no haya dos listados vacíos que borren el correo de la persona.
+    if let Some(marker) = marker {
+        if !marked {
+            write_marker(&marker)?;
+        }
+    }
+
+    Ok(state)
+}
+
+/// Lo mismo, para quien va a **escribir al lado** de las cuentas sin leerlas:
+/// las credenciales de un proveedor y el almacén de secretos.
+///
+/// Un `accounts.json` que falta es un error también para ellos, y no por
+/// prolijidad: [`never_held_accounts`] decide mirando que la última escritura
+/// del directorio haya sido de un archivo que no es de una cuenta. Si después
+/// de perder `accounts.json` se pudiera guardar un `client_id`, esa escritura
+/// dejaría el directorio con cara de recién estrenado, y la apertura siguiente
+/// lo «recuperaría» con una lista vacía: la poda de `#56` por otra puerta. Así
+/// que, perdido el archivo, al lado no se escribe nada hasta que alguien lo
+/// resuelva.
+pub fn prepare_user_directory_for_write(directory: &Path) -> Result<(), StorageError> {
+    match prepare_user_directory(directory)? {
+        AccountsFile::Present => Ok(()),
+        AccountsFile::Missing => Err(StorageError::Unreadable {
+            path: directory.join(AccountDatabase::FILE_NAME),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "falta en un directorio que tuvo cuentas; no se escribe nada al \
+                 lado hasta que se resuelva",
+            ),
+        }),
+    }
+}
+
+/// Lo único que puede haber en el directorio de alguien **que nunca tuvo
+/// cuentas**, además de `accounts.json`: sus credenciales propias de proveedor.
+/// No son de ninguna cuenta —son el `client_id` con el que se va a conectar
+/// una— y antes de `#66` las escribía `SetProviderCredentials` creando el
+/// directorio sin el archivo de cuentas.
+const NON_ACCOUNT_FILES: [&str; 1] = [crate::providers::UserCredentials::FILE_NAME];
+
+/// **Si un directorio sin `accounts.json` es de alguien que nunca tuvo
+/// cuentas**, que es la salida para los equipos que ya quedaron en el estado de
+/// `vasak-accounts#66`.
+///
+/// La pregunta es delicada porque la respuesta equivocada es la de `#56`: decir
+/// que sí a un archivo perdido le contesta lista vacía al sincronizador, y a
+/// los cinco minutos el podador borra el correo, el calendario y los
+/// contactos. Por eso sólo dice que sí cuando **las dos** cosas se cumplen, y
+/// ante cualquier duda —un archivo de más, un sistema de archivos que no sabe
+/// la fecha de creación— dice que no y el error sigue:
+///
+/// 1. **No hay nada que sea de una cuenta.** Se mira lo que hay, no lo que
+///    falta: la lista es de lo que se acepta ([`NON_ACCOUNT_FILES`]). Un
+///    `secrets.json` —aunque esté vacío—, un `accounts.tmp` de una escritura
+///    cortada o cualquier archivo desconocido alcanzan para decir que no.
+///
+/// 2. **Desde la última escritura nuestra no se sacó nada.** El punto 1 no
+///    alcanza solo: `RegisterAccount` acepta una cuenta sin secretos, así que
+///    alguien que tuvo una así y perdió `accounts.json` tiene un directorio
+///    vacío, igual que alguien que nunca tuvo nada. Lo que los separa es el
+///    tiempo de modificación del directorio, que cambia **cada vez que se
+///    agrega o se quita una entrada**: borrar `accounts.json` lo mueve. Si nunca
+///    se escribió nada adentro, el `mtime` del directorio es igual a su fecha
+///    de creación; si lo único que se escribió fue `providers.json`, es igual
+///    al `ctime` de ese archivo (el `rename` que lo deja en su lugar pone las
+///    dos marcas con el mismo instante). Un `mtime` posterior es una entrada
+///    que se fue, y eso es una pérdida.
+///
+/// Lo que queda afuera, y por qué se acepta: un directorio vacío que es punto
+/// de montaje de un disco que no montó tendría las mismas fechas que uno
+/// recién creado. Nada en VasakOS monta un disco en el directorio de una
+/// persona; si alguien lo hace a mano, el problema de `#56` ya lo tenía con el
+/// directorio padre.
+fn never_held_accounts(directory: &Path) -> Result<bool, StorageError> {
+    let unreadable = |source: std::io::Error| StorageError::Unreadable {
+        path: directory.to_path_buf(),
+        source,
+    };
+
+    let directory_meta = std::fs::symlink_metadata(directory).map_err(unreadable)?;
+    if !directory_meta.file_type().is_dir() {
+        return Ok(false);
+    }
+
+    // El instante de la última escritura nuestra que se acepta.
+    let mut last_known_write = None;
+    for entry in std::fs::read_dir(directory).map_err(unreadable)? {
+        let entry = entry.map_err(unreadable)?;
+        let name = entry.file_name();
+        if !NON_ACCOUNT_FILES.iter().any(|known| name == **known) {
+            return Ok(false);
+        }
+        // `DirEntry::metadata` no sigue enlaces: un symlink con ese nombre no
+        // es nuestro y no cuenta.
+        let meta = entry.metadata().map_err(unreadable)?;
+        if !meta.file_type().is_file() {
+            return Ok(false);
+        }
+        last_known_write = Some((meta.ctime(), meta.ctime_nsec()));
+    }
+
+    let reference = match last_known_write {
+        Some(instant) => instant,
+        // Vacío: la referencia es cuándo se creó. Sin fecha de creación no hay
+        // con qué comparar, y se dice que no.
+        None => match directory_meta.created() {
+            Ok(created) => match created.duration_since(std::time::UNIX_EPOCH) {
+                Ok(since) => (since.as_secs() as i64, i64::from(since.subsec_nanos())),
+                Err(_) => return Ok(false),
+            },
+            Err(_) => return Ok(false),
+        },
+    };
+
+    Ok((directory_meta.mtime(), directory_meta.mtime_nsec()) <= reference)
 }
 
 impl AccountDatabase {
@@ -401,84 +645,13 @@ impl AccountDatabase {
     /// Opens a database in a specific directory. The per-user path resolves to
     /// this; tests use it directly so they do not have to share a process-wide
     /// setting and can run alongside each other.
+    ///
+    /// Un `accounts.json` que falta no es un error **acá**: lo es al leerlo,
+    /// en [`AccountDatabase::load`], que es donde lo esperan quienes llaman.
     pub fn in_directory(directory: PathBuf) -> Result<Self, StorageError> {
-        // Antes de crearla, y preguntando por el motivo: `Path::exists()`
-        // devuelve `false` también cuando lo que falló fue un permiso o el
-        // disco, así que un directorio al que no se puede leer se confunde con
-        // uno que todavía no se creó — y esa confusión es la mitad del problema
-        // que `load` resuelve.
-        let directory_existed = match std::fs::metadata(&directory) {
-            Ok(_) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(source) => {
-                return Err(StorageError::Unreadable {
-                    path: directory,
-                    source,
-                });
-            }
-        };
-
-        // Y la otra mitad, la de afuera del directorio: alguien que ya tuvo
-        // cuentas y a quien le desapareció el directorio entero. Sin esto,
-        // `create_dir_all` de abajo lo volvería a crear y quedaría
-        // indistinguible de una instalación nueva.
-        let marker = marker_for(&directory);
-        let marcado = match &marker {
-            Some(marker) => marker_exists(marker)?,
-            // Un directorio sin nombre —la raíz itself— no tiene dónde dejar el
-            // marcador: se comporta como hasta ahora.
-            None => false,
-        };
-        if marcado && !directory_existed {
-            return Err(StorageError::Unreadable {
-                path: directory.clone(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!(
-                        "el directorio no está, pero {} dice que existió; \
-                         no se lo vuelve a crear en silencio",
-                        marker.expect("marcado implica que hay marcador").display()
-                    ),
-                ),
-            });
-        }
-
-        std::fs::create_dir_all(&directory)?;
-        // 0700: the listing alone says which accounts exist.
-        let _ = std::fs::set_permissions(&directory, PermissionsExt::from_mode(0o700));
-
-        // El marcador se deja puesto en los dos caminos en que puede faltar: una
-        // instalación nueva y una vieja que todavía no lo tenía. Así, la
-        // próxima vez que el directorio falte, el hueco se ve.
-        //
-        // **Si no se puede, es un error, y no se sigue.**
-        //
-        // La tentación es avisar en el diario y seguir, y parece inofensiva: el
-        // padre es de root, y si no fuera escribible `create_dir_all` de arriba
-        // ya habría fallado. Pero esa es justo la falsa tranquilidad. Lo que
-        // queda es un symlink colgante en el nombre del marcador o un disco
-        // lleno — `ENOSPC` — y en los dos casos **no** es un estado degradado
-        // pero en servicio: es un estado en el que el demonio acaba de no poder
-        // registrar que esta cuenta existe. Si se sigue, la próxima pérdida del
-        // directorio se lee como instalación nueva, la carga contesta lista
-        // vacía, y el podador borra las bases locales y la clave. Eso es
-        // exactamente el bug de `vasak-accounts#56`, reintroducido por la puerta
-        // de atrás: el marcador tiene que ser **fail closed**.
-        //
-        // Y el error no deja a nadie a la vista: el sincronizador trata un
-        // `ListAccounts` fallido como `AccountListing::Failed`, que es
-        // «no borrar nada». Lo que se pierde es la lista de cuentas en
-        // Configuración, y eso se arregla mirando el diario; lo que se gana es
-        // que no haya dos listados vacíos que borren el correo de la persona.
-        if let Some(marker) = marker {
-            if !marcado {
-                write_marker(&marker)?;
-            }
-        }
-
+        prepare_user_directory(&directory)?;
         Ok(AccountDatabase {
             path: directory.join(Self::FILE_NAME),
-            directory_existed,
             accounts: Vec::new(),
         })
     }
@@ -496,6 +669,12 @@ impl AccountDatabase {
     ///
     /// El sincronizador ya trata un error como «no borrar nada»
     /// (`AccountListing::Failed`), así que el error es la respuesta segura.
+    ///
+    /// **Y ahora falta siempre es error**, también la primera vez:
+    /// [`prepare_user_directory`] escribe `[]` al crear el directorio, así que
+    /// una persona sin cuentas tiene el archivo. Antes la primera vez se
+    /// distinguía por si el directorio se acababa de crear, y la segunda ya no
+    /// (`vasak-accounts#66`).
     pub fn load(&mut self) -> Result<(), StorageError> {
         // Se lee y se pregunta por el motivo. `self.path.exists()` devolvía
         // `false` para todo lo que no sea «existe» —un permiso cambiado, un
@@ -503,12 +682,6 @@ impl AccountDatabase {
         // de esos casos terminaba en una lista vacía.
         let data = match std::fs::read(&self.path) {
             Ok(data) => data,
-            // `NotFound` y sólo `NotFound`: si el directorio se acaba de crear,
-            // es la primera vez que se abre esta base y no hay cuentas todavía.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !self.directory_existed => {
-                self.accounts.clear();
-                return Ok(());
-            }
             Err(source) => {
                 return Err(StorageError::Unreadable {
                     path: self.path.clone(),
@@ -640,8 +813,9 @@ impl SecretStore {
         directory: &std::path::Path,
         secrets: &HashMap<String, HashMap<String, String>>,
     ) -> Result<(), StorageError> {
-        std::fs::create_dir_all(directory)?;
-        let _ = std::fs::set_permissions(directory, PermissionsExt::from_mode(0o700));
+        // Por el mismo camino que la base: si este fuera el que crea el
+        // directorio, lo dejaría sin `accounts.json` (`vasak-accounts#66`).
+        prepare_user_directory_for_write(directory)?;
 
         write_private(
             &directory.join(Self::FILE_NAME),
@@ -758,7 +932,7 @@ pub fn write_private(path: &std::path::Path, data: &[u8]) -> Result<(), StorageE
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
@@ -812,7 +986,7 @@ mod tests {
         let reloaded = db.get(&id).unwrap();
         assert_eq!(reloaded.display_name, "Updated Name");
 
-        borrar_base_de_prueba(&dir);
+        remove_test_database(&dir);
     }
 
     /// Las dos mitades de la misma verdad: `as_id()` es lo que se le manda al
@@ -915,7 +1089,7 @@ mod tests {
             "Alice Google"
         );
 
-        borrar_base_de_prueba(&dir);
+        remove_test_database(&dir);
     }
 
     /// Borrar algo que ya no está no es un error, pero tampoco puede decir que
@@ -932,7 +1106,7 @@ mod tests {
         assert!(db.remove(&id).unwrap());
         assert!(db.get(&id).is_none());
 
-        borrar_base_de_prueba(&dir);
+        remove_test_database(&dir);
     }
 
     /// Actualizar una cuenta que no está tiene que fallar y no agregarla en
@@ -947,7 +1121,7 @@ mod tests {
         assert!(db.update_account(huerfana).is_err());
         assert!(db.is_empty(), "no tenía que quedar ninguna cuenta");
 
-        borrar_base_de_prueba(&dir);
+        remove_test_database(&dir);
     }
 
     /// Un `accounts.json` ilegible tiene que dar error y **no** dejar la lista
@@ -965,7 +1139,7 @@ mod tests {
         let mut otra = AccountDatabase::in_directory(dir.clone()).unwrap();
         assert!(matches!(otra.load(), Err(StorageError::Json(_))));
 
-        borrar_base_de_prueba(&dir);
+        remove_test_database(&dir);
     }
 
     /// Un directorio sin `accounts.json` es una cuenta nueva, no un fallo: es
@@ -978,7 +1152,7 @@ mod tests {
         assert!(db.is_empty());
         assert!(db.get("cualquiera").is_none());
 
-        borrar_base_de_prueba(&dir);
+        remove_test_database(&dir);
     }
 
     /// Un `accounts.json` que **falta después de haber existido** es una pérdida
@@ -1003,6 +1177,11 @@ mod tests {
 
         // El disco no montó, o algo se lo llevó.
         std::fs::remove_file(dir.join("accounts.json")).unwrap();
+        // Y pasa el tiempo: una pérdida de verdad llega después de la última
+        // escritura, y eso es lo que el directorio registra. Sin esto, crear y
+        // borrar en el mismo tic del reloj del sistema de archivos se parece a
+        // un directorio que nunca se tocó (ver `never_held_accounts`).
+        touch_directory_later(&dir);
 
         let mut otra = AccountDatabase::in_directory(dir.clone()).unwrap();
         let error = otra
@@ -1017,7 +1196,7 @@ mod tests {
             "y aunque falle, no puede quedar una lista vacía por la cual pasar",
         );
 
-        borrar_base_de_prueba(&dir);
+        remove_test_database(&dir);
     }
 
     /// Un `accounts.json` que no se puede leer es un error, y lo mismo vale
@@ -1083,7 +1262,7 @@ mod tests {
             "se esperaba Unreadable, vino {error:?}",
         );
 
-        borrar_base_de_prueba(&dir);
+        remove_test_database(&dir);
     }
 
     /// **Un directorio que se perdió es un error, no una instalación nueva.**
@@ -1139,7 +1318,7 @@ mod tests {
             "se recreó el directorio perdido",
         );
 
-        borrar_base_de_prueba(&dir);
+        remove_test_database(&dir);
     }
 
     /// **Un symlink en el nombre del marcador no se sigue, y es un error.**
@@ -1195,7 +1374,7 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&objetivo);
-        borrar_base_de_prueba(&dir);
+        remove_test_database(&dir);
     }
 
     /// `marker_exists` pregunta por **la entrada del directorio**, no por lo que
@@ -1231,7 +1410,7 @@ mod tests {
         assert!(!marker_exists(&marcador).unwrap());
 
         let _ = std::fs::remove_file(&objetivo);
-        borrar_base_de_prueba(&dir);
+        remove_test_database(&dir);
     }
 
     /// **El marcador no se puede escribir → error, no una lista vacía.**
@@ -1272,7 +1451,7 @@ mod tests {
         assert!(mensaje.contains(marcador.to_str().unwrap()), "{mensaje}");
 
         let _ = std::fs::remove_file(&marcador);
-        borrar_base_de_prueba(&dir);
+        remove_test_database(&dir);
     }
 
     /// La primera instalación: no hay directorio ni marcador, y eso **no** es un
@@ -1290,7 +1469,7 @@ mod tests {
         // Y deja el marcador puesto, para que la próxima pérdida se vea.
         assert!(marker_for(&dir).unwrap().exists(), "no se dejó el marcador");
 
-        borrar_base_de_prueba(&dir);
+        remove_test_database(&dir);
     }
 
     /// Una instalación de antes de este PR: hay directorio y no hay marcador.
@@ -1319,7 +1498,7 @@ mod tests {
             "no se aprovechar la apertura para dejar el marcador"
         );
 
-        borrar_base_de_prueba(&dir);
+        remove_test_database(&dir);
     }
 
     /// El marcador no se confunde con una entrada más de la base: no es una
@@ -1342,7 +1521,7 @@ mod tests {
         assert_eq!(otra.len(), 1);
         assert!(otra.get(&id).is_some());
 
-        borrar_base_de_prueba(&dir);
+        remove_test_database(&dir);
     }
 
     /// El mensaje del error tiene que decir **qué** no se pudo leer, y no
@@ -1354,13 +1533,18 @@ mod tests {
         db.load().unwrap();
         db.add(sample_account()).unwrap();
         std::fs::remove_file(dir.join("accounts.json")).unwrap();
+        // Y pasa el tiempo: una pérdida de verdad llega después de la última
+        // escritura, y eso es lo que el directorio registra. Sin esto, crear y
+        // borrar en el mismo tic del reloj del sistema de archivos se parece a
+        // un directorio que nunca se tocó (ver `never_held_accounts`).
+        touch_directory_later(&dir);
 
         let mut otra = AccountDatabase::in_directory(dir.clone()).unwrap();
         let mensaje = otra.load().unwrap_err().to_string();
         assert!(mensaje.contains("accounts.json"), "{mensaje}");
         assert!(!mensaje.contains("no hay cuentas"), "{mensaje}");
 
-        borrar_base_de_prueba(&dir);
+        remove_test_database(&dir);
     }
 
     /// Lo que ve quien llama por D-Bus, sin pasar por un bus: un archivo que no
@@ -1373,6 +1557,11 @@ mod tests {
         db.load().unwrap();
         db.add(sample_account()).unwrap();
         std::fs::remove_file(dir.join("accounts.json")).unwrap();
+        // Y pasa el tiempo: una pérdida de verdad llega después de la última
+        // escritura, y eso es lo que el directorio registra. Sin esto, crear y
+        // borrar en el mismo tic del reloj del sistema de archivos se parece a
+        // un directorio que nunca se tocó (ver `never_held_accounts`).
+        touch_directory_later(&dir);
 
         // Esto es lo que hace `open_db`, que es el arranque de `ListAccounts`: el
         // error se traduce a un error de D-Bus y `ListAccounts` no llega a armar
@@ -1384,7 +1573,284 @@ mod tests {
         let texto = por_dbus.expect_err("ListAccounts no puede devolver una lista vacía");
         assert!(texto.starts_with("Error al cargar cuentas"), "{texto}");
 
-        borrar_base_de_prueba(&dir);
+        remove_test_database(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // vasak-accounts#66: el directorio nunca queda sin `accounts.json` por
+    // culpa nuestra, y lo que ya quedó así sale sin reabrir #56.
+    // -----------------------------------------------------------------------
+
+    /// Un directorio nuevo en una carpeta de prueba, sin crearlo.
+    fn new_directory() -> PathBuf {
+        std::env::temp_dir().join(uuid::Uuid::new_v4().to_string())
+    }
+
+    /// Mueve el `mtime` del directorio al futuro: lo que hace el paso del
+    /// tiempo entre que se escribió algo y que algo se lo llevó. Sin esto, una
+    /// prueba que crea y borra en el mismo instante del reloj del sistema de
+    /// archivos no se distingue de un directorio que nunca se tocó.
+    fn touch_directory_later(directory: &Path) {
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::open(directory)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+    }
+
+    /// El estado que dejaba la versión anterior: el directorio y el marcador,
+    /// sin `accounts.json`.
+    fn issue_66_state() -> PathBuf {
+        let dir = new_directory();
+        std::fs::create_dir(&dir).unwrap();
+        write_marker(&marker_for(&dir).unwrap()).unwrap();
+        dir
+    }
+
+    fn assert_unreadable(result: Result<(), StorageError>) {
+        let error = result.expect_err("tenía que seguir siendo un error");
+        assert!(
+            matches!(error, StorageError::Unreadable { .. }),
+            "se esperaba Unreadable, vino {error:?}",
+        );
+    }
+
+    /// **El caso de #66.** La primera apertura creaba el directorio y contestaba
+    /// vacío; la segunda encontraba el directorio sin archivo y daba error para
+    /// siempre. La prueba de antes abría una sola vez.
+    #[test]
+    fn abrir_dos_veces_un_directorio_nuevo_carga_vacio_las_dos_veces() {
+        let dir = new_directory();
+
+        for vez in 1..=3 {
+            let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
+            db.load()
+                .unwrap_or_else(|e| panic!("apertura {vez}: no tenía que fallar: {e}"));
+            assert!(db.is_empty());
+        }
+
+        // Y el archivo queda escrito como lo escribe `save()`: `[]`, 0600, y
+        // sin el temporal al lado.
+        let accounts = dir.join("accounts.json");
+        assert_eq!(std::fs::read_to_string(&accounts).unwrap(), "[]");
+        let mode = std::fs::metadata(&accounts).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(!dir.join("accounts.tmp").exists());
+
+        remove_test_database(&dir);
+    }
+
+    /// `SetProviderCredentials` creaba el directorio con su `create_dir_all`, sin
+    /// `accounts.json` y sin marcador: la primera lectura de cuentas ya veía un
+    /// directorio que existía sin archivo.
+    #[test]
+    fn un_directorio_creado_por_las_credenciales_de_proveedor_carga_vacio() {
+        let dir = new_directory();
+        crate::providers::UserCredentials::store_in(
+            &dir,
+            "google",
+            Some(crate::providers::UserCredentials {
+                client_id: "el-mio".into(),
+                client_secret: None,
+            }),
+        )
+        .unwrap();
+
+        assert!(dir.join("accounts.json").exists());
+        assert!(marker_for(&dir).unwrap().exists());
+        for _ in 0..2 {
+            let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
+            db.load()
+                .expect("sin cuentas, la lista es vacía y no un error");
+            assert!(db.is_empty());
+        }
+
+        remove_test_database(&dir);
+    }
+
+    /// El tercer camino que creaba el directorio: el almacén de secretos.
+    #[test]
+    fn el_almacen_de_secretos_no_deja_el_directorio_sin_accounts_json() {
+        let dir = new_directory();
+        SecretStore::store_secret_in(&dir, "acct-1", "access", "token").unwrap();
+
+        assert!(dir.join("accounts.json").exists());
+        let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
+        db.load().unwrap();
+
+        remove_test_database(&dir);
+    }
+
+    /// **La salida para los equipos que ya están en el estado de #66**: un
+    /// directorio vacío que nunca se tocó desde que se creó es de alguien que
+    /// nunca tuvo cuentas. Se escribe `[]` y se sigue — y desde ahí es un
+    /// directorio como cualquier otro.
+    #[test]
+    fn el_estado_de_66_sin_rastros_se_recupera() {
+        let dir = issue_66_state();
+
+        for _ in 0..2 {
+            let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
+            db.load()
+                .expect("un directorio que nunca tuvo cuentas se recupera");
+            assert!(db.is_empty());
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("accounts.json")).unwrap(),
+            "[]"
+        );
+
+        remove_test_database(&dir);
+    }
+
+    /// Lo mismo cuando el directorio lo había creado `SetProviderCredentials`:
+    /// lo único adentro es `providers.json`, que no es de ninguna cuenta.
+    #[test]
+    fn el_estado_de_66_con_solo_credenciales_de_proveedor_se_recupera() {
+        let dir = issue_66_state();
+        // Como lo escribía la versión anterior: temporal y `rename`.
+        write_private(
+            &dir.join("providers.json"),
+            br#"{"google":{"client_id":"x"}}"#,
+        )
+        .unwrap();
+
+        let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
+        db.load()
+            .expect("las credenciales de proveedor no son una cuenta");
+        assert!(db.is_empty());
+        // Y no se las tocó.
+        assert!(std::fs::read_to_string(dir.join("providers.json"))
+            .unwrap()
+            .contains("client_id"));
+
+        remove_test_database(&dir);
+    }
+
+    /// Un `secrets.json` al lado es un rastro de cuenta: el error de #56 sigue,
+    /// y no se escribe nada.
+    #[test]
+    fn con_secretos_al_lado_falta_accounts_json_sigue_siendo_error() {
+        let dir = issue_66_state();
+        write_private(&dir.join("secrets.json"), br#"{"acct-1":{"access":"t"}}"#).unwrap();
+
+        assert_unreadable(AccountDatabase::in_directory(dir.clone()).and_then(|mut db| db.load()));
+        assert!(
+            !dir.join("accounts.json").exists(),
+            "se escribió una lista vacía encima de una pérdida"
+        );
+
+        // Y lo mismo con uno vacío: lo deja así `forget_account` al borrar la
+        // última cuenta, así que también dice que hubo cuentas.
+        write_private(&dir.join("secrets.json"), b"{}").unwrap();
+        assert_unreadable(AccountDatabase::in_directory(dir.clone()).and_then(|mut db| db.load()));
+
+        remove_test_database(&dir);
+    }
+
+    /// Cualquier cosa fuera de la lista de lo aceptado es un rastro: acá, el
+    /// temporal de una escritura de cuentas que se cortó.
+    #[test]
+    fn un_archivo_desconocido_al_lado_sigue_siendo_error() {
+        let dir = issue_66_state();
+        std::fs::write(dir.join("accounts.tmp"), "[{\"id\":\"a\"}]").unwrap();
+
+        assert_unreadable(AccountDatabase::in_directory(dir.clone()).and_then(|mut db| db.load()));
+        assert!(!dir.join("accounts.json").exists());
+
+        remove_test_database(&dir);
+    }
+
+    /// **El caso que el punto 1 solo no cubre**: una cuenta sin secretos
+    /// —`RegisterAccount` lo permite— que pierde `accounts.json` deja un
+    /// directorio vacío, igual que el de alguien sin cuentas. Lo que delata la
+    /// pérdida es que el directorio se modificó después de crearse.
+    #[test]
+    fn una_cuenta_sin_secretos_que_pierde_accounts_json_sigue_siendo_error() {
+        let dir = new_directory();
+        let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
+        db.load().unwrap();
+        db.add(sample_account()).unwrap();
+
+        std::fs::remove_file(dir.join("accounts.json")).unwrap();
+        touch_directory_later(&dir);
+        assert!(std::fs::read_dir(&dir).unwrap().next().is_none());
+
+        assert_unreadable(AccountDatabase::in_directory(dir.clone()).and_then(|mut db| db.load()));
+        assert!(!dir.join("accounts.json").exists());
+
+        remove_test_database(&dir);
+    }
+
+    /// Lo mismo con `providers.json` al lado: lo que cuenta es que el
+    /// directorio cambió **después** de la última escritura de ese archivo.
+    #[test]
+    fn credenciales_de_proveedor_y_una_perdida_posterior_siguen_siendo_error() {
+        let dir = issue_66_state();
+        write_private(&dir.join("providers.json"), b"{}").unwrap();
+        // Una cuenta que se escribió y se perdió después.
+        std::fs::write(dir.join("accounts.json"), "[]").unwrap();
+        std::fs::remove_file(dir.join("accounts.json")).unwrap();
+        touch_directory_later(&dir);
+
+        assert_unreadable(AccountDatabase::in_directory(dir.clone()).and_then(|mut db| db.load()));
+        assert!(!dir.join("accounts.json").exists());
+
+        remove_test_database(&dir);
+    }
+
+    /// **Con `accounts.json` perdido, al lado no se escribe nada.** Si guardar un
+    /// `client_id` funcionara, esa escritura dejaría el directorio con la cara
+    /// de uno recién estrenado —la última modificación sería la de
+    /// `providers.json`— y la apertura siguiente lo recuperaría con una lista
+    /// vacía: la poda de #56 por otra puerta.
+    #[test]
+    fn con_accounts_json_perdido_no_se_guardan_credenciales_ni_secretos() {
+        let dir = new_directory();
+        let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
+        db.load().unwrap();
+        db.add(sample_account()).unwrap();
+        std::fs::remove_file(dir.join("accounts.json")).unwrap();
+        touch_directory_later(&dir);
+
+        let credentials = crate::providers::UserCredentials::store_in(
+            &dir,
+            "google",
+            Some(crate::providers::UserCredentials {
+                client_id: "el-mio".into(),
+                client_secret: None,
+            }),
+        );
+        assert!(
+            credentials.is_err(),
+            "se guardaron credenciales al lado de una pérdida"
+        );
+        assert!(!dir.join("providers.json").exists());
+
+        assert!(SecretStore::store_secret_in(&dir, "acct-1", "access", "t").is_err());
+        assert!(!dir.join("secrets.json").exists());
+
+        // Y la pérdida se sigue viendo.
+        assert_unreadable(AccountDatabase::in_directory(dir.clone()).and_then(|mut db| db.load()));
+
+        remove_test_database(&dir);
+    }
+
+    /// Un symlink en el nombre de `accounts.json` no es «no hay archivo»: no se
+    /// recupera, y sobre todo no se escribe por él — el demonio es root.
+    #[test]
+    fn un_symlink_colgante_en_accounts_json_no_se_recupera_ni_se_sigue() {
+        let dir = issue_66_state();
+        let target = dir.with_file_name(format!(
+            "destino-{}",
+            dir.file_name().unwrap().to_string_lossy()
+        ));
+        std::os::unix::fs::symlink(&target, dir.join("accounts.json")).unwrap();
+
+        assert_unreadable(AccountDatabase::in_directory(dir.clone()).and_then(|mut db| db.load()));
+        assert!(!target.exists(), "se escribió por el symlink");
+
+        remove_test_database(&dir);
     }
 
     /// Borra la base de una prueba y el marcador que dejó **al lado**.
@@ -1392,11 +1858,11 @@ mod tests {
     /// El marcador es la mitad de afuera del `directory_existed` de adentro, así
     /// que vive en el padre y `remove_dir_all` del directorio no se lo lleva.
     /// Sin esto, cada prueba deja un `.instalado-<uuid>` en `/tmp`.
-    fn borrar_base_de_prueba(directorio: &Path) {
-        if let Some(marcador) = marker_for(directorio) {
-            let _ = std::fs::remove_file(marcador);
+    pub(crate) fn remove_test_database(directory: &Path) {
+        if let Some(marker) = marker_for(directory) {
+            let _ = std::fs::remove_file(marker);
         }
-        let _ = std::fs::remove_dir_all(directorio);
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     /// Sólo para el caso de permisos: root no lo bloquea un `chmod`, y una
@@ -1424,7 +1890,7 @@ mod tests {
         let modo = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(modo, 0o700);
 
-        borrar_base_de_prueba(&dir);
+        remove_test_database(&dir);
     }
 
     /// Lo que sale por `ListAccounts`, que no pide permiso: tiene que alcanzar
@@ -1550,7 +2016,7 @@ mod tests {
         // mientras se hablaba con el proveedor.
         assert!(!db.set_needs_reauth("no-existe", true).unwrap());
 
-        borrar_base_de_prueba(&dir);
+        remove_test_database(&dir);
     }
 
     /// La marca tiene que sobrevivir al disco, o la pantalla diría que todo
@@ -1567,7 +2033,7 @@ mod tests {
         otra.load().unwrap();
         assert!(otra.get(&id).unwrap().needs_reauth);
 
-        borrar_base_de_prueba(&dir);
+        remove_test_database(&dir);
     }
 
     /// Los archivos escritos antes de que la marca existiera no la tienen, y una
@@ -1608,7 +2074,7 @@ mod tests {
             "refresh-xyz"
         );
 
-        borrar_base_de_prueba(&dir);
+        remove_test_database(&dir);
     }
 
     /// The file holds live credentials, so nobody but its owner may read it.
@@ -1629,7 +2095,7 @@ mod tests {
             "no temporary file should be left holding a token"
         );
 
-        borrar_base_de_prueba(&dir);
+        remove_test_database(&dir);
     }
 
     #[test]
@@ -1647,7 +2113,7 @@ mod tests {
             "two"
         );
 
-        borrar_base_de_prueba(&dir);
+        remove_test_database(&dir);
     }
 
     /// Deleting an account has to take its credentials with it, or a working
@@ -1667,14 +2133,14 @@ mod tests {
             "the other account must be untouched"
         );
 
-        borrar_base_de_prueba(&dir);
+        remove_test_database(&dir);
     }
 
     #[test]
     fn a_secret_that_was_never_stored_is_an_error_not_an_empty_string() {
         let dir = temp_dir();
         assert!(SecretStore::get_secret_in(&dir, "missing", "access").is_err());
-        borrar_base_de_prueba(&dir);
+        remove_test_database(&dir);
     }
 
     /// One person's request must never reach another person's directory.
