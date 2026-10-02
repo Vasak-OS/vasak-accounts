@@ -445,55 +445,54 @@ impl UserCredentials {
     pub fn store(
         uid: u32,
         provider_id: &str,
-        credenciales: Option<UserCredentials>,
+        credentials: Option<UserCredentials>,
     ) -> Result<(), CatalogError> {
         Self::store_in(
             &crate::storage::AccountDatabase::directory_for(uid),
             provider_id,
-            credenciales,
+            credentials,
         )
     }
 
     /// La versión que nombra el directorio; los tests la usan directamente en
     /// vez de compartir un ajuste de todo el proceso.
     pub fn store_in(
-        directorio: &Path,
+        directory: &Path,
         provider_id: &str,
-        credenciales: Option<UserCredentials>,
+        credentials: Option<UserCredentials>,
     ) -> Result<(), CatalogError> {
         // El directorio puede no existir: es la primera vez que esta persona
-        // guarda algo, y quien lo crea es `AccountDatabase::in_directory`, que
-        // en este camino no se llamó. Sin esto, poner el primer client_id falla
-        // con «no such file or directory» sobre el archivo temporal.
+        // guarda algo. Lo prepara el mismo ayudante que la base de cuentas, y
+        // no un `create_dir_all` propio: el de antes lo creaba sin
+        // `accounts.json`, y desde ahí la base leía «el archivo se perdió» para
+        // siempre (`vasak-accounts#66`). El ayudante lo deja en 0700, con el
+        // marcador y con `[]` en `accounts.json`.
         //
-        // 0700 como el resto, porque el archivo termina al lado de los tokens.
-        std::fs::create_dir_all(directorio)
-            .map_err(|e| CatalogError::Io(format!("{}: {e}", directorio.display())))?;
-        let _ = std::fs::set_permissions(
-            directorio,
-            std::os::unix::fs::PermissionsExt::from_mode(0o700),
-        );
+        // Y si lo que encuentra es un `accounts.json` perdido, falla y no se
+        // escribe nada al lado: ver `prepare_user_directory_for_write`.
+        crate::storage::prepare_user_directory_for_write(directory)
+            .map_err(|e| CatalogError::Io(format!("{}: {e}", directory.display())))?;
 
-        let ruta = directorio.join(Self::FILE_NAME);
-        let mut todas = Self::load_from(&ruta)?;
+        let path = directory.join(Self::FILE_NAME);
+        let mut all = Self::load_from(&path)?;
 
-        match credenciales {
-            Some(nuevas) => {
-                todas.insert(provider_id.to_string(), nuevas);
+        match credentials {
+            Some(new) => {
+                all.insert(provider_id.to_string(), new);
             }
             None => {
-                todas.remove(provider_id);
+                all.remove(provider_id);
             }
         }
 
-        let json = serde_json::to_string_pretty(&todas)
+        let json = serde_json::to_string_pretty(&all)
             .map_err(|e| CatalogError::Io(format!("no se pudo serializar: {e}")))?;
 
         // Con el mismo cuidado que los secretos: un client_secret de escritorio
         // no es un secreto de verdad, pero el archivo vive al lado de los que sí
         // lo son y no hay razón para que sea el único legible.
-        crate::storage::write_private(&ruta, json.as_bytes())
-            .map_err(|e| CatalogError::Io(format!("{}: {e}", ruta.display())))
+        crate::storage::write_private(&path, json.as_bytes())
+            .map_err(|e| CatalogError::Io(format!("{}: {e}", path.display())))
     }
 }
 
@@ -599,6 +598,13 @@ mod tests {
         dir
     }
 
+    /// El directorio de una persona, **sin crearlo**: lo prepara
+    /// `store_in`. Uno vacío creado a mano es, desde `vasak-accounts#66`, un
+    /// directorio sin `accounts.json`, y ahí no se guarda nada.
+    fn new_user_directory() -> PathBuf {
+        std::env::temp_dir().join(uuid::Uuid::new_v4().to_string())
+    }
+
     fn cargar(directorio: &Path) -> HashMap<String, Provider> {
         let mut catalogo = HashMap::new();
         merge_directory(directorio, &mut catalogo).unwrap();
@@ -701,7 +707,7 @@ mod tests {
     /// que el proveedor pase a estar listo.
     #[test]
     fn las_credenciales_propias_completan_un_proveedor() {
-        let dir = temp_dir();
+        let dir = new_user_directory();
         UserCredentials::store_in(
             &dir,
             "google",
@@ -722,7 +728,8 @@ mod tests {
             Some("el-secreto")
         );
 
-        std::fs::remove_dir_all(dir).unwrap_or_default();
+        // Con el marcador que la preparación del directorio deja al lado.
+        crate::storage::tests::remove_test_database(&dir);
     }
 
     /// La primera vez que alguien guarda un client_id, su directorio puede no
@@ -757,7 +764,8 @@ mod tests {
         let modo = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(modo, 0o700);
 
-        std::fs::remove_dir_all(dir).unwrap_or_default();
+        // Con el marcador que la preparación del directorio deja al lado.
+        crate::storage::tests::remove_test_database(&dir);
     }
 
     /// Nadie puso nada todavía es el caso normal, no un error: sin esto el
@@ -768,12 +776,13 @@ mod tests {
         assert!(UserCredentials::load_from(&dir.join("providers.json"))
             .unwrap()
             .is_empty());
-        std::fs::remove_dir_all(dir).unwrap_or_default();
+        // Con el marcador que la preparación del directorio deja al lado.
+        crate::storage::tests::remove_test_database(&dir);
     }
 
     #[test]
     fn se_pueden_quitar_sin_tocar_las_de_otro_proveedor() {
-        let dir = temp_dir();
+        let dir = new_user_directory();
         for id in ["google", "microsoft"] {
             UserCredentials::store_in(
                 &dir,
@@ -792,7 +801,8 @@ mod tests {
         assert!(!quedan.contains_key("google"));
         assert_eq!(quedan["microsoft"].client_id, "microsoft-id");
 
-        std::fs::remove_dir_all(dir).unwrap_or_default();
+        // Con el marcador que la preparación del directorio deja al lado.
+        crate::storage::tests::remove_test_database(&dir);
     }
 
     /// El archivo queda al lado de los tokens, y no hay razón para que sea el
@@ -801,7 +811,7 @@ mod tests {
     fn el_archivo_de_credenciales_es_solo_para_su_dueno() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = temp_dir();
+        let dir = new_user_directory();
         UserCredentials::store_in(
             &dir,
             "google",
@@ -819,7 +829,8 @@ mod tests {
             & 0o777;
         assert_eq!(modo, 0o600);
 
-        std::fs::remove_dir_all(dir).unwrap_or_default();
+        // Con el marcador que la preparación del directorio deja al lado.
+        crate::storage::tests::remove_test_database(&dir);
     }
 
     /// **El límite que sostiene todo esto**, por el lado del archivo.
