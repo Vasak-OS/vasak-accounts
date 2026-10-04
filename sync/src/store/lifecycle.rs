@@ -105,6 +105,10 @@ use super::{LogLevel, Store, StoreError};
 /// Las capacidades de una cuenta que van a tener lugar en el almacén.
 pub const STORE_AREAS: [&str; 3] = ["email", "calendar", "contacts"];
 
+/// El nombre del área de correo, en la capacidad de la cuenta y en
+/// `active_areas` de `stores.json`.
+pub const EMAIL_AREA: &str = "email";
+
 /// El nombre del área de contactos, en la capacidad de la cuenta y en
 /// `active_areas` de `stores.json`.
 pub const CONTACTS_AREA: &str = "contacts";
@@ -127,9 +131,9 @@ pub const CALENDAR_AREA: &str = "calendar";
 /// ausente se rehace (N5 de la segunda revisión de seguridad del #55).
 pub const PENDING_ADOPTION: &str = "?pending-adoption";
 
-/// Las áreas que se sincronizan por DAV y se encienden la primera vez que
-/// alguien las pide con permiso. El correo llega después.
-pub const SYNCED_AREAS: [&str; 2] = [CONTACTS_AREA, CALENDAR_AREA];
+/// Las áreas que se sincronizan y se encienden la primera vez que alguien las
+/// pide con permiso.
+pub const SYNCED_AREAS: [&str; 3] = [EMAIL_AREA, CONTACTS_AREA, CALENDAR_AREA];
 
 /// Cuánto tiene que haber entre el primer listado bueno en que falta una
 /// cuenta y el que confirma que se fue, antes de borrar nada suyo.
@@ -784,6 +788,39 @@ impl<K: KeySource> StoreManager<K> {
             return Err(StoreError::Key(KeyError::Locked));
         }
         Ok(pool)
+    }
+
+    /// Lee algo de la base abierta de una cuenta, pasando el `Store` completo
+    /// al cierre. Útil para métodos que están en `Store` y necesitan acceso
+    /// a los lectores (`self.readers()`). Relee el llavero antes de empezar.
+    ///
+    /// Con la base cerrada, `Err(Missing)`. Con el llavero bloqueado —o sin
+    /// poder saberlo—, `Err(Key(Locked))` y nada leído.
+    pub async fn read_store<T, F>(&self, account_id: &str, work: F) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Store) -> Result<T, StoreError> + Send + 'static,
+    {
+        let mut inner = self.inner.lock().await;
+        if !matches!(self.keys.is_locked().await, Ok(false)) {
+            self.run(&mut inner, Some(account_id)).await;
+            return Err(StoreError::Key(KeyError::Locked));
+        }
+        let Some(mut store) = inner
+            .entries
+            .get_mut(account_id)
+            .and_then(|e| e.store.take())
+        else {
+            return Err(StoreError::Missing);
+        };
+        let result = blocking(move || {
+            let res = work(&store);
+            (res, store)
+        })
+        .await?;
+        let (result, store) = result;
+        inner.entry(account_id).store = Some(store);
+        result
     }
 
     pub fn keys(&self) -> &K {

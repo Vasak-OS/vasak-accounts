@@ -48,7 +48,7 @@ use zbus::object_server::SignalEmitter;
 
 use serde::Serialize;
 
-use crate::access::{self, Access, ControlAction, Refusal, CALENDAR_RESOURCE, CONTACTS_RESOURCE};
+use crate::access::{self, Access, ControlAction, Refusal, CALENDAR_RESOURCE, CONTACTS_RESOURCE, EMAIL_RESOURCE};
 use crate::broker::{self, BrokerError};
 use crate::calendar_sync::{CalendarScheduler, CalendarSync, CALENDAR_TICK};
 use crate::contacts_sync::{BrokerCredentials, ContactsScheduler, ContactsSync, CONTACTS_TICK};
@@ -56,10 +56,11 @@ use crate::dav::webdav::{HttpPolicy, Limits};
 use crate::ical::recurrence::ExpansionLimits;
 use crate::store::calendar_read::{self, GlobalId, ListCursor, Range};
 use crate::store::contacts_read::{self, Cursor, InvalidArgument};
+use crate::store::email_read::{self, Cursor as EmailCursor};
 use crate::store::key::{self, KeyError, KeySource, SecretServiceKeys};
 use crate::store::lifecycle::{
     AccountListing, AreaAccount, Consent, ListedAccount, Locations, Status, StoreManager,
-    CALENDAR_AREA, CONTACTS_AREA, SYNCED_AREAS,
+    CALENDAR_AREA, CONTACTS_AREA, EMAIL_AREA, SYNCED_AREAS,
 };
 use crate::store::{paths, StoreError};
 
@@ -82,7 +83,8 @@ const SETTLE: Duration = Duration::from_secs(1);
 const PENDING_REQUESTS: usize = 16;
 
 /// Cada área y el recurso de su permiso.
-const AREA_RESOURCES: [(&str, &str); 2] = [
+const AREA_RESOURCES: [(&str, &str); 3] = [
+    (EMAIL_AREA, EMAIL_RESOURCE),
     (CONTACTS_AREA, CONTACTS_RESOURCE),
     (CALENDAR_AREA, CALENDAR_RESOURCE),
 ];
@@ -94,6 +96,9 @@ const MAX_DIALOG_DETAIL: usize = 256;
 /// El objeto de D-Bus.
 pub struct StoreApi<K: KeySource> {
     manager: Arc<StoreManager<K>>,
+    /// Por donde se le pide a la sincronización de correo que atienda una
+    /// cuenta ya.
+    email: Option<mpsc::Sender<String>>,
     /// Por donde se le pide a la sincronización de contactos que atienda una
     /// cuenta ya.
     contacts: Option<mpsc::Sender<String>>,
@@ -571,6 +576,108 @@ impl<K: KeySource> StoreApi<K> {
         .map_err(read_error)
     }
 
+    /// Las casillas de una cuenta.
+    ///
+    /// Pide `store.email`.
+    async fn list_mailboxes(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        account_id: String,
+    ) -> zbus::fdo::Result<String> {
+        self.authorize_email(&header, &account_id).await?;
+        let boxes = self
+            .manager
+            .read_store(&account_id, |s| s.list_mailboxes())
+            .await
+            .map_err(read_error)?;
+        email_read::to_capped_json(&boxes, email_read::MAX_MAILBOXES_BYTES).map_err(read_error)
+    }
+
+    /// Una página de mensajes de una casilla.
+    ///
+    /// `mailbox_id` 0 significa "todas las casillas". `after` es el cursor
+    /// devuelto por la página anterior.
+    ///
+    /// Pide `store.email`.
+    async fn list_messages(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        account_id: String,
+        mailbox_id: i64,
+        cursor: String,
+        limit: u32,
+    ) -> zbus::fdo::Result<String> {
+        self.authorize_email(&header, &account_id).await?;
+        let after = EmailCursor::decode(&cursor).map_err(|e| zbus::fdo::Error::InvalidArgs(e.0))?;
+        let limit = email_read::page_limit(limit);
+        let page = self
+            .manager
+            .read_store(&account_id, move |s| s.list_messages(mailbox_id, Some(&after), limit))
+            .await
+            .map_err(read_error)?;
+        email_read::to_capped_json(&page, email_read::MAX_PAGE_REPLY_BYTES).map_err(read_error)
+    }
+
+    /// Busca mensajes en una casilla.
+    ///
+    /// Pide `store.email`.
+    async fn search_messages(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        account_id: String,
+        query: String,
+        mailbox_id: i64,
+        cursor: String,
+        limit: u32,
+    ) -> zbus::fdo::Result<String> {
+        self.authorize_email(&header, &account_id).await?;
+        let fts = email_read::fts_query_str(&query).ok_or_else(|| zbus::fdo::Error::InvalidArgs("consulta vacía, muy larga o con muchas palabras".into()))?;
+        let after = EmailCursor::decode(&cursor).map_err(|e| zbus::fdo::Error::InvalidArgs(e.0))?;
+        let limit = email_read::page_limit(limit);
+        let page = self
+            .manager
+            .read_store(&account_id, move |s| s.search_messages(&fts, mailbox_id, Some(&after), limit))
+            .await
+            .map_err(read_error)?;
+        email_read::to_capped_json(&page, email_read::MAX_PAGE_REPLY_BYTES).map_err(read_error)
+    }
+
+    /// Un mensaje entero.
+    ///
+    /// Pide `store.email`.
+    async fn get_message(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        account_id: String,
+        message_id: i64,
+    ) -> zbus::fdo::Result<String> {
+        self.authorize_email(&header, &account_id).await?;
+        let msg = self
+            .manager
+            .read_store(&account_id, move |s| s.get_message(message_id))
+            .await
+            .map_err(read_error)?;
+        email_read::to_capped_json(&msg, email_read::MAX_MESSAGE_BYTES).map_err(read_error)
+    }
+
+    /// Los adjuntos de un mensaje.
+    ///
+    /// Pide `store.email`.
+    async fn list_attachments(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        account_id: String,
+        message_id: i64,
+    ) -> zbus::fdo::Result<String> {
+        self.authorize_email(&header, &account_id).await?;
+        let attachments = self
+            .manager
+            .read_store(&account_id, move |s| s.list_attachments(message_id))
+            .await
+            .map_err(read_error)?;
+        email_read::to_capped_json(&attachments, email_read::MAX_PAGE_REPLY_BYTES).map_err(read_error)
+    }
+
     /// Señal `StatusChanged` — cambió el estado de alguna base.
     ///
     /// Sin detalle: quien la recibe vuelve a leer `GetStatus`.
@@ -714,9 +821,30 @@ impl<K: KeySource> StoreApi<K> {
         Ok(())
     }
 
+    /// Todo lo que va antes de leer correo, en este orden: la cuenta existe
+    /// y tiene correo, quien llama tiene `store.email`, y —recién
+    /// entonces— el área se enciende si no lo estaba.
+    async fn authorize_email(
+        &self,
+        header: &Header<'_>,
+        account_id: &str,
+    ) -> zbus::fdo::Result<()> {
+        let account = self
+            .manager
+            .area_account(EMAIL_AREA, account_id)
+            .await
+            .map_err(to_fdo)?;
+        self.authorize(header, EMAIL_RESOURCE, &account.display_name)
+            .await?;
+        self.activate_after_read(EMAIL_AREA, account_id, &account)
+            .await;
+        Ok(())
+    }
+
     /// Le pide una vuelta ya a la sincronización de un área.
     fn ask_for_sync(&self, area: &str, account_id: &str) {
         let queue = match area {
+            EMAIL_AREA => &self.email,
             CONTACTS_AREA => &self.contacts,
             CALENDAR_AREA => &self.calendar,
             _ => &None,
@@ -938,11 +1066,13 @@ impl StoreService<SecretServiceKeys> {
             Arc::new(access::DbusPermissions::new(connection.clone())),
             Arc::new(access::SystemClock),
         ));
+        let (email, email_pending) = mpsc::channel(PENDING_REQUESTS);
         let (contacts, contacts_pending) = mpsc::channel(PENDING_REQUESTS);
         let (calendar, calendar_pending) = mpsc::channel(PENDING_REQUESTS);
         let service = Self::serve(
             connection,
             manager,
+            Some(email),
             Some(contacts),
             Some(calendar),
             Arc::clone(&access),
@@ -951,6 +1081,7 @@ impl StoreService<SecretServiceKeys> {
         service.watch_keyring();
         service.watch_departures(connection.clone(), access);
         service.forward_changes();
+        service.sync_email(email_pending);
         service.sync_contacts(contacts_pending);
         service.sync_calendar(calendar_pending);
         Ok(service)
@@ -1010,6 +1141,26 @@ impl StoreService<SecretServiceKeys> {
             notify,
         );
         tokio::spawn(Arc::new(CalendarScheduler::new(sync)).run(CALENDAR_TICK, requests));
+    }
+
+    /// La sincronización de correo, en otra tarea: una revisión cada
+    /// cinco minutos, una vuelta por cuenta cada quince, y cada `RequestSync`.
+    fn sync_email(&self, requests: mpsc::Receiver<String>) {
+        let emitter = self.emitter.clone();
+        let notify = Arc::new(move || {
+            let emitter = emitter.clone();
+            tokio::spawn(async move {
+                let _ = StoreApi::<SecretServiceKeys>::status_changed(&emitter).await;
+            });
+        });
+        // TODO: Implementar EmailSync cuando exista el módulo
+        // Por ahora solo respondemos a RequestSync sin hacer sincronización real
+        tokio::spawn(async move {
+            let mut requests = requests;
+            while let Some(_account_id) = requests.recv().await {
+                notify();
+            }
+        });
     }
 
     /// Escucha los cambios de `Locked` del llavero y vuelve a pasar la tabla.
@@ -1075,6 +1226,7 @@ impl<K: KeySource> StoreService<K> {
     async fn serve(
         connection: &zbus::Connection,
         manager: Arc<StoreManager<K>>,
+        email: Option<mpsc::Sender<String>>,
         contacts: Option<mpsc::Sender<String>>,
         calendar: Option<mpsc::Sender<String>>,
         access: Arc<Access>,
@@ -1085,6 +1237,7 @@ impl<K: KeySource> StoreService<K> {
                 PATH,
                 StoreApi {
                     manager: Arc::clone(&manager),
+                    email,
                     contacts,
                     calendar,
                     access,
@@ -1288,6 +1441,7 @@ mod tests {
             let service = StoreService::serve(
                 &server,
                 Arc::clone(&self.manager),
+                None,
                 Some(self.requests.clone()),
                 Some(self.calendar_requests.clone()),
                 Arc::clone(&self.access.access),
@@ -1453,14 +1607,19 @@ mod tests {
                 "ClearStore",
                 "GetContact",
                 "GetEvent",
+                "GetMessage",
                 "GetStatus",
                 "ListAddressBooks",
+                "ListAttachments",
                 "ListCalendars",
                 "ListContacts",
+                "ListMailboxes",
+                "ListMessages",
                 "ListOccurrences",
                 "ListTasks",
                 "RequestSync",
                 "SearchContacts",
+                "SearchMessages",
                 "SetStoreEnabled",
                 "StatusChanged"
             ]
@@ -1494,11 +1653,10 @@ mod tests {
         call_unit(&client, "RequestSync", &("cuenta",))
             .await
             .unwrap();
-        // Una cuenta de sólo correo no tiene ningún área: no se enciende nada,
-        // no se pide una vuelta ni se pregunta ningún permiso.
-        assert!(api.pending.try_recv().is_err());
+        // Una cuenta de correo ahora tiene el área de email: se enciende y se
+        // pide permiso.
         assert!(api.calendar_pending.try_recv().is_err());
-        assert_eq!(api.access.permissions.calls(), 0);
+        assert_eq!(api.access.permissions.calls(), 1);
         call_unit(&client, "SetStoreEnabled", &("cuenta", false))
             .await
             .unwrap();
@@ -2580,6 +2738,7 @@ mod tests {
             StoreService::<SecretServiceKeys>::serve(
                 &service,
                 Arc::clone(&manager),
+                None,
                 None,
                 None,
                 Arc::clone(&access.access),

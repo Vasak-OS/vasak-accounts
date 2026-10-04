@@ -120,6 +120,11 @@ pub const CONTACTS_RESOURCE: &str = "store.contacts";
 /// credencial.
 pub const CALENDAR_RESOURCE: &str = "store.calendar";
 
+/// El recurso de `vasak-permissions` para leer el correo guardado —casillas,
+/// mensajes, cuerpos y adjuntos—, distinto de `account.email`, que entrega la
+/// credencial.
+pub const EMAIL_RESOURCE: &str = "store.email";
+
 /// Cuántos comandos de control deja pasar [`CallerLimits`] por cuenta y
 /// nombre único en cada ventana.
 pub const CONTROL_BURST: usize = 3;
