@@ -614,9 +614,9 @@ impl AccountManager {
             .con_candado(uid, || async {
                 let mut db = open_db(uid)?;
                 let cuenta = storage::Account::new(&nombre, &proveedor.id, capabilities);
-                let account_id = db.add(cuenta).map_err(|e| {
-                    FdoError::Failed(format!("Error al guardar la cuenta: {e}"))
-                })?;
+                let account_id = db
+                    .add(cuenta)
+                    .map_err(|e| FdoError::Failed(format!("Error al guardar la cuenta: {e}")))?;
 
                 // Los secretos después de la cuenta: si esto falla, queda una cuenta sin
                 // token que la persona puede borrar y rehacer. Al revés quedarían tokens
@@ -814,9 +814,9 @@ impl AccountManager {
             .con_candado(uid, || async {
                 let mut db = open_db(uid)?;
                 let cuenta = storage::Account::new(&display_name, &provider_type, capabilities);
-                let account_id = db.add(cuenta).map_err(|e| {
-                    FdoError::Failed(format!("Error al guardar la cuenta: {e}"))
-                })?;
+                let account_id = db
+                    .add(cuenta)
+                    .map_err(|e| FdoError::Failed(format!("Error al guardar la cuenta: {e}")))?;
 
                 for (clave, valor) in secrets {
                     storage::SecretStore::store_secret(uid, &account_id, &clave, &valor).map_err(
@@ -875,16 +875,15 @@ impl AccountManager {
                     None => Revocacion::NoHaceFalta,
                 };
 
-                let borrada = db.remove(&account_id).map_err(|e| {
-                    FdoError::Failed(format!("Error al eliminar la cuenta: {e}"))
-                })?;
+                let borrada = db
+                    .remove(&account_id)
+                    .map_err(|e| FdoError::Failed(format!("Error al eliminar la cuenta: {e}")))?;
 
                 // Los secretos se limpian siempre, incluso si los metadatos ya no
                 // estaban: si no, queda una credencial viva en disco para una cuenta que
                 // la persona cree que no existe.
-                storage::SecretStore::forget_account(uid, &account_id).map_err(|e| {
-                    FdoError::Failed(format!("Error al borrar los secretos: {e}"))
-                })?;
+                storage::SecretStore::forget_account(uid, &account_id)
+                    .map_err(|e| FdoError::Failed(format!("Error al borrar los secretos: {e}")))?;
 
                 Ok::<_, FdoError>((borrada, revocacion))
             })
@@ -1056,9 +1055,9 @@ impl AccountManager {
             .con_candado(uid, || async {
                 let mut db = open_db(uid)?;
                 let cuenta = storage::Account::new(&nombre, "nextcloud", capabilities);
-                let account_id = db.add(cuenta).map_err(|e| {
-                    FdoError::Failed(format!("Error al guardar la cuenta: {e}"))
-                })?;
+                let account_id = db
+                    .add(cuenta)
+                    .map_err(|e| FdoError::Failed(format!("Error al guardar la cuenta: {e}")))?;
 
                 // El secreto después de la cuenta: si esto falla, queda una cuenta sin
                 // credencial que la persona puede borrar y rehacer. Al revés quedaría
@@ -1077,12 +1076,7 @@ impl AccountManager {
 
     /// El candado de este usuario, creándolo si todavía no existe.
     async fn candado(&self, uid: u32) -> Arc<Mutex<()>> {
-        self.candados
-            .lock()
-            .await
-            .entry(uid)
-            .or_default()
-            .clone()
+        self.candados.lock().await.entry(uid).or_default().clone()
     }
 
     /// Ejecuta `f` con el candado del usuario tomado de principio a fin.
@@ -1598,7 +1592,8 @@ mod tests {
 
     /// Un directorio temporal para las pruebas de concurrencia.
     fn dir_de_prueba() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("vasak-accounts-conc-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("vasak-accounts-conc-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1628,7 +1623,8 @@ mod tests {
                         tokio::task::yield_now().await;
                     }
                 }
-                db.add(Account::new(nombre, "imap", HashMap::new())).unwrap();
+                db.add(Account::new(nombre, "imap", HashMap::new()))
+                    .unwrap();
             })
             .await;
     }
@@ -1687,13 +1683,10 @@ mod tests {
         let t2 = tokio::spawn(async move { registrar(m2, d2, uid, "Dos", Some(b2)).await });
 
         // Timeout para no colgarse si el deadlock ocurre
-        let resultado = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            async {
-                let _ = t1.await;
-                let _ = t2.await;
-            },
-        )
+        let resultado = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let _ = t1.await;
+            let _ = t2.await;
+        })
         .await;
 
         // Si el timeout es que se colgó, el test falla
@@ -1892,9 +1885,10 @@ mod tests {
         let m2 = manager.clone();
         let d2 = dir.clone();
 
-        let t1 = tokio::spawn(async move {
-            guardar_credenciales(m1, d1, uid, "google", "id-1", None).await
-        });
+        let t1 =
+            tokio::spawn(
+                async move { guardar_credenciales(m1, d1, uid, "google", "id-1", None).await },
+            );
         let t2 = tokio::spawn(async move {
             guardar_credenciales(m2, d2, uid, "microsoft", "id-2", None).await
         });
@@ -1902,8 +1896,13 @@ mod tests {
         t1.await.unwrap();
         t2.await.unwrap();
 
-        let credenciales = providers::UserCredentials::load_from(&dir.join("providers.json")).unwrap();
-        assert_eq!(credenciales.len(), 2, "las dos credenciales tienen que estar");
+        let credenciales =
+            providers::UserCredentials::load_from(&dir.join("providers.json")).unwrap();
+        assert_eq!(
+            credenciales.len(),
+            2,
+            "las dos credenciales tienen que estar"
+        );
         assert_eq!(credenciales["google"].client_id, "id-1");
         assert_eq!(credenciales["microsoft"].client_id, "id-2");
 
