@@ -430,8 +430,13 @@ fn ignore_missing(result: rustix::io::Result<()>) -> rustix::io::Result<()> {
     }
 }
 
+/// El motivo de una apertura fallida, según sea.
+///
+/// **No hay un errno único para «es un enlace simbólico»**: `ELOOP` en Linux,
+/// `ENOTDIR` en Darwin, `EMLINK` en FreeBSD. La lista lleva las tres por eso, no
+/// por olvidarse una.
 fn dir_error(path: &Path, error: Errno) -> StoreError {
-    if error == Errno::LOOP || error == Errno::NOTDIR {
+    if matches!(error, Errno::LOOP | Errno::NOTDIR | Errno::MLINK) {
         return StoreError::Io(format!(
             "{} es un enlace simbólico o no es una carpeta; no se usa",
             path.display()
@@ -470,6 +475,33 @@ fn io_error(path: &Path, what: &str, error: io::Error) -> StoreError {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// El motivo de una apertura fallida se distingue antes de escribir el
+    /// mensaje, y el de un enlace son **tres**, no uno: `ELOOP` en Linux,
+    /// `ENOTDIR` en Darwin, `EMLINK` en FreeBSD.
+    ///
+    /// La diferencia importa porque el mensaje manda a la persona a mirar una
+    /// cosa u otra: si lo que se le acabaron fueron los descriptores, ir a
+    /// buscar un enlace en la carpeta es tiempo perdido.
+    #[test]
+    fn un_enlace_se_dice_y_el_resto_no() {
+        let ruta = Path::new("/var/lib/vasak-accounts/1000");
+
+        for e in [Errno::LOOP, Errno::NOTDIR, Errno::MLINK] {
+            let error = dir_error(ruta, e).to_string();
+            assert!(error.contains("enlace simbólico"), "{e:?}: {error}");
+        }
+
+        for e in [Errno::NOENT, Errno::ACCESS, Errno::MFILE, Errno::PERM] {
+            let error = dir_error(ruta, e).to_string();
+            assert!(
+                !error.contains("enlace simbólico"),
+                "{e:?} no es un enlace y se lo culpa como tal: {error}",
+            );
+            // El genérico dice qué se estaba haciendo, que es lo que sirve.
+            assert!(error.contains("abrir"), "{e:?}: {error}");
+        }
+    }
 
     /// Una carpeta temporal propia de cada prueba, que se borra sola.
     pub(crate) struct TempDir(pub PathBuf);

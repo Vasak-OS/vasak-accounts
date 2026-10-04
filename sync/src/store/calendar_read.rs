@@ -660,7 +660,8 @@ fn series_batch(
 }
 
 /// Expande una serie en el momento y suma a la página lo que entra. **Sin
-/// conexión**: es CPU. Devuelve si la expansión pasó un tope.
+/// conexión**: es CPU. Devuelve si de esta serie quedó algo afuera: un tope de
+/// la expansión, o la página llena antes de que terminara.
 fn expand_into(
     top: &mut TopRows<OccurrenceItem>,
     account_id: &str,
@@ -673,6 +674,12 @@ fn expand_into(
         return false;
     };
     let expansion = parsed.between(query.range.from, query.range.to, source.skip, limits);
+    // Si el recorrido de la serie se frena porque la página se llenó, quedan
+    // veces de esta serie sin listar: eso es truncamiento. Se anota en el
+    // momento en que pasa, en vez dededucirlo después mirando si la última vez
+    // de la serie habría entrado —una cuenta que sale falsa cuando la serie no
+    // tiene ninguna vez en el rango, y que no puede ser de otra forma—.
+    let mut cut = false;
     for occurrence in &expansion.occurrences {
         let at = position(
             account_id,
@@ -686,6 +693,7 @@ fn expand_into(
         // Las veces de una serie vienen en orden: si ésta ya no entra en la
         // página, las que siguen tampoco.
         if !top.admits(&at) {
+            cut = true;
             break;
         }
         let item = occurrence_item(
@@ -704,7 +712,7 @@ fn expand_into(
         );
         top.insert(at, item);
     }
-    expansion.truncated
+    expansion.truncated || cut
 }
 
 /// Las veces de los eventos de una cuenta que se ven en `range`, después de
@@ -1975,6 +1983,223 @@ mod tests {
         let second = page(Some(&first.rows[9].0));
         assert!(second.peak_rows <= 11);
         assert_eq!(second.rows[0].0, first.rows[10].0, "sigue sin saltear");
+    }
+
+    /// Una serie de una vez por día, que se corta donde dice `extra`.
+    fn serie_con_un_vez(uid: &str, start: &str, extra: &str) -> String {
+        format!(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:{uid}\r\nSUMMARY:{uid}\r\n\
+             DTSTART:{start}\r\nDURATION:PT1H\r\n{extra}END:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+    }
+
+    /// **Una serie sin ninguna vez en el rango no marca la página como
+    /// recortada.** Tres series de una vez cada una —que llenan la página— y una
+    /// cuarta que ya terminó, con su regla cortada antes del rango: no da ni una
+    /// vez que mirar. La página queda llena y **completa**: no hay nada afuera,
+    /// así que no hay qué avisar. Antes la cuarta la marcaba igual, porque el
+    /// aviso se decidía mirando una vez que la serie no tenía —el final del
+    /// rango—, y esa posición nunca entra en una página que ya está llena.
+    #[test]
+    fn una_serie_sin_veces_en_el_rango_no_marca_la_pagina_como_recortada() {
+        let temp = TempDir::new("leer-sin-veces");
+        let store = store_with(
+            &temp,
+            &[
+                (
+                    "https://x/c/a.ics",
+                    &serie_con_un_vez("a", "20300201T090000Z", "RRULE:FREQ=DAILY;COUNT=1\r\n"),
+                ),
+                (
+                    "https://x/c/b.ics",
+                    &serie_con_un_vez("b", "20300201T100000Z", "RRULE:FREQ=DAILY;COUNT=1\r\n"),
+                ),
+                (
+                    "https://x/c/c.ics",
+                    &serie_con_un_vez("c", "20300201T110000Z", "RRULE:FREQ=DAILY;COUNT=1\r\n"),
+                ),
+                // Terminó en 2026: en el rango pedido no hay ninguna vez suya.
+                (
+                    "https://x/c/vieja.ics",
+                    &serie_con_un_vez(
+                        "vieja",
+                        "20251201T090000Z",
+                        "RRULE:FREQ=DAILY;UNTIL=20260101T000000Z\r\n",
+                    ),
+                ),
+            ],
+        );
+        let rows = occurrences_in(
+            store.connection(),
+            "cuenta",
+            &OccurrenceQuery {
+                range: range("2030-02-01T00:00:00Z", "2030-02-02T00:00:00Z"),
+                calendars: None,
+                after: None,
+                limit: 2,
+            },
+            &ExpansionLimits::DEFAULT,
+            &OnTheFlyLimits {
+                budget: Duration::from_secs(30),
+                ..OnTheFlyLimits::DEFAULT
+            },
+        )
+        .unwrap();
+        // Las tres veces que hay, y sólo ellas: la página está llena —tres es
+        // la capacidad— y no le falta nada.
+        assert_eq!(rows.rows.len(), 3);
+        assert_eq!(
+            titles(&rows),
+            vec![
+                ("2030-02-01T09:00:00+00:00".into(), "a".into()),
+                ("2030-02-01T10:00:00+00:00".into(), "b".into()),
+                ("2030-02-01T11:00:00+00:00".into(), "c".into()),
+            ]
+        );
+        assert!(
+            !rows.truncated,
+            "avisa de un truncamiento que no pasó, con la página entera"
+        );
+    }
+
+    /// **Una serie que se corta a mitad de camino avisa.** La serie de
+    /// `store_with_series_after_the_window` da diez veces en el rango y la
+    /// página entra cuatro: a la quinta, que ya no entra, el recorrido de la
+    /// serie se frena —las que siguen tampoco entrarían, porque vienen en
+    /// orden— y quedan cinco veces sin listar. Eso sí es truncamiento, y tiene
+    /// que quedar dicho.
+    #[test]
+    fn una_serie_cortada_a_medio_de_la_pagina_avisa() {
+        let temp = TempDir::new("leer-cortada");
+        let store = store_with_series_after_the_window(&temp, 1);
+        let rows = occurrences_in(
+            store.connection(),
+            "cuenta",
+            &OccurrenceQuery {
+                range: range("2030-02-01T00:00:00Z", "2030-02-01T00:10:00Z"),
+                calendars: None,
+                after: None,
+                limit: 3,
+            },
+            &ExpansionLimits::DEFAULT,
+            &OnTheFlyLimits {
+                budget: Duration::from_secs(30),
+                ..OnTheFlyLimits::DEFAULT
+            },
+        )
+        .unwrap();
+        // Las cuatro primeras entran; de la quinta en adelante no hay lugar.
+        assert_eq!(rows.rows.len(), 4);
+        assert!(rows.rows[3].0.key == at("2030-02-01T00:03:00Z"));
+        assert!(
+            rows.truncated,
+            "cinco veces del rango quedaron afuera sin avisar"
+        );
+    }
+
+    /// Al revés del anterior: una página que entra entera y deja todo lo demás
+    /// para las páginas que siguen **no** es un truncamiento, y no se marca.
+    /// Una vez sola en el rango, con una página de diez.
+    #[test]
+    fn una_pagina_entera_no_avisa_de_truncamiento() {
+        let temp = TempDir::new("leer-entera");
+        let store = store_with(
+            &temp,
+            &[(
+                "https://x/c/a.ics",
+                &serie_con_un_vez("a", "20300201T090000Z", "RRULE:FREQ=DAILY;COUNT=1\r\n"),
+            )],
+        );
+        let rows = occurrences_in(
+            store.connection(),
+            "cuenta",
+            &OccurrenceQuery {
+                range: range("2030-02-01T00:00:00Z", "2030-02-02T00:00:00Z"),
+                calendars: None,
+                after: None,
+                limit: 10,
+            },
+            &ExpansionLimits::DEFAULT,
+            &OnTheFlyLimits {
+                budget: Duration::from_secs(30),
+                ..OnTheFlyLimits::DEFAULT
+            },
+        )
+        .unwrap();
+        assert_eq!(rows.rows.len(), 1);
+        assert!(!rows.truncated);
+    }
+
+    /// **Paginar no deja ocurrencias atrás sin avisar.** Cuatro series por
+    /// minuto, cinco minutos: veinte veces. Se recorren todas las páginas con
+    /// lo que el cliente se lleva de cada una —`limit` filas, no la de más— y
+    /// lo juntado tiene que ser exactamente las veinte, sin repeticiones: lo
+    /// que una página deja atrás del tope queda después de su cursor y vuelve
+    /// en la siguiente, y si una página dijera que no está recortada y dejara
+    /// filas atrás, el que pagina dejaría de preguntar y no las vería nunca.
+    #[test]
+    fn paginar_no_deja_ocurrencias_atras_sin_aviso() {
+        let temp = TempDir::new("leer-paginar");
+        let store = store_with_series_after_the_window(&temp, 4);
+        let r = range("2030-02-01T00:00:00Z", "2030-02-01T00:05:00Z");
+        let fly = OnTheFlyLimits {
+            budget: Duration::from_secs(30),
+            ..OnTheFlyLimits::DEFAULT
+        };
+        let pagina = |after: Option<&ListCursor>, limit| {
+            occurrences_in(
+                store.connection(),
+                "cuenta",
+                &OccurrenceQuery {
+                    range: r,
+                    calendars: None,
+                    after,
+                    limit,
+                },
+                &ExpansionLimits::DEFAULT,
+                &fly,
+            )
+            .unwrap()
+        };
+        let todas: Vec<ListCursor> = pagina(None, 100).rows.into_iter().map(|(c, _)| c).collect();
+        assert_eq!(todas.len(), 20);
+        for limit in [1, 2, 3, 7, 19, 20] {
+            let mut after: Option<ListCursor> = None;
+            let mut vistas: Vec<ListCursor> = Vec::new();
+            for _ in 0..40 {
+                let rows = pagina(after.as_ref(), limit);
+                if !rows.truncated {
+                    // Sin `truncated` no puede quedar nada después: la página
+                    // es el resto.
+                    let quedan = todas
+                        .iter()
+                        .filter(|c| after.as_ref().is_none_or(|a| a.is_before(c)))
+                        .count();
+                    assert_eq!(
+                        quedan,
+                        rows.rows.len(),
+                        "una página sin `truncated` con {}/{} de las que quedaban",
+                        rows.rows.len(),
+                        quedan
+                    );
+                }
+                let entregadas: Vec<ListCursor> = rows
+                    .rows
+                    .iter()
+                    .take(limit)
+                    .map(|(c, _)| c.clone())
+                    .collect();
+                for c in &entregadas {
+                    assert!(!vistas.contains(c), "la fila {c:?} salió dos veces");
+                }
+                vistas.extend(entregadas);
+                if rows.rows.len() < limit + 1 {
+                    break;
+                }
+                after = rows.rows.get(limit - 1).map(|(c, _)| c.clone());
+            }
+            assert_eq!(vistas, todas, "con un límite de {limit} se perdió algo");
+        }
     }
 
     /// **Una expansión en el momento no tiene tomado el lector.** Dos

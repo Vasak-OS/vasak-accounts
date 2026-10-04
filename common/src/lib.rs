@@ -8,5 +8,7 @@
 //! bus. Eso vive acá una sola vez: dos copias de la lectura de `/proc` son dos
 //! copias que se separan.
 
+#[cfg(any(test, feature = "introspection"))]
+pub mod introspection;
 pub mod permissions;
 pub mod process;

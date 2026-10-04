@@ -89,7 +89,7 @@ use std::time::Duration;
 
 use tokio::sync::Mutex;
 use zbus::interface;
-use zbus::object_server::SignalContext;
+use zbus::object_server::SignalEmitter;
 
 use broker::{Broker, BrokerError};
 
@@ -748,7 +748,7 @@ impl Service {
     /// borrar porque el servidor no sabe borrar una sola. Ver `imap::move_to`.
     async fn move_message(
         &self,
-        #[zbus(signal_context)] emitter: SignalContext<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         account_id: String,
         mailbox: String,
         uid: u32,
@@ -803,7 +803,7 @@ impl Service {
     /// un botón que dice «borrar», y decirlo permite ofrecer otra cosa.
     async fn delete_message(
         &self,
-        #[zbus(signal_context)] emitter: SignalContext<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         account_id: String,
         mailbox: String,
         uid: u32,
@@ -866,7 +866,7 @@ impl Service {
     /// es de los errores más molestos que puede tener un cliente de correo.
     async fn mark_read(
         &self,
-        #[zbus(signal_context)] emitter: SignalContext<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         account_id: String,
         mailbox: String,
         uid: u32,
@@ -934,7 +934,7 @@ impl Service {
     /// mensaje que sale ahora cuando se pidió para mañana no se puede deshacer.
     async fn send_message(
         &self,
-        #[zbus(signal_context)] emitter: SignalContext<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         account_id: String,
         draft: String,
         not_before: String,
@@ -1014,7 +1014,7 @@ impl Service {
     /// preguntar antes; acá no hay forma de preguntar.
     async fn discard_outgoing(
         &self,
-        #[zbus(signal_context)] emitter: SignalContext<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         id: String,
     ) -> zbus::fdo::Result<()> {
         // Sin barras ni puntos: el identificador viene de afuera y se convierte
@@ -1042,7 +1042,7 @@ impl Service {
     /// Sin detalle, como las otras: quien la recibe vuelve a leer y ve el
     /// estado completo.
     #[zbus(signal)]
-    async fn outbox_changed(emitter: &SignalContext<'_>) -> zbus::Result<()>;
+    async fn outbox_changed(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
 
     /// Señal `MessagesChanged` — cambió la lista de mensajes de alguna cuenta.
     ///
@@ -1050,7 +1050,7 @@ impl Service {
     /// leer y ve el estado completo, en vez de reconciliar señales que se pueden
     /// perder.
     #[zbus(signal)]
-    async fn messages_changed(emitter: &SignalContext<'_>) -> zbus::Result<()>;
+    async fn messages_changed(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
 
     /// Señal `MailboxChanged` — cambió el correo sin leer de alguna cuenta.
     ///
@@ -1058,7 +1058,7 @@ impl Service {
     /// la recibe vuelve a leer y ve el estado completo, en vez de reconciliar
     /// señales que se pueden perder.
     #[zbus(signal)]
-    async fn mailbox_changed(emitter: &SignalContext<'_>) -> zbus::Result<()>;
+    async fn mailbox_changed(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
 }
 
 /// Lo que necesita el servicio y no es un método de D-Bus.
@@ -1125,7 +1125,7 @@ fn next_unique() -> u64 {
 /// Se despierta cuando alguien encola algo y, si no, cada tanto: un mensaje
 /// que quedó esperando por un servidor caído tiene que salir solo cuando el
 /// servidor vuelva, sin que nadie apriete nada.
-async fn dispatch_outbox(service: Service, emitter: SignalContext<'static>) {
+async fn dispatch_outbox(service: Service, emitter: SignalEmitter<'static>) {
     loop {
         let changed = flush_outbox(&service).await;
         if changed {
@@ -1266,7 +1266,7 @@ async fn read_mailbox_status(
 /// Publica lo que se sabe de una cuenta y avisa si cambió.
 async fn publish_status(
     service: &Service,
-    emitter: &SignalContext<'_>,
+    emitter: &SignalEmitter<'_>,
     account: &broker::Account,
     result: Result<imap::MailboxStatus, String>,
 ) {
@@ -1304,7 +1304,7 @@ async fn publish_status(
 /// correo a redibujar una lista idéntica.
 async fn publish_messages(
     service: &Service,
-    emitter: &SignalContext<'_>,
+    emitter: &SignalEmitter<'_>,
     account_id: &str,
     messages: Vec<message::MessageSummary>,
 ) {
@@ -1416,7 +1416,7 @@ async fn follow_notification_actions(
 async fn serve_account(
     account: broker::Account,
     service: Service,
-    emitter: SignalContext<'static>,
+    emitter: SignalEmitter<'static>,
 ) {
     loop {
         let broker = match Broker::connect().await {
@@ -1503,7 +1503,7 @@ async fn account_session(
     broker: &Broker,
     account: &broker::Account,
     service: &Service,
-    emitter: &SignalContext<'_>,
+    emitter: &SignalEmitter<'_>,
 ) -> Result<std::convert::Infallible, SessionEnd> {
     let mut session = open_session(broker, account)
         .await
@@ -1601,7 +1601,7 @@ async fn account_session(
 async fn list_inbox(
     session: &mut imap::Session,
     service: &Service,
-    emitter: &SignalContext<'_>,
+    emitter: &SignalEmitter<'_>,
     account: &broker::Account,
     messages: u32,
 ) -> Result<(), SessionEnd> {
@@ -1634,7 +1634,7 @@ fn classify_session_end(detail: String) -> SessionEnd {
 async fn reconcile_tasks(
     broker: &Broker,
     service: &Service,
-    emitter: &SignalContext<'static>,
+    emitter: &SignalEmitter<'static>,
     tasks: &mut HashMap<String, tokio::task::JoinHandle<()>>,
 ) -> Result<Vec<broker::Account>, BrokerError> {
     let accounts = broker.accounts().await?;
@@ -1763,7 +1763,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .request_name("ar.net.vasak.os.AccountsSync")
         .await?;
 
-    let emitter = SignalContext::new(&connection, "/ar/net/vasak/os/AccountsSync")?.to_owned();
+    let emitter = SignalEmitter::new(&connection, "/ar/net/vasak/os/AccountsSync")?.to_owned();
 
     let (wake, mut wakeup) = tokio::sync::mpsc::channel::<()>(1);
     tokio::spawn(async move {
@@ -1954,6 +1954,113 @@ mod tests {
         assert!(!sent_by(Some(&other), Some(&service)));
         assert!(!sent_by(Some(&service), None));
         assert!(!sent_by(None, Some(&service)));
+    }
+
+    /// **Lo que ve `vasak-mail` de `AccountsSync` no cambia sin querer.**
+    ///
+    /// Los nombres, las firmas y las señales, leídos del `Introspect` que
+    /// contesta el objeto de verdad, contra `dbus/ar.net.vasak.os.AccountsSync.txt`.
+    /// El archivo se escribió con la salida de zbus 4, antes de subir a la 5
+    /// (`Vasak-OS/vasak-accounts#58`). `vasak-mail` es el único cliente: cambiar
+    /// la interfaz a propósito es cambiar también ese archivo y su proxy.
+    #[tokio::test]
+    async fn la_interfaz_del_correo_no_cambia_para_sus_clientes() {
+        const PATH: &str = "/ar/net/vasak/os/AccountsSync";
+        let (_server, client) =
+            vasak_accounts_common::introspection::serve_p2p(PATH, Service::default())
+                .await
+                .unwrap();
+        let xml = vasak_accounts_common::introspection::introspect(&client, PATH)
+            .await
+            .unwrap();
+        let surface = vasak_accounts_common::introspection::interface_surface(
+            &xml,
+            "ar.net.vasak.os.AccountsSync",
+        )
+        .expect("el objeto publica la interfaz");
+        assert_eq!(
+            surface,
+            include_str!("../dbus/ar.net.vasak.os.AccountsSync.txt"),
+            "la interfaz cambió; si es a propósito, esto es lo que hay ahora:\n{surface}"
+        );
+    }
+
+    /// Lo que se rechaza por los argumentos se rechaza **antes** de buscar la
+    /// cuenta, el servidor o la cola: con `InvalidArgs`, que es lo que
+    /// `vasak-mail` muestra como «revisá lo que pusiste», y sin tocar nada.
+    /// Por el bus, con la firma de cada método tal como la llama `vasak-mail`.
+    #[tokio::test]
+    async fn los_argumentos_invalidos_se_rechazan_por_el_bus_sin_tocar_nada() {
+        const PATH: &str = "/ar/net/vasak/os/AccountsSync";
+        const INTERFACE: &str = "ar.net.vasak.os.AccountsSync";
+        let (_server, client) =
+            vasak_accounts_common::introspection::serve_p2p(PATH, Service::default())
+                .await
+                .unwrap();
+        let invalid_args = |result: zbus::Result<zbus::Message>, what: &str| {
+            let Err(zbus::Error::MethodError(name, _, _)) = result else {
+                panic!("{what}: se esperaba un rechazo: {result:?}");
+            };
+            assert_eq!(
+                name.as_str(),
+                "org.freedesktop.DBus.Error.InvalidArgs",
+                "{what}"
+            );
+        };
+
+        invalid_args(
+            client
+                .call_method(
+                    None::<&str>,
+                    PATH,
+                    Some(INTERFACE),
+                    "MoveMessage",
+                    &("cuenta", "INBOX", 1u32, " "),
+                )
+                .await,
+            "mover sin destino",
+        );
+        invalid_args(
+            client
+                .call_method(
+                    None::<&str>,
+                    PATH,
+                    Some(INTERFACE),
+                    "SendMessage",
+                    &("cuenta", "{}", "mañana"),
+                )
+                .await,
+            "una hora que no se entiende",
+        );
+        invalid_args(
+            client
+                .call_method(
+                    None::<&str>,
+                    PATH,
+                    Some(INTERFACE),
+                    "DiscardOutgoing",
+                    &("../../algo",),
+                )
+                .await,
+            "un identificador con barras",
+        );
+
+        // Mover a donde ya está no es un error, ni algo que haya que pedirle al
+        // servidor: contesta sin buscar la cuenta.
+        let reply: String = client
+            .call_method(
+                None::<&str>,
+                PATH,
+                Some(INTERFACE),
+                "MoveMessage",
+                &("cuenta", "", 1u32, "INBOX"),
+            )
+            .await
+            .unwrap()
+            .body()
+            .deserialize()
+            .unwrap();
+        assert_eq!(reply, "entero");
     }
 
     /// Después de arrancar, el proceso no es volcable. (Deja así al proceso de

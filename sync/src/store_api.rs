@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use zbus::interface;
 use zbus::message::Header;
-use zbus::object_server::SignalContext;
+use zbus::object_server::SignalEmitter;
 
 use serde::Serialize;
 
@@ -138,7 +138,7 @@ impl<K: KeySource> StoreApi<K> {
     async fn set_store_enabled(
         &self,
         #[zbus(header)] header: Header<'_>,
-        #[zbus(signal_context)] emitter: SignalContext<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         account_id: String,
         enabled: bool,
     ) -> zbus::fdo::Result<()> {
@@ -166,7 +166,7 @@ impl<K: KeySource> StoreApi<K> {
     async fn clear_store(
         &self,
         #[zbus(header)] header: Header<'_>,
-        #[zbus(signal_context)] emitter: SignalContext<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         account_id: String,
     ) -> zbus::fdo::Result<()> {
         self.admit_control(&header, &account_id, ControlAction::Clear)
@@ -202,7 +202,7 @@ impl<K: KeySource> StoreApi<K> {
     async fn request_sync(
         &self,
         #[zbus(header)] header: Header<'_>,
-        #[zbus(signal_context)] emitter: SignalContext<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         account_id: String,
     ) -> zbus::fdo::Result<()> {
         self.admit_control(&header, &account_id, ControlAction::Sync)
@@ -575,7 +575,7 @@ impl<K: KeySource> StoreApi<K> {
     ///
     /// Sin detalle: quien la recibe vuelve a leer `GetStatus`.
     #[zbus(signal)]
-    async fn status_changed(emitter: &SignalContext<'_>) -> zbus::Result<()>;
+    async fn status_changed(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
 
     /// Señal `Changed` — un lote cambió lo guardado de un área (`contacts`,
     /// `calendar`) de una cuenta. Una por lote que cambió algo; ninguna por un
@@ -583,7 +583,7 @@ impl<K: KeySource> StoreApi<K> {
     /// sale, si cambió lo que se ve.
     #[zbus(signal)]
     async fn changed(
-        emitter: &SignalContext<'_>,
+        emitter: &SignalEmitter<'_>,
         area: &str,
         account_id: &str,
         generation: u64,
@@ -921,7 +921,7 @@ pub fn listing_from(result: &Result<Vec<broker::Account>, BrokerError>) -> Accou
 /// El almacén andando: la interfaz publicada y el llavero escuchado.
 pub struct StoreService<K: KeySource> {
     manager: Arc<StoreManager<K>>,
-    emitter: SignalContext<'static>,
+    emitter: SignalEmitter<'static>,
 }
 
 impl StoreService<SecretServiceKeys> {
@@ -1014,14 +1014,30 @@ impl StoreService<SecretServiceKeys> {
 
     /// Escucha los cambios de `Locked` del llavero y vuelve a pasar la tabla.
     ///
-    /// Es lo que abre las bases al iniciar sesión, cuando el llavero se
-    /// desbloquea después de que este servicio arrancó. Lo contrario —que se
-    /// bloquee— **no es inmediato**: `vasak-keyring` no avisa al bloquear, así
-    /// que lo levanta la revisión de cada cinco minutos, y hasta entonces —hasta
-    /// 300 segundos— la base sigue abierta con su clave en memoria.
+    /// Con los dos sentidos: abre las bases cuando el llavero se desbloquea al
+    /// iniciar sesión, y **las cierra cuando se bloquea**. `vasak-keyring` avisa
+    /// de los dos
+    /// (`Vasak-OS/vasak-keyring#25`); antes sólo del desbloqueo, así que el
+    /// bloqueo lo levantaba la revisión de cada cinco minutos y, hasta entonces
+    /// —hasta 300 segundos— la base seguía abierta con la clave en memoria.
+    ///
+    /// Polling nocerraba esa ventana, la acotaba: son 300 segundos, no
+    /// «hasta que la persona vuelva a abrir la aplicación». El aviso es lo que
+    /// la cierra, y la revisión por reloj queda como red para el aviso que no
+    /// llega —un llavero que se va sin cerrar nada, por ejemplo—, no como el
+    /// mecanismo.
     ///
     /// Sólo cuentan los avisos del dueño de `org.freedesktop.secrets`, y cada
-    /// uno espera [`SETTLE`] antes de reaccionar.
+    /// uno espera [`SETTLE`] antes de reaccionar. Reaccionar es
+    /// [`StoreManager::refresh`], que con el llavero bloqueado cierra bases y
+    /// lectores: es idempotente, y por eso dos señales del mismo bloqueo —o de
+    /// dos colecciones bloqueadas a la vez— no rompen nada.
+    ///
+    /// Lo de acá —que la señal llegue y la base se cierre— lo prueba
+    /// `el_aviso_que_manda_el_llavero_cierra_la_base`, más abajo, con un
+    /// `SecretServiceKeys` de verdad y un llavero falso al otro lado del hilo.
+    /// Las pruebas de `store::lifecycle` que se llaman `refresh_…` no alcanzan
+    /// para esto: llaman a `refresh` ellas mismas.
     fn watch_keyring(&self) {
         use futures_util::{FutureExt, StreamExt};
 
@@ -1075,7 +1091,7 @@ impl<K: KeySource> StoreService<K> {
                 },
             )
             .await?;
-        let emitter = SignalContext::new(connection, PATH)?.to_owned();
+        let emitter = SignalEmitter::new(connection, PATH)?.to_owned();
         Ok(Self { manager, emitter })
     }
 
@@ -1127,7 +1143,8 @@ mod tests {
     use crate::store::contacts::tests::row;
     use crate::store::contacts::ContactOp;
     use crate::store::key::fake::FakeKeys;
-    use crate::store::lifecycle::StoreSettings;
+    use crate::store::key::tests::{fake_keyring, lock_and_announce, unlock_and_announce, Shared};
+    use crate::store::lifecycle::{StoreSettings, StoreState};
     use crate::store::paths::tests::TempDir;
 
     const IFACE: &str = "ar.net.vasak.os.AccountsStore";
@@ -1178,6 +1195,34 @@ mod tests {
         let ids: Vec<&str> = accounts.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b"]);
         assert_eq!(accounts[1].capabilities, vec!["email"]);
+    }
+
+    /// **Lo que ven los clientes de `AccountsStore` no cambia sin querer.**
+    ///
+    /// Los nombres, las firmas y las señales, leídos del `Introspect` que
+    /// contesta el objeto de verdad, contra `dbus/ar.net.vasak.os.AccountsStore.txt`.
+    /// El archivo se escribió con la salida de zbus 4, antes de subir a la 5
+    /// (`Vasak-OS/vasak-accounts#58`): un salto del andamiaje de D-Bus no dice
+    /// en ninguna otra prueba si una interfaz sigue igual para quien la usa.
+    /// Cambiar la interfaz a propósito es cambiar también ese archivo, en el
+    /// mismo PR, y avisar a los clientes.
+    #[tokio::test]
+    async fn la_interfaz_del_almacen_no_cambia_para_sus_clientes() {
+        let mut api = Api::new("introspeccion", Vec::new(), Answer::Allow).await;
+        let (client, _service) = api.client(":1.20").await;
+        let xml = vasak_accounts_common::introspection::introspect(&client, PATH)
+            .await
+            .unwrap();
+        let surface = vasak_accounts_common::introspection::interface_surface(
+            &xml,
+            "ar.net.vasak.os.AccountsStore",
+        )
+        .expect("el objeto publica la interfaz");
+        assert_eq!(
+            surface,
+            include_str!("../dbus/ar.net.vasak.os.AccountsStore.txt"),
+            "la interfaz cambió; si es a propósito, esto es lo que hay ahora:\n{surface}"
+        );
     }
 
     /// La interfaz entera, con el llavero falso y un `vasak-permissions` falso,
@@ -2464,5 +2509,207 @@ mod tests {
         api.with_calendar_data("cuenta", "c").await;
         let (area, account_id, _) = next_changed(&mut signals).await;
         assert_eq!((area.as_str(), account_id.as_str()), ("calendar", "cuenta"));
+    }
+
+    /// El sincronizador con el llavero de verdad encima: el
+    /// [`SecretServiceKeys`] de verdad, conectado por una conexión punto a
+    /// punto al llavero falso de `key.rs` ([`fake_keyring`]), una base de
+    /// verdad con su clave en ese llavero, y el servicio con su espectador de
+    /// avisos ya escuchando.
+    ///
+    /// Es un fixture aparte de [`Api`] a propósito: `Api` usa
+    /// [`crate::store::key::fake::FakeKeys`], y con un `KeySource` falso
+    /// `watch_keyring` **no se puede probar**, porque no se puede ni escribir:
+    /// [`crate::store::key::SecretServiceKeys::lock_changes`] e
+    /// `is_from_keyring` son del cliente de verdad de
+    /// `org.freedesktop.secrets`, y por eso el impl de [`StoreService`] que los
+    /// tiene es el de `SecretServiceKeys` y no el de cualquier `K`.
+    struct Watched {
+        /// Para que la carpeta de las bases no se borre a mitad de la prueba.
+        _temp: TempDir,
+        manager: Arc<StoreManager<SecretServiceKeys>>,
+        /// El otro extremo del hilo: el llavero falso, el que manda el aviso.
+        keyring: zbus::Connection,
+        shared: Shared,
+        /// Las dos puntas de la conexión del servicio. La del servicio porque es
+        /// la que tiene el emisor de señales; la del otro, porque una
+        /// `UnixStream::pair()` a la que se le suelta un extremo se rompe.
+        _service: (zbus::Connection, zbus::Connection),
+    }
+
+    impl Watched {
+        async fn new(label: &str) -> Self {
+            let temp = TempDir::new(label);
+            let (keys, keyring, shared) = fake_keyring().await;
+            let manager = Arc::new(StoreManager::new(
+                keys,
+                Ok(Locations {
+                    stores: temp.0.join("data/stores"),
+                    settings: temp.0.join("data/stores.json"),
+                }),
+            ));
+            manager
+                .accounts_listed(
+                    listing_from(&Ok(vec![account("cuenta", false)])),
+                    Instant::now(),
+                )
+                .await;
+            assert!(
+                manager.is_open("cuenta").await,
+                "la base se abre con el llavero de verdad, y su clave"
+            );
+
+            // La conexión del servicio, que `serve` necesita para sacar el
+            // emisor de señales. Es otro par, aparte del del llavero.
+            let (service_end, peer_end) = tokio::net::UnixStream::pair().unwrap();
+            let service = zbus::connection::Builder::unix_stream(service_end)
+                .server(zbus::Guid::generate())
+                .unwrap()
+                .p2p()
+                .build();
+            let peer = zbus::connection::Builder::unix_stream(peer_end)
+                .p2p()
+                .build();
+            let (service, peer) = tokio::join!(service, peer);
+            let (service, peer) = (service.unwrap(), peer.unwrap());
+            // Lo que haría el bus: cada mensaje de este cliente sale con su
+            // nombre único como remitente.
+            peer.set_unique_name(":1.9").unwrap();
+
+            let access = AccessFixture::new(Answer::Allow).await;
+            StoreService::<SecretServiceKeys>::serve(
+                &service,
+                Arc::clone(&manager),
+                None,
+                None,
+                Arc::clone(&access.access),
+            )
+            .await
+            .unwrap()
+            .watch_keyring();
+
+            Self {
+                _temp: temp,
+                manager,
+                keyring,
+                shared,
+                _service: (service, peer),
+            }
+        }
+
+        async fn state(&self) -> StoreState {
+            self.manager
+                .status()
+                .await
+                .accounts
+                .into_iter()
+                .find(|a| a.account_id == "cuenta")
+                .map(|a| a.state)
+                .expect("la cuenta figura en el estado")
+        }
+
+        /// El llavero se bloquea y avisa, como lo hace `vasak-keyring`: el
+        /// mensaje de verdad, por el hilo, desde el otro extremo.
+        async fn lock(&self) {
+            lock_and_announce(&self.keyring, &self.shared)
+                .await
+                .expect("el llavero falso pudo avisar del bloqueo");
+        }
+
+        /// Y al revés: desbloquea y avisa.
+        async fn unlock(&self) {
+            unlock_and_announce(&self.keyring, &self.shared)
+                .await
+                .expect("el llavero falso pudo avisar del desbloqueo");
+        }
+
+        /// Espera a que la base esté como se le pide, y dice si llegó.
+        async fn wait_open(&self, abierta: bool) -> bool {
+            tokio::time::timeout(ESPERA, async {
+                while self.manager.is_open("cuenta").await != abierta {
+                    tokio::time::sleep(ESPERA_PASO).await;
+                }
+            })
+            .await
+            .is_ok()
+        }
+    }
+
+    /// Cuánto se le da a una reacción del espectador antes de darla por perdida,
+    /// y cada cuánto se mira. El espectador espera [`SETTLE`] —un segundo— y
+    /// después pasa la tabla, que va al llavero por el hilo; en un runner
+    /// cargado eso no es instantáneo, así que el margen es holgado.
+    const ESPERA: Duration = Duration::from_secs(20);
+    const ESPERA_PASO: Duration = Duration::from_millis(50);
+
+    /// Cuánto se espera a que el espectador esté de verdad suscrito antes de
+    /// mandar el primer aviso. Suscribirse no es una ida al bus —en una
+    /// conexión punto a punto la regla se registra localmente—, así que esto es
+    /// holgado a propósito: si el aviso saliera antes de la suscripción, el
+    /// mensaje se perdería y la prueba fallaría sin motivo.
+    const ESPERA_SUSCRIPCION: Duration = Duration::from_millis(500);
+
+    /// El aviso de bloqueo **llega por el bus y cierra la base**, sin que nadie
+    /// llame a `refresh` a mano y sin que corran los 300 segundos.
+    ///
+    /// Ésta es la mitad de la cadena que las pruebas de `lifecycle.rs` no
+    /// cubren. Esas empiezan aquí: cambian el estado del llavero falso y llaman
+    /// a [`StoreManager::refresh`] ellas mismas, así que pasan aunque el
+    /// espectador deje de reaccionar —si alguien renombra el aviso, cambia la
+    /// suscripción o toca el filtro, siguen verdes y la ventana de 300 segundos
+    /// vuelve sin que nadie lo note—. Esta arranca antes, en el otro extremo del
+    /// hilo: el `PropertiesChanged` de `Locked` que emite un
+    /// [`SecretServiceKeys`] de verdad, y [`StoreService::watch_keyring`] es lo
+    /// único que reacciona.
+    ///
+    /// El reloj va **sin pausar**, al revés que las de `lifecycle.rs`, y por un
+    /// motivo que vale la pena: aquí hay D-Bus de verdad, y el reloj de un tokio
+    /// pausado adelanta sus propios temporizadores mientras las llamadas de
+    /// bus —que son de verdad— todavía vuelan. Con `start_paused` el tiempo
+    /// virtual se acababa antes de que terminara una ida al llavero, y la
+    /// prueba moría por tiempo agotado sin que el espectador tuviera culpa. Los
+    /// 300 segundos no los mide el reloj de todos modos: en esta prueba **no
+    /// hay revisión por reloj**, porque [`StoreManager::run`] —lo único que la
+    /// tiene— no llega a llamarse, y lo que se comprueba es que la reacción
+    /// tarda un segundo y no cinco minutos.
+    #[tokio::test]
+    async fn el_aviso_que_manda_el_llavero_cierra_la_base() {
+        let w = Watched::new("watch-keyring").await;
+        assert_eq!(w.state().await, StoreState::Open, "la base está abierta");
+
+        // El control negativo: se le da tiempo a suscribirse, y con el
+        // espectador ya escuchando y sin que llegue nada, la base sigue
+        // abierta. Sin este tramo, la prueba de abajo probaría que la base se
+        // cierra, que también ocurre si el espectador no hace nada y la cierra
+        // otra cosa.
+        tokio::time::sleep(ESPERA_SUSCRIPCION).await;
+        assert!(
+            w.manager.is_open("cuenta").await,
+            "sin aviso no se cierra: lo que reacciona es al aviso, no al reloj"
+        );
+
+        // Y ahora sí: el llavero se bloquea y avisa.
+        let antes = Instant::now();
+        w.lock().await;
+        assert!(
+            w.wait_open(false).await,
+            "el aviso no cerró la base: el espectador no reaccionó al bloqueo"
+        );
+        let tardo = Instant::now() - antes;
+        assert!(
+            tardo < crate::POLL_INTERVAL,
+            "y tardó {tardo:?}, que no es la revisión de cada cinco minutos"
+        );
+        assert_eq!(w.state().await, StoreState::Locked, "y queda bloqueada");
+
+        // Y al desbloquear vuelve por el mismo camino, sin que nadie llame a
+        // `refresh` a mano: es el mismo espectador, y por eso el aviso de vuelta
+        // importa tanto como el de ida.
+        w.unlock().await;
+        assert!(
+            w.wait_open(true).await,
+            "el desbloqueo tampoco llegó, y es el mismo código que el de ida"
+        );
+        assert_eq!(w.state().await, StoreState::Open, "y vuelve a abrir");
     }
 }

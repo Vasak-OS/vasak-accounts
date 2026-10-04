@@ -18,7 +18,7 @@ use zbus::fdo::Error as FdoError;
 use zbus::interface;
 use zbus::message::Header;
 use zbus::names::BusName;
-use zbus::object_server::SignalContext;
+use zbus::object_server::SignalEmitter;
 
 /// Decides whether `caller` may use `capability` on `account_id`.
 ///
@@ -348,7 +348,7 @@ impl AccountManager {
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
-        #[zbus(signal_context)] emisor: SignalContext<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         provider_id: String,
         client_id: String,
         client_secret: String,
@@ -399,7 +399,7 @@ impl AccountManager {
         .await?;
 
         tracing::info!("credenciales propias guardadas para '{provider_id}' (uid {uid})");
-        Self::accounts_changed(&emisor, uid).await?;
+        Self::accounts_changed(&emitter, uid).await?;
         Ok(())
     }
 
@@ -413,7 +413,7 @@ impl AccountManager {
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
-        #[zbus(signal_context)] emisor: SignalContext<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         provider_id: String,
     ) -> zbus::fdo::Result<()> {
         let (_caller, uid) = caller_identity(connection, &header).await?;
@@ -425,7 +425,7 @@ impl AccountManager {
         .await?;
 
         tracing::info!("credenciales propias de '{provider_id}' borradas (uid {uid})");
-        Self::accounts_changed(&emisor, uid).await?;
+        Self::accounts_changed(&emitter, uid).await?;
         Ok(())
     }
 
@@ -539,7 +539,7 @@ impl AccountManager {
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
-        #[zbus(signal_context)] emisor: SignalContext<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         request_id: String,
         code: String,
         state: String,
@@ -631,7 +631,7 @@ impl AccountManager {
             "cuenta '{account_id}' conectada a '{}' (uid {uid})",
             proveedor.id
         );
-        Self::accounts_changed(&emisor, uid).await?;
+        Self::accounts_changed(&emitter, uid).await?;
         Ok(account_id)
     }
 
@@ -710,7 +710,7 @@ impl AccountManager {
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
-        #[zbus(signal_context)] emisor: SignalContext<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         request_id: String,
     ) -> zbus::fdo::Result<String> {
         let (_caller, uid) = caller_identity(connection, &header).await?;
@@ -743,7 +743,7 @@ impl AccountManager {
             "cuenta '{account_id}' conectada a {} (uid {uid})",
             flujo.server
         );
-        Self::accounts_changed(&emisor, uid).await?;
+        Self::accounts_changed(&emitter, uid).await?;
 
         Ok(serde_json::json!({ "status": "done", "account_id": account_id }).to_string())
     }
@@ -786,7 +786,7 @@ impl AccountManager {
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
-        #[zbus(signal_context)] emisor: SignalContext<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         display_name: String,
         provider_type: String,
         capabilities_json: String,
@@ -828,7 +828,7 @@ impl AccountManager {
             .await?;
 
         tracing::info!("Cuenta '{account_id}' registrada para el usuario {uid}");
-        Self::accounts_changed(&emisor, uid).await?;
+        Self::accounts_changed(&emitter, uid).await?;
         Ok(account_id)
     }
 
@@ -856,7 +856,7 @@ impl AccountManager {
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
-        #[zbus(signal_context)] emisor: SignalContext<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         account_id: String,
     ) -> zbus::fdo::Result<String> {
         let (caller, uid) = caller_identity(connection, &header).await?;
@@ -891,7 +891,7 @@ impl AccountManager {
             .await?;
 
         if borrada {
-            Self::accounts_changed(&emisor, uid).await?;
+            Self::accounts_changed(&emitter, uid).await?;
         }
 
         let (revocada, detalle) = match revocacion {
@@ -936,7 +936,7 @@ impl AccountManager {
     /// Releer sólo una deja la pantalla mostrando un proveedor apagado que ya
     /// está listo, o al revés.
     #[zbus(signal)]
-    async fn accounts_changed(emisor: &SignalContext<'_>, uid: u32) -> zbus::Result<()>;
+    async fn accounts_changed(emitter: &SignalEmitter<'_>, uid: u32) -> zbus::Result<()>;
 
     /// Método `GetAccessToken` — un access_token **válido** para la cuenta y
     /// capacidad indicadas, refrescándolo si hace falta.
@@ -944,7 +944,7 @@ impl AccountManager {
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
         #[zbus(header)] header: Header<'_>,
-        #[zbus(signal_context)] emisor: SignalContext<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         account_id: String,
         capability: String,
     ) -> zbus::fdo::Result<String> {
@@ -1018,15 +1018,13 @@ impl AccountManager {
             .capabilities
             .iter()
             .map(|capacidad| {
-                let url = match capacidad {
-                    CapabilityType::Drive => Some(rutas.files.as_str()),
-                    CapabilityType::Calendar => Some(rutas.calendars.as_str()),
-                    CapabilityType::Contacts => Some(rutas.addressbooks.as_str()),
-                    // Talk y las tareas se hablan por otras rutas que todavía no
-                    // consume nadie. Se guarda el servidor y el usuario, que es
-                    // lo que hará falta cuando exista la app de chats.
-                    _ => None,
-                };
+                // De `DavUrls`, y no de un `match` escrito acá: la misma lista
+                // que dice qué capacidades tienen dirección es la que decide lo
+                // que se anuncia como no disponible, así que no pueden
+                // separarse. `BeginAuth` ya descarta lo que no está en esa
+                // lista, pero si algo llegara igual, queda `null` y no una URL
+                // armada a mano que no va a ningún lado.
+                let url = rutas.for_capability(capacidad);
                 (
                     *capacidad,
                     serde_json::json!({
@@ -1361,6 +1359,101 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use crate::storage::Account;
+
+    /// **Lo que ven los clientes de `AccountManager` no cambia sin querer.**
+    ///
+    /// Los nombres, las firmas y las señales, leídos del `Introspect` que
+    /// contesta el objeto de verdad, contra `dbus/ar.net.vasak.os.AccountManager.txt`.
+    /// El archivo se escribió con la salida de zbus 4, antes de subir a la 5
+    /// (`Vasak-OS/vasak-accounts#58`): la ventana de cuentas, el sincronizador y
+    /// cada aplicación que pide un token hablan esta interfaz, y un salto del
+    /// andamiaje de D-Bus no lo dice en ninguna otra prueba. Cambiarla a
+    /// propósito es cambiar también ese archivo, en el mismo PR.
+    #[tokio::test]
+    async fn la_interfaz_de_cuentas_no_cambia_para_sus_clientes() {
+        const PATH: &str = "/ar/net/vasak/os/AccountManager";
+        let (_server, client) =
+            vasak_accounts_common::introspection::serve_p2p(PATH, AccountManager::default())
+                .await
+                .unwrap();
+        let xml = vasak_accounts_common::introspection::introspect(&client, PATH)
+            .await
+            .unwrap();
+        let surface = vasak_accounts_common::introspection::interface_surface(
+            &xml,
+            "ar.net.vasak.os.AccountManager",
+        )
+        .expect("el objeto publica la interfaz");
+        assert_eq!(
+            surface,
+            include_str!("../dbus/ar.net.vasak.os.AccountManager.txt"),
+            "la interfaz cambió; si es a propósito, esto es lo que hay ahora:\n{surface}"
+        );
+    }
+
+    /// Sin remitente no hay a quién atribuir el pedido, y **ningún** método que
+    /// cambia algo o da un secreto sigue adelante: todos contestan `Failed`
+    /// antes de tocar la base, el catálogo o la red.
+    ///
+    /// Por una conexión punto a punto, donde los mensajes llegan sin
+    /// remitente: es el caso de un llamante que no se pudo identificar. Pasa
+    /// además por cada método con su firma de verdad, así que también dice que
+    /// siguen contestando por el bus con los argumentos que mandan sus clientes.
+    #[tokio::test]
+    async fn sin_identidad_del_llamante_ningun_metodo_sigue_adelante() {
+        const PATH: &str = "/ar/net/vasak/os/AccountManager";
+        const INTERFACE: &str = "ar.net.vasak.os.AccountManager";
+        let (_server, client) =
+            vasak_accounts_common::introspection::serve_p2p(PATH, AccountManager::default())
+                .await
+                .unwrap();
+        // Cada método con los argumentos de su firma; lo que valen no importa,
+        // porque ninguno tiene que llegar a mirarlos.
+        async fn refused<B>(client: &zbus::Connection, method: &str, body: &B)
+        where
+            B: serde::Serialize + zbus::zvariant::DynamicType,
+        {
+            let result = client
+                .call_method(None::<&str>, PATH, Some(INTERFACE), method, body)
+                .await;
+            let Err(zbus::Error::MethodError(name, detail, _)) = result else {
+                panic!("{method} siguió adelante sin saber quién llama: {result:?}");
+            };
+            assert_eq!(
+                name.as_str(),
+                "org.freedesktop.DBus.Error.Failed",
+                "{method}"
+            );
+            assert!(
+                detail.as_deref().unwrap_or_default().contains("Sender"),
+                "{method} tiene que frenar en la identidad: {detail:?}"
+            );
+        }
+
+        refused(&client, "Ping", &()).await;
+        refused(
+            &client,
+            "SetProviderCredentials",
+            &("google", "id", "secreto"),
+        )
+        .await;
+        refused(&client, "ClearProviderCredentials", &("google",)).await;
+        refused(
+            &client,
+            "CompleteAuth",
+            &("pedido", "codigo", "estado", "Trabajo"),
+        )
+        .await;
+        refused(&client, "PollNextcloudLogin", &("pedido",)).await;
+        refused(
+            &client,
+            "RegisterAccount",
+            &("Trabajo", "custom", "{}", "{}"),
+        )
+        .await;
+        refused(&client, "RemoveAccount", &("cuenta",)).await;
+        refused(&client, "GetAccessToken", &("cuenta", "email")).await;
+    }
 
     #[test]
     fn una_lista_de_capacidades_se_interpreta() {

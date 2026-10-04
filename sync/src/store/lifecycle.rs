@@ -1928,7 +1928,7 @@ impl<K: KeySource> StoreManager<K> {
     }
 
     #[cfg(test)]
-    async fn is_open(&self, account_id: &str) -> bool {
+    pub(crate) async fn is_open(&self, account_id: &str) -> bool {
         self.inner
             .lock()
             .await
@@ -1969,6 +1969,7 @@ mod tests {
     use super::super::key::fake::FakeKeys;
     use super::super::paths::tests::TempDir;
     use super::*;
+    use crate::store_api::listing_from;
 
     struct Fixture {
         temp: TempDir,
@@ -2804,6 +2805,187 @@ mod tests {
         assert!(f.paths("a").db_exists().unwrap());
         assert!(f.paths("b").db_exists().unwrap());
         assert!(f.keys.state().deleted.is_empty());
+    }
+
+    /// El mismo camino entero, de punta a punta: un `ListAccounts` que el
+    /// demonio no puede responder, traducido por [`crate::store_api::listing_from`]
+    /// —la función real que decide si una respuesta es una lista o un fallo—,
+    /// y de ahí al podador.
+    ///
+    /// Es la prueba de `Vasak-OS/vasak-accounts#56`, y lo que fija es la
+    /// costura entre las dos mitades. El demonio contestaba una lista vacía
+    /// cuando no podía leer `accounts.json`; esa lista vacía la ve
+    /// [`Listings`] como «la persona no tiene cuentas», y dos listados vacíos
+    /// separados por una vuelta son exactamente lo que confirma una ausencia
+    /// para podar. Cinco minutos después, el correo, el calendario y los
+    /// contactos de la persona estaban borrados y no quedaba copia de la que
+    /// volver.
+    ///
+    /// Lo que se comprueba acá es que el otro lado del cable —el que decide que
+    /// un error es «no borrar nada»— sigue siendo así, y que no depende de
+    /// cuántas vueltas pasen: el podador no lleva la cuenta de los fallos.
+    #[tokio::test]
+    async fn un_list_accounts_que_el_demonio_no_puede_contestar_no_poda_nada() {
+        let f = Fixture::new("falla-de-lectura");
+        f.list(listing(&["correo", "calendario", "contactos"]))
+            .await;
+        for cuenta in ["correo", "calendario", "contactos"] {
+            assert!(
+                f.paths(cuenta).db_exists().unwrap(),
+                "la base de {cuenta} tenía que existir",
+            );
+        }
+
+        // Lo que llega del demonio cuando `accounts.json` no se puede leer: un
+        // error de D-Bus, que el broker vuelve como `BrokerError`.
+        let respuesta: Result<Vec<crate::broker::Account>, crate::broker::BrokerError> =
+            Err(crate::broker::BrokerError::Failed(
+                "Error al cargar cuentas: no se pudo leer \
+                 /var/lib/vasak-accounts/1000/accounts.json"
+                    .into(),
+            ));
+
+        // Muchas vueltas, y cada una con su reloj: es lo que haría falta para
+        // confirmar una ausencia. Las dos últimas, con la separación que la
+        // confirmación exige.
+        for _ in 0..5 {
+            f.list(listing_from(&respuesta)).await;
+            f.advance(PRUNE_CONFIRMATION);
+        }
+        f.list(listing_from(&respuesta)).await;
+        f.advance(PRUNE_CONFIRMATION);
+        f.list(listing_from(&respuesta)).await;
+
+        for cuenta in ["correo", "calendario", "contactos"] {
+            assert!(
+                f.paths(cuenta).db_exists().unwrap(),
+                "un error de lectura borró la base de {cuenta}",
+            );
+        }
+        assert!(
+            f.keys.state().deleted.is_empty(),
+            "no se puede borrar la clave de una cuenta que no se sabe que se fue",
+        );
+        // Y la sospecha no se movió: las tres siguen anotadas como presentes.
+        let inner = f.manager.inner.lock().await;
+        let listings = inner
+            .listings
+            .as_ref()
+            .expect("hubo un listado bueno al principio");
+        for cuenta in ["correo", "calendario", "contactos"] {
+            assert!(
+                listings.listed.contains(cuenta),
+                "{cuenta} dejó de figurar en el último listado bueno",
+            );
+        }
+        assert!(
+            listings.missing_since.is_empty(),
+            "un fallo de lectura no puede anotar una ausencia: {:?}",
+            listings.missing_since,
+        );
+    }
+
+    /// Lo mismo con el otro error de lectura que puede llegar: **el directorio de
+    /// la persona se perdió entero**. Es el caso que el primer arreglo de
+    /// `vasak-accounts#56` no cubría, porque `in_directory` lo volvía a crear y
+    /// contestaba lista vacía — indistinguible de una primera instalación. Con
+    /// el marcador ya no: llega un error, y lo que importa es que el podador no
+    /// lo confunda con dos confirmaciones.
+    ///
+    /// Es el hermano de la prueba de arriba con el mensaje real que produce
+    /// `StorageError::Unreadable` en ese caso, para que quede fijado de qué
+    /// depende la costura.
+    #[tokio::test]
+    async fn un_directorio_perdido_tambien_es_no_poda_nada() {
+        let f = Fixture::new("directorio-perdido");
+        f.list(listing(&["correo", "calendario"])).await;
+        for cuenta in ["correo", "calendario"] {
+            assert!(f.paths(cuenta).db_exists().unwrap());
+        }
+
+        let respuesta: Result<Vec<crate::broker::Account>, crate::broker::BrokerError> =
+            Err(crate::broker::BrokerError::Failed(
+                "Error al cargar cuentas: no se pudo leer /var/lib/vasak-accounts/1000: \
+                 el directorio no está, pero /var/lib/vasak-accounts/.instalado-1000 dice \
+                 que existió; no se lo vuelve a crear en silencio"
+                    .into(),
+            ));
+
+        for _ in 0..3 {
+            f.list(listing_from(&respuesta)).await;
+            f.advance(PRUNE_CONFIRMATION);
+        }
+        f.list(listing_from(&respuesta)).await;
+        f.advance(PRUNE_CONFIRMATION);
+        f.list(listing_from(&respuesta)).await;
+
+        for cuenta in ["correo", "calendario"] {
+            assert!(
+                f.paths(cuenta).db_exists().unwrap(),
+                "un directorio perdido borró la base de {cuenta}",
+            );
+        }
+        assert!(
+            f.keys.state().deleted.is_empty(),
+            "no se puede borrar la clave de una cuenta que no se sabe que se fue",
+        );
+        assert_eq!(f.manager.inner.lock().await.wanted.len(), 2);
+    }
+
+    /// Y el tercer camino por el que puede llegar un «no te puedo decir qué
+    /// cuentas tenés»: **el marcador que no se pudo escribir**. Es el que cerró la
+    /// puerta de atrás del hallazgo de review —sin él, el demonio seguía con una
+    /// base sin marcador y la próxima pérdida del directorio se leía como
+    /// instalación nueva, o sea como lista vacía—.
+    ///
+    /// Va por el mismo camino que los otros dos: `Failed` es `Failed`, y el
+    /// podador no lleva la cuenta de los fallos.
+    #[tokio::test]
+    async fn un_marcador_que_no_se_pudo_escribir_tampoco_poda_nada() {
+        let f = Fixture::new("marcador-sin-escribir");
+        f.list(listing(&["correo", "calendario"])).await;
+
+        let respuesta: Result<Vec<crate::broker::Account>, crate::broker::BrokerError> =
+            Err(crate::broker::BrokerError::Failed(
+                "Error al cargar cuentas: no se pudo leer \
+                 /var/lib/vasak-accounts/.instalado-1000: \
+                 /var/lib/vasak-accounts/.instalado-1000 ya existe y no es un archivo: \
+                 no se adopta como marcador"
+                    .into(),
+            ));
+
+        for _ in 0..3 {
+            f.list(listing_from(&respuesta)).await;
+            f.advance(PRUNE_CONFIRMATION);
+        }
+        f.list(listing_from(&respuesta)).await;
+        f.advance(PRUNE_CONFIRMATION);
+        f.list(listing_from(&respuesta)).await;
+
+        for cuenta in ["correo", "calendario"] {
+            assert!(
+                f.paths(cuenta).db_exists().unwrap(),
+                "un marcador que no se pudo escribir borró la base de {cuenta}",
+            );
+        }
+        assert!(f.keys.state().deleted.is_empty());
+        assert_eq!(f.manager.inner.lock().await.wanted.len(), 2);
+    }
+
+    /// Y lo del otro lado, que es lo que la poda **sí** tiene que hacer: dos
+    /// listados buenos que no la nombran, separados por una vuelta, borran su
+    /// base. Sin esta, la de arriba no probaría nada: podría no podar porque la
+    /// poda no funciona.
+    #[tokio::test]
+    async fn dos_listados_buenos_que_no_la_nombran_si_podan() {
+        let f = Fixture::new("dos-listados-buenos");
+        f.list(listing(&["se-queda", "se-va"])).await;
+
+        f.list(listing(&["se-queda"])).await;
+        f.list_after_a_round(listing(&["se-queda"])).await;
+
+        assert!(f.paths("se-queda").db_exists().unwrap());
+        assert!(!f.paths("se-va").db_exists().unwrap());
     }
 
     /// Bien respondido y confirmado, se van sólo las bases de las cuentas que
@@ -3833,6 +4015,104 @@ mod tests {
         release_tx.send(()).unwrap();
         writer.await.unwrap().unwrap();
         assert_eq!(count(Arc::clone(&f)).await, Ok(1));
+    }
+
+    /// `refresh` con el llavero bloqueado **cierra la base en el acto**, y no en
+    /// la revisión de cada cinco minutos.
+    ///
+    /// Esto es lo que hace [`StoreManager::refresh`] cuando el llavero está
+    /// bloqueado, y el reloj va con `tokio::time::pause()`: sin avanzar el
+    /// tiempo, el reloj de las revisiones —`POLL_INTERVAL`, 300 segundos— **no
+    /// puede** ser el que cerró esto.
+    ///
+    /// Lo que **no** prueba, y por eso el nombre no dice «el aviso»: que la
+    /// señal llegue a `refresh`. Acá se cambia el estado del llavero falso y se
+    /// llama a `refresh` a mano, así que pasaría igual si `store_api::watch_keyring`
+    /// dejara de reaccionar al bloqueo, que es el otro tramo de la cadena y sí
+    /// tiene su prueba, en `el_aviso_que_manda_el_llavero_cierra_la_base` de
+    /// `store_api`: allí el `PropertiesChanged` de `Locked` viaja por el bus y
+    /// el espectador es lo único que cierra la base.
+    ///
+    /// Y lo que importa no es sólo que se cierre: es que la clave salga de la
+    /// memoria. SQLCipher la borra al cerrar, y `StoreKey` vivía en un
+    /// `Zeroizing` que se borró al abrir.
+    #[tokio::test(start_paused = true)]
+    async fn refresh_con_el_bloqueo_cierra_la_base_sin_esperar_la_revision() {
+        let f = Fixture::new("refresh-bloqueo");
+        f.list(listing(&["cuenta"])).await;
+        let base = f.paths("cuenta").db.clone();
+        assert!(f.manager.is_open("cuenta").await, "la base está abierta");
+        assert!(
+            f.manager.reader_pool("cuenta").is_some(),
+            "y tiene lectores"
+        );
+        assert_eq!(f.state("cuenta").await, StoreState::Open);
+        assert!(f.key("cuenta").is_some(), "la clave se puede volver a leer");
+
+        // El llavero pasa a bloqueado y se llama a `refresh`, que es lo que
+        // `store_api::watch_keyring` hace con cada aviso. La señal en sí no
+        // viaja por acá: la prueba de eso es la del espectador, en `store_api`.
+        f.keys.state().locked = true;
+        assert!(f.manager.refresh().await, "el estado cambió");
+        f.manager.status().await;
+
+        assert_eq!(
+            f.state("cuenta").await,
+            StoreState::Locked,
+            "al bloquear, la base queda bloqueada y no «abierta con un error»"
+        );
+        assert!(
+            !f.manager.is_open("cuenta").await,
+            "la conexión se suelta: la clave de SQLCipher se va con ella"
+        );
+        assert!(
+            f.manager.reader_pool("cuenta").is_none(),
+            "los lectores se cierran también, o la base queda viva por otro lado"
+        );
+        assert!(base.exists(), "el archivo queda: bloquear no borra nada");
+
+        // Y sin volver a pedir nada más. El reloj de las revisiones no corrió.
+        assert_eq!(
+            f.state("cuenta").await,
+            StoreState::Locked,
+            "y sigue bloqueada"
+        );
+    }
+
+    /// Un `refresh` repetido no rompe nada. Al llavero se le pueden llegar
+    /// varias señales del mismo bloqueo, y también una cuando la base ya estaba
+    /// cerrada, que es lo que pasa con dos colecciones bloqueadas en el mismo
+    /// instante: una sola pasada por la tabla, y dos cuentas.
+    ///
+    /// Como la anterior, esto es `refresh` y no la señal que lo dispara: el
+    /// idempotente que se prueba es el de `refresh`.
+    #[tokio::test(start_paused = true)]
+    async fn refresh_repetido_con_el_bloqueo_no_rompe_nada() {
+        let f = Fixture::new("refresh-repetido");
+        f.list(listing(&["cuenta-a", "cuenta-b"])).await;
+        assert!(f.manager.is_open("cuenta-a").await);
+        assert!(f.manager.is_open("cuenta-b").await);
+
+        f.keys.state().locked = true;
+        // El primero cambia el estado; los que siguen ya no encuentran nada que
+        // cambiar, y no tienen que encontrar un error tampoco.
+        assert!(f.manager.refresh().await, "el primero abre y cierra");
+        for intento in 0..3 {
+            assert!(
+                !f.manager.refresh().await,
+                "el {intento} ya no tenía nada que cambiar"
+            );
+            assert_eq!(f.state("cuenta-a").await, StoreState::Locked);
+            assert_eq!(f.state("cuenta-b").await, StoreState::Locked);
+            assert!(!f.manager.is_open("cuenta-a").await);
+            assert!(!f.manager.is_open("cuenta-b").await);
+        }
+
+        // Volver a abrir es lo de siempre, y no deja cuentas a medias.
+        f.keys.state().locked = false;
+        f.manager.refresh().await;
+        assert!(f.manager.is_open("cuenta-a").await);
+        assert!(f.manager.is_open("cuenta-b").await);
     }
 
     /// Con el llavero bloqueado, leer no da nada: error claro, y los lectores
