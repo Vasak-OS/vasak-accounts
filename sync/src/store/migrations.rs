@@ -1128,10 +1128,7 @@ mod tests {
                 [mb_id],
             )
             .unwrap();
-        assert_eq!(
-            count(&connection, "SELECT count(*) FROM messages"),
-            1
-        );
+        assert_eq!(count(&connection, "SELECT count(*) FROM messages"), 1);
     }
 
     /// Borrar una casilla se lleva sus mensajes, sus cuerpos, sus adjuntos,
@@ -1208,7 +1205,10 @@ mod tests {
 
         assert_eq!(count(&connection, "SELECT count(*) FROM messages"), 1);
         assert_eq!(count(&connection, "SELECT count(*) FROM message_bodies"), 1);
-        assert_eq!(count(&connection, "SELECT count(*) FROM message_attachments"), 1);
+        assert_eq!(
+            count(&connection, "SELECT count(*) FROM message_attachments"),
+            1
+        );
         assert_eq!(count(&connection, "SELECT count(*) FROM message_flags"), 1);
         assert_eq!(
             count(
@@ -1267,7 +1267,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(count(&connection, "SELECT count(*) FROM message_bodies"), 1);
-        assert_eq!(count(&connection, "SELECT count(*) FROM message_attachments"), 1);
+        assert_eq!(
+            count(&connection, "SELECT count(*) FROM message_attachments"),
+            1
+        );
         assert_eq!(count(&connection, "SELECT count(*) FROM message_flags"), 1);
 
         connection
@@ -1275,7 +1278,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(count(&connection, "SELECT count(*) FROM message_bodies"), 0);
-        assert_eq!(count(&connection, "SELECT count(*) FROM message_attachments"), 0);
+        assert_eq!(
+            count(&connection, "SELECT count(*) FROM message_attachments"),
+            0
+        );
         assert_eq!(count(&connection, "SELECT count(*) FROM message_flags"), 0);
     }
 
@@ -1305,7 +1311,10 @@ mod tests {
             "SELECT id FROM messages WHERE mailbox_id = 1 AND (sort_key, id) > (100, 0) \
              ORDER BY sort_key DESC, id LIMIT 50",
         );
-        assert!(by_mailbox.contains("messages_by_mailbox_and_sort"), "{by_mailbox}");
+        assert!(
+            by_mailbox.contains("messages_by_mailbox_and_sort"),
+            "{by_mailbox}"
+        );
         assert!(!by_mailbox.contains("TEMP B-TREE"), "{by_mailbox}");
     }
 

@@ -49,13 +49,18 @@ impl Cursor {
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(text)
             .map_err(|_| InvalidArgument("cursor inválido".into()))?;
-        let text = String::from_utf8(bytes).map_err(|_| InvalidArgument("cursor inválido".into()))?;
+        let text =
+            String::from_utf8(bytes).map_err(|_| InvalidArgument("cursor inválido".into()))?;
         let (sk, id) = text
             .split_once(':')
             .ok_or_else(|| InvalidArgument("cursor inválido".into()))?;
         Ok(Self {
-            sort_key: sk.parse().map_err(|_| InvalidArgument("cursor inválido".into()))?,
-            id: id.parse().map_err(|_| InvalidArgument("cursor inválido".into()))?,
+            sort_key: sk
+                .parse()
+                .map_err(|_| InvalidArgument("cursor inválido".into()))?,
+            id: id
+                .parse()
+                .map_err(|_| InvalidArgument("cursor inválido".into()))?,
         })
     }
 }
@@ -184,7 +189,8 @@ impl Store {
     pub fn list_mailboxes(&self) -> Result<Vec<MailboxSummary>, StoreError> {
         let mut statement = self
             .connection
-            .prepare("SELECT id, name, display_name, role FROM mailboxes ORDER BY
+            .prepare(
+                "SELECT id, name, display_name, role FROM mailboxes ORDER BY
                 CASE role
                     WHEN 'inbox' THEN 0
                     WHEN 'sent' THEN 1
@@ -194,7 +200,8 @@ impl Store {
                     WHEN 'junk' THEN 5
                     WHEN 'outbox' THEN 6
                     ELSE 7
-                END, name")
+                END, name",
+            )
             .map_err(classify)?;
         let rows = statement
             .query_map([], |row| {
@@ -232,7 +239,10 @@ impl Store {
                           ORDER BY m.sort_key DESC, m.id
                           LIMIT ?3";
                 let (sk, id) = after.unwrap().encode_decode();
-                (base.into(), vec![Box::new(sk), Box::new(id), Box::new(limit as i64 + 1)])
+                (
+                    base.into(),
+                    vec![Box::new(sk), Box::new(id), Box::new(limit as i64 + 1)],
+                )
             } else {
                 let base = "SELECT m.id, m.mailbox_id, mb.name, m.uid, m.message_id,
                             m.from_addr, m.to_addrs, m.cc_addrs, m.reply_to, m.subject,
@@ -278,10 +288,7 @@ impl Store {
                           LIMIT ?2";
                 (
                     base.into(),
-                    vec![
-                        Box::new(mailbox_id),
-                        Box::new(limit as i64 + 1),
-                    ],
+                    vec![Box::new(mailbox_id), Box::new(limit as i64 + 1)],
                 )
             }
         };
@@ -306,7 +313,11 @@ impl Store {
         }
         Ok(Page {
             items,
-            next_cursor: if has_more { last.map(|c| c.encode()) } else { None },
+            next_cursor: if has_more {
+                last.map(|c| c.encode())
+            } else {
+                None
+            },
         })
     }
 
@@ -340,7 +351,15 @@ impl Store {
                           ORDER BY m.sort_key DESC, m.id
                           LIMIT ?4";
                 let (sk, id) = after.unwrap().encode_decode();
-                (base.into(), vec![Box::new(fts), Box::new(sk), Box::new(id), Box::new(limit as i64 + 1)])
+                (
+                    base.into(),
+                    vec![
+                        Box::new(fts),
+                        Box::new(sk),
+                        Box::new(id),
+                        Box::new(limit as i64 + 1),
+                    ],
+                )
             } else {
                 let base = "SELECT m.id, m.mailbox_id, mb.name, m.uid, m.message_id,
                             m.from_addr, m.to_addrs, m.cc_addrs, m.reply_to, m.subject,
@@ -415,10 +434,7 @@ impl Store {
             })
             .map(|c| c.encode());
 
-        Ok(Page {
-            items,
-            next_cursor,
-        })
+        Ok(Page { items, next_cursor })
     }
 
     /// Un mensaje entero (para abrir).
@@ -455,17 +471,18 @@ impl Store {
                      FROM message_attachments WHERE message_id = ?1 ORDER BY part_number",
                 )
                 .map_err(classify)?;
-            let rows = stmt.query_map([message_id], |row| {
-                Ok(AttachmentSummary {
-                    part_number: row.get(0)?,
-                    name: row.get(1)?,
-                    content_type: row.get(2)?,
-                    size: row.get(3)?,
-                    inline: row.get::<_, i64>(4)? != 0,
-                    content_id: row.get(5)?,
+            let rows = stmt
+                .query_map([message_id], |row| {
+                    Ok(AttachmentSummary {
+                        part_number: row.get(0)?,
+                        name: row.get(1)?,
+                        content_type: row.get(2)?,
+                        size: row.get(3)?,
+                        inline: row.get::<_, i64>(4)? != 0,
+                        content_id: row.get(5)?,
+                    })
                 })
-            })
-            .map_err(classify)?;
+                .map_err(classify)?;
             rows.collect::<Result<_, _>>().map_err(classify)?
         } else {
             Vec::new()
@@ -477,7 +494,9 @@ impl Store {
                 .connection
                 .prepare("SELECT flag FROM message_flags WHERE message_id = ?1 ORDER BY flag")
                 .map_err(classify)?;
-            let rows = stmt.query_map([message_id], |row| row.get(0)).map_err(classify)?;
+            let rows = stmt
+                .query_map([message_id], |row| row.get(0))
+                .map_err(classify)?;
             rows.collect::<Result<_, _>>().map_err(classify)?
         } else {
             Vec::new()
@@ -493,10 +512,7 @@ impl Store {
     }
 
     /// Los adjuntos de un mensaje.
-    pub fn list_attachments(
-        &self,
-        message_id: i64,
-    ) -> Result<Vec<AttachmentSummary>, StoreError> {
+    pub fn list_attachments(&self, message_id: i64) -> Result<Vec<AttachmentSummary>, StoreError> {
         let mut stmt = self
             .connection
             .prepare(
@@ -504,17 +520,18 @@ impl Store {
                  FROM message_attachments WHERE message_id = ?1 ORDER BY part_number",
             )
             .map_err(classify)?;
-        let rows = stmt.query_map([message_id], |row| {
-            Ok(AttachmentSummary {
-                part_number: row.get(0)?,
-                name: row.get(1)?,
-                content_type: row.get(2)?,
-                size: row.get(3)?,
-                inline: row.get::<_, i64>(4)? != 0,
-                content_id: row.get(5)?,
+        let rows = stmt
+            .query_map([message_id], |row| {
+                Ok(AttachmentSummary {
+                    part_number: row.get(0)?,
+                    name: row.get(1)?,
+                    content_type: row.get(2)?,
+                    size: row.get(3)?,
+                    inline: row.get::<_, i64>(4)? != 0,
+                    content_id: row.get(5)?,
+                })
             })
-        })
-        .map_err(classify)?;
+            .map_err(classify)?;
         rows.collect::<Result<_, _>>().map_err(classify)
     }
 
@@ -524,7 +541,9 @@ impl Store {
             .connection
             .prepare("SELECT flag FROM message_flags WHERE message_id = ?1 ORDER BY flag")
             .map_err(classify)?;
-        let rows = stmt.query_map([message_id], |row| row.get(0)).map_err(classify)?;
+        let rows = stmt
+            .query_map([message_id], |row| row.get(0))
+            .map_err(classify)?;
         rows.collect::<Result<_, _>>().map_err(classify)
     }
 }
@@ -609,7 +628,13 @@ pub fn fts_query_str(text: &str) -> Option<String> {
     if text.len() > 256 {
         return None;
     }
-    Some(words.into_iter().map(|w| format!("{w}*")).collect::<Vec<_>>().join(" "))
+    Some(
+        words
+            .into_iter()
+            .map(|w| format!("{w}*"))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }
 
 /// Lo que se contesta por el bus, en JSON, sin pasar de `cap` bytes.
@@ -626,12 +651,15 @@ pub fn to_capped_json<T: Serialize>(value: &T, cap: usize) -> Result<String, Sto
 
 #[cfg(test)]
 mod tests {
+    use crate::store::email::{
+        MailboxListing, MailboxRole, MessageAttachmentRow, MessageBodyRow, MessageFlagRow,
+        MessageOp, MessageRow,
+    };
+    use crate::store::email_read::Cursor;
+    use crate::store::key::tests::fake_keyring;
     use crate::store::paths::tests::TempDir;
     use crate::store::paths::StorePaths;
     use crate::store::{Store, StoreKey};
-    use crate::store::email::{MailboxRole, MessageOp, MessageRow, MailboxListing, MessageBodyRow, MessageAttachmentRow, MessageFlagRow};
-    use crate::store::email_read::Cursor;
-    use crate::store::key::tests::fake_keyring;
     use zeroize::Zeroizing;
 
     fn key_of(c: u8) -> StoreKey {
@@ -652,9 +680,21 @@ mod tests {
         let (_, mut store) = make_store();
         store
             .upsert_mailboxes(&[
-                MailboxListing { name: "Junk".into(), display_name: "Spam".into(), role: MailboxRole::Junk },
-                MailboxListing { name: "INBOX".into(), display_name: "Bandeja".into(), role: MailboxRole::Inbox },
-                MailboxListing { name: "Sent".into(), display_name: "Enviados".into(), role: MailboxRole::Sent },
+                MailboxListing {
+                    name: "Junk".into(),
+                    display_name: "Spam".into(),
+                    role: MailboxRole::Junk,
+                },
+                MailboxListing {
+                    name: "INBOX".into(),
+                    display_name: "Bandeja".into(),
+                    role: MailboxRole::Inbox,
+                },
+                MailboxListing {
+                    name: "Sent".into(),
+                    display_name: "Enviados".into(),
+                    role: MailboxRole::Sent,
+                },
             ])
             .unwrap();
         let boxes = store.list_mailboxes().unwrap();
@@ -791,17 +831,23 @@ mod tests {
         }
 
         // Buscar "reunion" (sin acento)
-        let page = store.search_messages("reunion", inbox_id, None, 10).unwrap();
+        let page = store
+            .search_messages("reunion", inbox_id, None, 10)
+            .unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].subject, "Reunión mañana");
 
         // Buscar "factura"
-        let page = store.search_messages("factura", inbox_id, None, 10).unwrap();
+        let page = store
+            .search_messages("factura", inbox_id, None, 10)
+            .unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].subject, "Factura adjunta");
 
         // Buscar "mañana factura" (ambas palabras)
-        let page = store.search_messages("mañana factura", inbox_id, None, 10).unwrap();
+        let page = store
+            .search_messages("mañana factura", inbox_id, None, 10)
+            .unwrap();
         assert_eq!(page.items.len(), 0);
     }
 
@@ -888,7 +934,10 @@ mod tests {
 
     #[test]
     fn cursor_encode_decode() {
-        let c = Cursor { sort_key: 1000, id: 42 };
+        let c = Cursor {
+            sort_key: 1000,
+            id: 42,
+        };
         let encoded = c.encode();
         let decoded = Cursor::decode(&encoded).unwrap();
         assert_eq!(c, decoded);

@@ -314,7 +314,11 @@ impl Store {
     }
 
     /// Guarda el `modseq` de una casilla (al terminar su vuelta).
-    pub fn set_mailbox_modseq(&mut self, name: &str, modseq: Option<String>) -> Result<(), StoreError> {
+    pub fn set_mailbox_modseq(
+        &mut self,
+        name: &str,
+        modseq: Option<String>,
+    ) -> Result<(), StoreError> {
         let changed = self
             .connection
             .execute(
@@ -421,10 +425,7 @@ impl Store {
 
                     // Poblar índice FTS5
                     transaction
-                        .execute(
-                            "DELETE FROM messages_fts WHERE rowid = ?1",
-                            [msg_id],
-                        )
+                        .execute("DELETE FROM messages_fts WHERE rowid = ?1", [msg_id])
                         .map_err(classify)?;
                     transaction
                         .execute(
@@ -572,11 +573,14 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    use crate::store::email::{
+        MailboxListing, MailboxRole, MessageAttachmentRow, MessageBodyRow, MessageFlagRow,
+        MessageOp, MessageRow,
+    };
+    use crate::store::key::tests::fake_keyring;
     use crate::store::paths::tests::TempDir;
     use crate::store::paths::StorePaths;
     use crate::store::{Store, StoreKey};
-    use crate::store::email::{MailboxRole, MessageOp, MessageRow, MailboxListing, MessageBodyRow, MessageAttachmentRow, MessageFlagRow};
-    use crate::store::key::tests::fake_keyring;
     use zeroize::Zeroizing;
 
     fn key_of(c: u8) -> StoreKey {
@@ -659,8 +663,7 @@ mod tests {
         }
 
         // Borra la casilla por chunks
-        while store.remove_mailbox_chunk(inbox_id).unwrap() > 0 {
-        }
+        while store.remove_mailbox_chunk(inbox_id).unwrap() > 0 {}
         assert!(store.mailboxes().unwrap().is_empty());
     }
 

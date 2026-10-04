@@ -48,7 +48,9 @@ use zbus::object_server::SignalEmitter;
 
 use serde::Serialize;
 
-use crate::access::{self, Access, ControlAction, Refusal, CALENDAR_RESOURCE, CONTACTS_RESOURCE, EMAIL_RESOURCE};
+use crate::access::{
+    self, Access, ControlAction, Refusal, CALENDAR_RESOURCE, CONTACTS_RESOURCE, EMAIL_RESOURCE,
+};
 use crate::broker::{self, BrokerError};
 use crate::calendar_sync::{CalendarScheduler, CalendarSync, CALENDAR_TICK};
 use crate::contacts_sync::{BrokerCredentials, ContactsScheduler, ContactsSync, CONTACTS_TICK};
@@ -612,7 +614,9 @@ impl<K: KeySource> StoreApi<K> {
         let limit = email_read::page_limit(limit);
         let page = self
             .manager
-            .read_store(&account_id, move |s| s.list_messages(mailbox_id, Some(&after), limit))
+            .read_store(&account_id, move |s| {
+                s.list_messages(mailbox_id, Some(&after), limit)
+            })
             .await
             .map_err(read_error)?;
         email_read::to_capped_json(&page, email_read::MAX_PAGE_REPLY_BYTES).map_err(read_error)
@@ -631,12 +635,16 @@ impl<K: KeySource> StoreApi<K> {
         limit: u32,
     ) -> zbus::fdo::Result<String> {
         self.authorize_email(&header, &account_id).await?;
-        let fts = email_read::fts_query_str(&query).ok_or_else(|| zbus::fdo::Error::InvalidArgs("consulta vacía, muy larga o con muchas palabras".into()))?;
+        let fts = email_read::fts_query_str(&query).ok_or_else(|| {
+            zbus::fdo::Error::InvalidArgs("consulta vacía, muy larga o con muchas palabras".into())
+        })?;
         let after = EmailCursor::decode(&cursor).map_err(|e| zbus::fdo::Error::InvalidArgs(e.0))?;
         let limit = email_read::page_limit(limit);
         let page = self
             .manager
-            .read_store(&account_id, move |s| s.search_messages(&fts, mailbox_id, Some(&after), limit))
+            .read_store(&account_id, move |s| {
+                s.search_messages(&fts, mailbox_id, Some(&after), limit)
+            })
             .await
             .map_err(read_error)?;
         email_read::to_capped_json(&page, email_read::MAX_PAGE_REPLY_BYTES).map_err(read_error)
@@ -675,7 +683,8 @@ impl<K: KeySource> StoreApi<K> {
             .read_store(&account_id, move |s| s.list_attachments(message_id))
             .await
             .map_err(read_error)?;
-        email_read::to_capped_json(&attachments, email_read::MAX_PAGE_REPLY_BYTES).map_err(read_error)
+        email_read::to_capped_json(&attachments, email_read::MAX_PAGE_REPLY_BYTES)
+            .map_err(read_error)
     }
 
     /// Señal `StatusChanged` — cambió el estado de alguna base.
