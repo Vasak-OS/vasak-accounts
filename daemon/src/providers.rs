@@ -1497,6 +1497,54 @@ mod tests {
         assert!(correo.contains_key("smtp_server") && correo.contains_key("smtp_port"));
     }
 
+    /// El calendario de Google tiene que guardar el **calendar-home-set con el
+    /// correo adentro**, no la raíz pelada.
+    ///
+    /// El calendario hace un solo `PROPFIND` Depth:1 sobre lo que la cuenta le
+    /// guardó, sin un paso de descubrimiento aparte, así que la dirección tiene
+    /// que ser ya la colección que lista los calendarios. Google no expone
+    /// descubrimiento en la raíz `.../caldav/v2/`: exige el calendarId —el
+    /// correo— en la ruta, y sin él un `PROPFIND` no devuelve ningún calendario,
+    /// que es «no cargan los eventos de Google» (Vasak-OS/vasak-calendar#57).
+    /// Esta prueba existe para que nadie vuelva a poner la raíz sin el correo.
+    #[test]
+    fn el_calendario_de_google_guarda_el_home_set_con_el_correo() {
+        let directorio =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/providers.d");
+        let google = &cargar(&directorio)["google"];
+
+        let calendario = &google.endpoints[&CapabilityType::Calendar];
+        let EndpointValue::Text(url) = calendario
+            .get("url")
+            .expect("el calendario de Google tiene que decir dónde vive")
+        else {
+            panic!("la dirección del calendario tiene que ser texto");
+        };
+
+        assert!(
+            url.contains("{email}"),
+            "el calendario de Google guarda la raíz sin el correo ({url}); \
+             sin el calendarId en la ruta el PROPFIND no lista ningún calendario"
+        );
+        assert_eq!(
+            url,
+            "https://apidata.googleusercontent.com/caldav/v2/{email}/"
+        );
+
+        // Y como lleva el correo, sin identidad no se guarda a medias: la cuenta
+        // pide reconectarse en vez de quedar con una URL que falla al usarse.
+        assert!(
+            EndpointValue::Text(url.clone()).resolve(None).is_none(),
+            "una dirección con {{email}} no puede resolverse sin identidad"
+        );
+        assert_eq!(
+            EndpointValue::Text(url.clone()).resolve(Some("pepe@gmail.com")),
+            Some(serde_json::Value::String(
+                "https://apidata.googleusercontent.com/caldav/v2/pepe@gmail.com/".into()
+            ))
+        );
+    }
+
     #[test]
     fn el_archivo_de_google_pide_acceso_sin_conexion() {
         let directorio =
