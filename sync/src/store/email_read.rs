@@ -16,7 +16,8 @@
 //! - **Adjuntos**: `ListAttachments` — los adjuntos de un mensaje.
 //! - **Banderas**: `GetFlags` — las banderas extra de un mensaje.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 use rusqlite::{OptionalExtension, Row};
 use serde::Serialize;
@@ -44,24 +45,27 @@ impl Cursor {
         (self.sort_key, self.id)
     }
 
-    pub fn decode(text: &str) -> Result<Self, InvalidArgument> {
+    pub fn decode(text: &str) -> Result<Option<Self>, InvalidArgument> {
         use base64::Engine;
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(text)
             .map_err(|_| InvalidArgument("cursor inválido".into()))?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
         let text =
             String::from_utf8(bytes).map_err(|_| InvalidArgument("cursor inválido".into()))?;
         let (sk, id) = text
             .split_once(':')
             .ok_or_else(|| InvalidArgument("cursor inválido".into()))?;
-        Ok(Self {
+        Ok(Some(Self {
             sort_key: sk
                 .parse()
                 .map_err(|_| InvalidArgument("cursor inválido".into()))?,
             id: id
                 .parse()
                 .map_err(|_| InvalidArgument("cursor inválido".into()))?,
-        })
+        }))
     }
 }
 
@@ -335,7 +339,7 @@ impl Store {
         after: Option<&Cursor>,
         limit: usize,
     ) -> Result<Page<MessageSummary>, StoreError> {
-        let fts = fts_query_str(fts_query).ok_or(InvalidArgument::query())?;
+        let fts = cached_fts_query(fts_query).ok_or(InvalidArgument::query())?;
 
         let (sql, params): (String, Vec<Box<dyn rusqlite::ToSql>>) = if mailbox_id == 0 {
             if after.is_some() {
@@ -635,6 +639,28 @@ pub fn fts_query_str(text: &str) -> Option<String> {
             .collect::<Vec<_>>()
             .join(" "),
     )
+}
+
+/// Caché global para la conversión de consultas FTS. Evita que la misma
+/// consulta de búsqueda sea convertida una y otra vez.
+pub fn cached_fts_query(text: &str) -> Option<String> {
+    static CACHE: OnceLock<HashMap<String, String>> = OnceLock::new();
+    let cache = CACHE.get_or_init(HashMap::new);
+    // No podemos usar get_mut porque es &self, pero podemos usar entry API
+    // con un RwLock alternativo. Como OnceLock no es mutable, usamos un
+    // Mutex interno para el caché.
+    // En su lugar, usamos un simple cache con entry API y un Mutex.
+    // Pero como no podemos cambiar OnceLock, usamos un RwLock.
+    // Para evitar complejidad, usamos un Mutex simple.
+    use std::sync::Mutex;
+    static CACHE: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
+    let mut cache = CACHE.lock().unwrap();
+    if let Some(fts) = cache.get(text) {
+        return Some(fts.clone());
+    }
+    let fts = fts_query_str(text)?;
+    cache.insert(text.to_string(), fts.clone());
+    Some(fts)
 }
 
 /// Lo que se contesta por el bus, en JSON, sin pasar de `cap` bytes.
