@@ -644,9 +644,8 @@ pub fn fts_query_str(text: &str) -> Option<String> {
 /// Caché global para la conversión de consultas FTS. Evita que la misma
 /// consulta de búsqueda sea convertida una y otra vez.
 pub fn cached_fts_query(text: &str) -> Option<String> {
-    static CACHE: once_cell::sync::Lazy<std::sync::Mutex<HashMap<String, String>>> = once_cell::sync::Lazy::new(|| {
-        std::sync::Mutex::new(HashMap::new())
-    });
+    static CACHE: once_cell::sync::Lazy<std::sync::Mutex<HashMap<String, String>>> =
+        once_cell::sync::Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
     let mut cache = CACHE.lock().unwrap();
     if let Some(fts) = cache.get(text) {
         return Some(fts.clone());
