@@ -610,12 +610,15 @@ impl<K: KeySource> StoreApi<K> {
         limit: u32,
     ) -> zbus::fdo::Result<String> {
         self.authorize_email(&header, &account_id).await?;
-        let after = EmailCursor::decode(&cursor).map_err(|e| zbus::fdo::Error::InvalidArgs(e.0))?;
+        let after = EmailCursor::decode(&cursor)
+            .map_err(|e| zbus::fdo::Error::InvalidArgs(e.0))?
+            .map(Some)
+            .unwrap_or(None);
         let limit = email_read::page_limit(limit);
         let page = self
             .manager
             .read_store(&account_id, move |s| {
-                s.list_messages(mailbox_id, Some(&after), limit)
+                s.list_messages(mailbox_id, after.as_ref(), limit)
             })
             .await
             .map_err(read_error)?;
@@ -638,12 +641,15 @@ impl<K: KeySource> StoreApi<K> {
         let fts = email_read::fts_query_str(&query).ok_or_else(|| {
             zbus::fdo::Error::InvalidArgs("consulta vacía, muy larga o con muchas palabras".into())
         })?;
-        let after = EmailCursor::decode(&cursor).map_err(|e| zbus::fdo::Error::InvalidArgs(e.0))?;
+        let after = EmailCursor::decode(&cursor)
+            .map_err(|e| zbus::fdo::Error::InvalidArgs(e.0))?
+            .map(Some)
+            .unwrap_or(None);
         let limit = email_read::page_limit(limit);
         let page = self
             .manager
             .read_store(&account_id, move |s| {
-                s.search_messages(&fts, mailbox_id, Some(&after), limit)
+                s.search_messages(&fts, mailbox_id, after.as_ref(), limit)
             })
             .await
             .map_err(read_error)?;

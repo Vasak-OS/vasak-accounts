@@ -644,16 +644,9 @@ pub fn fts_query_str(text: &str) -> Option<String> {
 /// Caché global para la conversión de consultas FTS. Evita que la misma
 /// consulta de búsqueda sea convertida una y otra vez.
 pub fn cached_fts_query(text: &str) -> Option<String> {
-    static CACHE: OnceLock<HashMap<String, String>> = OnceLock::new();
-    let cache = CACHE.get_or_init(HashMap::new);
-    // No podemos usar get_mut porque es &self, pero podemos usar entry API
-    // con un RwLock alternativo. Como OnceLock no es mutable, usamos un
-    // Mutex interno para el caché.
-    // En su lugar, usamos un simple cache con entry API y un Mutex.
-    // Pero como no podemos cambiar OnceLock, usamos un RwLock.
-    // Para evitar complejidad, usamos un Mutex simple.
-    use std::sync::Mutex;
-    static CACHE: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
+    static CACHE: once_cell::sync::Lazy<std::sync::Mutex<HashMap<String, String>>> = once_cell::sync::Lazy::new(|| {
+        std::sync::Mutex::new(HashMap::new())
+    });
     let mut cache = CACHE.lock().unwrap();
     if let Some(fts) = cache.get(text) {
         return Some(fts.clone());
@@ -779,14 +772,14 @@ mod tests {
 
         // Segunda página
         let cursor = Cursor::decode(&page1.next_cursor.unwrap()).unwrap();
-        let page2 = store.list_messages(inbox_id, Some(&cursor), 2).unwrap();
+        let page2 = store.list_messages(inbox_id, cursor.as_ref(), 2).unwrap();
         assert_eq!(page2.items.len(), 2);
         assert_eq!(page2.items[0].subject, "Hola 3");
         assert_eq!(page2.items[1].subject, "Hola 2");
 
         // Tercera página (la última)
         let cursor = Cursor::decode(&page2.next_cursor.unwrap()).unwrap();
-        let page3 = store.list_messages(inbox_id, Some(&cursor), 2).unwrap();
+        let page3 = store.list_messages(inbox_id, cursor.as_ref(), 2).unwrap();
         assert_eq!(page3.items.len(), 1);
         assert_eq!(page3.items[0].subject, "Hola 1");
         assert!(page3.next_cursor.is_none());
@@ -965,8 +958,7 @@ mod tests {
             id: 42,
         };
         let encoded = c.encode();
-        let decoded = Cursor::decode(&encoded).unwrap();
-        assert_eq!(c, decoded);
+        assert_eq!(Cursor::decode(&encoded), Ok(Some(c)));
 
         // Inválido
         assert!(Cursor::decode("basura").is_err());
