@@ -86,9 +86,24 @@ prompt = "consent"
 # `{email}` se reemplaza por la cuenta que se conectó, que sale de `userinfo_url`.
 
 [endpoints.calendar]
-# El CalDAV de Google. La raíz alcanza: el calendario descubre desde ahí cuáles
-# hay, con el mismo `PROPFIND` que usa contra cualquier otro servidor.
-url = "https://apidata.googleusercontent.com/caldav/v2/"
+# El CalDAV de Google. Va el **calendar-home-set con el correo adentro**: es la
+# colección que contiene los calendarios de la cuenta, así que el calendario hace
+# un solo `PROPFIND` Depth:1 sobre esta dirección y lista todos —el principal y
+# los secundarios— con el mismo código que usa contra cualquier otro servidor.
+#
+# La raíz pelada `.../caldav/v2/` **no** sirve, aunque antes estuviera puesta:
+# Google no expone descubrimiento ahí, exige el calendarId —que para el
+# calendario principal es el propio correo— en la ruta, y sin él un `PROPFIND` no
+# devuelve ningún calendario (guía de CalDAV v2 de Google). El `/user` del final
+# sería el *principal*, que se consulta para **obtener** el home-set; como el
+# calendario no hace ese paso de descubrimiento aparte —va directo con un
+# `PROPFIND` sobre lo que la cuenta le guardó—, se guarda ya el home-set.
+#
+# Por eso lleva `{email}` y no es una dirección fija: sin identidad no se guarda,
+# y la cuenta pide reconectarse en vez de quedar con una URL que falla al usarse.
+# No se pudo probar contra una cuenta de Google real en esta sesión: se verifica
+# reconectando la cuenta y abriendo el calendario.
+url = "https://apidata.googleusercontent.com/caldav/v2/{email}/"
 
 [endpoints.contacts]
 # El CardDAV lleva la cuenta en la ruta, y por eso hace falta la identidad.
