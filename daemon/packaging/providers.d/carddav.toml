@@ -1,0 +1,64 @@
+# CardDAV genérico — iCloud, Fastmail, Zimbra, Baïkal, Radicale, SOGo y cualquier
+# servidor CardDAV que hable el estándar.
+#
+# ── Qué hace falta ──────────────────────────────────────────────────────────
+#
+# La persona escribe la URL base de su servidor CardDAV, su usuario y su
+# contraseña (o contraseña de aplicación). No hay nada que registrar: el
+# servidor es de la propia persona o de su organización, y la autenticación es
+# HTTP Basic (usuario/contraseña) sobre TLS.
+#
+# ── Qué se guarda ────────────────────────────────────────────────────────────
+#
+# La URL base del servidor CardDAV, el usuario y la contraseña (o contraseña
+# de aplicación). La contraseña se guarda cifrada en el almacén de secretos del
+# usuario (`vasak-keyring`), no en el archivo de configuración.
+#
+# ── Autodescubrimiento ───────────────────────────────────────────────────────
+#
+# Si la persona solo sabe su dirección de correo, se intenta autodescubrir la
+# URL CardDAV usando:
+#
+# - `.well-known/carddav` (RFC 6764)
+# - Registros SRV `_carddavs._tcp`
+#
+# Si el autodescubrimiento falla, la persona escribe la URL a mano.
+#
+# ── iCloud ───────────────────────────────────────────────────────────────────
+#
+# iCloud usa CardDAV en `https://contacts.icloud.com/`. El usuario es la
+# dirección de correo de la Apple ID, y la contraseña es una **contraseña
+# específica de aplicación** generada en https://appleid.apple.com/ (no la
+# contraseña principal de la cuenta).
+#
+# ── Fastmail, Zimbra, Baïkal, Radicale, SOGo, etc. ──────────────────────────
+#
+# Cualquier servidor que hable CardDAV estándar funciona. Basta con escribir
+# la URL base, el usuario y la contraseña.
+
+id = "carddav"
+display_name = "CardDAV genérico"
+kind = "carddav"
+
+capabilities = ["calendar", "contacts"]
+
+# La URL base del servidor CardDAV.
+# Ejemplos:
+#   iCloud:        https://contacts.icloud.com/
+#   Fastmail:      https://carddav.fastmail.com/
+#   Zimbra:        https://zimbra.example.com/dav/
+#   Baïkal:        https://dav.example.com/
+#   Radicale:      https://dav.example.com:5232/
+#   SOGo:          https://sogo.example.com/SOGo/dav/
+#   Genérico:      https://dav.ejemplo.com/
+# dav_url = "https://contacts.icloud.com/"
+
+# Usuario en el servidor CardDAV.
+# En iCloud es la dirección de correo de la Apple ID.
+# En otros servidores suele ser el nombre de usuario o el correo.
+# username = "usuario@ejemplo.com"
+
+# Contraseña o contraseña de aplicación.
+# En iCloud es una contraseña de aplicación generada en appleid.apple.com.
+# Se guarda cifrada en el almacén de secretos (vasak-keyring), no aquí.
+# password = "contraseña-o-contraseña-de-aplicación"

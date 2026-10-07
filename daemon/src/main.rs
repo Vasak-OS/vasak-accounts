@@ -315,6 +315,7 @@ impl AccountManager {
                     "kind": match proveedor.kind {
                         providers::ProviderKind::Oauth2 => "oauth2",
                         providers::ProviderKind::Nextcloud => "nextcloud",
+                        providers::ProviderKind::CardDav => "carddav",
                     },
                 })
             })
