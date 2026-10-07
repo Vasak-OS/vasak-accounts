@@ -3,11 +3,11 @@
 //! ── Qué hay acá, y qué todavía no ───────────────────────────────────────────
 //!
 //! La base: su clave en el llavero, su archivo cifrado, el esquema —dónde quedó
-//! la sincronización, una bitácora, desde la v2 **los contactos** y desde la v3
-//! **el calendario** (ver `migrations.rs`, `contacts.rs` y `calendar.rs`)— y el
-//! ciclo de vida entero (crear, abrir, cerrar al bloquear, rehacer si se perdió
-//! la clave, apagar, vaciar, borrar al quitar la cuenta). El correo llega
-//! después, con su propia migración. Ver `vasak-accounts#23`.
+//! la sincronización, una bitácora, desde la v2 **los contactos**, desde la v3
+//! **el calendario** y desde la v4 **el correo** (ver `migrations.rs`,
+//! `contacts.rs`, `calendar.rs` y `email.rs`)— y el ciclo de vida entero
+//! (crear, abrir, cerrar al bloquear, rehacer si se perdió la clave, apagar,
+//! vaciar, borrar al quitar la cuenta). Ver `vasak-accounts#23`.
 //!
 //! ── Qué protege el cifrado, y qué no ────────────────────────────────────────
 //!
@@ -38,6 +38,8 @@ pub mod calendar;
 pub mod calendar_read;
 pub mod contacts;
 pub mod contacts_read;
+pub mod email;
+pub mod email_read;
 pub mod key;
 pub mod lifecycle;
 pub mod migrations;
@@ -61,6 +63,8 @@ pub enum StoreError {
     /// El identificador de cuenta no se puede usar como nombre de carpeta.
     InvalidAccountId(String),
     /// La clave no abre la base, o el archivo no es una base: SQLite contesta
+    /// El argumento proporcionado es inválido (consulta vacía, demasiado larga, etc.).
+    InvalidArgument(String),
     /// lo mismo en los dos casos (`SQLITE_NOTADB`).
     WrongKey,
     /// La base se abrió pero no está cifrada: esta compilación no trae
@@ -100,6 +104,7 @@ impl std::fmt::Display for StoreError {
             }
             StoreError::Missing => f.write_str("no hay base"),
             StoreError::Schema(d) => write!(f, "el esquema de la base: {d}"),
+            StoreError::InvalidArgument(d) => write!(f, "{d}"),
             StoreError::Io(d) | StoreError::Sqlite(d) => write!(f, "{d}"),
             StoreError::Key(e) => write!(f, "{e}"),
             StoreError::Settings(d) => write!(f, "stores.json: {d}"),
@@ -120,6 +125,7 @@ impl StoreError {
         match self {
             StoreError::NoBaseDir => "no hay un directorio de datos para el almacén",
             StoreError::InvalidAccountId(_) => "el identificador de la cuenta no es válido",
+            StoreError::InvalidArgument(_) => "el argumento proporcionado es inválido",
             StoreError::WrongKey => "la clave no abre la base",
             StoreError::NotEncrypted => "esta compilación no cifra la base; no se usa sin cifrar",
             StoreError::Missing => "no hay base",
@@ -147,6 +153,12 @@ impl std::error::Error for StoreError {}
 impl From<KeyError> for StoreError {
     fn from(error: KeyError) -> Self {
         StoreError::Key(error)
+    }
+}
+
+impl From<crate::store::email_read::InvalidArgument> for StoreError {
+    fn from(error: crate::store::email_read::InvalidArgument) -> Self {
+        StoreError::InvalidArgument(error.0)
     }
 }
 
@@ -620,7 +632,7 @@ mod tests {
             .connection()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
     }
 
     /// 0700 la carpeta y 0600 los tres archivos, y otra vez en cada apertura si

@@ -1,7 +1,7 @@
 [package]
 name = "vasak-accounts-sync"
 version.workspace = true
-edition.workspace = true
+edition = "2021"
 authors.workspace = true
 license.workspace = true
 description = "Mantiene al día el correo de las cuentas en línea, como servicio del usuario"
@@ -42,6 +42,9 @@ url.workspace = true
 # cada acento. Es Rust puro —el mismo motor de codificaciones de Firefox—, así
 # que no suma ninguna biblioteca compartida al paquete.
 encoding_rs = "0.8"
+
+# Para caché global de conversiones de consultas FTS (requiere feature "std" para Lazy).
+once_cell = { version = "1.19", features = ["std"] }
 # El almacén local cifrado, una base por cuenta. SQLCipher compilado junto con el
 # programa —la versión la fija el `Cargo.lock`— y enlazado contra el OpenSSL del
 # sistema, que sigue recibiendo los parches de la distribución. Es la única

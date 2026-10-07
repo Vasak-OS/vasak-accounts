@@ -301,9 +301,128 @@ CREATE TABLE alarms (
 CREATE INDEX alarms_by_time ON alarms (fires_at);
 ";
 
+/// v4 (PR para vasak-accounts#23): el correo.
+///
+/// El almacén local guarda:
+/// - **mailboxes**: las casillas (carpetas/etiquetas) de la cuenta —INBOX,
+///   Enviados, Papelera, Archivo, las que haya creado la persona—. El
+///   `HIGHESTMODSEQ` de IMAP vive en `sync_state` (`area = 'email'`,
+///   `collection` = su nombre), y un disparador lo borra junto con la casilla.
+/// - **messages**: un resumen por mensaje que hay en el servidor, identificado
+///   por `(mailbox_id, uid)` y no por el `UID` solo, porque los UID son por
+///   casilla. Lo derivado: remitente, destinatarios, asunto, fecha, banderas
+///   (leído, respondido, reenviado, borrado, marcado), si tiene adjuntos,
+///   tamaño y el `Message-ID` para enhebrar. La fecha está en segundos UTC
+///   (`date_ts`), y `sort_key` ordena por fecha descendente (lo más nuevo
+///   primero) para que la lista de la bandeja de entrada sea instantánea.
+/// - **message_bodies**: el cuerpo del mensaje, en texto plano y en HTML
+///   saneado. Una fila por mensaje, vinculada a `messages.id`. Se guarda
+///   cuando alguien abre el mensaje, no en la sincronización de la lista.
+/// - **message_attachments**: los adjuntos de un mensaje, con su número de
+///   parte, nombre, tipo MIME y tamaño. El contenido no se guarda aquí —se
+///   trae del servidor al pedirlo—; esta tabla dice qué hay.
+/// - **message_flags**: las banderas IMAP por mensaje, separadas para poder
+///   consultar «¿qué mensajes tienen la bandera X en esta casilla?» sin
+///   leer el JSON. Una fila por bandera distinta de `\Seen` (leído), que es
+///   la más común y vive como columna booleana en `messages` para la lista.
+///   El resto (`\Answered`, `\Flagged`, `\Draft`, `\Deleted`, `$MDNSent`,
+///   palabras clave del servidor) van aquí.
+///
+/// **Cómo se mantiene el índice**, como en contactos y calendario: la
+/// inserción la hace el código en la misma transacción, y el borrado va por
+/// disparador (una casilla borrada se lleva sus mensajes, sus cuerpos, sus
+/// adjuntos y sus banderas).
+///
+/// La lista de una casilla pagina por `(sort_key, id)` descendente, con
+/// índice propio y otro por casilla; la búsqueda (cuando llegue) usará FTS5
+/// sobre `messages.subject`, `messages.from_addr`, `messages.to_addrs`,
+/// `messages.cc_addrs` y `message_bodies.text_body`.
+const V4: &str = "
+CREATE TABLE mailboxes (
+    id           INTEGER PRIMARY KEY,
+    name         TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    role         TEXT NOT NULL CHECK (role IN ('inbox', 'sent', 'drafts', 'trash', 'archive', 'junk', 'outbox', 'other')),
+    modseq       TEXT,
+    updated_at   TEXT NOT NULL
+) STRICT;
+
+CREATE TRIGGER mailboxes_forget_token AFTER DELETE ON mailboxes
+BEGIN
+    DELETE FROM sync_state WHERE area = 'email' AND collection = OLD.name;
+END;
+
+CREATE TABLE messages (
+    id              INTEGER PRIMARY KEY,
+    mailbox_id      INTEGER NOT NULL REFERENCES mailboxes (id) ON DELETE CASCADE,
+    uid             INTEGER NOT NULL,
+    message_id      TEXT,
+    from_addr       TEXT NOT NULL,
+    to_addrs        TEXT NOT NULL,
+    cc_addrs        TEXT NOT NULL,
+    bcc_addrs       TEXT NOT NULL,
+    reply_to        TEXT,
+    subject         TEXT NOT NULL,
+    date_ts         INTEGER NOT NULL,
+    sort_key        INTEGER NOT NULL,
+    flags_seen      INTEGER NOT NULL DEFAULT 0,
+    flags_answered  INTEGER NOT NULL DEFAULT 0,
+    flags_flagged   INTEGER NOT NULL DEFAULT 0,
+    flags_draft     INTEGER NOT NULL DEFAULT 0,
+    flags_deleted   INTEGER NOT NULL DEFAULT 0,
+    has_attachments INTEGER NOT NULL DEFAULT 0,
+    size            INTEGER NOT NULL,
+    updated_at      TEXT NOT NULL,
+    UNIQUE (mailbox_id, uid)
+) STRICT;
+
+CREATE INDEX messages_by_sort ON messages (sort_key DESC, id DESC);
+CREATE INDEX messages_by_mailbox_and_sort ON messages (mailbox_id, sort_key DESC, id DESC);
+CREATE INDEX messages_by_message_id ON messages (message_id);
+CREATE INDEX messages_by_uid ON messages (uid);
+
+CREATE TABLE message_bodies (
+    message_id   INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE,
+    text_body    TEXT,
+    html_body    TEXT,
+    truncated    INTEGER NOT NULL DEFAULT 0,
+    updated_at   TEXT NOT NULL,
+    PRIMARY KEY (message_id)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE message_attachments (
+    message_id   INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE,
+    part_number  TEXT NOT NULL,
+    name         TEXT,
+    content_type TEXT NOT NULL,
+    size         INTEGER NOT NULL,
+    inline       INTEGER NOT NULL DEFAULT 0,
+    content_id   TEXT,
+    PRIMARY KEY (message_id, part_number)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE message_flags (
+    message_id  INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE,
+    flag        TEXT NOT NULL,
+    PRIMARY KEY (message_id, flag)
+) STRICT, WITHOUT ROWID;
+
+CREATE VIRTUAL TABLE messages_fts USING fts5 (
+    subject, from_addr, to_addrs, cc_addrs, text_body,
+    content = '',
+    contentless_delete = 1,
+    tokenize = 'unicode61 remove_diacritics 2'
+);
+
+CREATE TRIGGER messages_fts_forget AFTER DELETE ON messages
+BEGIN
+    DELETE FROM messages_fts WHERE rowid = OLD.id;
+END;
+";
+
 /// Todas las migraciones, en orden.
 pub fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(V1), M::up(V2), M::up(V3)])
+    Migrations::new(vec![M::up(V1), M::up(V2), M::up(V3), M::up(V4)])
 }
 
 /// Lleva la base a la última versión. Aplicarlo sobre una base al día no hace
@@ -339,7 +458,7 @@ mod tests {
         let mut connection = Connection::open_in_memory().unwrap();
         apply(&mut connection).unwrap();
         let version = schema_version(&connection).unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
 
         let tables = |c: &Connection| -> Vec<String> {
             let mut statement = c
@@ -383,6 +502,18 @@ mod tests {
             "object_titles",
             "alarms",
             "alarms_by_time",
+            "mailboxes",
+            "mailboxes_forget_token",
+            "messages",
+            "messages_by_sort",
+            "messages_by_mailbox_and_sort",
+            "messages_by_message_id",
+            "messages_by_uid",
+            "message_bodies",
+            "message_attachments",
+            "message_flags",
+            "messages_fts",
+            "messages_fts_forget",
         ] {
             assert!(before.iter().any(|t| t == table), "falta {table}");
         }
@@ -471,7 +602,7 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .unwrap();
-        let all = [V1, V2, V3];
+        let all = [V1, V2, V3, V4];
         Migrations::new(all[..version].iter().map(|sql| M::up(sql)).collect())
             .to_latest(&mut connection)
             .unwrap();
@@ -498,7 +629,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 3);
+        assert_eq!(schema_version(&connection).unwrap(), 4);
         let message: String = connection
             .query_row("SELECT message FROM sync_log", [], |row| row.get(0))
             .unwrap();
@@ -799,7 +930,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 3);
+        assert_eq!(schema_version(&connection).unwrap(), 4);
         assert_eq!(found(&connection, "jose"), vec![id]);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_emails"), 1);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_phones"), 1);
@@ -951,5 +1082,288 @@ mod tests {
         );
         assert!(tasks.contains("calendar_objects_by_due"), "{tasks}");
         assert!(!tasks.contains("TEMP B-TREE"), "{tasks}");
+    }
+
+    /// **v3 → v4 no pierde nada**: el calendario, los contactos, sus datos, sus
+    /// índices y sus tokens siguen ahí después de migrar, y la bitácora también.
+    #[test]
+    fn de_v3_a_v4_se_conserva_todo() {
+        let mut connection = at_version(3);
+        let calendar = insert_calendar(&connection, "https://x/c/");
+        insert_object(&connection, calendar, "https://x/c/1.ics");
+        let book = insert_book(&connection, "https://x/a/");
+        let id = insert_contact(&connection, book, "https://x/a/1.vcf", "José Pérez");
+        connection
+            .execute(
+                "INSERT INTO sync_log (at, level, area, message) VALUES ('ayer', 'warn', 'calendar', 'algo')",
+                [],
+            )
+            .unwrap();
+
+        apply(&mut connection).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 4);
+        assert_eq!(found(&connection, "jose"), vec![id]);
+        assert_eq!(count(&connection, "SELECT count(*) FROM occurrences"), 2);
+        assert_eq!(count(&connection, "SELECT count(*) FROM contact_emails"), 1);
+        assert_eq!(
+            count(
+                &connection,
+                "SELECT count(*) FROM sync_state WHERE area = 'calendar'"
+            ),
+            1
+        );
+        assert_eq!(count(&connection, "SELECT count(*) FROM sync_log"), 1);
+        // Y se puede escribir en las tablas nuevas.
+        connection
+            .execute(
+                "INSERT INTO mailboxes (name, display_name, role, updated_at) VALUES ('INBOX', 'Bandeja de entrada', 'inbox', 'ahora')",
+                [],
+            )
+            .unwrap();
+        let mb_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO messages (mailbox_id, uid, from_addr, to_addrs, cc_addrs, bcc_addrs, subject, date_ts, sort_key, size, updated_at)
+                 VALUES (?1, 1, 'ana@x.com', 'yo@x.com', '', '', 'Hola', 100, 100, 1024, 'ahora')",
+                [mb_id],
+            )
+            .unwrap();
+        assert_eq!(count(&connection, "SELECT count(*) FROM messages"), 1);
+    }
+
+    /// Borrar una casilla se lleva sus mensajes, sus cuerpos, sus adjuntos,
+    /// sus banderas y su token; lo de las otras casillas no se toca.
+    #[test]
+    fn borrar_una_casilla_se_lleva_todo_lo_suyo() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        apply(&mut connection).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO mailboxes (name, display_name, role, updated_at) VALUES ('INBOX', 'Bandeja de entrada', 'inbox', 'ahora')",
+                [],
+            )
+            .unwrap();
+        let inbox = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO mailboxes (name, display_name, role, updated_at) VALUES ('Sent', 'Enviados', 'sent', 'ahora')",
+                [],
+            )
+            .unwrap();
+        let sent = connection.last_insert_rowid();
+
+        for (mb, n) in [(inbox, 1), (inbox, 2), (sent, 1)] {
+            connection
+                .execute(
+                    "INSERT INTO messages (mailbox_id, uid, from_addr, to_addrs, cc_addrs, bcc_addrs, subject, date_ts, sort_key, size, updated_at)
+                     VALUES (?1, ?2, 'ana@x.com', 'yo@x.com', '', '', 'Hola', 100, 100, 1024, 'ahora')",
+                    rusqlite::params![mb, n],
+                )
+                .unwrap();
+            let mid = connection.last_insert_rowid();
+            connection
+                .execute(
+                    "INSERT INTO message_bodies (message_id, text_body, html_body, truncated, updated_at)
+                     VALUES (?1, 'texto', '<p>texto</p>', 0, 'ahora')",
+                    [mid],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO message_attachments (message_id, part_number, name, content_type, size, inline, content_id)
+                     VALUES (?1, '2', 'x.pdf', 'application/pdf', 1024, 0, '')",
+                    [mid],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO message_flags (message_id, flag) VALUES (?1, '\\\\Flagged')",
+                    [mid],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO sync_state (area, collection, token, updated_at) VALUES ('email', 'INBOX', 't1', 'ahora')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sync_state (area, collection, token, updated_at) VALUES ('email', 'Sent', 't2', 'ahora')",
+                [],
+            )
+            .unwrap();
+
+        connection
+            .execute("DELETE FROM mailboxes WHERE id = ?1", [inbox])
+            .unwrap();
+
+        assert_eq!(count(&connection, "SELECT count(*) FROM messages"), 1);
+        assert_eq!(count(&connection, "SELECT count(*) FROM message_bodies"), 1);
+        assert_eq!(
+            count(&connection, "SELECT count(*) FROM message_attachments"),
+            1
+        );
+        assert_eq!(count(&connection, "SELECT count(*) FROM message_flags"), 1);
+        assert_eq!(
+            count(
+                &connection,
+                "SELECT count(*) FROM sync_state WHERE area = 'email'"
+            ),
+            1,
+            "el token de la casilla borrada se va con ella"
+        );
+    }
+
+    /// Y borrar un mensaje suelto se lleva su cuerpo, sus adjuntos y sus
+    /// banderas.
+    #[test]
+    fn borrar_un_mensaje_se_lleva_sus_datos() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        apply(&mut connection).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO mailboxes (name, display_name, role, updated_at) VALUES ('INBOX', 'Bandeja de entrada', 'inbox', 'ahora')",
+                [],
+            )
+            .unwrap();
+        let inbox = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO messages (mailbox_id, uid, from_addr, to_addrs, cc_addrs, bcc_addrs, subject, date_ts, sort_key, size, updated_at)
+                 VALUES (?1, 1, 'ana@x.com', 'yo@x.com', '', '', 'Hola', 100, 100, 1024, 'ahora')",
+                [inbox],
+            )
+            .unwrap();
+        let mid = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO message_bodies (message_id, text_body, html_body, truncated, updated_at)
+                 VALUES (?1, 'texto', '<p>texto</p>', 0, 'ahora')",
+                [mid],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO message_attachments (message_id, part_number, name, content_type, size, inline, content_id)
+                 VALUES (?1, '2', 'x.pdf', 'application/pdf', 1024, 0, '')",
+                [mid],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO message_flags (message_id, flag) VALUES (?1, '\\\\Flagged')",
+                [mid],
+            )
+            .unwrap();
+
+        assert_eq!(count(&connection, "SELECT count(*) FROM message_bodies"), 1);
+        assert_eq!(
+            count(&connection, "SELECT count(*) FROM message_attachments"),
+            1
+        );
+        assert_eq!(count(&connection, "SELECT count(*) FROM message_flags"), 1);
+
+        connection
+            .execute("DELETE FROM messages WHERE id = ?1", [mid])
+            .unwrap();
+
+        assert_eq!(count(&connection, "SELECT count(*) FROM message_bodies"), 0);
+        assert_eq!(
+            count(&connection, "SELECT count(*) FROM message_attachments"),
+            0
+        );
+        assert_eq!(count(&connection, "SELECT count(*) FROM message_flags"), 0);
+    }
+
+    /// La lista de una casilla pagina por `(sort_key DESC, id)`: el plan usa
+    /// el índice y no ordena en memoria.
+    #[test]
+    fn el_orden_de_la_lista_de_correo_usa_su_indice() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        apply(&mut connection).unwrap();
+        let plan = |sql: &str| -> String {
+            let mut statement = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        };
+        let all = plan(
+            "SELECT id FROM messages WHERE (sort_key, id) < (100, 0) ORDER BY sort_key DESC, id DESC LIMIT 50",
+        );
+        assert!(all.contains("messages_by_sort"), "{all}");
+        assert!(!all.contains("TEMP B-TREE"), "{all}");
+        let by_mailbox = plan(
+            "SELECT id FROM messages WHERE mailbox_id = 1 AND (sort_key, id) < (100, 0) \
+             ORDER BY sort_key DESC, id DESC LIMIT 50",
+        );
+        assert!(
+            by_mailbox.contains("messages_by_mailbox_and_sort"),
+            "{by_mailbox}"
+        );
+        assert!(!by_mailbox.contains("TEMP B-TREE"), "{by_mailbox}");
+    }
+
+    /// Un mensaje es uno por casilla y UID; el mismo UID en otra casilla es
+    /// otro mensaje.
+    #[test]
+    fn un_mensaje_es_uno_por_casilla_y_uid() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        apply(&mut connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO mailboxes (name, display_name, role, updated_at) VALUES ('INBOX', 'Bandeja de entrada', 'inbox', 'ahora')",
+                [],
+            )
+            .unwrap();
+        let a = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO mailboxes (name, display_name, role, updated_at) VALUES ('Sent', 'Enviados', 'sent', 'ahora')",
+                [],
+            )
+            .unwrap();
+        let b = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO messages (mailbox_id, uid, from_addr, to_addrs, cc_addrs, bcc_addrs, subject, date_ts, sort_key, size, updated_at)
+                 VALUES (?1, 1, 'ana@x.com', 'yo@x.com', '', '', 'Hola', 100, 100, 1024, 'ahora')",
+                [a],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages (mailbox_id, uid, from_addr, to_addrs, cc_addrs, bcc_addrs, subject, date_ts, sort_key, size, updated_at)
+                 VALUES (?1, 1, 'ana@x.com', 'yo@x.com', '', '', 'Hola', 100, 100, 1024, 'ahora')",
+                [b],
+            )
+            .unwrap();
+        let again = connection.execute(
+            "INSERT INTO messages (mailbox_id, uid, from_addr, to_addrs, cc_addrs, bcc_addrs, subject, date_ts, sort_key, size, updated_at)
+             VALUES (?1, 1, 'ana@x.com', 'yo@x.com', '', '', 'Hola', 100, 100, 1024, 'ahora')",
+            [a],
+        );
+        assert!(again.is_err());
+        // Y sin casilla no hay mensaje.
+        let orphan = connection.execute(
+            "INSERT INTO messages (mailbox_id, uid, from_addr, to_addrs, cc_addrs, bcc_addrs, subject, date_ts, sort_key, size, updated_at)
+             VALUES (999, 1, 'ana@x.com', 'yo@x.com', '', '', 'Hola', 100, 100, 1024, 'ahora')",
+            [],
+        );
+        assert!(orphan.is_err());
     }
 }

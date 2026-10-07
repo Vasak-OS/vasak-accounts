@@ -105,6 +105,10 @@ use super::{LogLevel, Store, StoreError};
 /// Las capacidades de una cuenta que van a tener lugar en el almacén.
 pub const STORE_AREAS: [&str; 3] = ["email", "calendar", "contacts"];
 
+/// El nombre del área de correo, en la capacidad de la cuenta y en
+/// `active_areas` de `stores.json`.
+pub const EMAIL_AREA: &str = "email";
+
 /// El nombre del área de contactos, en la capacidad de la cuenta y en
 /// `active_areas` de `stores.json`.
 pub const CONTACTS_AREA: &str = "contacts";
@@ -127,9 +131,9 @@ pub const CALENDAR_AREA: &str = "calendar";
 /// ausente se rehace (N5 de la segunda revisión de seguridad del #55).
 pub const PENDING_ADOPTION: &str = "?pending-adoption";
 
-/// Las áreas que se sincronizan por DAV y se encienden la primera vez que
-/// alguien las pide con permiso. El correo llega después.
-pub const SYNCED_AREAS: [&str; 2] = [CONTACTS_AREA, CALENDAR_AREA];
+/// Las áreas que se sincronizan y se encienden la primera vez que alguien las
+/// pide con permiso.
+pub const SYNCED_AREAS: [&str; 3] = [EMAIL_AREA, CONTACTS_AREA, CALENDAR_AREA];
 
 /// Cuánto tiene que haber entre el primer listado bueno en que falta una
 /// cuenta y el que confirma que se fue, antes de borrar nada suyo.
@@ -306,6 +310,9 @@ pub struct AccountStatus {
     /// El área de calendario, sólo en las cuentas que tienen calendario.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub calendar: Option<AreaStatus>,
+    /// El área de correo, sólo en las cuentas que tienen correo.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<AreaStatus>,
     /// Si la cuenta tiene la capacidad de contactos, aunque no se sincronice.
     /// No se publica: decide quién ve el detalle.
     #[serde(skip)]
@@ -313,6 +320,9 @@ pub struct AccountStatus {
     /// Lo mismo, del calendario.
     #[serde(skip)]
     pub has_calendar: bool,
+    /// Lo mismo, del correo.
+    #[serde(skip)]
+    pub has_email: bool,
 }
 
 impl AccountStatus {
@@ -321,6 +331,7 @@ impl AccountStatus {
         match area {
             CONTACTS_AREA => self.contacts.as_ref(),
             CALENDAR_AREA => self.calendar.as_ref(),
+            EMAIL_AREA => self.email.as_ref(),
             _ => None,
         }
     }
@@ -330,6 +341,7 @@ impl AccountStatus {
         match area {
             CONTACTS_AREA => self.has_contacts,
             CALENDAR_AREA => self.has_calendar,
+            EMAIL_AREA => self.has_email,
             _ => false,
         }
     }
@@ -786,6 +798,39 @@ impl<K: KeySource> StoreManager<K> {
         Ok(pool)
     }
 
+    /// Lee algo de la base abierta de una cuenta, pasando el `Store` completo
+    /// al cierre. Útil para métodos que están en `Store` y necesitan acceso
+    /// a los lectores (`self.readers()`). Relee el llavero antes de empezar.
+    ///
+    /// Con la base cerrada, `Err(Missing)`. Con el llavero bloqueado —o sin
+    /// poder saberlo—, `Err(Key(Locked))` y nada leído.
+    pub async fn read_store<T, F>(&self, account_id: &str, work: F) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Store) -> Result<T, StoreError> + Send + 'static,
+    {
+        let mut inner = self.inner.lock().await;
+        if !matches!(self.keys.is_locked().await, Ok(false)) {
+            self.run(&mut inner, Some(account_id)).await;
+            return Err(StoreError::Key(KeyError::Locked));
+        }
+        let Some(store) = inner
+            .entries
+            .get_mut(account_id)
+            .and_then(|e| e.store.take())
+        else {
+            return Err(StoreError::Missing);
+        };
+        let result = blocking(move || {
+            let res = work(&store);
+            (res, store)
+        })
+        .await?;
+        let (result, store) = result;
+        inner.entry(account_id).store = Some(store);
+        result
+    }
+
     pub fn keys(&self) -> &K {
         &self.keys
     }
@@ -838,8 +883,10 @@ impl<K: KeySource> StoreManager<K> {
                     size_bytes,
                     contacts: area(CONTACTS_AREA),
                     calendar: area(CALENDAR_AREA),
+                    email: area(EMAIL_AREA),
                     has_contacts: inner.has_area(CONTACTS_AREA, id),
                     has_calendar: inner.has_area(CALENDAR_AREA, id),
+                    has_email: inner.has_area(EMAIL_AREA, id),
                 }
             })
             .collect();
