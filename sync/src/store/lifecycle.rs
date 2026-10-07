@@ -310,6 +310,9 @@ pub struct AccountStatus {
     /// El área de calendario, sólo en las cuentas que tienen calendario.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub calendar: Option<AreaStatus>,
+    /// El área de correo, sólo en las cuentas que tienen correo.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<AreaStatus>,
     /// Si la cuenta tiene la capacidad de contactos, aunque no se sincronice.
     /// No se publica: decide quién ve el detalle.
     #[serde(skip)]
@@ -317,6 +320,9 @@ pub struct AccountStatus {
     /// Lo mismo, del calendario.
     #[serde(skip)]
     pub has_calendar: bool,
+    /// Lo mismo, del correo.
+    #[serde(skip)]
+    pub has_email: bool,
 }
 
 impl AccountStatus {
@@ -325,6 +331,7 @@ impl AccountStatus {
         match area {
             CONTACTS_AREA => self.contacts.as_ref(),
             CALENDAR_AREA => self.calendar.as_ref(),
+            EMAIL_AREA => self.email.as_ref(),
             _ => None,
         }
     }
@@ -334,6 +341,7 @@ impl AccountStatus {
         match area {
             CONTACTS_AREA => self.has_contacts,
             CALENDAR_AREA => self.has_calendar,
+            EMAIL_AREA => self.has_email,
             _ => false,
         }
     }
@@ -875,8 +883,10 @@ impl<K: KeySource> StoreManager<K> {
                     size_bytes,
                     contacts: area(CONTACTS_AREA),
                     calendar: area(CALENDAR_AREA),
+                    email: area(EMAIL_AREA),
                     has_contacts: inner.has_area(CONTACTS_AREA, id),
                     has_calendar: inner.has_area(CALENDAR_AREA, id),
+                    has_email: inner.has_area(EMAIL_AREA, id),
                 }
             })
             .collect();

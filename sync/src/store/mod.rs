@@ -159,7 +159,7 @@ impl From<KeyError> for StoreError {
 
 impl From<crate::store::email_read::InvalidArgument> for StoreError {
     fn from(error: crate::store::email_read::InvalidArgument) -> Self {
-        StoreError::Sqlite(error.0)
+        StoreError::InvalidArgument(error.0)
     }
 }
 

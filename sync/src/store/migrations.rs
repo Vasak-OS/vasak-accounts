@@ -376,8 +376,8 @@ CREATE TABLE messages (
     UNIQUE (mailbox_id, uid)
 ) STRICT;
 
-CREATE INDEX messages_by_sort ON messages (sort_key DESC, id);
-CREATE INDEX messages_by_mailbox_and_sort ON messages (mailbox_id, sort_key DESC, id);
+CREATE INDEX messages_by_sort ON messages (sort_key DESC, id DESC);
+CREATE INDEX messages_by_mailbox_and_sort ON messages (mailbox_id, sort_key DESC, id DESC);
 CREATE INDEX messages_by_message_id ON messages (message_id);
 CREATE INDEX messages_by_uid ON messages (uid);
 
@@ -1303,13 +1303,13 @@ mod tests {
                 .join(" | ")
         };
         let all = plan(
-            "SELECT id FROM messages WHERE (sort_key, id) > (100, 0) ORDER BY sort_key DESC, id LIMIT 50",
+            "SELECT id FROM messages WHERE (sort_key, id) < (100, 0) ORDER BY sort_key DESC, id DESC LIMIT 50",
         );
         assert!(all.contains("messages_by_sort"), "{all}");
         assert!(!all.contains("TEMP B-TREE"), "{all}");
         let by_mailbox = plan(
-            "SELECT id FROM messages WHERE mailbox_id = 1 AND (sort_key, id) > (100, 0) \
-             ORDER BY sort_key DESC, id LIMIT 50",
+            "SELECT id FROM messages WHERE mailbox_id = 1 AND (sort_key, id) < (100, 0) \
+             ORDER BY sort_key DESC, id DESC LIMIT 50",
         );
         assert!(
             by_mailbox.contains("messages_by_mailbox_and_sort"),

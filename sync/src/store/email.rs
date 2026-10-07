@@ -138,7 +138,7 @@ pub struct MessageFlagRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MessageOp {
     Upsert(Box<MessageRow>),
-    Delete(String), // mailbox/uid
+    Delete(i64, u64), // mailbox_id, uid
 }
 
 /// Lo que se hace con un cuerpo de mensaje.
@@ -361,7 +361,6 @@ impl Store {
         // Límite de bytes por cuenta (configurable en la sincronización).
         // Aquí solo contamos; la decisión de parar la vuelta está en el
         // sincronizador.
-        let mut written = 0;
         let mut statement = transaction
             .prepare_cached(
                 "INSERT INTO messages
@@ -423,48 +422,26 @@ impl Store {
                         )
                         .map_err(classify)?;
 
-                    // Poblar índice FTS5
-                    transaction
-                        .execute("DELETE FROM messages_fts WHERE rowid = ?1", [msg_id])
-                        .map_err(classify)?;
+                    // Poblar índice FTS5 usando el cuerpo ya guardado en message_bodies
                     transaction
                         .execute(
                             "INSERT INTO messages_fts (rowid, subject, from_addr, to_addrs, cc_addrs, text_body)
-                             VALUES (?1, ?2, ?3, ?4, ?5, '')",
-                            rusqlite::params![
-                                msg_id,
-                                &m.subject,
-                                &m.from_addr,
-                                &m.to_addrs,
-                                &m.cc_addrs,
-                            ],
+                             SELECT m.id, m.subject, m.from_addr, m.to_addrs, m.cc_addrs,
+                                    COALESCE(b.text_body, '')
+                             FROM messages m
+                             LEFT JOIN message_bodies b ON m.id = b.message_id
+                             WHERE m.id = ?1",
+                            [msg_id],
                         )
                         .map_err(classify)?;
-
-                    written += 1;
                 }
-                MessageOp::Delete(key) => {
-                    // key es "mailbox/uid"
-                    if let Some((name, uid_str)) = key.split_once('/') {
-                        if let Ok(uid) = uid_str.parse::<u64>() {
-                            let mailbox_id_check: Option<i64> = transaction
-                                .query_row(
-                                    "SELECT id FROM mailboxes WHERE name = ?1",
-                                    [name],
-                                    |row| row.get(0),
-                                )
-                                .optional()
-                                .map_err(classify)?;
-                            if let Some(mid) = mailbox_id_check {
-                                let _ = transaction
-                                    .execute(
-                                        "DELETE FROM messages WHERE mailbox_id = ?1 AND uid = ?2",
-                                        rusqlite::params![mid, uid as i64],
-                                    )
-                                    .map_err(classify)?;
-                            }
-                        }
-                    }
+                MessageOp::Delete(mailbox_id_del, uid) => {
+                    let _ = transaction
+                        .execute(
+                            "DELETE FROM messages WHERE mailbox_id = ?1 AND uid = ?2",
+                            rusqlite::params![mailbox_id_del, uid as i64],
+                        )
+                        .map_err(classify)?;
                 }
             }
         }
@@ -478,7 +455,9 @@ impl Store {
 
     /// Guarda el cuerpo de un mensaje (cuando se abre).
     pub fn upsert_message_body(&mut self, body: MessageBodyRow) -> Result<(), StoreError> {
-        self.connection
+        let transaction = self.connection.transaction().map_err(classify)?;
+
+        transaction
             .execute(
                 "INSERT INTO message_bodies (message_id, text_body, html_body, truncated, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)
@@ -499,13 +478,13 @@ impl Store {
 
         // Actualizar índice FTS5 con el cuerpo de texto
         if let Some(text) = body.text_body {
-            self.connection
+            transaction
                 .execute(
                     "DELETE FROM messages_fts WHERE rowid = ?1",
                     [body.message_id],
                 )
                 .map_err(classify)?;
-            self.connection
+            transaction
                 .execute(
                     "INSERT INTO messages_fts (rowid, subject, from_addr, to_addrs, cc_addrs, text_body)
                      SELECT ?1, subject, from_addr, to_addrs, cc_addrs, ?2
@@ -514,6 +493,10 @@ impl Store {
                 )
                 .map_err(classify)?;
         }
+
+        let generation = bump_generation(&transaction, EMAIL_AREA)?;
+        transaction.commit().map_err(classify)?;
+        self.note_change(EMAIL_AREA, generation);
         Ok(())
     }
 
@@ -522,7 +505,9 @@ impl Store {
         &mut self,
         attachment: MessageAttachmentRow,
     ) -> Result<(), StoreError> {
-        self.connection
+        let transaction = self.connection.transaction().map_err(classify)?;
+
+        transaction
             .execute(
                 "INSERT INTO message_attachments
                     (message_id, part_number, name, content_type, size, inline, content_id)
@@ -544,29 +529,45 @@ impl Store {
                 ],
             )
             .map_err(classify)?;
+
+        let generation = bump_generation(&transaction, EMAIL_AREA)?;
+        transaction.commit().map_err(classify)?;
+        self.note_change(EMAIL_AREA, generation);
         Ok(())
     }
 
     /// Guarda una bandera extra.
     pub fn upsert_message_flag(&mut self, flag: MessageFlagRow) -> Result<(), StoreError> {
-        self.connection
+        let transaction = self.connection.transaction().map_err(classify)?;
+
+        transaction
             .execute(
                 "INSERT INTO message_flags (message_id, flag) VALUES (?1, ?2)
                  ON CONFLICT (message_id, flag) DO NOTHING",
                 rusqlite::params![flag.message_id, &flag.flag],
             )
             .map_err(classify)?;
+
+        let generation = bump_generation(&transaction, EMAIL_AREA)?;
+        transaction.commit().map_err(classify)?;
+        self.note_change(EMAIL_AREA, generation);
         Ok(())
     }
 
     /// Borra una bandera extra.
     pub fn delete_message_flag(&mut self, message_id: i64, flag: &str) -> Result<(), StoreError> {
-        self.connection
+        let transaction = self.connection.transaction().map_err(classify)?;
+
+        transaction
             .execute(
                 "DELETE FROM message_flags WHERE message_id = ?1 AND flag = ?2",
                 rusqlite::params![message_id, flag],
             )
             .map_err(classify)?;
+
+        let generation = bump_generation(&transaction, EMAIL_AREA)?;
+        transaction.commit().map_err(classify)?;
+        self.note_change(EMAIL_AREA, generation);
         Ok(())
     }
 }

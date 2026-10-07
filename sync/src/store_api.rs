@@ -614,6 +614,7 @@ impl<K: KeySource> StoreApi<K> {
             .map(Some)
             .unwrap_or(None);
         let limit = email_read::page_limit(limit);
+        // Validate arguments before permission check
         self.authorize_email(&header, &account_id).await?;
         let page = self
             .manager
