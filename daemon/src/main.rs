@@ -961,7 +961,7 @@ impl AccountManager {
                     .con_candado(uid, || async { marcar_reauth(uid, &account_id, false) })
                     .await?;
                 if cambio {
-                    Self::accounts_changed(&emisor, uid).await?;
+                    Self::accounts_changed(&emitter, uid).await?;
                 }
                 Ok(token)
             }
@@ -974,7 +974,7 @@ impl AccountManager {
                     .con_candado(uid, || async { marcar_reauth(uid, &account_id, true) })
                     .await?;
                 if cambio {
-                    Self::accounts_changed(&emisor, uid).await?;
+                    Self::accounts_changed(&emitter, uid).await?;
                 }
                 Err(FdoError::Failed(format!(
                     "hay que volver a conectar la cuenta: {detalle}"
@@ -1594,7 +1594,6 @@ mod tests {
     fn dir_de_prueba() -> std::path::PathBuf {
         let dir =
             std::env::temp_dir().join(format!("vasak-accounts-conc-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
@@ -1609,7 +1608,7 @@ mod tests {
         dir: std::path::PathBuf,
         uid: u32,
         nombre: &'static str,
-        pausa: Option<Arc<std::sync::Barrier>>,
+        pausa: Option<Arc<tokio::sync::Barrier>>,
     ) {
         manager
             .con_candado(uid, || async move {
@@ -1617,7 +1616,7 @@ mod tests {
                 db.load().unwrap();
                 match pausa {
                     Some(b) => {
-                        b.wait();
+                        b.wait().await;
                     }
                     None => {
                         tokio::task::yield_now().await;
@@ -1657,10 +1656,13 @@ mod tests {
 
     /// Con el candado saboteado, la prueba anterior tiene que fallar: es el
     /// criterio de aceptación del arreglo.
+    /// Con el candado saboteado, la prueba anterior tiene que fallar: es el
+    /// criterio de aceptación del arreglo.
     ///
-    /// Sin el candado, las dos tareas se pisan en el `Barrier` y una queda
-    /// colgada. Por eso se usa un timeout: si la prueba se cuelga, el timeout
-    /// la mata y el test falla.
+    /// Sin el candado, las dos tareas se pisan: ambas leen la base vacía,
+    /// ambas escriben, y una pisa a la otra. Al final solo queda una cuenta.
+    /// El timeout es solo para que la prueba no se cuelgue para siempre si
+    /// hubiera un deadlock inesperado.
     #[tokio::test]
     async fn sin_el_candado_los_registros_concurrentes_pierden_cuentas() {
         let dir = dir_de_prueba();
@@ -1670,7 +1672,7 @@ mod tests {
             ..Default::default()
         };
         let uid = 1000;
-        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
 
         let m1 = manager.clone();
         let d1 = dir.clone();
@@ -1682,17 +1684,25 @@ mod tests {
         let t1 = tokio::spawn(async move { registrar(m1, d1, uid, "Uno", Some(b1)).await });
         let t2 = tokio::spawn(async move { registrar(m2, d2, uid, "Dos", Some(b2)).await });
 
-        // Timeout para no colgarse si el deadlock ocurre
-        let resultado = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let _ = t1.await;
-            let _ = t2.await;
+        // Esperar a que ambas tareas terminen (con timeout por seguridad)
+        let resultado = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let _ = tokio::join!(t1, t2);
         })
         .await;
 
-        // Si el timeout es que se colgó, el test falla
+        // Ambas tareas tienen que terminar (sin deadlock)
         assert!(
-            resultado.is_err(),
-            "sin el candado, la prueba tiene que colgarse o fallar"
+            resultado.is_ok(),
+            "las tareas tienen que terminar, no colgarse"
+        );
+
+        // Pero al final solo queda una cuenta (se pisan)
+        let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
+        db.load().unwrap();
+        assert_eq!(
+            db.len(),
+            1,
+            "sin el candado, una de las dos escrituras se pierde"
         );
 
         std::fs::remove_dir_all(dir).unwrap_or_default();
@@ -1705,7 +1715,7 @@ mod tests {
         dir: std::path::PathBuf,
         uid: u32,
         account_id: String,
-        pausa: Option<Arc<std::sync::Barrier>>,
+        pausa: Option<Arc<tokio::sync::Barrier>>,
     ) {
         manager
             .con_candado(uid, || async move {
@@ -1713,7 +1723,7 @@ mod tests {
                 db.load().unwrap();
                 match pausa {
                     Some(b) => {
-                        b.wait();
+                        b.wait().await;
                     }
                     None => {
                         tokio::task::yield_now().await;
@@ -1769,7 +1779,7 @@ mod tests {
         account_id: String,
         necesita: bool,
         cambios: Arc<std::sync::atomic::AtomicUsize>,
-        pausa: Option<Arc<std::sync::Barrier>>,
+        pausa: Option<Arc<tokio::sync::Barrier>>,
     ) {
         manager
             .con_candado(uid, || async move {
@@ -1777,7 +1787,7 @@ mod tests {
                 db.load().unwrap();
                 match pausa {
                     Some(b) => {
-                        b.wait();
+                        b.wait().await;
                     }
                     None => {
                         tokio::task::yield_now().await;
@@ -1847,13 +1857,13 @@ mod tests {
         uid: u32,
         provider_id: &'static str,
         client_id: &'static str,
-        pausa: Option<Arc<std::sync::Barrier>>,
+        pausa: Option<Arc<tokio::sync::Barrier>>,
     ) {
         manager
             .con_candado(uid, || async move {
                 match pausa {
                     Some(b) => {
-                        b.wait();
+                        b.wait().await;
                     }
                     None => {
                         tokio::task::yield_now().await;
