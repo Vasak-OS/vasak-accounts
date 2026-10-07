@@ -371,6 +371,7 @@ pub fn provider_desde_config(
         identity_scopes: Default::default(),
         userinfo_url: Default::default(),
         endpoints: Default::default(),
+        dav_url: None,
     })
 }
 
@@ -677,6 +678,7 @@ mod tests {
             identity_scopes: vec!["openid".into()],
             userinfo_url: Some("https://openidconnect.googleapis.com/v1/userinfo".into()),
             endpoints,
+            dav_url: None,
         }
     }
 

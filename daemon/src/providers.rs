@@ -49,6 +49,11 @@ pub enum ProviderKind {
     /// contraseña de aplicación. Por eso es el único proveedor que funciona sin
     /// que nadie pague ni tramite nada.
     Nextcloud,
+    /// Un servidor CardDAV genérico (iCloud, Fastmail, Zimbra, Baïkal, etc.).
+    /// La persona escribe la URL del servidor, su usuario y su contraseña
+    /// (o contraseña de aplicación). No requiere registro de aplicación.
+    #[serde(rename = "carddav")]
+    CardDav,
 }
 
 /// Un proveedor tal como se lee del archivo.
@@ -137,6 +142,16 @@ pub struct Provider {
     /// dirección de CardDAV de Google la lleva adentro.
     #[serde(default)]
     pub endpoints: HashMap<CapabilityType, HashMap<String, EndpointValue>>,
+
+    /// La URL base del servidor CardDAV.
+    ///
+    /// Sólo para proveedores `CardDav`. Se usa para armar las direcciones de
+    /// cada capacidad DAV (`caldav`, `carddav`, `webdav`, etc.) a partir de la
+    /// URL base que la persona escribe.
+    ///
+    /// Ejemplo: `https://contacts.icloud.com/` o `https://dav.mijndomein.nl/`.
+    #[serde(default)]
+    pub dav_url: Option<String>,
 }
 
 /// Lo que puede valer un campo de una dirección de servicio.
@@ -225,7 +240,17 @@ impl Provider {
                 .into_iter()
                 .filter(|c| !crate::protocols::nextcloud::is_dav_capability(c))
                 .collect(),
+            ProviderKind::CardDav => self
+                .capabilities()
+                .into_iter()
+                .filter(|c| !Self::is_dav_capability(c))
+                .collect(),
         }
+    }
+
+    /// Si esta capacidad tiene una dirección DAV que se pueda armar.
+    pub fn is_dav_capability(capability: &CapabilityType) -> bool {
+        crate::protocols::nextcloud::is_dav_capability(capability)
     }
 
     /// Separa un pedido de capacidades en las que hoy se pueden dar y las que no.
@@ -275,6 +300,7 @@ impl Provider {
                     && self.token_url.is_some()
             }
             ProviderKind::Nextcloud => true,
+            ProviderKind::CardDav => self.dav_url.is_some(),
         }
     }
 }
@@ -517,6 +543,7 @@ pub fn resolve(
             esperado: match proveedor.kind {
                 ProviderKind::Oauth2 => "oauth2",
                 ProviderKind::Nextcloud => "nextcloud",
+                ProviderKind::CardDav => "carddav",
             },
         });
     }
@@ -1091,6 +1118,17 @@ mod tests {
                     assert!(
                         proveedor.is_configured(),
                         "{id} tiene que poder conectarse sin configurar nada"
+                    );
+                }
+                // CardDav no las tiene: la dirección la escribe la persona y
+                // no se sabe hasta ese momento.
+                ProviderKind::CardDav => {
+                    assert_eq!(proveedor.auth_url, None, "{id} no debería tener auth_url");
+                    assert_eq!(proveedor.token_url, None, "{id} no debería tener token_url");
+                    // CardDav necesita dav_url para estar configurado
+                    assert!(
+                        !proveedor.is_configured(),
+                        "{id} no debería estar configurado sin dav_url"
                     );
                 }
             }
