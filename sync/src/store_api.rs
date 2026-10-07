@@ -53,8 +53,9 @@ use crate::access::{
 };
 use crate::broker::{self, BrokerError};
 use crate::calendar_sync::{CalendarScheduler, CalendarSync, CALENDAR_TICK};
-use crate::contacts_sync::{BrokerCredentials, ContactsScheduler, ContactsSync, CONTACTS_TICK};
+use crate::contacts_sync::{ContactsScheduler, ContactsSync, CONTACTS_TICK};
 use crate::dav::webdav::{HttpPolicy, Limits};
+use crate::dav_sync::BrokerCredentials;
 use crate::ical::recurrence::ExpansionLimits;
 use crate::store::calendar_read::{self, GlobalId, ListCursor, Range};
 use crate::store::contacts_read::{self, Cursor, InvalidArgument};
@@ -1150,13 +1151,7 @@ impl StoreService<SecretServiceKeys> {
                 let _ = StoreApi::<SecretServiceKeys>::status_changed(&emitter).await;
             });
         });
-        let sync = ContactsSync::new(
-            Arc::clone(&self.manager),
-            BrokerCredentials,
-            Limits::DEFAULT,
-            HttpPolicy::default(),
-            notify,
-        );
+        let sync = ContactsSync::new(Arc::clone(&self.manager), notify);
         tokio::spawn(Arc::new(ContactsScheduler::new(sync)).run(CONTACTS_TICK, requests));
     }
 

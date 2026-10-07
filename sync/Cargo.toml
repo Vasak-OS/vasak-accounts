@@ -34,7 +34,7 @@ futures-util = "0.3"
 # Para traer las imágenes de un correo cuando la persona las pide. El mismo
 # cliente que ya usa el servicio de cuentas del mismo espacio de trabajo, con
 # rustls: es Rust puro y no suma bibliotecas compartidas al paquete.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 # Para mirar la dirección de una imagen antes de pedirla. Ver `images.rs`.
 url.workspace = true
 # Los juegos de caracteres del correo. Medio correo viejo viene en latin-1, y sin
@@ -81,6 +81,8 @@ chrono-tz = "0.10"
 # El momento de arranque de un proceso y la pregunta a `vasak-permissions`,
 # compartidos con el servicio de cuentas. Ver `common/` y `access.rs`.
 vasak-accounts-common.workspace = true
+# Cliente LDAP para sincronización de contactos contra Active Directory.
+ldap3 = "0.12"
 
 [dev-dependencies]
 # Leer la superficie de `AccountsSync` y `AccountsStore` desde su `Introspect`,
