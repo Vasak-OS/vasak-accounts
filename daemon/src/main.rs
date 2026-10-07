@@ -65,11 +65,39 @@ async fn authorize(
 /// Estructura principal del servicio AccountManager.
 /// Los métodos definidos en el bloque `#[interface]` se exponen como
 /// métodos D-Bus en la interfaz `ar.net.vasak.os.AccountManager`.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct AccountManager {
     /// Los flujos de autorización a medio terminar. Sólo en memoria: ver
     /// [`pending`].
     pendientes: Arc<Mutex<PendingAuths>>,
+
+    /// Un candado por usuario que serializa la sección leer → modificar →
+    /// guardar de los métodos que escriben.
+    ///
+    /// Sin esto, dos pedidos del mismo uid —`RegisterAccount` y
+    /// `RemoveAccount`, por ejemplo— abren cada uno su propia
+    /// [`AccountDatabase`], y el último `save()` pisa la escritura del otro:
+    /// la cuenta que agregó el primero desaparece de `accounts.json` sin
+    /// ningún error.
+    ///
+    /// `tokio::sync::Mutex` y no `std::sync::Mutex`: el guard se mantiene a
+    /// través de `await` en `RemoveAccount` (la revocación al proveedor tarda
+    /// hasta 10 s), y un `std` en ese tramo dejaría un hilo del runtime
+    /// esperando un candado que sólo puede soltar un task que necesita ese
+    /// mismo hilo.
+    ///
+    /// Vive en el struct y no en un `LazyLock` global: zbus construye el
+    /// objeto una sola vez (`serve_at` en `main`) y lo comparte entre todas
+    /// las llamadas, así que el mapa vive tanto como el servicio. `pendientes`
+    /// es lo mismo, y mezclar los dos estilos sería peor.
+    candados: Arc<Mutex<HashMap<u32, Arc<Mutex<()>>>>>,
+
+    /// Sólo pruebas: en verdadero, [`con_candado`](Self::con_candado) no toma
+    /// el candado. Existe para que las pruebas de concurrencia puedan
+    /// verificar que fallan sin él, que es el criterio de aceptación del
+    /// arreglo.
+    #[cfg(test)]
+    sabotear_candado: bool,
 }
 
 /// Abre la base del usuario y la carga, que es el arranque de casi todo método.
@@ -355,17 +383,20 @@ impl AccountManager {
         }
 
         let client_secret = client_secret.trim();
-        providers::UserCredentials::store(
-            uid,
-            &provider_id,
-            Some(providers::UserCredentials {
-                client_id,
-                // Vacío es «no tiene», no «es la cadena vacía»: hay proveedores
-                // que rechazan el pedido si se les manda un secreto vacío.
-                client_secret: (!client_secret.is_empty()).then(|| client_secret.to_string()),
-            }),
-        )
-        .map_err(|e| FdoError::Failed(e.to_string()))?;
+        self.con_candado(uid, || async {
+            providers::UserCredentials::store(
+                uid,
+                &provider_id,
+                Some(providers::UserCredentials {
+                    client_id,
+                    // Vacío es «no tiene», no «es la cadena vacía»: hay proveedores
+                    // que rechazan el pedido si se les manda un secreto vacío.
+                    client_secret: (!client_secret.is_empty()).then(|| client_secret.to_string()),
+                }),
+            )
+            .map_err(|e| FdoError::Failed(e.to_string()))
+        })
+        .await?;
 
         tracing::info!("credenciales propias guardadas para '{provider_id}' (uid {uid})");
         Self::accounts_changed(&emitter, uid).await?;
@@ -387,8 +418,11 @@ impl AccountManager {
     ) -> zbus::fdo::Result<()> {
         let (_caller, uid) = caller_identity(connection, &header).await?;
 
-        providers::UserCredentials::store(uid, &provider_id, None)
-            .map_err(|e| FdoError::Failed(e.to_string()))?;
+        self.con_candado(uid, || async {
+            providers::UserCredentials::store(uid, &provider_id, None)
+                .map_err(|e| FdoError::Failed(e.to_string()))
+        })
+        .await?;
 
         tracing::info!("credenciales propias de '{provider_id}' borradas (uid {uid})");
         Self::accounts_changed(&emitter, uid).await?;
@@ -576,16 +610,22 @@ impl AccountManager {
             })
             .collect();
 
-        let mut db = open_db(uid)?;
-        let cuenta = storage::Account::new(&nombre, &proveedor.id, capabilities);
-        let account_id = db
-            .add(cuenta)
-            .map_err(|e| FdoError::Failed(format!("Error al guardar la cuenta: {e}")))?;
+        let account_id = self
+            .con_candado(uid, || async {
+                let mut db = open_db(uid)?;
+                let cuenta = storage::Account::new(&nombre, &proveedor.id, capabilities);
+                let account_id = db
+                    .add(cuenta)
+                    .map_err(|e| FdoError::Failed(format!("Error al guardar la cuenta: {e}")))?;
 
-        // Los secretos después de la cuenta: si esto falla, queda una cuenta sin
-        // token que la persona puede borrar y rehacer. Al revés quedarían tokens
-        // huérfanos que nada limpia.
-        guardar_secretos_de_oauth(uid, &account_id, &proveedor, &frescos)?;
+                // Los secretos después de la cuenta: si esto falla, queda una cuenta sin
+                // token que la persona puede borrar y rehacer. Al revés quedarían tokens
+                // huérfanos que nada limpia.
+                guardar_secretos_de_oauth(uid, &account_id, &proveedor, &frescos)?;
+
+                Ok::<_, FdoError>(account_id)
+            })
+            .await?;
 
         tracing::info!(
             "cuenta '{account_id}' conectada a '{}' (uid {uid})",
@@ -693,7 +733,7 @@ impl AccountManager {
                 Err(otro) => return Err(FdoError::Failed(otro.to_string())),
             };
 
-        let account_id = self.guardar_nextcloud(uid, &flujo, &credenciales)?;
+        let account_id = self.guardar_nextcloud(uid, &flujo, &credenciales).await?;
 
         // Se saca recién ahora: el sondeo se repite, y quitarlo antes habría
         // dejado sin nada que buscar al intento siguiente.
@@ -770,16 +810,22 @@ impl AccountManager {
             }
         }
 
-        let mut db = open_db(uid)?;
-        let cuenta = storage::Account::new(&display_name, &provider_type, capabilities);
-        let account_id = db
-            .add(cuenta)
-            .map_err(|e| FdoError::Failed(format!("Error al guardar la cuenta: {e}")))?;
+        let account_id = self
+            .con_candado(uid, || async {
+                let mut db = open_db(uid)?;
+                let cuenta = storage::Account::new(&display_name, &provider_type, capabilities);
+                let account_id = db
+                    .add(cuenta)
+                    .map_err(|e| FdoError::Failed(format!("Error al guardar la cuenta: {e}")))?;
 
-        for (clave, valor) in secrets {
-            storage::SecretStore::store_secret(uid, &account_id, &clave, &valor)
-                .map_err(|e| FdoError::Failed(format!("Error al guardar el secreto: {e}")))?;
-        }
+                for (clave, valor) in secrets {
+                    storage::SecretStore::store_secret(uid, &account_id, &clave, &valor).map_err(
+                        |e| FdoError::Failed(format!("Error al guardar el secreto: {e}")),
+                    )?;
+                }
+                Ok::<_, FdoError>(account_id)
+            })
+            .await?;
 
         tracing::info!("Cuenta '{account_id}' registrada para el usuario {uid}");
         Self::accounts_changed(&emitter, uid).await?;
@@ -819,23 +865,29 @@ impl AccountManager {
         // avisado al proveedor ni haber tocado el disco.
         polkit::authorize_removal(connection, &caller).await?;
 
-        let mut db = open_db(uid)?;
+        let (borrada, revocacion) = self
+            .con_candado(uid, || async {
+                let mut db = open_db(uid)?;
 
-        // El aviso va **antes** de borrar: hace falta el secreto para mandarlo.
-        let revocacion = match db.get(&account_id).cloned() {
-            Some(cuenta) => revocar(uid, &cuenta).await,
-            None => Revocacion::NoHaceFalta,
-        };
+                // El aviso va **antes** de borrar: hace falta el secreto para mandarlo.
+                let revocacion = match db.get(&account_id).cloned() {
+                    Some(cuenta) => revocar(uid, &cuenta).await,
+                    None => Revocacion::NoHaceFalta,
+                };
 
-        let borrada = db
-            .remove(&account_id)
-            .map_err(|e| FdoError::Failed(format!("Error al eliminar la cuenta: {e}")))?;
+                let borrada = db
+                    .remove(&account_id)
+                    .map_err(|e| FdoError::Failed(format!("Error al eliminar la cuenta: {e}")))?;
 
-        // Los secretos se limpian siempre, incluso si los metadatos ya no
-        // estaban: si no, queda una credencial viva en disco para una cuenta que
-        // la persona cree que no existe.
-        storage::SecretStore::forget_account(uid, &account_id)
-            .map_err(|e| FdoError::Failed(format!("Error al borrar los secretos: {e}")))?;
+                // Los secretos se limpian siempre, incluso si los metadatos ya no
+                // estaban: si no, queda una credencial viva en disco para una cuenta que
+                // la persona cree que no existe.
+                storage::SecretStore::forget_account(uid, &account_id)
+                    .map_err(|e| FdoError::Failed(format!("Error al borrar los secretos: {e}")))?;
+
+                Ok::<_, FdoError>((borrada, revocacion))
+            })
+            .await?;
 
         if borrada {
             Self::accounts_changed(&emitter, uid).await?;
@@ -905,7 +957,10 @@ impl AccountManager {
                 // Una cuenta que vuelve a andar deja de pedir reautenticación.
                 // Pasa cuando la persona la reconecta, y sin esto la pantalla
                 // seguiría diciendo que hay algo que arreglar.
-                if marcar_reauth(uid, &account_id, false)? {
+                let cambio = self
+                    .con_candado(uid, || async { marcar_reauth(uid, &account_id, false) })
+                    .await?;
+                if cambio {
                     Self::accounts_changed(&emitter, uid).await?;
                 }
                 Ok(token)
@@ -915,7 +970,10 @@ impl AccountManager {
             // y un error de red que se repite para siempre sin decir qué hacer.
             Err(protocols::oauth2::TokenError::Revoked(detalle)) => {
                 tracing::warn!("'{account_id}' necesita reautenticación: {detalle}");
-                if marcar_reauth(uid, &account_id, true)? {
+                let cambio = self
+                    .con_candado(uid, || async { marcar_reauth(uid, &account_id, true) })
+                    .await?;
+                if cambio {
                     Self::accounts_changed(&emitter, uid).await?;
                 }
                 Err(FdoError::Failed(format!(
@@ -942,7 +1000,7 @@ impl AccountManager {
     /// caduca, así que no hay nada que refrescar. El motor de tokens ya trata la
     /// ausencia de vencimiento como «entregala tal cual», que es exactamente lo
     /// correcto acá.
-    fn guardar_nextcloud(
+    async fn guardar_nextcloud(
         &self,
         uid: u32,
         flujo: &NextcloudFlow,
@@ -993,19 +1051,50 @@ impl AccountManager {
             flujo.display_name.clone()
         };
 
-        let mut db = open_db(uid)?;
-        let cuenta = storage::Account::new(&nombre, "nextcloud", capabilities);
-        let account_id = db
-            .add(cuenta)
-            .map_err(|e| FdoError::Failed(format!("Error al guardar la cuenta: {e}")))?;
+        let account_id = self
+            .con_candado(uid, || async {
+                let mut db = open_db(uid)?;
+                let cuenta = storage::Account::new(&nombre, "nextcloud", capabilities);
+                let account_id = db
+                    .add(cuenta)
+                    .map_err(|e| FdoError::Failed(format!("Error al guardar la cuenta: {e}")))?;
 
-        // El secreto después de la cuenta: si esto falla, queda una cuenta sin
-        // credencial que la persona puede borrar y rehacer. Al revés quedaría
-        // una credencial huérfana que nada limpia.
-        storage::SecretStore::store_token(uid, &account_id, &credenciales.app_password)
-            .map_err(|e| FdoError::Failed(format!("Error al guardar la contraseña: {e}")))?;
+                // El secreto después de la cuenta: si esto falla, queda una cuenta sin
+                // credencial que la persona puede borrar y rehacer. Al revés quedaría
+                // una credencial huérfana que nada limpia.
+                storage::SecretStore::store_token(uid, &account_id, &credenciales.app_password)
+                    .map_err(|e| {
+                        FdoError::Failed(format!("Error al guardar la contraseña: {e}"))
+                    })?;
+
+                Ok::<_, FdoError>(account_id)
+            })
+            .await?;
 
         Ok(account_id)
+    }
+
+    /// El candado de este usuario, creándolo si todavía no existe.
+    async fn candado(&self, uid: u32) -> Arc<Mutex<()>> {
+        self.candados.lock().await.entry(uid).or_default().clone()
+    }
+
+    /// Ejecuta `f` con el candado del usuario tomado de principio a fin.
+    ///
+    /// El guard se mantiene a través de los `await` de `f`: es lo que hace
+    /// que la sección leer → modificar → guardar sea atómica por uid.
+    async fn con_candado<F, Fut, R>(&self, uid: u32, f: F) -> R
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = R>,
+    {
+        #[cfg(test)]
+        if self.sabotear_candado {
+            return f().await;
+        }
+        let candado = self.candado(uid).await;
+        let _guard = candado.lock().await;
+        f().await
     }
 }
 
@@ -1263,6 +1352,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::Account;
 
     /// **Lo que ven los clientes de `AccountManager` no cambia sin querer.**
     ///
@@ -1494,5 +1584,338 @@ mod tests {
         assert_eq!(resumenes.len(), 1);
         assert_eq!(resumenes[0].capabilities, vec!["drive"]);
         assert!(resumenes[0].unavailable_capabilities.is_empty());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Pruebas de concurrencia: el candado por uid
+    // ---------------------------------------------------------------------------
+
+    /// Un directorio temporal para las pruebas de concurrencia.
+    fn dir_de_prueba() -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("vasak-accounts-conc-{}", uuid::Uuid::new_v4()));
+        dir
+    }
+
+    /// Simula la sección crítica de `RegisterAccount`: abrir la base, agregar la
+    /// cuenta y guardar.
+    ///
+    /// `pausa` se usa para forzar el interleaving en la prueba de sabotaje, donde
+    /// no hay candado que serialice: las dos tareas tienen que cargar antes de que
+    /// cualquiera agregue, o la segunda escritura pisa a la primera.
+    async fn registrar(
+        manager: AccountManager,
+        dir: std::path::PathBuf,
+        uid: u32,
+        nombre: &'static str,
+        pausa: Option<Arc<tokio::sync::Barrier>>,
+    ) {
+        manager
+            .con_candado(uid, || async move {
+                let mut db = AccountDatabase::in_directory(dir).unwrap();
+                db.load().unwrap();
+                match pausa {
+                    Some(b) => {
+                        b.wait().await;
+                    }
+                    None => {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                db.add(Account::new(nombre, "imap", HashMap::new()))
+                    .unwrap();
+            })
+            .await;
+    }
+
+    /// La prueba que pide el issue: dos `RegisterAccount` concurrentes del mismo
+    /// uid, en bucle, y al final están las dos cuentas.
+    #[tokio::test]
+    async fn dos_registros_concurrentes_del_mismo_uid_no_pierden_cuentas() {
+        let dir = dir_de_prueba();
+        let manager = AccountManager::default();
+        let uid = 1000;
+
+        let m1 = manager.clone();
+        let d1 = dir.clone();
+        let m2 = manager.clone();
+        let d2 = dir.clone();
+
+        let t1 = tokio::spawn(async move { registrar(m1, d1, uid, "Uno", None).await });
+        let t2 = tokio::spawn(async move { registrar(m2, d2, uid, "Dos", None).await });
+
+        t1.await.unwrap();
+        t2.await.unwrap();
+
+        let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
+        db.load().unwrap();
+        assert_eq!(db.len(), 2, "las dos cuentas tienen que estar");
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// Con el candado saboteado, la prueba anterior tiene que fallar: es el
+    /// criterio de aceptación del arreglo.
+    /// Con el candado saboteado, la prueba anterior tiene que fallar: es el
+    /// criterio de aceptación del arreglo.
+    ///
+    /// Sin el candado, las dos tareas se pisan: ambas leen la base vacía,
+    /// ambas escriben, y una pisa a la otra. Al final solo queda una cuenta.
+    /// El timeout es solo para que la prueba no se cuelgue para siempre si
+    /// hubiera un deadlock inesperado.
+    #[tokio::test]
+    async fn sin_el_candado_los_registros_concurrentes_pierden_cuentas() {
+        let dir = dir_de_prueba();
+        let manager = AccountManager {
+            #[cfg(test)]
+            sabotear_candado: true,
+            ..Default::default()
+        };
+        let uid = 1000;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let m1 = manager.clone();
+        let d1 = dir.clone();
+        let b1 = barrier.clone();
+        let m2 = manager.clone();
+        let d2 = dir.clone();
+        let b2 = barrier.clone();
+
+        let t1 = tokio::spawn(async move { registrar(m1, d1, uid, "Uno", Some(b1)).await });
+        let t2 = tokio::spawn(async move { registrar(m2, d2, uid, "Dos", Some(b2)).await });
+
+        // Esperar a que ambas tareas terminen (con timeout por seguridad)
+        let resultado = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let _ = tokio::join!(t1, t2);
+        })
+        .await;
+
+        // Ambas tareas tienen que terminar (sin deadlock)
+        assert!(
+            resultado.is_ok(),
+            "las tareas tienen que terminar, no colgarse"
+        );
+
+        // Pero al final solo queda una cuenta (se pisan)
+        let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
+        db.load().unwrap();
+        assert_eq!(
+            db.len(),
+            1,
+            "sin el candado, una de las dos escrituras se pierde"
+        );
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// Simula la sección crítica de `RemoveAccount`: abrir la base, borrar la
+    /// cuenta y guardar.
+    async fn remover(
+        manager: AccountManager,
+        dir: std::path::PathBuf,
+        uid: u32,
+        account_id: String,
+        pausa: Option<Arc<tokio::sync::Barrier>>,
+    ) {
+        manager
+            .con_candado(uid, || async move {
+                let mut db = AccountDatabase::in_directory(dir).unwrap();
+                db.load().unwrap();
+                match pausa {
+                    Some(b) => {
+                        b.wait().await;
+                    }
+                    None => {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                db.remove(&account_id).unwrap();
+            })
+            .await;
+    }
+
+    /// Dos `RemoveAccount` concurrentes del mismo uid: las dos cuentas tienen
+    /// que desaparecer.
+    #[tokio::test]
+    async fn dos_remociones_concurrentes_del_mismo_uid_no_pierden_cuentas() {
+        let dir = dir_de_prueba();
+        let manager = AccountManager::default();
+        let uid = 1000;
+
+        // Crear dos cuentas primero.
+        let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
+        db.load().unwrap();
+        let id1 = db.add(Account::new("Uno", "imap", HashMap::new())).unwrap();
+        let id2 = db.add(Account::new("Dos", "imap", HashMap::new())).unwrap();
+        drop(db);
+
+        let m1 = manager.clone();
+        let d1 = dir.clone();
+        let m2 = manager.clone();
+        let d2 = dir.clone();
+
+        let t1 = tokio::spawn(async move { remover(m1, d1, uid, id1, None).await });
+        let t2 = tokio::spawn(async move { remover(m2, d2, uid, id2, None).await });
+
+        t1.await.unwrap();
+        t2.await.unwrap();
+
+        let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
+        db.load().unwrap();
+        assert_eq!(db.len(), 0, "las dos cuentas tienen que estar borradas");
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// Simula la sección crítica de `marcar_reauth`: abrir la base, marcar la
+    /// cuenta y guardar.
+    ///
+    /// `cambios` cuenta cuántas veces la marca cambió de verdad: con el candado,
+    /// exactamente una de las dos llamadas concurrentes lo hace.
+    async fn marcar_reauth_concurrente(
+        manager: AccountManager,
+        dir: std::path::PathBuf,
+        uid: u32,
+        account_id: String,
+        necesita: bool,
+        cambios: Arc<std::sync::atomic::AtomicUsize>,
+        pausa: Option<Arc<tokio::sync::Barrier>>,
+    ) {
+        manager
+            .con_candado(uid, || async move {
+                let mut db = AccountDatabase::in_directory(dir).unwrap();
+                db.load().unwrap();
+                match pausa {
+                    Some(b) => {
+                        b.wait().await;
+                    }
+                    None => {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                if db.set_needs_reauth(&account_id, necesita).unwrap() {
+                    cambios.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            })
+            .await;
+    }
+
+    /// Dos `marcar_reauth` concurrentes del mismo uid con el mismo valor: la
+    /// primera cambia la marca y la segunda la ve ya cambiada y no hace nada.
+    ///
+    /// Se cuenta cuántas veces `set_needs_reauth` devuelve `true` (es decir,
+    /// cambió la marca). Con el candado, exactamente una de las dos llamadas
+    /// cambia la marca. Sin el candado, ambas podrían cambiar la marca si cargan
+    /// antes de que la otra escriba.
+    #[tokio::test]
+    async fn dos_marcas_concurrentes_del_mismo_uid_no_se_pisan() {
+        let dir = dir_de_prueba();
+        let manager = AccountManager::default();
+        let uid = 1000;
+
+        // Crear una cuenta primero.
+        let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
+        db.load().unwrap();
+        let id = db.add(Account::new("Uno", "imap", HashMap::new())).unwrap();
+        drop(db);
+
+        let cambios = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let m1 = manager.clone();
+        let d1 = dir.clone();
+        let c1 = cambios.clone();
+        let m2 = manager.clone();
+        let d2 = dir.clone();
+        let c2 = cambios.clone();
+
+        let id1 = id.clone();
+        let id2 = id.clone();
+        let t1 = tokio::spawn(async move {
+            marcar_reauth_concurrente(m1, d1, uid, id1, true, c1, None).await
+        });
+        let t2 = tokio::spawn(async move {
+            marcar_reauth_concurrente(m2, d2, uid, id2, true, c2, None).await
+        });
+
+        t1.await.unwrap();
+        t2.await.unwrap();
+
+        assert_eq!(
+            cambios.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactamente una de las dos marcas tiene que cambiar la cuenta"
+        );
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// Simula la sección crítica de `SetProviderCredentials`: guardar las
+    /// credenciales del proveedor.
+    async fn guardar_credenciales(
+        manager: AccountManager,
+        dir: std::path::PathBuf,
+        uid: u32,
+        provider_id: &'static str,
+        client_id: &'static str,
+        pausa: Option<Arc<tokio::sync::Barrier>>,
+    ) {
+        manager
+            .con_candado(uid, || async move {
+                match pausa {
+                    Some(b) => {
+                        b.wait().await;
+                    }
+                    None => {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                providers::UserCredentials::store_in(
+                    &dir,
+                    provider_id,
+                    Some(providers::UserCredentials {
+                        client_id: client_id.to_string(),
+                        client_secret: None,
+                    }),
+                )
+                .unwrap();
+            })
+            .await;
+    }
+
+    /// Dos `SetProviderCredentials` concurrentes del mismo uid para proveedores
+    /// distintos: las dos credenciales tienen que estar.
+    #[tokio::test]
+    async fn dos_credenciales_concurrentes_del_mismo_uid_no_se_pisan() {
+        let dir = dir_de_prueba();
+        let manager = AccountManager::default();
+        let uid = 1000;
+
+        let m1 = manager.clone();
+        let d1 = dir.clone();
+        let m2 = manager.clone();
+        let d2 = dir.clone();
+
+        let t1 =
+            tokio::spawn(
+                async move { guardar_credenciales(m1, d1, uid, "google", "id-1", None).await },
+            );
+        let t2 = tokio::spawn(async move {
+            guardar_credenciales(m2, d2, uid, "microsoft", "id-2", None).await
+        });
+
+        t1.await.unwrap();
+        t2.await.unwrap();
+
+        let credenciales =
+            providers::UserCredentials::load_from(&dir.join("providers.json")).unwrap();
+        assert_eq!(
+            credenciales.len(),
+            2,
+            "las dos credenciales tienen que estar"
+        );
+        assert_eq!(credenciales["google"].client_id, "id-1");
+        assert_eq!(credenciales["microsoft"].client_id, "id-2");
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
     }
 }

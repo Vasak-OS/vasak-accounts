@@ -431,7 +431,7 @@ impl UserCredentials {
         Self::load_from(&Self::path(uid))
     }
 
-    fn load_from(ruta: &Path) -> Result<HashMap<String, UserCredentials>, CatalogError> {
+    pub fn load_from(ruta: &Path) -> Result<HashMap<String, UserCredentials>, CatalogError> {
         match std::fs::read_to_string(ruta) {
             Ok(texto) => serde_json::from_str(&texto)
                 .map_err(|e| CatalogError::Io(format!("{}: {e}", ruta.display()))),
