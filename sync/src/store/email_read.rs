@@ -35,16 +35,22 @@ pub struct Cursor {
 }
 
 impl Cursor {
+    /// Codifica el cursor como base64 URL-safe sin padding: `"<sort_key>:<id>"`.
     pub fn encode(&self) -> String {
         use base64::Engine;
         base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(format!("{}:{}", self.sort_key, self.id))
     }
 
+    /// Devuelve la tupla `(sort_key, id)` sin codificar.
     pub fn encode_decode(&self) -> (i64, i64) {
         (self.sort_key, self.id)
     }
 
+    /// Decodifica un cursor base64 URL-safe.
+    ///
+    /// Retorna `Ok(None)` si el cursor está vacío (primera página).
+    /// Retorna `Err(InvalidArgument)` si el formato es inválido.
     pub fn decode(text: &str) -> Result<Option<Self>, InvalidArgument> {
         use base64::Engine;
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -661,7 +667,6 @@ pub fn fts_query_str(text: &str) -> Option<String> {
     )
 }
 
-/// Caché global para la conversión de consultas FTS. Evita que la misma
 /// Caché global para la conversión de consultas FTS. Evita que la misma
 /// consulta de búsqueda sea convertida una y otra vez.
 pub fn cached_fts_query(text: &str) -> Option<String> {
