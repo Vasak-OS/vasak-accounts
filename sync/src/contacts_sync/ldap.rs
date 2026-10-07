@@ -46,9 +46,13 @@ pub struct LdapCredential {
 }
 
 /// Fuente de credenciales para LDAP.
+///
+/// Obtiene la configuración LDAP (URL, bind DN, password, base DN, filtro, atributos)
+/// del servicio de cuentas.
 pub struct LdapCredentialSource;
 
 impl LdapCredentialSource {
+    /// Obtiene la credencial LDAP para una cuenta.
     pub async fn credential(
         &self,
         account_id: &str,
@@ -129,11 +133,18 @@ impl LdapCredentialSource {
     }
 }
 
-/// Backend LDAP/AD.
+/// Backend LDAP/AD (solo lectura).
+///
+/// Implementa la sincronización de contactos contra un servidor LDAP/Active Directory
+/// mediante búsquedas LDAP simples. Convierte las entradas LDAP a vCard y las almacena
+/// en el almacén local. No soporta escritura.
 pub struct LdapBackend;
 
 impl LdapBackend {
     /// Sincroniza los contactos usando LDAP.
+    ///
+    /// Conecta al servidor LDAP, busca entradas con objectClass=person, las convierte
+    /// a vCard y las guarda en el almacén local. Crea una libreta por defecto si no existe.
     pub async fn sync<K: KeySource>(
         &self,
         ctx: SyncContext<'_, K>,

@@ -31,6 +31,8 @@ const CLOSED_DETAIL: &str =
 const GRAPH_BASE_URL: &str = "https://graph.microsoft.com/v1.0";
 
 /// Credencial para Microsoft Graph API.
+///
+/// Contiene el token de acceso OAuth2 y el ID de usuario para la People API.
 #[derive(Debug, Clone)]
 pub struct GraphCredential {
     /// Token de acceso OAuth2.
@@ -40,9 +42,12 @@ pub struct GraphCredential {
 }
 
 /// Fuente de credenciales para Graph API.
+///
+/// Obtiene el token de acceso y el ID de usuario del servicio de cuentas.
 pub struct GraphCredentialSource;
 
 impl GraphCredentialSource {
+    /// Obtiene la credencial de Graph API para una cuenta.
     pub async fn credential(
         &self,
         account_id: &str,
@@ -132,10 +137,17 @@ struct GraphSyncToken {
 }
 
 /// Backend Microsoft Graph API.
+///
+/// Implementa la sincronización de contactos contra la People API de Microsoft Graph
+/// (`/users/{id}/people`). Convierte los contactos de Graph a vCard y los almacena
+/// en el almacén local.
 pub struct GraphApiBackend;
 
 impl GraphApiBackend {
     /// Sincroniza los contactos usando Microsoft Graph People API.
+    ///
+    /// Obtiene los contactos de la People API con paginación, los convierte a vCard
+    /// y los guarda en el almacén local. Crea una libreta por defecto si no existe.
     pub async fn sync<K: KeySource>(
         &self,
         ctx: SyncContext<'_, K>,

@@ -82,7 +82,8 @@ chrono-tz = "0.10"
 # compartidos con el servicio de cuentas. Ver `common/` y `access.rs`.
 vasak-accounts-common.workspace = true
 # Cliente LDAP para sincronización de contactos contra Active Directory.
-ldap3 = "0.12"
+# default-features = false para evitar native-tls; tls-rustls-ring para LDAPS con rustls+ring.
+ldap3 = { version = "0.12", default-features = false, features = ["tls-rustls-ring"] }
 
 [dev-dependencies]
 # Leer la superficie de `AccountsSync` y `AccountsStore` desde su `Introspect`,
