@@ -851,4 +851,221 @@ mod tests {
             .unwrap();
         assert!(flags.contains(&"\\Flagged".into()));
     }
+
+    #[test]
+    fn message_op_delete_con_mailbox_id_y_uid() {
+        let (_, mut store) = make_store();
+        store
+            .upsert_mailboxes(&[mailbox("INBOX", MailboxRole::Inbox)])
+            .unwrap();
+        let inbox_id = store.mailboxes().unwrap()[0].id;
+
+        store
+            .apply_messages(
+                vec![MessageOp::Upsert(Box::new(MessageRow {
+                    mailbox_id: inbox_id,
+                    uid: 1,
+                    message_id: Some("<msg@x>".into()),
+                    from_addr: "ana@x.com".into(),
+                    to_addrs: "yo@x.com".into(),
+                    cc_addrs: "".into(),
+                    bcc_addrs: "".into(),
+                    reply_to: None,
+                    subject: "Hola".into(),
+                    date_ts: 100,
+                    sort_key: 100,
+                    flags_seen: false,
+                    flags_answered: false,
+                    flags_flagged: false,
+                    flags_draft: false,
+                    flags_deleted: false,
+                    has_attachments: false,
+                    size: 100,
+                }))],
+                inbox_id,
+            )
+            .unwrap();
+
+        // Borrar usando (mailbox_id, uid)
+        store
+            .apply_messages(vec![MessageOp::Delete(inbox_id, 1)], inbox_id)
+            .unwrap();
+
+        let count: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE mailbox_id = ?1",
+                [inbox_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn upsert_message_body_transaccional_con_fts() {
+        let (_, mut store) = make_store();
+        store
+            .upsert_mailboxes(&[mailbox("INBOX", MailboxRole::Inbox)])
+            .unwrap();
+        let inbox_id = store.mailboxes().unwrap()[0].id;
+
+        store
+            .apply_messages(
+                vec![MessageOp::Upsert(Box::new(MessageRow {
+                    mailbox_id: inbox_id,
+                    uid: 1,
+                    message_id: Some("<msg@x>".into()),
+                    from_addr: "ana@x.com".into(),
+                    to_addrs: "yo@x.com".into(),
+                    cc_addrs: "".into(),
+                    bcc_addrs: "".into(),
+                    reply_to: None,
+                    subject: "Test FTS".into(),
+                    date_ts: 100,
+                    sort_key: 100,
+                    flags_seen: false,
+                    flags_answered: false,
+                    flags_flagged: false,
+                    flags_draft: false,
+                    flags_deleted: false,
+                    has_attachments: false,
+                    size: 100,
+                }))],
+                inbox_id,
+            )
+            .unwrap();
+
+        let msg_id = store
+            .connection
+            .query_row(
+                "SELECT id FROM messages WHERE mailbox_id = ?1 AND uid = 1",
+                [inbox_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        // Guardar cuerpo -> debe actualizar FTS
+        store
+            .upsert_message_body(MessageBodyRow {
+                message_id: msg_id,
+                text_body: Some("Cuerpo para búsqueda FTS".into()),
+                html_body: None,
+                truncated: false,
+            })
+            .unwrap();
+
+        // Verificar que el cuerpo se guardó en message_bodies
+        let saved_body: String = store
+            .connection
+            .query_row(
+                "SELECT text_body FROM message_bodies WHERE message_id = ?1",
+                [msg_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved_body, "Cuerpo para búsqueda FTS");
+    }
+
+    #[test]
+    fn upsert_message_attachment_transaccional_con_generation() {
+        let (_, mut store) = make_store();
+        store
+            .upsert_mailboxes(&[mailbox("INBOX", MailboxRole::Inbox)])
+            .unwrap();
+        let inbox_id = store.mailboxes().unwrap()[0].id;
+
+        store
+            .apply_messages(
+                vec![MessageOp::Upsert(Box::new(MessageRow {
+                    mailbox_id: inbox_id,
+                    uid: 1,
+                    message_id: Some("<msg@x>".into()),
+                    from_addr: "ana@x.com".into(),
+                    to_addrs: "yo@x.com".into(),
+                    cc_addrs: "".into(),
+                    bcc_addrs: "".into(),
+                    reply_to: None,
+                    subject: "Test adjunto".into(),
+                    date_ts: 100,
+                    sort_key: 100,
+                    flags_seen: false,
+                    flags_answered: false,
+                    flags_flagged: false,
+                    flags_draft: false,
+                    flags_deleted: false,
+                    has_attachments: false,
+                    size: 100,
+                }))],
+                inbox_id,
+            )
+            .unwrap();
+
+        let msg_id = store
+            .connection
+            .query_row(
+                "SELECT id FROM messages WHERE mailbox_id = ?1 AND uid = 1",
+                [inbox_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let gen_antes: i64 = store
+            .connection
+            .query_row(
+                "SELECT value FROM store_meta WHERE key = 'generation.email'",
+                [],
+                |row| {
+                    let v: String = row.get(0).unwrap();
+                    v.parse::<i64>().map_err(|_| {
+                        rusqlite::Error::InvalidColumnType(
+                            0,
+                            "value".into(),
+                            rusqlite::types::Type::Null,
+                        )
+                    })
+                },
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("query error: {}", e);
+                0
+            });
+        eprintln!("gen_antes = {}", gen_antes);
+
+        store
+            .upsert_message_attachment(MessageAttachmentRow {
+                message_id: msg_id,
+                part_number: "2".into(),
+                name: Some("test.pdf".into()),
+                content_type: "application/pdf".into(),
+                size: 1024,
+                inline: false,
+                content_id: None,
+            })
+            .unwrap();
+
+        let gen_despues: i64 = store
+            .connection
+            .query_row(
+                "SELECT value FROM store_meta WHERE key = 'generation.email'",
+                [],
+                |row| -> rusqlite::Result<i64> {
+                    let v: String = row.get(0)?;
+                    v.parse::<i64>().map_err(|_| {
+                        rusqlite::Error::InvalidColumnType(
+                            0,
+                            "value".into(),
+                            rusqlite::types::Type::Null,
+                        )
+                    })
+                },
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("query error: {}", e);
+                0
+            });
+        eprintln!("gen_despues = {}", gen_despues);
+
+        assert!(gen_despues > gen_antes);
+    }
 }

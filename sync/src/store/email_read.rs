@@ -662,6 +662,7 @@ pub fn fts_query_str(text: &str) -> Option<String> {
 }
 
 /// Caché global para la conversión de consultas FTS. Evita que la misma
+/// Caché global para la conversión de consultas FTS. Evita que la misma
 /// consulta de búsqueda sea convertida una y otra vez.
 pub fn cached_fts_query(text: &str) -> Option<String> {
     static CACHE: once_cell::sync::Lazy<std::sync::Mutex<HashMap<String, String>>> =
@@ -693,7 +694,7 @@ mod tests {
         MailboxListing, MailboxRole, MessageAttachmentRow, MessageBodyRow, MessageFlagRow,
         MessageOp, MessageRow,
     };
-    use crate::store::email_read::Cursor;
+    use crate::store::email_read::{cached_fts_query, Cursor};
     use crate::store::key::tests::fake_keyring;
     use crate::store::paths::tests::TempDir;
     use crate::store::paths::StorePaths;
@@ -981,5 +982,105 @@ mod tests {
 
         // Inválido
         assert!(matches!(Cursor::decode("basura"), Err(_)));
+
+        // Cursor vacío
+        assert_eq!(Cursor::decode(""), Ok(None));
+    }
+
+    #[test]
+    fn cached_fts_query_simple() {
+        let q1 = cached_fts_query("hola mundo").unwrap();
+        assert_eq!(q1, "hola* mundo*");
+
+        // Segunda llamada debe usar caché
+        let q2 = cached_fts_query("hola mundo").unwrap();
+        assert_eq!(q1, q2);
+
+        // Consulta distinta
+        let q3 = cached_fts_query("otro término").unwrap();
+        assert_eq!(q3, "otro* término*");
+    }
+
+    #[test]
+    fn search_messages_paginacion_limit_plus_1() {
+        let (_, mut store) = make_store();
+        store
+            .upsert_mailboxes(&[MailboxListing {
+                name: "INBOX".into(),
+                display_name: "Bandeja".into(),
+                role: MailboxRole::Inbox,
+            }])
+            .unwrap();
+        let inbox_id = store.mailboxes().unwrap()[0].id;
+
+        // Insertar 5 mensajes con cuerpos para FTS
+        for i in 1..=5 {
+            store
+                .apply_messages(
+                    vec![MessageOp::Upsert(Box::new(MessageRow {
+                        mailbox_id: inbox_id,
+                        uid: i,
+                        message_id: Some(format!("<msg{i}@x>")),
+                        from_addr: "ana@x.com".into(),
+                        to_addrs: "yo@x.com".into(),
+                        cc_addrs: "".into(),
+                        bcc_addrs: "".into(),
+                        reply_to: None,
+                        subject: format!("Hola {i}"),
+                        date_ts: 1000 + i as i64,
+                        sort_key: 1000 + i as i64,
+                        flags_seen: false,
+                        flags_answered: false,
+                        flags_flagged: false,
+                        flags_draft: false,
+                        flags_deleted: false,
+                        has_attachments: false,
+                        size: 100,
+                    }))],
+                    inbox_id,
+                )
+                .unwrap();
+            let msg_id = store
+                .connection
+                .query_row(
+                    "SELECT id FROM messages WHERE mailbox_id = ?1 AND uid = ?2",
+                    rusqlite::params![inbox_id, i as i64],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            store
+                .upsert_message_body(MessageBodyRow {
+                    message_id: msg_id,
+                    text_body: Some(format!("Cuerpo {i}")),
+                    html_body: None,
+                    truncated: false,
+                })
+                .unwrap();
+        }
+
+        // Buscar "hola" con límite 2 -> debería devolver 2 items y next_cursor
+        let page1 = store.search_messages("hola", inbox_id, None, 2).unwrap();
+        assert_eq!(page1.items.len(), 2);
+        assert!(page1.next_cursor.is_some());
+
+        // Segunda página
+        let cursor = Cursor::decode(&page1.next_cursor.unwrap())
+            .unwrap()
+            .unwrap();
+        let page2 = store
+            .search_messages("hola", inbox_id, Some(&cursor), 2)
+            .unwrap();
+        assert_eq!(page2.items.len(), 2);
+        assert!(page2.next_cursor.is_some());
+
+        // Tercera página (última)
+        let cursor = Cursor::decode(&page2.next_cursor.unwrap())
+            .unwrap()
+            .unwrap();
+        let page3 = store
+            .search_messages("hola", inbox_id, Some(&cursor), 2)
+            .unwrap();
+        assert_eq!(page3.items.len(), 1);
+        assert!(page3.next_cursor.is_none());
     }
 }
