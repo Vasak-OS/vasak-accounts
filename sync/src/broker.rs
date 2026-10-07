@@ -9,7 +9,7 @@
 //! la aplicación de correo: es el primer cliente real del modelo de permisos, y
 //! sirve para ejercitarlo de punta a punta.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub(crate) const SERVICE: &str = "ar.net.vasak.os.AccountManager";
 pub(crate) const PATH: &str = "/ar/net/vasak/os/AccountManager";
@@ -24,6 +24,17 @@ pub struct Account {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub needs_reauth: bool,
+}
+
+/// Un proveedor del catálogo, tal como lo devuelve `ListProviders`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct Provider {
+    pub id: String,
+    pub display_name: String,
+    pub capabilities: Vec<String>,
+    pub unavailable_capabilities: Vec<String>,
+    pub configured: bool,
+    pub kind: String,
 }
 
 impl Account {
@@ -120,6 +131,14 @@ impl Broker {
             .await?;
         serde_json::from_str(&json)
             .map_err(|e| BrokerError::Failed(format!("no se pudo leer la configuración: {e}")))
+    }
+
+    /// El catálogo de proveedores disponible para este usuario.
+    pub async fn list_providers(&self) -> Result<Vec<Provider>, BrokerError> {
+        let json = self.call("ListProviders", &()).await?;
+        serde_json::from_str(&json).map_err(|e| {
+            BrokerError::Failed(format!("no se pudo leer el catálogo de proveedores: {e}"))
+        })
     }
 }
 
