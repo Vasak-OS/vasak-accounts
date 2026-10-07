@@ -236,7 +236,8 @@ impl Store {
                 let base = "SELECT m.id, m.mailbox_id, mb.name, m.uid, m.message_id,
                             m.from_addr, m.to_addrs, m.cc_addrs, m.reply_to, m.subject,
                             m.date_ts, m.flags_seen, m.flags_answered, m.flags_flagged,
-                            m.flags_draft, m.flags_deleted, m.has_attachments, m.size
+                            m.flags_draft, m.flags_deleted, m.has_attachments, m.size,
+                            m.sort_key
                           FROM messages m
                           JOIN mailboxes mb ON m.mailbox_id = mb.id
                           WHERE (m.sort_key, m.id) < (?1, ?2)
@@ -251,7 +252,8 @@ impl Store {
                 let base = "SELECT m.id, m.mailbox_id, mb.name, m.uid, m.message_id,
                             m.from_addr, m.to_addrs, m.cc_addrs, m.reply_to, m.subject,
                             m.date_ts, m.flags_seen, m.flags_answered, m.flags_flagged,
-                            m.flags_draft, m.flags_deleted, m.has_attachments, m.size
+                            m.flags_draft, m.flags_deleted, m.has_attachments, m.size,
+                            m.sort_key
                           FROM messages m
                           JOIN mailboxes mb ON m.mailbox_id = mb.id
                           ORDER BY m.sort_key DESC, m.id
@@ -263,7 +265,8 @@ impl Store {
                 let base = "SELECT m.id, m.mailbox_id, mb.name, m.uid, m.message_id,
                             m.from_addr, m.to_addrs, m.cc_addrs, m.reply_to, m.subject,
                             m.date_ts, m.flags_seen, m.flags_answered, m.flags_flagged,
-                            m.flags_draft, m.flags_deleted, m.has_attachments, m.size
+                            m.flags_draft, m.flags_deleted, m.has_attachments, m.size,
+                            m.sort_key
                           FROM messages m
                           JOIN mailboxes mb ON m.mailbox_id = mb.id
                           WHERE m.mailbox_id = ?1
@@ -284,7 +287,8 @@ impl Store {
                 let base = "SELECT m.id, m.mailbox_id, mb.name, m.uid, m.message_id,
                             m.from_addr, m.to_addrs, m.cc_addrs, m.reply_to, m.subject,
                             m.date_ts, m.flags_seen, m.flags_answered, m.flags_flagged,
-                            m.flags_draft, m.flags_deleted, m.has_attachments, m.size
+                            m.flags_draft, m.flags_deleted, m.has_attachments, m.size,
+                            m.sort_key
                           FROM messages m
                           JOIN mailboxes mb ON m.mailbox_id = mb.id
                           WHERE m.mailbox_id = ?1
@@ -311,7 +315,7 @@ impl Store {
             }
             items.push(message_from_row(&row)?);
             last = Some(Cursor {
-                sort_key: row.get::<_, i64>(10).map_err(classify)?,
+                sort_key: row.get::<_, i64>(18).map_err(classify)?,
                 id: row.get::<_, i64>(0).map_err(classify)?,
             });
         }
@@ -346,7 +350,8 @@ impl Store {
                 let base = "SELECT m.id, m.mailbox_id, mb.name, m.uid, m.message_id,
                             m.from_addr, m.to_addrs, m.cc_addrs, m.reply_to, m.subject,
                             m.date_ts, m.flags_seen, m.flags_answered, m.flags_flagged,
-                            m.flags_draft, m.flags_deleted, m.has_attachments, m.size
+                            m.flags_draft, m.flags_deleted, m.has_attachments, m.size,
+                            m.sort_key
                           FROM messages m
                           JOIN mailboxes mb ON m.mailbox_id = mb.id
                           JOIN messages_fts fts ON m.id = fts.rowid
@@ -368,7 +373,8 @@ impl Store {
                 let base = "SELECT m.id, m.mailbox_id, mb.name, m.uid, m.message_id,
                             m.from_addr, m.to_addrs, m.cc_addrs, m.reply_to, m.subject,
                             m.date_ts, m.flags_seen, m.flags_answered, m.flags_flagged,
-                            m.flags_draft, m.flags_deleted, m.has_attachments, m.size
+                            m.flags_draft, m.flags_deleted, m.has_attachments, m.size,
+                            m.sort_key
                           FROM messages m
                           JOIN mailboxes mb ON m.mailbox_id = mb.id
                           JOIN messages_fts fts ON m.id = fts.rowid
@@ -382,7 +388,8 @@ impl Store {
                 let base = "SELECT m.id, m.mailbox_id, mb.name, m.uid, m.message_id,
                             m.from_addr, m.to_addrs, m.cc_addrs, m.reply_to, m.subject,
                             m.date_ts, m.flags_seen, m.flags_answered, m.flags_flagged,
-                            m.flags_draft, m.flags_deleted, m.has_attachments, m.size
+                            m.flags_draft, m.flags_deleted, m.has_attachments, m.size,
+                            m.sort_key
                           FROM messages m
                           JOIN mailboxes mb ON m.mailbox_id = mb.id
                           JOIN messages_fts fts ON m.id = fts.rowid
@@ -406,7 +413,8 @@ impl Store {
                 let base = "SELECT m.id, m.mailbox_id, mb.name, m.uid, m.message_id,
                             m.from_addr, m.to_addrs, m.cc_addrs, m.reply_to, m.subject,
                             m.date_ts, m.flags_seen, m.flags_answered, m.flags_flagged,
-                            m.flags_draft, m.flags_deleted, m.has_attachments, m.size
+                            m.flags_draft, m.flags_deleted, m.has_attachments, m.size,
+                            m.sort_key
                           FROM messages m
                           JOIN mailboxes mb ON m.mailbox_id = mb.id
                           JOIN messages_fts fts ON m.id = fts.rowid
@@ -428,17 +436,29 @@ impl Store {
         let mut statement = self.connection.prepare(&sql).map_err(classify)?;
         let params_ref: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
         let mut rows = statement.query(&params_ref[..]).map_err(classify)?;
-        let items = collect_messages(&mut rows, limit)?;
 
-        let next_cursor = items
-            .last()
-            .map(|m| Cursor {
-                sort_key: m.date_ts,
-                id: m.id,
-            })
-            .map(|c| c.encode());
-
-        Ok(Page { items, next_cursor })
+        let mut items = Vec::new();
+        let mut last: Option<Cursor> = None;
+        let mut has_more = false;
+        while let Some(row) = rows.next().map_err(classify)? {
+            if items.len() == limit {
+                has_more = true;
+                break;
+            }
+            items.push(message_from_row(&row)?);
+            last = Some(Cursor {
+                sort_key: row.get::<_, i64>(18).map_err(classify)?,
+                id: row.get::<_, i64>(0).map_err(classify)?,
+            });
+        }
+        Ok(Page {
+            items,
+            next_cursor: if has_more {
+                last.map(|c| c.encode())
+            } else {
+                None
+            },
+        })
     }
 
     /// Un mensaje entero (para abrir).
@@ -960,6 +980,6 @@ mod tests {
         assert_eq!(Cursor::decode(&encoded), Ok(Some(c)));
 
         // Inválido
-        assert!(Cursor::decode("basura").is_err());
+        assert!(matches!(Cursor::decode("basura"), Err(_)));
     }
 }

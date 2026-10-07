@@ -54,6 +54,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use key::{KeyError, StoreKey};
 use paths::StorePaths;
 use readers::ReadPool;
+use std::ffi::CString;
 
 /// Lo que puede salir mal con una base.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +64,8 @@ pub enum StoreError {
     /// El identificador de cuenta no se puede usar como nombre de carpeta.
     InvalidAccountId(String),
     /// La clave no abre la base, o el archivo no es una base: SQLite contesta
+    /// El argumento proporcionado es inválido (consulta vacía, demasiado larga, etc.).
+    InvalidArgument(String),
     /// lo mismo en los dos casos (`SQLITE_NOTADB`).
     WrongKey,
     /// La base se abrió pero no está cifrada: esta compilación no trae
@@ -102,6 +105,7 @@ impl std::fmt::Display for StoreError {
             }
             StoreError::Missing => f.write_str("no hay base"),
             StoreError::Schema(d) => write!(f, "el esquema de la base: {d}"),
+            StoreError::InvalidArgument(d) => write!(f, "{d}"),
             StoreError::Io(d) | StoreError::Sqlite(d) => write!(f, "{d}"),
             StoreError::Key(e) => write!(f, "{e}"),
             StoreError::Settings(d) => write!(f, "stores.json: {d}"),
@@ -122,6 +126,7 @@ impl StoreError {
         match self {
             StoreError::NoBaseDir => "no hay un directorio de datos para el almacén",
             StoreError::InvalidAccountId(_) => "el identificador de la cuenta no es válido",
+            StoreError::InvalidArgument(_) => "el argumento proporcionado es inválido",
             StoreError::WrongKey => "la clave no abre la base",
             StoreError::NotEncrypted => "esta compilación no cifra la base; no se usa sin cifrar",
             StoreError::Missing => "no hay base",

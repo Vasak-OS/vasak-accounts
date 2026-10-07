@@ -53,6 +53,7 @@
 //! la frontera del cifrado en `store/mod.rs`). Así que queda `plain`.
 
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -445,8 +446,10 @@ impl SecretServiceKeys {
         let proxy = zbus::fdo::DBusProxy::new(&self.connection)
             .await
             .map_err(|e| KeyError::Unavailable(format!("GetNameOwner: {e}")))?;
-        let bus_name = zbus::names::BusName::try_from(name)
-            .map_err(|e| KeyError::Failed(format!("GetNameOwner: {e}")))?;
+        let bus_name = match zbus::names::BusName::try_from(name) {
+            Ok(b) => b,
+            Err(e) => return Err(KeyError::Failed(format!("GetNameOwner: {e}"))),
+        };
         proxy
             .get_name_owner(bus_name)
             .await
@@ -558,8 +561,9 @@ impl SecretServiceKeys {
         let Ok(proxy) = zbus::fdo::DBusProxy::new(&self.connection).await else {
             return false;
         };
-        let Ok(bus_name) = zbus::names::BusName::try_from(name) else {
-            return false;
+        let bus_name = match zbus::names::BusName::try_from(name) {
+            Ok(b) => b,
+            Err(_) => return false,
         };
         let Ok(current) = proxy.get_name_owner(bus_name).await else {
             return false;

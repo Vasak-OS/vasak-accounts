@@ -609,12 +609,12 @@ impl<K: KeySource> StoreApi<K> {
         cursor: String,
         limit: u32,
     ) -> zbus::fdo::Result<String> {
-        self.authorize_email(&header, &account_id).await?;
         let after = EmailCursor::decode(&cursor)
             .map_err(|e| zbus::fdo::Error::InvalidArgs(e.0))?
             .map(Some)
             .unwrap_or(None);
         let limit = email_read::page_limit(limit);
+        self.authorize_email(&header, &account_id).await?;
         let page = self
             .manager
             .read_store(&account_id, move |s| {
@@ -637,7 +637,6 @@ impl<K: KeySource> StoreApi<K> {
         cursor: String,
         limit: u32,
     ) -> zbus::fdo::Result<String> {
-        self.authorize_email(&header, &account_id).await?;
         let fts = email_read::fts_query_str(&query).ok_or_else(|| {
             zbus::fdo::Error::InvalidArgs("consulta vacía, muy larga o con muchas palabras".into())
         })?;
@@ -646,6 +645,7 @@ impl<K: KeySource> StoreApi<K> {
             .map(Some)
             .unwrap_or(None);
         let limit = email_read::page_limit(limit);
+        self.authorize_email(&header, &account_id).await?;
         let page = self
             .manager
             .read_store(&account_id, move |s| {
@@ -666,11 +666,31 @@ impl<K: KeySource> StoreApi<K> {
         message_id: i64,
     ) -> zbus::fdo::Result<String> {
         self.authorize_email(&header, &account_id).await?;
-        let msg = self
+        let mut msg = self
             .manager
             .read_store(&account_id, move |s| s.get_message(message_id))
             .await
             .map_err(read_error)?;
+
+        // Truncate large text_body and html_body fields to prevent oversized responses
+        if let Some(ref mut body) = msg.as_mut() {
+            const MAX_BODY_SIZE: usize = 256 * 1024; // 256 KB
+
+            if let Some(ref mut text) = body.text_body {
+                if text.len() > MAX_BODY_SIZE {
+                    text.truncate(MAX_BODY_SIZE);
+                    body.truncated = true;
+                }
+            }
+
+            if let Some(ref mut html) = body.html_body {
+                if html.len() > MAX_BODY_SIZE {
+                    html.truncate(MAX_BODY_SIZE);
+                    body.truncated = true;
+                }
+            }
+        }
+
         email_read::to_capped_json(&msg, email_read::MAX_MESSAGE_BYTES).map_err(read_error)
     }
 
@@ -942,6 +962,7 @@ fn sender_of(header: &Header<'_>) -> Option<String> {
 
 fn denied(resource: &str) -> zbus::fdo::Error {
     let what = match resource {
+        EMAIL_RESOURCE => "el correo guardado",
         CALENDAR_RESOURCE => "el calendario guardado",
         _ => "los contactos guardados",
     };
@@ -962,6 +983,7 @@ fn read_error(error: StoreError) -> zbus::fdo::Error {
         StoreError::Missing => zbus::fdo::Error::Failed(
             "el almacén de esta cuenta no está abierto; GetStatus dice por qué".into(),
         ),
+        StoreError::InvalidArgument(msg) => zbus::fdo::Error::InvalidArgs(msg.clone()),
         other => {
             tracing::warn!("no se pudo leer del almacén: {other}");
             zbus::fdo::Error::Failed(other.public_detail().into())

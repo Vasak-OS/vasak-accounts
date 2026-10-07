@@ -84,6 +84,7 @@ mod vcard;
 mod xdg;
 
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::sync::Arc;
 use std::time::Duration;
 
