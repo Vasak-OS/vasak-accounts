@@ -24,7 +24,7 @@
 //! casilla, y cada lote que cambia algo sube la generación del área `email`
 //! en su misma transacción.
 
-use rusqlite::OptionalExtension;
+use rusqlite::{OptionalExtension, Transaction};
 
 use super::lifecycle::EMAIL_AREA;
 use super::{bump_generation, classify, Store, StoreError};
@@ -195,6 +195,20 @@ impl Store {
             })
             .map_err(classify)?;
         rows.collect::<Result<_, _>>().map_err(classify)
+    }
+
+    /// Ejecuta una operación en una transacción, sube la generación del área `email`
+    /// y anuncia el cambio. Reduce el boilerplate de transacción + bump_generation + commit.
+    fn with_transaction_email<F>(&mut self, f: F) -> Result<(), StoreError>
+    where
+        F: FnOnce(&Transaction) -> Result<(), StoreError>,
+    {
+        let transaction = self.connection.transaction().map_err(classify)?;
+        f(&transaction)?;
+        let generation = bump_generation(&transaction, EMAIL_AREA)?;
+        transaction.commit().map_err(classify)?;
+        self.note_change(EMAIL_AREA, generation);
+        Ok(())
     }
 
     /// Da de alta las casillas que listó el servidor, o les actualiza el
@@ -452,49 +466,45 @@ impl Store {
 
     /// Guarda el cuerpo de un mensaje (cuando se abre).
     pub fn upsert_message_body(&mut self, body: MessageBodyRow) -> Result<(), StoreError> {
-        let transaction = self.connection.transaction().map_err(classify)?;
-
-        transaction
-            .execute(
-                "INSERT INTO message_bodies (message_id, text_body, html_body, truncated, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT (message_id) DO UPDATE SET
-                     text_body = excluded.text_body,
-                     html_body = excluded.html_body,
-                     truncated = excluded.truncated,
-                     updated_at = excluded.updated_at",
-                rusqlite::params![
-                    body.message_id,
-                    body.text_body,
-                    body.html_body,
-                    body.truncated as i64,
-                    now(),
-                ],
-            )
-            .map_err(classify)?;
-
-        // Actualizar índice FTS5 con el cuerpo de texto
-        if let Some(text) = body.text_body {
+        self.with_transaction_email(|transaction| {
             transaction
                 .execute(
-                    "DELETE FROM messages_fts WHERE rowid = ?1",
-                    [body.message_id],
+                    "INSERT INTO message_bodies (message_id, text_body, html_body, truncated, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT (message_id) DO UPDATE SET
+                         text_body = excluded.text_body,
+                         html_body = excluded.html_body,
+                         truncated = excluded.truncated,
+                         updated_at = excluded.updated_at",
+                    rusqlite::params![
+                        body.message_id,
+                        body.text_body,
+                        body.html_body,
+                        body.truncated as i64,
+                        now(),
+                    ],
                 )
                 .map_err(classify)?;
-            transaction
-                .execute(
-                    "INSERT INTO messages_fts (rowid, subject, from_addr, to_addrs, cc_addrs, text_body)
-                     SELECT ?1, subject, from_addr, to_addrs, cc_addrs, ?2
-                     FROM messages WHERE id = ?1",
-                    rusqlite::params![body.message_id, text],
-                )
-                .map_err(classify)?;
-        }
 
-        let generation = bump_generation(&transaction, EMAIL_AREA)?;
-        transaction.commit().map_err(classify)?;
-        self.note_change(EMAIL_AREA, generation);
-        Ok(())
+            // Actualizar índice FTS5 con el cuerpo de texto
+            if let Some(text) = body.text_body {
+                transaction
+                    .execute(
+                        "DELETE FROM messages_fts WHERE rowid = ?1",
+                        [body.message_id],
+                    )
+                    .map_err(classify)?;
+                transaction
+                    .execute(
+                        "INSERT INTO messages_fts (rowid, subject, from_addr, to_addrs, cc_addrs, text_body)
+                         SELECT ?1, subject, from_addr, to_addrs, cc_addrs, ?2
+                         FROM messages WHERE id = ?1",
+                        rusqlite::params![body.message_id, text],
+                    )
+                    .map_err(classify)?;
+            }
+            Ok(())
+        })
     }
 
     /// Guarda un adjunto.
@@ -502,70 +512,58 @@ impl Store {
         &mut self,
         attachment: MessageAttachmentRow,
     ) -> Result<(), StoreError> {
-        let transaction = self.connection.transaction().map_err(classify)?;
-
-        transaction
-            .execute(
-                "INSERT INTO message_attachments
-                    (message_id, part_number, name, content_type, size, inline, content_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT (message_id, part_number) DO UPDATE SET
-                     name = excluded.name,
-                     content_type = excluded.content_type,
-                     size = excluded.size,
-                     inline = excluded.inline,
-                     content_id = excluded.content_id",
-                rusqlite::params![
-                    attachment.message_id,
-                    &attachment.part_number,
-                    attachment.name,
-                    &attachment.content_type,
-                    attachment.size,
-                    attachment.inline as i64,
-                    attachment.content_id,
-                ],
-            )
-            .map_err(classify)?;
-
-        let generation = bump_generation(&transaction, EMAIL_AREA)?;
-        transaction.commit().map_err(classify)?;
-        self.note_change(EMAIL_AREA, generation);
-        Ok(())
+        self.with_transaction_email(|transaction| {
+            transaction
+                .execute(
+                    "INSERT INTO message_attachments
+                        (message_id, part_number, name, content_type, size, inline, content_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT (message_id, part_number) DO UPDATE SET
+                         name = excluded.name,
+                         content_type = excluded.content_type,
+                         size = excluded.size,
+                         inline = excluded.inline,
+                         content_id = excluded.content_id",
+                    rusqlite::params![
+                        attachment.message_id,
+                        &attachment.part_number,
+                        attachment.name,
+                        &attachment.content_type,
+                        attachment.size,
+                        attachment.inline as i64,
+                        attachment.content_id,
+                    ],
+                )
+                .map_err(classify)?;
+            Ok(())
+        })
     }
 
     /// Guarda una bandera extra.
     pub fn upsert_message_flag(&mut self, flag: MessageFlagRow) -> Result<(), StoreError> {
-        let transaction = self.connection.transaction().map_err(classify)?;
-
-        transaction
-            .execute(
-                "INSERT INTO message_flags (message_id, flag) VALUES (?1, ?2)
-                 ON CONFLICT (message_id, flag) DO NOTHING",
-                rusqlite::params![flag.message_id, &flag.flag],
-            )
-            .map_err(classify)?;
-
-        let generation = bump_generation(&transaction, EMAIL_AREA)?;
-        transaction.commit().map_err(classify)?;
-        self.note_change(EMAIL_AREA, generation);
-        Ok(())
+        self.with_transaction_email(|transaction| {
+            transaction
+                .execute(
+                    "INSERT INTO message_flags (message_id, flag) VALUES (?1, ?2)
+                     ON CONFLICT (message_id, flag) DO NOTHING",
+                    rusqlite::params![flag.message_id, &flag.flag],
+                )
+                .map_err(classify)?;
+            Ok(())
+        })
     }
 
     /// Borra una bandera extra.
     pub fn delete_message_flag(&mut self, message_id: i64, flag: &str) -> Result<(), StoreError> {
-        let transaction = self.connection.transaction().map_err(classify)?;
-
-        transaction
-            .execute(
-                "DELETE FROM message_flags WHERE message_id = ?1 AND flag = ?2",
-                rusqlite::params![message_id, flag],
-            )
-            .map_err(classify)?;
-
-        let generation = bump_generation(&transaction, EMAIL_AREA)?;
-        transaction.commit().map_err(classify)?;
-        self.note_change(EMAIL_AREA, generation);
-        Ok(())
+        self.with_transaction_email(|transaction| {
+            transaction
+                .execute(
+                    "DELETE FROM message_flags WHERE message_id = ?1 AND flag = ?2",
+                    rusqlite::params![message_id, flag],
+                )
+                .map_err(classify)?;
+            Ok(())
+        })
     }
 }
 
