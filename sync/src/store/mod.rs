@@ -54,7 +54,6 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use key::{KeyError, StoreKey};
 use paths::StorePaths;
 use readers::ReadPool;
-use std::ffi::CString;
 
 /// Lo que puede salir mal con una base.
 #[derive(Debug, Clone, PartialEq, Eq)]

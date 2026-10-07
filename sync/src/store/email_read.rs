@@ -17,12 +17,10 @@
 //! - **Banderas**: `GetFlags` — las banderas extra de un mensaje.
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
 
-use rusqlite::{OptionalExtension, Row};
+use rusqlite::Row;
 use serde::Serialize;
 
-use super::lifecycle::EMAIL_AREA;
 use super::{classify, Store, StoreError};
 
 /// El cursor estable para paginar: `(sort_key DESC, id)`.
@@ -493,7 +491,7 @@ impl Store {
         };
 
         // Adjuntos
-        let attachments = if let Some(ref msg) = message {
+        let attachments = if let Some(ref _msg) = message {
             let mut stmt = self
                 .connection
                 .prepare(
@@ -519,7 +517,7 @@ impl Store {
         };
 
         // Banderas extra
-        let flags = if let Some(ref msg) = message {
+        let flags = if let Some(ref _msg) = message {
             let mut stmt = self
                 .connection
                 .prepare("SELECT flag FROM message_flags WHERE message_id = ?1 ORDER BY flag")

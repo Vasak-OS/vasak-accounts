@@ -814,7 +814,7 @@ impl<K: KeySource> StoreManager<K> {
             self.run(&mut inner, Some(account_id)).await;
             return Err(StoreError::Key(KeyError::Locked));
         }
-        let Some(mut store) = inner
+        let Some(store) = inner
             .entries
             .get_mut(account_id)
             .and_then(|e| e.store.take())

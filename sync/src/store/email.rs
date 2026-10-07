@@ -24,9 +24,6 @@
 //! casilla, y cada lote que cambia algo sube la generación del área `email`
 //! en su misma transacción.
 
-use std::collections::HashMap;
-
-use chrono::{DateTime, Utc};
 use rusqlite::OptionalExtension;
 
 use super::lifecycle::EMAIL_AREA;
