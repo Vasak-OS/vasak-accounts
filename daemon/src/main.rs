@@ -316,6 +316,8 @@ impl AccountManager {
                         providers::ProviderKind::Oauth2 => "oauth2",
                         providers::ProviderKind::Nextcloud => "nextcloud",
                         providers::ProviderKind::CardDav => "carddav",
+                        providers::ProviderKind::GraphApi => "graph",
+                        providers::ProviderKind::Ldap => "ldap",
                     },
                 })
             })

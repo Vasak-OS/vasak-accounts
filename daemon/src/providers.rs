@@ -54,6 +54,14 @@ pub enum ProviderKind {
     /// (o contraseña de aplicación). No requiere registro de aplicación.
     #[serde(rename = "carddav")]
     CardDav,
+    /// Microsoft Graph API (Outlook.com, Office 365). Contactos, calendario y
+    /// archivos vía Microsoft Graph REST API.
+    #[serde(rename = "graph")]
+    GraphApi,
+    /// Active Directory / LDAP. Sólo lectura: búsqueda de contactos contra un
+    /// servidor LDAP/AD. Autenticación simple o SASL/Kerberos.
+    #[serde(rename = "ldap")]
+    Ldap,
 }
 
 /// Un proveedor tal como se lee del archivo.
@@ -152,6 +160,37 @@ pub struct Provider {
     /// Ejemplo: `https://contacts.icloud.com/` o `https://dav.mijndomein.nl/`.
     #[serde(default)]
     pub dav_url: Option<String>,
+
+    /// La URL base del servidor Microsoft Graph.
+    ///
+    /// Sólo para proveedores `GraphApi`. Es la URL base de Microsoft Graph API.
+    ///
+    /// Ejemplo: `https://graph.microsoft.com/v1.0/`.
+    #[serde(default)]
+    pub graph_url: Option<String>,
+
+    /// La URL base del servidor LDAP/AD.
+    ///
+    /// Sólo para proveedores `Ldap`. Incluye el esquema (ldap:// o ldaps://).
+    ///
+    /// Ejemplo: `ldap://ldap.example.com:389` o `ldaps://ad.example.com:636/`.
+    #[serde(default)]
+    pub ldap_url: Option<String>,
+
+    /// El DN de enlace para autenticación LDAP.
+    ///
+    /// Sólo para proveedores `Ldap`. El DN del usuario que hará las búsquedas.
+    ///
+    /// Ejemplo: `cn=vasak,ou=service,dc=example,dc=com` o `vasak@example.com`.
+    #[serde(default)]
+    pub ldap_bind_dn: Option<String>,
+
+    /// La contraseña para autenticación LDAP.
+    ///
+    /// Sólo para proveedores `Ldap`. Se guarda cifrada en el almacén de secretos
+    /// (`vasak-keyring`), no en el archivo de configuración.
+    #[serde(default)]
+    pub ldap_password: Option<String>,
 }
 
 /// Lo que puede valer un campo de una dirección de servicio.
@@ -245,6 +284,16 @@ impl Provider {
                 .into_iter()
                 .filter(|c| !Self::is_dav_capability(c))
                 .collect(),
+            ProviderKind::GraphApi => self
+                .capabilities()
+                .into_iter()
+                .filter(|c| !self.endpoints.contains_key(c))
+                .collect(),
+            ProviderKind::Ldap => self
+                .capabilities()
+                .into_iter()
+                .filter(|c| !self.endpoints.contains_key(c))
+                .collect(),
         }
     }
 
@@ -301,6 +350,16 @@ impl Provider {
             }
             ProviderKind::Nextcloud => true,
             ProviderKind::CardDav => self.dav_url.is_some(),
+            ProviderKind::GraphApi => {
+                self.client_id.as_deref().is_some_and(|id| !id.is_empty())
+                    && self.auth_url.is_some()
+                    && self.token_url.is_some()
+            }
+            ProviderKind::Ldap => {
+                self.ldap_url.is_some()
+                    && self.ldap_bind_dn.is_some()
+                    && self.ldap_password.is_some()
+            }
         }
     }
 }
@@ -544,6 +603,8 @@ pub fn resolve(
                 ProviderKind::Oauth2 => "oauth2",
                 ProviderKind::Nextcloud => "nextcloud",
                 ProviderKind::CardDav => "carddav",
+                ProviderKind::GraphApi => "graph",
+                ProviderKind::Ldap => "ldap",
             },
         });
     }
@@ -1129,6 +1190,28 @@ mod tests {
                     assert!(
                         !proveedor.is_configured(),
                         "{id} no debería estar configurado sin dav_url"
+                    );
+                }
+                // GraphApi no las tiene: la dirección la escribe la persona y
+                // no se sabe hasta ese momento.
+                ProviderKind::GraphApi => {
+                    assert_eq!(proveedor.auth_url, None, "{id} no debería tener auth_url");
+                    assert_eq!(proveedor.token_url, None, "{id} no debería tener token_url");
+                    // GraphApi necesita client_id, auth_url y token_url para estar configurado
+                    assert!(
+                        !proveedor.is_configured(),
+                        "{id} no debería estar configurado sin client_id, auth_url y token_url"
+                    );
+                }
+                // Ldap no las tiene: la dirección la escribe la persona y
+                // no se sabe hasta ese momento.
+                ProviderKind::Ldap => {
+                    assert_eq!(proveedor.auth_url, None, "{id} no debería tener auth_url");
+                    assert_eq!(proveedor.token_url, None, "{id} no debería tener token_url");
+                    // Ldap necesita ldap_url, ldap_bind_dn y ldap_password para estar configurado
+                    assert!(
+                        !proveedor.is_configured(),
+                        "{id} no debería estar configurado sin ldap_url, ldap_bind_dn y ldap_password"
                     );
                 }
             }

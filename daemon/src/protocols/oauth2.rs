@@ -372,6 +372,10 @@ pub fn provider_desde_config(
         userinfo_url: Default::default(),
         endpoints: Default::default(),
         dav_url: None,
+        graph_url: None,
+        ldap_url: None,
+        ldap_bind_dn: None,
+        ldap_password: None,
     })
 }
 
@@ -679,6 +683,10 @@ mod tests {
             userinfo_url: Some("https://openidconnect.googleapis.com/v1/userinfo".into()),
             endpoints,
             dav_url: None,
+            graph_url: None,
+            ldap_url: None,
+            ldap_bind_dn: None,
+            ldap_password: None,
         }
     }
 
