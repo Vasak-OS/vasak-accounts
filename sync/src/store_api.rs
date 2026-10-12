@@ -55,8 +55,8 @@ use crate::broker::{self, BrokerError};
 use crate::calendar_sync::{CalendarScheduler, CalendarSync, CALENDAR_TICK};
 use crate::contacts_sync::{ContactsScheduler, ContactsSync, CONTACTS_TICK};
 use crate::dav::webdav::{HttpPolicy, Limits};
-use crate::email_sync::{EmailScheduler, EmailSync, EMAIL_TICK};
 use crate::dav_sync::BrokerCredentials;
+use crate::email_sync::{EmailScheduler, EmailSync, EMAIL_TICK};
 use crate::ical::recurrence::ExpansionLimits;
 use crate::store::calendar_read::{self, GlobalId, ListCursor, Range};
 use crate::store::contacts_read::{self, Cursor, InvalidArgument};
@@ -694,7 +694,10 @@ impl<K: KeySource> StoreApi<K> {
         if let Some(ref mut body) = msg.as_mut() {
             const MAX_BODY_SIZE: usize = 256 * 1024; // 256 KB
 
-            for field in [&mut body.text_body, &mut body.html_body].into_iter().flatten() {
+            for field in [&mut body.text_body, &mut body.html_body]
+                .into_iter()
+                .flatten()
+            {
                 if truncate_at_char(field, MAX_BODY_SIZE) {
                     body.truncated = true;
                 }
@@ -964,8 +967,6 @@ fn paginate<T: Serialize>(
     (items, if more { last.map(|c| c.encode()) } else { None })
 }
 
-/// El nombre único de quien mandó el mensaje. Lo pone el bus; en una conexión
-/// punto a punto, lo que diga el otro lado (las pruebas).
 /// Corta un texto a lo sumo en `max` bytes **sin partir un carácter**:
 /// `String::truncate` en el medio de una «ñ» hace caer el proceso, y el texto
 /// lo escribió un desconocido. Devuelve si cortó.
@@ -981,6 +982,8 @@ pub fn truncate_at_char(text: &mut String, max: usize) -> bool {
     true
 }
 
+/// El nombre único de quien mandó el mensaje. Lo pone el bus; en una conexión
+/// punto a punto, lo que diga el otro lado (las pruebas).
 fn sender_of(header: &Header<'_>) -> Option<String> {
     header.sender().map(|s| s.to_string())
 }

@@ -360,15 +360,21 @@ pub struct HeaderRecord {
 
 /// El número de un código de respuesta: `* OK [HIGHESTMODSEQ 715194045007]`.
 ///
-/// Sólo dentro de los corchetes de una respuesta sin etiqueta: el mismo texto
-/// en el asunto de un mensaje no puede pasar por el estado de la casilla.
+/// Sólo dentro de los corchetes de una respuesta de estado sin etiqueta —`* OK
+/// [...]`, y no un `* 3 FETCH` cualquiera—, y sólo si los corchetes van
+/// pegados al estado, que es donde los pone RFC 3501 §7.1: el mismo texto en
+/// el asunto de un mensaje no puede pasar por el estado de la casilla.
 pub fn response_code_number(line: &str, code: &str) -> Option<u64> {
-    if !line.starts_with("* ") {
+    let rest = line.strip_prefix("* ")?;
+    let (status, rest) = rest.split_once(' ')?;
+    if !["OK", "NO", "BAD", "PREAUTH", "BYE"]
+        .iter()
+        .any(|s| status.eq_ignore_ascii_case(s))
+    {
         return None;
     }
-    let open = line.find('[')?;
-    let close = open + line[open..].find(']')?;
-    let inside = &line[open + 1..close];
+    let rest = rest.trim_start().strip_prefix('[')?;
+    let inside = &rest[..rest.find(']')?];
     let mut words = inside.split_ascii_whitespace();
     if !words.next()?.eq_ignore_ascii_case(code) {
         return None;

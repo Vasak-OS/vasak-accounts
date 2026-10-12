@@ -551,7 +551,6 @@ impl Store {
         rows.collect::<Result<_, _>>().map_err(classify)
     }
 
-
     /// Aplica un lote de operaciones sobre mensajes. Devuelve cuántos bytes
     /// netos de mensajes crudos se sumaron (negativo si borró más de lo que
     /// agregó), o `OverCap` si pasaría el tope.
