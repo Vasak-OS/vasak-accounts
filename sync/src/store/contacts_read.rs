@@ -371,7 +371,9 @@ fn cards_page(
             last = Some(Cursor { sort_key, id });
             continue;
         }
-        if used + size > byte_cap {
+        // La primera de la página entra siempre —ya se sabe que sola entra—:
+        // si no, una tarjeta justa en el tope terminaría la lista sin cursor.
+        if !items.is_empty() && used + size > byte_cap {
             // No entra en ésta: la página se corta antes, con el cursor
             // apuntándola.
             more = true;
@@ -1501,6 +1503,25 @@ mod tests {
     /// Una tarjeta que sola no entra en ninguna página se saltea, y la lista
     /// sigue después de ella: ni un error, ni una página que vuelve siempre
     /// igual, ni el final de la lista antes de tiempo.
+    /// Una tarjeta que entra justa en el tope —su JSON y su coma son el tope—
+    /// no termina la lista: sale sola en su página.
+    #[test]
+    fn una_tarjeta_que_entra_justa_no_termina_la_lista() {
+        let temp = TempDir::new("tarjetas-justa");
+        let mut store = open_store(&temp);
+        let b = book(&mut store, "https://x/a/", "A");
+        add(&mut store, &b, vec![named(0, "C 0"), named(1, "C 1")]);
+        let all = list_cards(store.connection(), None, None, 1000).unwrap();
+        let cap = json_len(&all.items[0]) + 1;
+        let pages = all_card_pages(store.connection(), None, 1000, cap);
+        assert_eq!(
+            card_ids(&pages).len(),
+            2,
+            "se perdieron tarjetas: {:?}",
+            pages
+        );
+    }
+
     #[test]
     fn una_tarjeta_que_sola_no_entra_se_saltea_y_la_lista_sigue() {
         let temp = TempDir::new("tarjetas-grande");
