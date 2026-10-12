@@ -793,6 +793,7 @@ del mismo nombre de bus. Todo contesta en JSON.
 |---|---|---|
 | `ListAddressBooks(account_id)` | `store.contacts` | Las libretas: `[{id, display_name, contacts}]`. |
 | `ListContacts(account_id, address_book_id, cursor, limit)` | `store.contacts` | Una página por nombre, de todas las libretas (`""`) o de una: `{items: [{id, address_book_id, display_name, email, phone}], next_cursor}`. |
+| `ListContactCards(account_id, address_book_id, cursor, limit)` | `store.contacts` | Las tarjetas crudas, con el orden y el cursor de `ListContacts`: `{items: [{id, address_book_id, href, vcard}], next_cursor}`. Para quien interpreta la vCard entera, como `vasak-contacts`; el texto es el que mandó el servidor. |
 | `SearchContacts(account_id, query, cursor, limit)` | `store.contacts` | Lo mismo, buscando por el principio de cada palabra en nombre, correos, teléfonos y organización. |
 | `GetContact(account_id, contact_id)` | `store.contacts` | Un contacto entero, leído de su vCard en el momento: `{id, address_book_id, uid, display_name, emails, phones, organization, notes, related, truncated}`, o `null`. |
 | `ListCalendars()` | `store.calendar` | Los calendarios de **todas las cuentas**: `[{id, account_id, display_name, color, components}]`. |

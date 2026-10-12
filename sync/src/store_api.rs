@@ -389,17 +389,39 @@ impl<K: KeySource> StoreApi<K> {
         cursor: String,
         limit: u32,
     ) -> zbus::fdo::Result<String> {
-        let book = match address_book_id.as_str() {
-            "" => None,
-            id => Some(contacts_read::parse_id(id).map_err(invalid)?),
-        };
-        let after = Cursor::decode(&cursor).map_err(invalid)?;
-        let limit = contacts_read::page_limit(limit);
+        let (book, after, limit) = page_args(&address_book_id, &cursor, limit)?;
         self.authorize_contacts(&header, &account_id).await?;
         let page = self
             .manager
             .read(&account_id, move |c| {
                 contacts_read::list_contacts(c, book, after.as_ref(), limit)
+            })
+            .await
+            .map_err(read_error)?;
+        contacts_read::to_capped_json(&page, contacts_read::MAX_PAGE_REPLY_BYTES)
+            .map_err(read_error)
+    }
+
+    /// Una página de tarjetas crudas: `{items: [{id, address_book_id, href,
+    /// vcard}], next_cursor}`, en el orden y con el cursor de `ListContacts`.
+    /// Es para quien interpreta la vCard entera —la aplicación de
+    /// contactos—; el texto es el que mandó el servidor.
+    ///
+    /// Pide `store.contacts`.
+    async fn list_contact_cards(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        account_id: String,
+        address_book_id: String,
+        cursor: String,
+        limit: u32,
+    ) -> zbus::fdo::Result<String> {
+        let (book, after, limit) = page_args(&address_book_id, &cursor, limit)?;
+        self.authorize_contacts(&header, &account_id).await?;
+        let page = self
+            .manager
+            .read(&account_id, move |c| {
+                contacts_read::list_cards(c, book, after.as_ref(), limit)
             })
             .await
             .map_err(read_error)?;
@@ -1054,6 +1076,21 @@ pub fn truncate_at_char(text: &mut String, max: usize) -> bool {
 
 /// El nombre único de quien mandó el mensaje. Lo pone el bus; en una conexión
 /// punto a punto, lo que diga el otro lado (las pruebas).
+/// Los argumentos de una página de contactos, validados antes de preguntar
+/// nada: la libreta (vacía es todas), el cursor y el tamaño.
+fn page_args(
+    address_book_id: &str,
+    cursor: &str,
+    limit: u32,
+) -> zbus::fdo::Result<(Option<i64>, Option<Cursor>, usize)> {
+    let book = match address_book_id {
+        "" => None,
+        id => Some(contacts_read::parse_id(id).map_err(invalid)?),
+    };
+    let after = Cursor::decode(cursor).map_err(invalid)?;
+    Ok((book, after, contacts_read::page_limit(limit)))
+}
+
 fn sender_of(header: &Header<'_>) -> Option<String> {
     header.sender().map(|s| s.to_string())
 }
@@ -1737,6 +1774,7 @@ mod tests {
                 "ListAddressBooks",
                 "ListAttachments",
                 "ListCalendars",
+                "ListContactCards",
                 "ListContacts",
                 "ListMailboxes",
                 "ListMessages",
@@ -1917,6 +1955,7 @@ mod tests {
         let results = [
             call(&client, "ListAddressBooks", &("cuenta",)).await,
             call(&client, "ListContacts", &("cuenta", "", "", 0u32)).await,
+            call(&client, "ListContactCards", &("cuenta", "", "", 0u32)).await,
             call(&client, "SearchContacts", &("cuenta", "ana", "", 0u32)).await,
             call(&client, "GetContact", &("cuenta", "1")).await,
         ];
@@ -1932,6 +1971,10 @@ mod tests {
         let (other, _s) = api.client(":1.8").await;
         assert_eq!(
             error_name(&call(&other, "ListContacts", &("cuenta", "", "", 0u32)).await),
+            ACCESS_DENIED
+        );
+        assert_eq!(
+            error_name(&call(&other, "ListContactCards", &("cuenta", "", "", 0u32)).await),
             ACCESS_DENIED
         );
     }
@@ -2021,6 +2064,98 @@ mod tests {
         );
     }
 
+    /// `ListContactCards` por el bus: pide `store.contacts` una sola vez, pagina
+    /// con el cursor de `ListContacts`, filtra por libreta, y cada tarjeta
+    /// llega con el texto que mandó el servidor.
+    #[tokio::test]
+    async fn con_permiso_se_leen_las_tarjetas_crudas() {
+        let mut api = Api::new("api-tarjetas", vec![with_contacts("cuenta")], Answer::Allow).await;
+        api.with_two_contacts().await;
+        let (client, _service) = api.client(":1.7").await;
+
+        let first: serde_json::Value = serde_json::from_str(
+            &call(&client, "ListContactCards", &("cuenta", "", "", 1u32))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(api.settings().is_active("cuenta", CONTACTS_AREA));
+        assert_eq!(api.pending.try_recv().unwrap(), "cuenta");
+        let items = first["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(first["items"][0]["href"], "https://x/a/1.vcf");
+        assert_eq!(
+            first["items"][0]["vcard"],
+            "BEGIN:VCARD\r\nFN:Ana Pérez\r\nEMAIL:ana@x.com\r\nEND:VCARD"
+        );
+        let mut keys: Vec<&str> = first["items"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort();
+        assert_eq!(keys, vec!["address_book_id", "href", "id", "vcard"]);
+
+        // El mismo cursor que la lista.
+        let listed: serde_json::Value = serde_json::from_str(
+            &call(&client, "ListContacts", &("cuenta", "", "", 1u32))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first["next_cursor"], listed["next_cursor"]);
+        assert_eq!(first["items"][0]["id"], listed["items"][0]["id"]);
+
+        let cursor = first["next_cursor"].as_str().unwrap().to_string();
+        let second: serde_json::Value = serde_json::from_str(
+            &call(
+                &client,
+                "ListContactCards",
+                &("cuenta", "", cursor.as_str(), 1u32),
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(second["items"][0]["href"], "https://x/a/2.vcf");
+        assert_eq!(
+            second["items"][0]["vcard"],
+            "BEGIN:VCARD\r\nFN:Beto Gómez\r\nEMAIL:beto@x.com\r\nEND:VCARD"
+        );
+        assert!(second["next_cursor"].is_null());
+
+        let book_id = first["items"][0]["address_book_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let in_book: serde_json::Value = serde_json::from_str(
+            &call(
+                &client,
+                "ListContactCards",
+                &("cuenta", book_id.as_str(), "", 0u32),
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(in_book["items"].as_array().unwrap().len(), 2);
+        let other_book: serde_json::Value = serde_json::from_str(
+            &call(&client, "ListContactCards", &("cuenta", "999999", "", 0u32))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(other_book["items"].as_array().unwrap().len(), 0);
+        assert!(other_book["next_cursor"].is_null());
+
+        assert_eq!(
+            api.access.permissions.calls(),
+            1,
+            "una sola pregunta, guardada"
+        );
+    }
+
     /// Un argumento que no se entiende es `InvalidArgs` antes de preguntar
     /// nada: no se abre un diálogo por un pedido mal hecho.
     #[tokio::test]
@@ -2035,6 +2170,15 @@ mod tests {
             )
             .await,
             call(&client, "ListContacts", &("cuenta", "x", "", 0u32)).await,
+            call(
+                &client,
+                "ListContactCards",
+                &("cuenta", "", "no-es-un-cursor", 0u32),
+            )
+            .await,
+            call(&client, "ListContactCards", &("cuenta", "x", "", 0u32)).await,
+            call(&client, "ListContactCards", &("cuenta", "0", "", 0u32)).await,
+            call(&client, "ListContactCards", &("cuenta", "+1", "", 0u32)).await,
             call(&client, "SearchContacts", &("cuenta", "   ", "", 0u32)).await,
             call(
                 &client,
