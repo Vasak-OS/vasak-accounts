@@ -258,6 +258,11 @@ pub struct OccurrenceItem {
     /// resolver.
     pub floating: bool,
     pub color: Option<String>,
+    /// Si es una vez de una serie. Es lo que pone el ícono de «se repite».
+    pub recurring: bool,
+    /// Si es una serie cuya regla no se entendió y se muestra sólo el día que
+    /// empieza: antes que inventar fechas se muestra una vez, y se dice.
+    pub shown_once: bool,
 }
 
 /// Una tarea, para `ListTasks`.
@@ -390,7 +395,8 @@ pub fn occurrences_sql(
     };
     format!(
         "SELECT o.starts_at, o.object_id, o.recurrence_id, o.ends_at, o.all_day,
-                coalesce(t.summary, c.summary), o.calendar_id, k.color, c.zone
+                coalesce(t.summary, c.summary), o.calendar_id, k.color, c.zone,
+                c.recurring, c.expansion
            FROM occurrences o INDEXED BY {index}
            JOIN calendar_objects c ON c.id = o.object_id
            JOIN calendars k ON k.id = o.calendar_id
@@ -518,6 +524,8 @@ fn occurrence_item(
     calendar: i64,
     color: Option<String>,
     zone: &str,
+    recurring: bool,
+    shown_once: bool,
 ) -> OccurrenceItem {
     OccurrenceItem {
         event_id: GlobalId {
@@ -537,6 +545,8 @@ fn occurrence_item(
         all_day,
         floating: floating(zone),
         color,
+        recurring,
+        shown_once,
     }
 }
 
@@ -583,6 +593,8 @@ fn stored_occurrences(
                 row.get(6).map_err(classify)?,
                 row.get(7).map_err(classify)?,
                 &zone,
+                row.get(9).map_err(classify)?,
+                row.get::<_, String>(10).map_err(classify)? == "invalid",
             );
             top.insert(at, item);
         }
@@ -709,6 +721,10 @@ fn expand_into(
             source.calendar,
             source.color.clone(),
             &source.zone,
+            // Lo que se expande en el momento es siempre de una serie, y una
+            // que se pudo expandir no es «sólo una vez».
+            true,
+            false,
         );
         top.insert(at, item);
     }

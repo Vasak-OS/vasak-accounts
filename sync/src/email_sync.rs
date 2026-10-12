@@ -83,6 +83,10 @@ pub const HEADER_CHUNK: usize = 200;
 /// Cuántos cuerpos de la bandeja de entrada se traen por vuelta.
 pub const BODY_PREFETCH: usize = 25;
 
+/// Cuánto puede durar una vuelta de una cuenta, como mucho. Lo que quedó sin
+/// hacer lo retoma la siguiente: cada casilla guarda su token al terminar.
+pub const ROUND_DEADLINE: Duration = Duration::from_secs(10 * 60);
+
 /// Lo que se ve en el estado cuando el servicio de cuentas dice que no.
 const DENIED_DETAIL: &str = "el servicio de cuentas no le da al sincronizador permiso para el \
      correo de esta cuenta: hay que permitirlo en Configuración → Privacidad y seguridad";
@@ -478,7 +482,19 @@ impl<K: KeySource> EmailSync<K> {
             }
         };
 
-        let outcome = sync_session(&self.manager, account_id, &mut session).await;
+        // Con plazo: la vuelta de las cuentas es una por vez, y un servidor que
+        // contesta lento no puede dejar sin correo al resto.
+        let outcome = match tokio::time::timeout(
+            ROUND_DEADLINE,
+            sync_session(&self.manager, account_id, &mut session),
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => Err(RoundError::Imap(ImapError::Failed(
+                "la vuelta pasó su plazo".into(),
+            ))),
+        };
         let _ = session.logout().await;
         match outcome {
             Ok(report) => {

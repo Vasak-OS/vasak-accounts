@@ -112,6 +112,43 @@ pub fn nudge_email(account_id: &str) {
     }
 }
 
+/// El almacén de verdad, para reflejar en el acto lo que la sesión en vivo
+/// hizo en el servidor —marcar como leído, mover— sin esperar a una vuelta.
+static LIVE_STORE: std::sync::OnceLock<Arc<StoreManager<SecretServiceKeys>>> =
+    std::sync::OnceLock::new();
+
+/// Marca como leído en el almacén un mensaje que se acaba de marcar en el
+/// servidor. Si la cuenta no tiene almacén, o el mensaje no está guardado, no
+/// hace nada: la próxima vuelta lo pone al día igual.
+pub async fn store_mark_seen(account_id: &str, mailbox: &str, uid: u32) {
+    let Some(manager) = LIVE_STORE.get() else {
+        return;
+    };
+    let mailbox = mailbox.to_string();
+    if let Err(e) = manager
+        .with_store(account_id, move |s| s.mark_seen(&mailbox, u64::from(uid)))
+        .await
+    {
+        tracing::debug!("'{account_id}': no se reflejó la lectura en el almacén: {e}");
+    }
+}
+
+/// Saca del almacén un mensaje que se acaba de mover o borrar en el servidor.
+pub async fn store_forget(account_id: &str, mailbox: &str, uid: u32) {
+    let Some(manager) = LIVE_STORE.get() else {
+        return;
+    };
+    let mailbox = mailbox.to_string();
+    if let Err(e) = manager
+        .with_store(account_id, move |s| {
+            s.forget_message(&mailbox, u64::from(uid))
+        })
+        .await
+    {
+        tracing::debug!("'{account_id}': no se reflejó el movimiento en el almacén: {e}");
+    }
+}
+
 /// El objeto de D-Bus.
 pub struct StoreApi<K: KeySource> {
     manager: Arc<StoreManager<K>>,
@@ -1127,6 +1164,7 @@ impl StoreService<SecretServiceKeys> {
     pub async fn start(connection: &zbus::Connection) -> zbus::Result<Self> {
         let keys = SecretServiceKeys::on_session_bus(connection.clone());
         let manager = Arc::new(StoreManager::new(keys, Locations::from_environment()));
+        let _ = LIVE_STORE.set(Arc::clone(&manager));
         let access = Arc::new(Access::new(
             Arc::new(access::DbusPermissions::new(connection.clone())),
             Arc::new(access::SystemClock),

@@ -70,6 +70,15 @@ const MAX_LINE: u64 = 64 * 1024;
 /// estructura del mensaje y a pedir sólo la parte que se muestra.
 pub const MAX_BODY: usize = 1024 * 1024;
 
+/// Cuántas respuestas de `FETCH (UID FLAGS)` se aceptan como mucho por pedido.
+/// La ventana más grande que se pide es de 2000; esto deja margen sin dejar que
+/// un servidor llene la memoria.
+pub const MAX_UID_FLAGS: usize = 10_000;
+
+/// Hasta cuánto de los encabezados de un mensaje se lee. Los que pide el
+/// almacén son siete campos; más que esto es relleno.
+pub const MAX_HEADER_BYTES: usize = 64 * 1024;
+
 /// Cuántos mensajes se traen de la casilla.
 ///
 /// No todos: una casilla de veinte años tiene decenas de miles, y traerlos en el
@@ -698,7 +707,12 @@ impl<F: AsyncRead + AsyncWrite + Unpin + Send> Session<F> {
             let mut found = Vec::new();
             loop {
                 let (line, _) = self.read_response().await?;
-                if line.starts_with("* ") && line.to_ascii_uppercase().contains(" FETCH ") {
+                // Con tope: cuántas respuestas manda lo decide el servidor, y
+                // las que pasan del rango pedido no son de esta ventana.
+                if found.len() < MAX_UID_FLAGS
+                    && line.starts_with("* ")
+                    && line.to_ascii_uppercase().contains(" FETCH ")
+                {
                     if let Some(uid) = uid_from(&line) {
                         found.push(UidFlags {
                             uid,
@@ -740,19 +754,26 @@ impl<F: AsyncRead + AsyncWrite + Unpin + Send> Session<F> {
         ))
         .await?;
 
+        let mut wanted: std::collections::HashSet<u32> = uids.iter().copied().collect();
         Self::with_timeout("los encabezados", async {
             let mut records = Vec::new();
             loop {
                 let (line, literals) = self.read_response().await?;
                 // Igual que en la lista: un `FETCH` sin literal es un aviso de
                 // banderas intercalado, no un mensaje.
+                // Sólo los UID pedidos, y una vez cada uno: lo que el servidor
+                // mande de más no entra a la base, o la ventana que le pone
+                // techo la decidiría él.
                 if let (Some(uid), Some(block)) = (uid_from(&line), literals.first()) {
-                    records.push(HeaderRecord {
-                        uid,
-                        flags: flags_from(&line),
-                        size: rfc822_size_from(&line).unwrap_or(block.len() as u64),
-                        headers: crate::message::decode_text(block, ""),
-                    });
+                    if wanted.remove(&uid) {
+                        let block = &block[..block.len().min(MAX_HEADER_BYTES)];
+                        records.push(HeaderRecord {
+                            uid,
+                            flags: flags_from(&line),
+                            size: rfc822_size_from(&line).unwrap_or(block.len() as u64),
+                            headers: crate::message::decode_text(block, ""),
+                        });
+                    }
                 }
                 match tagged_status(&line, &tag) {
                     Some(TaggedStatus::Ok) => return Ok(records),
@@ -821,7 +842,11 @@ impl<F: AsyncRead + AsyncWrite + Unpin + Send> Session<F> {
         };
         self.write_line(&format!("{tag} {command} {name}{condstore}"))
             .await?;
-        // Lo de la casilla anterior no vale para ésta.
+        // Lo de la casilla anterior no vale para ésta: tampoco el
+        // `UIDVALIDITY`. Un servidor que no lo manda para esta casilla dejaría
+        // si no el de la anterior, y los UID guardados se darían por válidos
+        // contra una numeración que no es la suya.
+        self.uidvalidity = None;
         self.highest_modseq = None;
         self.uid_next = None;
 

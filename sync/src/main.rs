@@ -119,6 +119,9 @@ const POLL_INTERVAL: Duration = Duration::from_secs(300);
 /// refresh_token caducado por no usarse.
 const IDLE_RENEWAL: Duration = Duration::from_secs(24 * 60);
 
+/// Cada cuánto, como mucho, un aviso de IDLE le pide una vuelta al almacén.
+const STORE_NUDGE_FLOOR: Duration = Duration::from_secs(120);
+
 /// Cuánto se espera antes de reconectar una cuenta que falló.
 ///
 /// Las conexiones largas se cortan: se cae el wifi, el servidor se reinicia, un
@@ -777,7 +780,10 @@ impl Service {
             .map_err(zbus::fdo::Error::Failed)?;
         drop(reader);
         // Y que el almacén se entere sin esperar su vuelta: las aplicaciones
-        // leen de ahí.
+        // leen de ahí. Del origen se saca ya; donde llegó lo trae la vuelta.
+        if matches!(outcome, imap::MoveOutcome::Complete) {
+            store_api::store_forget(&account_id, &origin, uid).await;
+        }
         store_api::nudge_email(&account_id);
 
         // La lista en memoria es la de la de entrada. Si de ahí salió algo, se
@@ -884,7 +890,9 @@ impl Service {
             .mark_read(&broker, &account, &mailbox, uid)
             .await
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo marcar: {e}")))?;
-        store_api::nudge_email(&account_id);
+        // En el almacén en el acto: la aplicación relee de ahí, y sin esto el
+        // mensaje volvería a verse sin leer hasta la próxima vuelta.
+        store_api::store_mark_seen(&account_id, &mailbox, uid).await;
 
         // Y acá también, para que la lista no muestre en negrita algo que el
         // servidor ya sabe que se leyó. La próxima vuelta del bucle lo confirma.
@@ -1540,6 +1548,7 @@ async fn account_session(
     }
 
     let mut woke;
+    let mut last_nudge: Option<std::time::Instant> = None;
     loop {
         if notifies {
             // Esperar a que el servidor diga algo. Vuelve por novedad o porque
@@ -1594,7 +1603,14 @@ async fn account_session(
         // Lo que avisó el servidor también tiene que llegar al almacén, que es
         // lo que leen las aplicaciones, sin esperar a su intervalo. Sólo si la
         // espera terminó por un aviso: la renovación no trae novedades.
-        if woke == imap::IdleWake::Changed {
+        //
+        // Con piso propio: cada vuelta del almacén es una conexión y un LIST, y
+        // una bandeja muy activa avisa a cada rato. Lo que llegue entre medio
+        // lo trae la vuelta siguiente; la lista en memoria ya lo muestra.
+        if woke == imap::IdleWake::Changed
+            && last_nudge.is_none_or(|t: std::time::Instant| t.elapsed() >= STORE_NUDGE_FLOOR)
+        {
+            last_nudge = Some(std::time::Instant::now());
             store_api::nudge_email(&account.id);
         }
     }

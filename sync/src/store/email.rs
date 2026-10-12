@@ -427,6 +427,56 @@ impl Store {
         Ok(())
     }
 
+    /// Marca como leído un mensaje guardado, por el nombre de su casilla y su
+    /// UID: lo que hizo la aplicación en el servidor se ve en el almacén en el
+    /// acto, sin esperar a la próxima vuelta. Devuelve si cambió algo.
+    pub fn mark_seen(&mut self, mailbox: &str, uid: u64) -> Result<bool, StoreError> {
+        let transaction = self.connection.transaction().map_err(classify)?;
+        let changed = transaction
+            .execute(
+                "UPDATE messages SET flags_seen = 1, updated_at = ?1
+                 WHERE uid = ?2 AND flags_seen = 0
+                   AND mailbox_id = (SELECT id FROM mailboxes WHERE name = ?3)",
+                rusqlite::params![now(), uid as i64, mailbox],
+            )
+            .map_err(classify)?
+            > 0;
+        let generation = if changed {
+            Some(bump_generation(&transaction, EMAIL_AREA)?)
+        } else {
+            None
+        };
+        transaction.commit().map_err(classify)?;
+        if let Some(generation) = generation {
+            self.note_change(EMAIL_AREA, generation);
+        }
+        Ok(changed)
+    }
+
+    /// Saca del almacén un mensaje que se movió o se borró en el servidor.
+    /// Donde llegó lo trae la próxima vuelta. Devuelve si estaba.
+    pub fn forget_message(&mut self, mailbox: &str, uid: u64) -> Result<bool, StoreError> {
+        let transaction = self.connection.transaction().map_err(classify)?;
+        let removed = transaction
+            .execute(
+                "DELETE FROM messages
+                 WHERE uid = ?1 AND mailbox_id = (SELECT id FROM mailboxes WHERE name = ?2)",
+                rusqlite::params![uid as i64, mailbox],
+            )
+            .map_err(classify)?
+            > 0;
+        let generation = if removed {
+            Some(bump_generation(&transaction, EMAIL_AREA)?)
+        } else {
+            None
+        };
+        transaction.commit().map_err(classify)?;
+        if let Some(generation) = generation {
+            self.note_change(EMAIL_AREA, generation);
+        }
+        Ok(removed)
+    }
+
     /// Las banderas guardadas de cada UID de una casilla.
     pub fn stored_flags(&self, mailbox_id: i64) -> Result<HashMap<u64, StoredFlags>, StoreError> {
         let mut statement = self
@@ -571,7 +621,7 @@ impl Store {
         let mut net_bytes: i64 = 0;
         for op in &ops {
             if let MessageOp::Upsert(m) = op {
-                net_bytes += m.size;
+                net_bytes = net_bytes.saturating_add(m.size);
             }
         }
 
