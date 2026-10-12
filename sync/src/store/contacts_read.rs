@@ -322,24 +322,7 @@ fn cards_page(
           WHERE c.display_name != ''",
     );
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
-    if let Some(book) = address_book {
-        params.push(book.into());
-        sql.push_str(&format!(" AND c.address_book_id = ?{}", params.len()));
-    }
-    if let Some(after) = after {
-        params.push(after.sort_key.clone().into());
-        params.push(after.id.into());
-        sql.push_str(&format!(
-            " AND (c.sort_key, c.id) > (?{}, ?{})",
-            params.len() - 1,
-            params.len()
-        ));
-    }
-    params.push(((limit + 1) as i64).into());
-    sql.push_str(&format!(
-        " ORDER BY c.sort_key, c.id LIMIT ?{}",
-        params.len()
-    ));
+    page_filters(&mut sql, &mut params, address_book, after, limit);
 
     let mut statement = connection.prepare(&sql).map_err(classify)?;
     let mut rows = statement
@@ -403,6 +386,36 @@ pub fn search_contacts(
     page(connection, None, Some(query), after, limit, MAX_PAGE_BYTES)
 }
 
+/// Lo que comparten las páginas de contactos y de tarjetas: la libreta, desde
+/// dónde seguir y el orden, con uno más de los pedidos para saber si hay otra
+/// página. Todo va como parámetro; al texto sólo se le suman `?N`.
+fn page_filters(
+    sql: &mut String,
+    params: &mut Vec<rusqlite::types::Value>,
+    address_book: Option<i64>,
+    after: Option<&Cursor>,
+    limit: usize,
+) {
+    if let Some(book) = address_book {
+        params.push(book.into());
+        sql.push_str(&format!(" AND c.address_book_id = ?{}", params.len()));
+    }
+    if let Some(after) = after {
+        params.push(after.sort_key.clone().into());
+        params.push(after.id.into());
+        sql.push_str(&format!(
+            " AND (c.sort_key, c.id) > (?{}, ?{})",
+            params.len() - 1,
+            params.len()
+        ));
+    }
+    params.push(((limit + 1) as i64).into());
+    sql.push_str(&format!(
+        " ORDER BY c.sort_key, c.id LIMIT ?{}",
+        params.len()
+    ));
+}
+
 /// La consulta de las dos, armada según lo que se pidió, para que cada forma
 /// use su índice.
 fn page(
@@ -423,10 +436,6 @@ fn page(
           WHERE c.display_name != ''",
     );
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
-    if let Some(book) = address_book {
-        params.push(book.into());
-        sql.push_str(&format!(" AND c.address_book_id = ?{}", params.len()));
-    }
     if let Some(fts) = fts {
         params.push(fts.to_string().into());
         sql.push_str(&format!(
@@ -434,21 +443,7 @@ fn page(
             params.len()
         ));
     }
-    if let Some(after) = after {
-        params.push(after.sort_key.clone().into());
-        params.push(after.id.into());
-        sql.push_str(&format!(
-            " AND (c.sort_key, c.id) > (?{}, ?{})",
-            params.len() - 1,
-            params.len()
-        ));
-    }
-    // Uno más de los pedidos, para saber si hay otra página.
-    params.push(((limit + 1) as i64).into());
-    sql.push_str(&format!(
-        " ORDER BY c.sort_key, c.id LIMIT ?{}",
-        params.len()
-    ));
+    page_filters(&mut sql, &mut params, address_book, after, limit);
 
     let mut statement = connection.prepare(&sql).map_err(classify)?;
     let mut rows = statement

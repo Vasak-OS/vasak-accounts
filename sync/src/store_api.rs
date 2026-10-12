@@ -301,12 +301,7 @@ impl<K: KeySource> StoreApi<K> {
         cursor: String,
         limit: u32,
     ) -> zbus::fdo::Result<String> {
-        let book = match address_book_id.as_str() {
-            "" => None,
-            id => Some(contacts_read::parse_id(id).map_err(invalid)?),
-        };
-        let after = Cursor::decode(&cursor).map_err(invalid)?;
-        let limit = contacts_read::page_limit(limit);
+        let (book, after, limit) = page_args(&address_book_id, &cursor, limit)?;
         self.authorize_contacts(&header, &account_id).await?;
         let page = self
             .manager
@@ -333,12 +328,7 @@ impl<K: KeySource> StoreApi<K> {
         cursor: String,
         limit: u32,
     ) -> zbus::fdo::Result<String> {
-        let book = match address_book_id.as_str() {
-            "" => None,
-            id => Some(contacts_read::parse_id(id).map_err(invalid)?),
-        };
-        let after = Cursor::decode(&cursor).map_err(invalid)?;
-        let limit = contacts_read::page_limit(limit);
+        let (book, after, limit) = page_args(&address_book_id, &cursor, limit)?;
         self.authorize_contacts(&header, &account_id).await?;
         let page = self
             .manager
@@ -990,6 +980,21 @@ fn paginate<T: Serialize>(
 
 /// El nombre único de quien mandó el mensaje. Lo pone el bus; en una conexión
 /// punto a punto, lo que diga el otro lado (las pruebas).
+/// Los argumentos de una página de contactos, validados antes de preguntar
+/// nada: la libreta (vacía es todas), el cursor y el tamaño.
+fn page_args(
+    address_book_id: &str,
+    cursor: &str,
+    limit: u32,
+) -> zbus::fdo::Result<(Option<i64>, Option<Cursor>, usize)> {
+    let book = match address_book_id {
+        "" => None,
+        id => Some(contacts_read::parse_id(id).map_err(invalid)?),
+    };
+    let after = Cursor::decode(cursor).map_err(invalid)?;
+    Ok((book, after, contacts_read::page_limit(limit)))
+}
+
 fn sender_of(header: &Header<'_>) -> Option<String> {
     header.sender().map(|s| s.to_string())
 }
