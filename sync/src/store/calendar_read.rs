@@ -2313,4 +2313,67 @@ mod tests {
             vec![("2030-01-05T10:00:00+00:00".into(), "Suelto v".into())]
         );
     }
+
+    /// Lo que pone el ícono de «se repite» y el aviso de «se muestra una
+    /// vez»: un suelto no es ninguna de las dos; una serie guardada se repite;
+    /// una regla que no se entendió se muestra una vez y se dice; y lo que se
+    /// expande en el momento es de una serie que sí se entendió.
+    #[test]
+    fn cada_vez_dice_si_es_de_una_serie_y_si_se_muestra_una_sola_vez() {
+        let temp = TempDir::new("leer-repite");
+        let broken = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:r\r\nSUMMARY:Rota r\r\n\
+                      DTSTART:20260916T080000Z\r\nDURATION:PT1H\r\nRRULE:FREQ=NUNCA\r\n\
+                      END:VEVENT\r\nEND:VCALENDAR\r\n";
+        let store = store_with(
+            &temp,
+            &[
+                ("https://x/c/s.ics", &weekly("s", "20260907T090000Z")),
+                ("https://x/c/a.ics", &single("a", "20260915T120000Z")),
+                ("https://x/c/r.ics", broken),
+            ],
+        );
+        let flags = |rows: &AccountRows<OccurrenceItem>| -> Vec<(String, bool, bool)> {
+            rows.rows
+                .iter()
+                .map(|(_, i)| (i.title.clone(), i.recurring, i.shown_once))
+                .collect()
+        };
+
+        let stored = account_occurrences(
+            store.connection(),
+            "cuenta",
+            range("2026-09-14T00:00:00Z", "2026-09-21T00:00:00Z"),
+            None,
+            None,
+            100,
+            &ExpansionLimits::DEFAULT,
+        )
+        .unwrap();
+        assert_eq!(
+            flags(&stored),
+            vec![
+                ("Semanal s".into(), true, false),
+                ("Suelto a".into(), false, false),
+                ("Rota r".into(), true, true),
+            ]
+        );
+
+        // Fuera de la ventana: la serie se expande en el momento.
+        let on_the_fly = account_occurrences(
+            store.connection(),
+            "cuenta",
+            range("2030-01-01T00:00:00Z", "2030-01-08T00:00:00Z"),
+            None,
+            None,
+            100,
+            &ExpansionLimits::DEFAULT,
+        )
+        .unwrap();
+        assert_eq!(flags(&on_the_fly), vec![("Semanal s".into(), true, false)]);
+
+        // Y las dos claves viajan en el JSON de `ListOccurrences`.
+        let json = serde_json::to_value(&stored.rows[1].1).unwrap();
+        assert_eq!(json["recurring"], false);
+        assert_eq!(json["shown_once"], false);
+    }
 }

@@ -2375,6 +2375,12 @@ mod tests {
             .await
             .unwrap(),
         );
+        // La serie dice que se repite; el suelto no. Ninguno se muestra «una
+        // sola vez»: las dos reglas se entendieron.
+        assert_eq!(whole["items"][0]["recurring"], true);
+        assert_eq!(whole["items"][0]["shown_once"], false);
+        assert_eq!(whole["items"][1]["recurring"], false);
+        assert_eq!(whole["items"][1]["shown_once"], false);
         let event_id = whole["items"][1]["event_id"].as_str().unwrap().to_string();
         let event = json(
             &call(&client, "GetEvent", &(event_id.as_str(), ""))
@@ -3113,5 +3119,16 @@ mod tests {
             pending.try_recv().is_err(),
             "la fila estaba llena: se descarta"
         );
+    }
+
+    /// Sin el almacén de la sesión —una cuenta sin almacén, o antes de que el
+    /// servicio arranque—, reflejar lo hecho en vivo no hace nada y no falla:
+    /// la próxima vuelta pone la base al día igual.
+    #[tokio::test]
+    async fn reflejar_en_vivo_sin_almacen_no_hace_nada() {
+        assert!(LIVE_STORE.get().is_none());
+        store_mark_seen("cuenta", "INBOX", 7).await;
+        store_forget("cuenta", "INBOX", 7).await;
+        assert!(LIVE_STORE.get().is_none());
     }
 }

@@ -790,7 +790,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use crate::store::email::{
-        MailboxListing, MailboxRole, MessageAttachmentRow, MessageBodyRow, MessageFlagRow,
+        Applied, MailboxListing, MailboxRole, MessageAttachmentRow, MessageBodyRow, MessageFlagRow,
         MessageOp, MessageRow, StoredFlags, WRITE_BATCH_ROWS,
     };
     use crate::store::key::tests::fake_keyring;
@@ -1659,5 +1659,103 @@ mod tests {
         store.set_mailbox_modseq("INBOX", None).unwrap();
         assert_eq!(store.mailboxes().unwrap()[0].modseq, None);
         assert_eq!(generation(&store), before);
+    }
+
+    /// Lo que la aplicación marcó como leído en el servidor se ve en el
+    /// almacén en el acto. Marcar lo que ya estaba leído, o algo que no está,
+    /// no escribe nada ni despierta a nadie.
+    #[test]
+    fn marcar_como_leido_cambia_solo_lo_que_hace_falta() {
+        let (_, mut store) = make_store();
+        store
+            .upsert_mailboxes(&[
+                mailbox("INBOX", MailboxRole::Inbox),
+                mailbox("Sent", MailboxRole::Sent),
+            ])
+            .unwrap();
+        let boxes = store.mailboxes().unwrap();
+        let (inbox, sent) = (boxes[0].id, boxes[1].id);
+        upsert(&mut store, message(inbox, 7, "x", 1));
+        upsert(&mut store, message(sent, 7, "x", 1));
+        store.take_changes();
+        let before = pin_generation(&store);
+
+        assert!(store.mark_seen("INBOX", 7).unwrap());
+        assert!(store.stored_flags(inbox).unwrap()[&7].seen);
+        assert!(
+            !store.stored_flags(sent).unwrap()[&7].seen,
+            "se marcó el de otra casilla con el mismo UID"
+        );
+        assert_eq!(generation(&store), before + 1);
+        assert_eq!(store.take_changes().len(), 1);
+
+        // Ya leído, un UID que no está, una casilla que no está.
+        assert!(!store.mark_seen("INBOX", 7).unwrap());
+        assert!(!store.mark_seen("INBOX", 8).unwrap());
+        assert!(!store.mark_seen("Desconocida", 7).unwrap());
+        assert_eq!(generation(&store), before + 1);
+        assert!(store.take_changes().is_empty());
+    }
+
+    /// Un mensaje que la aplicación movió o borró sale del almacén en el acto,
+    /// sólo de su casilla.
+    #[test]
+    fn olvidar_un_mensaje_lo_saca_solo_de_su_casilla() {
+        let (_, mut store) = make_store();
+        store
+            .upsert_mailboxes(&[
+                mailbox("INBOX", MailboxRole::Inbox),
+                mailbox("Sent", MailboxRole::Sent),
+            ])
+            .unwrap();
+        let boxes = store.mailboxes().unwrap();
+        let (inbox, sent) = (boxes[0].id, boxes[1].id);
+        upsert(&mut store, message(inbox, 7, "x", 1));
+        upsert(&mut store, message(inbox, 8, "y", 2));
+        upsert(&mut store, message(sent, 7, "x", 1));
+        store.take_changes();
+        let before = pin_generation(&store);
+
+        assert!(store.forget_message("INBOX", 7).unwrap());
+        let left: Vec<u64> = store.stored_flags(inbox).unwrap().into_keys().collect();
+        assert_eq!(left, vec![8]);
+        assert_eq!(store.stored_flags(sent).unwrap().len(), 1);
+        assert_eq!(generation(&store), before + 1);
+        assert_eq!(store.take_changes().len(), 1);
+
+        assert!(!store.forget_message("INBOX", 7).unwrap());
+        assert!(!store.forget_message("Desconocida", 8).unwrap());
+        assert_eq!(generation(&store), before + 1);
+        assert!(store.take_changes().is_empty());
+    }
+
+    /// El tamaño de cada mensaje lo dice el servidor. Dos que dicen
+    /// `i64::MAX` no pueden hacer caer el proceso al sumarlos.
+    #[test]
+    fn dos_tamanos_enormes_no_desbordan_la_cuenta_del_lote() {
+        let (_, mut store) = make_store();
+        let inbox = inbox(&mut store);
+        let mut a = message(inbox, 1, "a", 1);
+        a.size = i64::MAX;
+        let mut b = message(inbox, 2, "b", 2);
+        b.size = i64::MAX;
+
+        let applied = store.apply_messages(
+            vec![
+                MessageOp::Upsert(Box::new(a)),
+                MessageOp::Upsert(Box::new(b)),
+            ],
+            inbox,
+        );
+        assert!(
+            matches!(
+                applied,
+                Ok(Applied::Written {
+                    net_bytes: i64::MAX
+                })
+            ),
+            "{applied:?}"
+        );
+        assert_eq!(store.stored_flags(inbox).unwrap().len(), 2);
     }
 }

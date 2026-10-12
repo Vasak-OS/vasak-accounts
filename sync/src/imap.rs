@@ -2709,4 +2709,118 @@ pub(crate) mod tests {
         assert_eq!(received.len(), 1);
         assert!(received[0].ends_with(" LOGOUT"));
     }
+
+    /// Un servidor que no manda `UIDVALIDITY` para una casilla no la deja con
+    /// el de la anterior: los UID guardados se darían por válidos contra una
+    /// numeración que no es la suya.
+    #[tokio::test]
+    async fn una_casilla_sin_uidvalidity_no_hereda_el_de_la_anterior() {
+        let (mut session, task) = with_server(
+            "* OK listo",
+            vec![
+                (
+                    "EXAMINE \"A\"",
+                    vec!["* 1 EXISTS", "* OK [UIDVALIDITY 1]", "{tag} OK completado"],
+                ),
+                ("EXAMINE \"B\"", vec!["* 1 EXISTS", "{tag} OK completado"]),
+            ],
+        );
+        session.examine("A").await.unwrap();
+        assert_eq!(session.uidvalidity(), Some(1));
+        session.examine("B").await.unwrap();
+        assert_eq!(session.uidvalidity(), None);
+        task.await.unwrap();
+    }
+
+    /// Cuántas respuestas manda lo decide el servidor: más allá del tope no se
+    /// guardan, pero se leen hasta la respuesta con etiqueta, para que la
+    /// sesión siga sincronizada.
+    #[tokio::test]
+    async fn las_banderas_de_una_ventana_tienen_tope() {
+        let mut reply: Vec<&'static str> = (1..=MAX_UID_FLAGS as u32 + 5)
+            .map(|n| leak(format!("* {n} FETCH (UID {n} FLAGS ())")))
+            .collect();
+        reply.push("{tag} OK FETCH completado");
+        let (mut session, task) = with_server(
+            "* OK listo",
+            vec![
+                ("FETCH 1:2000 (UID FLAGS)", reply),
+                ("LOGOUT", vec!["{tag} OK chau"]),
+            ],
+        );
+
+        let found = session.uid_flags("1:2000").await.unwrap();
+        assert_eq!(found.len(), MAX_UID_FLAGS);
+        assert_eq!(found.last().unwrap().uid, MAX_UID_FLAGS as u32);
+        // La sesión sigue sirviendo: lo que sobró no quedó en el búfer.
+        session.logout().await.unwrap();
+        assert_eq!(task.await.unwrap().len(), 2);
+    }
+
+    /// Lo que el servidor manda de más —un UID que no se pidió, el mismo dos
+    /// veces— no entra: la ventana que le pone techo a la base la decide el
+    /// sincronizador, no el servidor.
+    #[tokio::test]
+    async fn los_encabezados_son_solo_de_los_uid_pedidos_y_una_vez_cada_uno() {
+        let headers = "Subject: Hola";
+        let fetch = |seq: u32, uid: u32| {
+            leak(format!(
+                "* {seq} FETCH (UID {uid} FLAGS () BODY[HEADER.FIELDS (SUBJECT)] {{{}}}",
+                headers.len() + 2
+            ))
+        };
+        let (mut session, task) = with_server(
+            "* OK listo",
+            vec![(
+                "UID FETCH 5 (",
+                vec![
+                    fetch(1, 5),
+                    headers,
+                    ")",
+                    fetch(2, 99),
+                    headers,
+                    ")",
+                    fetch(1, 5),
+                    headers,
+                    ")",
+                    "{tag} OK FETCH completado",
+                ],
+            )],
+        );
+        let records = session.header_records(&[5]).await.unwrap();
+        task.await.unwrap();
+        let uids: Vec<u32> = records.iter().map(|r| r.uid).collect();
+        assert_eq!(uids, vec![5]);
+    }
+
+    /// Siete campos no ocupan 100 KiB: lo que pase del tope es relleno, y no
+    /// se analiza ni se guarda.
+    #[tokio::test]
+    async fn los_encabezados_enormes_se_cortan_antes_de_analizarlos() {
+        let headers = leak(format!(
+            "Subject: Hola\r\nX-Relleno: {}",
+            "a".repeat(100 * 1024)
+        ));
+        let announce = leak(format!(
+            "* 1 FETCH (UID 5 FLAGS () RFC822.SIZE 200000 BODY[HEADER.FIELDS (SUBJECT)] {{{}}}",
+            headers.len() + 2
+        ));
+        let (mut session, task) = with_server(
+            "* OK listo",
+            vec![(
+                "UID FETCH 5 (",
+                vec![announce, headers, ")", "{tag} OK FETCH completado"],
+            )],
+        );
+        let records = session.header_records(&[5]).await.unwrap();
+        task.await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0].headers.len() <= MAX_HEADER_BYTES,
+            "se guardaron {} bytes",
+            records[0].headers.len()
+        );
+        assert!(records[0].headers.starts_with("Subject: Hola"));
+        assert_eq!(records[0].size, 200_000);
+    }
 }
