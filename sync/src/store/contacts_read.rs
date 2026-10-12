@@ -282,6 +282,115 @@ pub fn list_contacts(
     page(connection, address_book, None, after, limit, MAX_PAGE_BYTES)
 }
 
+/// Una tarjeta cruda, para quien la lee con su propio intérprete de vCard.
+///
+/// Es lo que necesita una aplicación de contactos: todos los campos de la
+/// tarjeta —direcciones, fechas, fotos, redes— y no el resumen de
+/// [`ContactDetail`]. El texto es el que mandó el servidor, tal cual se
+/// guardó: quien lo lee tiene que tratarlo como lo escribió un desconocido.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ContactCard {
+    pub id: String,
+    pub address_book_id: String,
+    /// Dónde vive en el servidor: lo que identifica a la tarjeta entre vueltas.
+    pub href: String,
+    pub vcard: String,
+}
+
+/// Una página de tarjetas crudas, en el mismo orden y con el mismo cursor que
+/// [`list_contacts`]. Tope por bytes como las demás: una tarjeta que sola no
+/// entra en una página se saltea —queda en el diario— y la lista sigue.
+pub fn list_cards(
+    connection: &Connection,
+    address_book: Option<i64>,
+    after: Option<&Cursor>,
+    limit: usize,
+) -> Result<Page<ContactCard>, StoreError> {
+    cards_page(connection, address_book, after, limit, MAX_PAGE_BYTES)
+}
+
+fn cards_page(
+    connection: &Connection,
+    address_book: Option<i64>,
+    after: Option<&Cursor>,
+    limit: usize,
+    byte_cap: usize,
+) -> Result<Page<ContactCard>, StoreError> {
+    let mut sql = String::from(
+        "SELECT c.id, c.address_book_id, c.sort_key, c.href, c.raw_vcard
+           FROM contacts c
+          WHERE c.display_name != ''",
+    );
+    let mut params: Vec<rusqlite::types::Value> = Vec::new();
+    if let Some(book) = address_book {
+        params.push(book.into());
+        sql.push_str(&format!(" AND c.address_book_id = ?{}", params.len()));
+    }
+    if let Some(after) = after {
+        params.push(after.sort_key.clone().into());
+        params.push(after.id.into());
+        sql.push_str(&format!(
+            " AND (c.sort_key, c.id) > (?{}, ?{})",
+            params.len() - 1,
+            params.len()
+        ));
+    }
+    params.push(((limit + 1) as i64).into());
+    sql.push_str(&format!(
+        " ORDER BY c.sort_key, c.id LIMIT ?{}",
+        params.len()
+    ));
+
+    let mut statement = connection.prepare(&sql).map_err(classify)?;
+    let mut rows = statement
+        .query(rusqlite::params_from_iter(params))
+        .map_err(classify)?;
+    let mut items = Vec::new();
+    let mut used = 2; // `[` y `]`
+    let mut last: Option<Cursor> = None;
+    let mut more = false;
+    let mut seen = 0;
+    while let Some(row) = rows.next().map_err(classify)? {
+        if seen == limit {
+            more = true;
+            break;
+        }
+        seen += 1;
+        let id: i64 = row.get(0).map_err(classify)?;
+        let sort_key: String = row.get(2).map_err(classify)?;
+        let card = ContactCard {
+            id: id.to_string(),
+            address_book_id: row.get::<_, i64>(1).map_err(classify)?.to_string(),
+            href: row.get(3).map_err(classify)?,
+            vcard: row.get(4).map_err(classify)?,
+        };
+        let size = json_len(&card) + 1;
+        if size > byte_cap {
+            // Sola no entra en ninguna página: se saltea y se sigue.
+            tracing::info!("una tarjeta de {size} bytes no entra en una página; se saltea");
+            last = Some(Cursor { sort_key, id });
+            continue;
+        }
+        if used + size > byte_cap {
+            // No entra en ésta: la página se corta antes, con el cursor
+            // apuntándola.
+            more = true;
+            break;
+        }
+        used += size;
+        items.push(card);
+        last = Some(Cursor { sort_key, id });
+    }
+    Ok(Page {
+        items,
+        next_cursor: if more {
+            last.as_ref().map(Cursor::encode)
+        } else {
+            None
+        },
+    })
+}
+
 /// Una página de la búsqueda. `query` es lo que devolvió [`fts_query`].
 pub fn search_contacts(
     connection: &Connection,

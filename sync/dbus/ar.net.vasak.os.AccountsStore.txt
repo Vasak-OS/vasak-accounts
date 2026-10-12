@@ -7,6 +7,7 @@ interface ar.net.vasak.os.AccountsStore
   method ListAddressBooks(in s account_id, out s)
   method ListAttachments(in s account_id, in x message_id, out s)
   method ListCalendars(out s)
+  method ListContactCards(in s account_id, in s address_book_id, in s cursor, in u limit, out s)
   method ListContacts(in s account_id, in s address_book_id, in s cursor, in u limit, out s)
   method ListMailboxes(in s account_id, out s)
   method ListMessages(in s account_id, in x mailbox_id, in s cursor, in u limit, out s)

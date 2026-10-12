@@ -319,6 +319,38 @@ impl<K: KeySource> StoreApi<K> {
             .map_err(read_error)
     }
 
+    /// Una página de tarjetas crudas: `{items: [{id, address_book_id, href,
+    /// vcard}], next_cursor}`, en el orden y con el cursor de `ListContacts`.
+    /// Es para quien interpreta la vCard entera —la aplicación de
+    /// contactos—; el texto es el que mandó el servidor.
+    ///
+    /// Pide `store.contacts`.
+    async fn list_contact_cards(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        account_id: String,
+        address_book_id: String,
+        cursor: String,
+        limit: u32,
+    ) -> zbus::fdo::Result<String> {
+        let book = match address_book_id.as_str() {
+            "" => None,
+            id => Some(contacts_read::parse_id(id).map_err(invalid)?),
+        };
+        let after = Cursor::decode(&cursor).map_err(invalid)?;
+        let limit = contacts_read::page_limit(limit);
+        self.authorize_contacts(&header, &account_id).await?;
+        let page = self
+            .manager
+            .read(&account_id, move |c| {
+                contacts_read::list_cards(c, book, after.as_ref(), limit)
+            })
+            .await
+            .map_err(read_error)?;
+        contacts_read::to_capped_json(&page, contacts_read::MAX_PAGE_REPLY_BYTES)
+            .map_err(read_error)
+    }
+
     /// Una página de la búsqueda, con la misma forma y el mismo cursor que
     /// `ListContacts`. Busca por el principio de cada palabra, sin acentos ni
     /// mayúsculas, en el nombre, los correos, los teléfonos y la organización;
@@ -1645,6 +1677,7 @@ mod tests {
                 "ListAddressBooks",
                 "ListAttachments",
                 "ListCalendars",
+                "ListContactCards",
                 "ListContacts",
                 "ListMailboxes",
                 "ListMessages",
