@@ -162,7 +162,7 @@ fn el_token_de_una_casilla_vuelve_igual_de_ida_y_vuelta() {
         token(u32::MAX, Some(u64::MAX), None, u32::MAX),
         token(9, None, None, 5),
     ] {
-        assert_eq!(MailboxToken::decode(&t.encode()), Some(t), "{}", t.encode());
+        assert_eq!(MailboxToken::decode(&t.encode()), Some(t));
     }
     assert_eq!(token(7, Some(100), Some(3), 2).encode(), "v1 7 100 3 2");
     // Lo que no se sabe va como `-`.
