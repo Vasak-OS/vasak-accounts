@@ -56,6 +56,7 @@ use crate::calendar_sync::{CalendarScheduler, CalendarSync, CALENDAR_TICK};
 use crate::contacts_sync::{ContactsScheduler, ContactsSync, CONTACTS_TICK};
 use crate::dav::webdav::{HttpPolicy, Limits};
 use crate::dav_sync::BrokerCredentials;
+use crate::email_sync::{EmailScheduler, EmailSync, EMAIL_TICK};
 use crate::ical::recurrence::ExpansionLimits;
 use crate::store::calendar_read::{self, GlobalId, ListCursor, Range};
 use crate::store::contacts_read::{self, Cursor, InvalidArgument};
@@ -95,6 +96,93 @@ const AREA_RESOURCES: [(&str, &str); 3] = [
 /// Hasta cuánto del nombre de las cuentas va al diálogo de permiso de una
 /// lectura que junta todas.
 const MAX_DIALOG_DETAIL: usize = 256;
+
+/// Por donde se le pide a la sincronización de correo una vuelta de una
+/// cuenta desde fuera de esta interfaz: la sesión en vivo de la bandeja de
+/// entrada, cuando el servidor avisa por IDLE, o cuando la aplicación marcó,
+/// movió o borró algo.
+static EMAIL_NUDGE: std::sync::OnceLock<mpsc::Sender<String>> = std::sync::OnceLock::new();
+
+/// Pide una vuelta del correo de una cuenta, sin esperar. Si la fila está
+/// llena, se descarta: la cuenta ya tiene una vuelta pedida, o la revisión de
+/// siempre la va a alcanzar.
+pub fn nudge_email(account_id: &str) {
+    if let Some(queue) = EMAIL_NUDGE.get() {
+        enqueue(queue, EMAIL_AREA, account_id);
+    }
+}
+
+/// Los pedidos que esperan lugar en una fila llena, por área y cuenta.
+static WAITING: std::sync::Mutex<Vec<(&'static str, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Pone a una cuenta en la fila de su área sin bloquear. Si la fila está
+/// llena —otra cuenta está tardando—, el pedido **no se pierde**: espera su
+/// lugar en una tarea aparte. Uno solo por área y cuenta, así que un aluvión
+/// de avisos de la misma cuenta no junta tareas.
+fn enqueue(queue: &mpsc::Sender<String>, area: &'static str, account_id: &str) {
+    match queue.try_send(account_id.to_string()) {
+        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+        Err(mpsc::error::TrySendError::Full(account)) => {
+            // Sin runtime no hay quién espere: pasa sólo fuera del servicio.
+            let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+                return;
+            };
+            {
+                let Ok(mut waiting) = WAITING.lock() else {
+                    return;
+                };
+                if waiting.iter().any(|(a, id)| *a == area && *id == account) {
+                    return;
+                }
+                waiting.push((area, account.clone()));
+            }
+            let queue = queue.clone();
+            runtime.spawn(async move {
+                let _ = queue.send(account.clone()).await;
+                if let Ok(mut waiting) = WAITING.lock() {
+                    waiting.retain(|(a, id)| !(*a == area && *id == account));
+                }
+            });
+        }
+    }
+}
+
+/// El almacén de verdad, para reflejar en el acto lo que la sesión en vivo
+/// hizo en el servidor —marcar como leído, mover— sin esperar a una vuelta.
+static LIVE_STORE: std::sync::OnceLock<Arc<StoreManager<SecretServiceKeys>>> =
+    std::sync::OnceLock::new();
+
+/// Marca como leído en el almacén un mensaje que se acaba de marcar en el
+/// servidor. Si la cuenta no tiene almacén, o el mensaje no está guardado, no
+/// hace nada: la próxima vuelta lo pone al día igual.
+pub async fn store_mark_seen(account_id: &str, mailbox: &str, uid: u32) {
+    let Some(manager) = LIVE_STORE.get() else {
+        return;
+    };
+    let mailbox = mailbox.to_string();
+    if let Err(e) = manager
+        .with_store(account_id, move |s| s.mark_seen(&mailbox, u64::from(uid)))
+        .await
+    {
+        tracing::debug!("'{account_id}': no se reflejó la lectura en el almacén: {e}");
+    }
+}
+
+/// Saca del almacén un mensaje que se acaba de mover o borrar en el servidor.
+pub async fn store_forget(account_id: &str, mailbox: &str, uid: u32) {
+    let Some(manager) = LIVE_STORE.get() else {
+        return;
+    };
+    let mailbox = mailbox.to_string();
+    if let Err(e) = manager
+        .with_store(account_id, move |s| {
+            s.forget_message(&mailbox, u64::from(uid))
+        })
+        .await
+    {
+        tracing::debug!("'{account_id}': no se reflejó el movimiento en el almacén: {e}");
+    }
+}
 
 /// El objeto de D-Bus.
 pub struct StoreApi<K: KeySource> {
@@ -678,16 +766,11 @@ impl<K: KeySource> StoreApi<K> {
         if let Some(ref mut body) = msg.as_mut() {
             const MAX_BODY_SIZE: usize = 256 * 1024; // 256 KB
 
-            if let Some(ref mut text) = body.text_body {
-                if text.len() > MAX_BODY_SIZE {
-                    text.truncate(MAX_BODY_SIZE);
-                    body.truncated = true;
-                }
-            }
-
-            if let Some(ref mut html) = body.html_body {
-                if html.len() > MAX_BODY_SIZE {
-                    html.truncate(MAX_BODY_SIZE);
+            for field in [&mut body.text_body, &mut body.html_body]
+                .into_iter()
+                .flatten()
+            {
+                if truncate_at_char(field, MAX_BODY_SIZE) {
                     body.truncated = true;
                 }
             }
@@ -886,10 +969,8 @@ impl<K: KeySource> StoreApi<K> {
             CALENDAR_AREA => &self.calendar,
             _ => &None,
         };
-        if let Some(queue) = queue {
-            if queue.try_send(account_id.to_string()).is_err() {
-                tracing::debug!("ya hay bastantes pedidos de sincronización en la fila");
-            }
+        if let (Some(queue), Some(area)) = (queue, SYNCED_AREAS.iter().find(|a| **a == area)) {
+            enqueue(queue, area, account_id);
         }
     }
 }
@@ -954,6 +1035,21 @@ fn paginate<T: Serialize>(
         items.push(item);
     }
     (items, if more { last.map(|c| c.encode()) } else { None })
+}
+
+/// Corta un texto a lo sumo en `max` bytes **sin partir un carácter**:
+/// `String::truncate` en el medio de una «ñ» hace caer el proceso, y el texto
+/// lo escribió un desconocido. Devuelve si cortó.
+pub fn truncate_at_char(text: &mut String, max: usize) -> bool {
+    if text.len() <= max {
+        return false;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    true
 }
 
 /// El nombre único de quien mandó el mensaje. Lo pone el bus; en una conexión
@@ -1101,11 +1197,13 @@ impl StoreService<SecretServiceKeys> {
     pub async fn start(connection: &zbus::Connection) -> zbus::Result<Self> {
         let keys = SecretServiceKeys::on_session_bus(connection.clone());
         let manager = Arc::new(StoreManager::new(keys, Locations::from_environment()));
+        let _ = LIVE_STORE.set(Arc::clone(&manager));
         let access = Arc::new(Access::new(
             Arc::new(access::DbusPermissions::new(connection.clone())),
             Arc::new(access::SystemClock),
         ));
         let (email, email_pending) = mpsc::channel(PENDING_REQUESTS);
+        let _ = EMAIL_NUDGE.set(email.clone());
         let (contacts, contacts_pending) = mpsc::channel(PENDING_REQUESTS);
         let (calendar, calendar_pending) = mpsc::channel(PENDING_REQUESTS);
         let service = Self::serve(
@@ -1186,14 +1284,8 @@ impl StoreService<SecretServiceKeys> {
                 let _ = StoreApi::<SecretServiceKeys>::status_changed(&emitter).await;
             });
         });
-        // TODO: Implementar EmailSync cuando exista el módulo
-        // Por ahora solo respondemos a RequestSync sin hacer sincronización real
-        tokio::spawn(async move {
-            let mut requests = requests;
-            while let Some(_account_id) = requests.recv().await {
-                notify();
-            }
-        });
+        let sync = EmailSync::new(Arc::clone(&self.manager), notify);
+        tokio::spawn(Arc::new(EmailScheduler::new(sync)).run(EMAIL_TICK, requests));
     }
 
     /// Escucha los cambios de `Locked` del llavero y vuelve a pasar la tabla.
@@ -2316,6 +2408,12 @@ mod tests {
             .await
             .unwrap(),
         );
+        // La serie dice que se repite; el suelto no. Ninguno se muestra «una
+        // sola vez»: las dos reglas se entendieron.
+        assert_eq!(whole["items"][0]["recurring"], true);
+        assert_eq!(whole["items"][0]["shown_once"], false);
+        assert_eq!(whole["items"][1]["recurring"], false);
+        assert_eq!(whole["items"][1]["shown_once"], false);
         let event_id = whole["items"][1]["event_id"].as_str().unwrap().to_string();
         let event = json(
             &call(&client, "GetEvent", &(event_id.as_str(), ""))
@@ -2903,5 +3001,169 @@ mod tests {
             "el desbloqueo tampoco llegó, y es el mismo código que el de ida"
         );
         assert_eq!(w.state().await, StoreState::Open, "y vuelve a abrir");
+    }
+
+    // -----------------------------------------------------------------------
+    // GetMessage y el corte de los cuerpos largos
+    // -----------------------------------------------------------------------
+
+    /// Un mensaje con un cuerpo de texto de más de 256 KiB, escrito como lo
+    /// escribe la sincronización. Devuelve su `id`.
+    async fn with_long_message(api: &Api, text: String) -> i64 {
+        use crate::store::email::{
+            MailboxListing, MailboxRole, MessageBodyRow, MessageOp, MessageRow,
+        };
+        api.manager
+            .with_store("cuenta", move |store| {
+                let inbox = store
+                    .upsert_mailboxes(&[MailboxListing {
+                        name: "INBOX".into(),
+                        display_name: "INBOX".into(),
+                        role: MailboxRole::Inbox,
+                    }])?
+                    .remove(0)
+                    .id;
+                store.apply_messages(
+                    vec![MessageOp::Upsert(Box::new(MessageRow {
+                        mailbox_id: inbox,
+                        uid: 1,
+                        message_id: Some("<largo@x>".into()),
+                        from_addr: "ana@x.com".into(),
+                        to_addrs: "yo@x.com".into(),
+                        cc_addrs: String::new(),
+                        bcc_addrs: String::new(),
+                        reply_to: None,
+                        subject: "Largo".into(),
+                        date_ts: 100,
+                        sort_key: 100,
+                        flags_seen: false,
+                        flags_answered: false,
+                        flags_flagged: false,
+                        flags_draft: false,
+                        flags_deleted: false,
+                        has_attachments: false,
+                        size: 300_000,
+                    }))],
+                    inbox,
+                )?;
+                let id: i64 = store
+                    .connection()
+                    .query_row("SELECT id FROM messages WHERE uid = 1", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                store.upsert_message_body(MessageBodyRow {
+                    message_id: id,
+                    text_body: Some(text.clone()),
+                    html_body: Some(format!("<p>{text}</p>")),
+                    truncated: false,
+                })?;
+                Ok(id)
+            })
+            .await
+            .unwrap()
+    }
+
+    /// **El corte de 256 KiB no puede caer en el medio de una «ñ».**
+    ///
+    /// El cuerpo lo escribió un desconocido. Cortarlo con `String::truncate`
+    /// en un byte que no es borde de carácter hace caer el proceso que
+    /// atiende el pedido: con un mensaje armado a propósito, alcanza con que
+    /// la aplicación lo abra.
+    #[tokio::test]
+    async fn get_message_corta_un_cuerpo_largo_sin_partir_un_caracter() {
+        const MAX: usize = 256 * 1024;
+        let mut api = Api::new(
+            "api-cuerpo-largo",
+            vec![account("cuenta", false)],
+            Answer::Allow,
+        )
+        .await;
+        // La «ñ» ocupa los bytes MAX-1 y MAX: el corte cae entre los dos.
+        let text = format!("{}ñ{}", "a".repeat(MAX - 1), "b".repeat(1000));
+        assert!(!text.is_char_boundary(MAX));
+        let id = with_long_message(&api, text).await;
+        let (client, _service) = api.client(":1.7").await;
+
+        let reply = tokio::time::timeout(
+            Duration::from_secs(10),
+            call(&client, "GetMessage", &("cuenta", id)),
+        )
+        .await
+        .expect("GetMessage no contestó: el servicio se cayó al cortar el cuerpo");
+        let message: serde_json::Value =
+            serde_json::from_str(&reply.expect("GetMessage falló")).unwrap();
+
+        let body = message["text_body"].as_str().unwrap();
+        assert_eq!(body.len(), MAX - 1, "se corta antes de la «ñ», no después");
+        assert!(body.chars().all(|c| c == 'a'));
+        assert!(message["html_body"].as_str().unwrap().len() <= MAX);
+        assert_eq!(message["truncated"], true);
+    }
+
+    #[test]
+    fn truncate_at_char_no_corta_lo_que_entra() {
+        let mut text = String::from("canción");
+        assert!(!truncate_at_char(&mut text, 100));
+        let exact = text.len();
+        assert!(!truncate_at_char(&mut text, exact));
+        assert_eq!(text, "canción");
+    }
+
+    #[test]
+    fn truncate_at_char_retrocede_hasta_el_borde_de_un_caracter() {
+        // «ó» son dos bytes (5 y 6); «🎵» son cuatro.
+        let mut text = String::from("canción");
+        assert!(truncate_at_char(&mut text, 6));
+        assert_eq!(text, "canci");
+
+        let mut text = String::from("a🎵b");
+        assert!(truncate_at_char(&mut text, 4));
+        assert_eq!(text, "a");
+
+        let mut text = String::from("abc");
+        assert!(truncate_at_char(&mut text, 2));
+        assert_eq!(text, "ab");
+
+        let mut text = String::from("ñ");
+        assert!(truncate_at_char(&mut text, 1));
+        assert_eq!(text, "");
+    }
+
+    /// El aviso de la sesión en vivo —IDLE, marcar, mover— pide una vuelta del
+    /// correo sin esperar: con la fila llena se descarta en vez de frenar a
+    /// quien avisa, que es la conexión con el servidor.
+    ///
+    /// La fila es global y se fija una sola vez: ésta es la única prueba que la
+    /// fija.
+    #[tokio::test]
+    async fn avisar_al_correo_pide_una_vuelta_sin_bloquear_y_sin_perderla() {
+        // Antes de que haya fila, avisar no hace nada y no falla.
+        if EMAIL_NUDGE.get().is_none() {
+            nudge_email("nadie");
+        }
+        let (queue, mut pending) = mpsc::channel(1);
+        assert!(EMAIL_NUDGE.set(queue).is_ok(), "otra prueba fijó la fila");
+
+        // La fila es de uno: «otra» no entra, pero no se pierde. Y avisar
+        // dos veces de la misma cuenta mientras espera no la pone dos veces.
+        nudge_email("cuenta");
+        nudge_email("otra");
+        nudge_email("otra");
+        assert_eq!(pending.recv().await.unwrap(), "cuenta");
+        assert_eq!(pending.recv().await.unwrap(), "otra");
+        tokio::task::yield_now().await;
+        assert!(pending.try_recv().is_err(), "«otra» quedó una sola vez");
+    }
+
+    /// Sin el almacén de la sesión —una cuenta sin almacén, o antes de que el
+    /// servicio arranque—, reflejar lo hecho en vivo no hace nada y no falla:
+    /// la próxima vuelta pone la base al día igual.
+    #[tokio::test]
+    async fn reflejar_en_vivo_sin_almacen_no_hace_nada() {
+        assert!(LIVE_STORE.get().is_none());
+        store_mark_seen("cuenta", "INBOX", 7).await;
+        store_forget("cuenta", "INBOX", 7).await;
+        assert!(LIVE_STORE.get().is_none());
     }
 }
