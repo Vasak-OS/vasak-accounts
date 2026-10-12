@@ -929,8 +929,11 @@ servidor** —ésa es la fuente de verdad— y, derivados de ella sólo para ord
 y buscar, el nombre, los correos, los teléfonos y un índice de búsqueda sin
 acentos. Además la dirección y el ETag de cada tarjeta y el `sync-token` de cada
 libreta, para traer después sólo lo que cambió. Sale sólo por las lecturas de
-arriba, con permiso, y lo que se devuelve se lee de la vCard: nunca la tarjeta
-cruda ni su dirección en el servidor.
+arriba, con permiso. Las resumidas —`ListContacts`, `SearchContacts`,
+`GetContact`— se leen de la vCard y nunca devuelven la tarjeta cruda ni su
+dirección en el servidor. `ListContactCards` es la excepción, a propósito:
+devuelve la tarjeta tal como vino y su `href`, para quien la interpreta entera
+(`vasak-contacts`), con el mismo permiso `store.contacts`.
 
 Cuándo: el área de contactos de una cuenta **se enciende la primera vez que
 alguien la pide** —una lectura o un `RequestSync`, con `store.contacts`—, queda
