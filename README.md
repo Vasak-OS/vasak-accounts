@@ -452,6 +452,7 @@ vasak-accounts/
         ├── dav_sync.rs      # lo que comparten las dos sincronizaciones DAV
         ├── contacts_sync.rs # los contactos de cada cuenta al almacén, y cuándo
         ├── calendar_sync.rs # el calendario de cada cuenta al almacén, y la ventana
+        ├── email_sync.rs    # el correo de cada cuenta al almacén, incremental
         ├── vcard.rs         # leer una vCard (2.1, 3.0 y 4.0), sin escribir
         ├── ical.rs          # leer iCalendar: eventos, tareas, recordatorios
         ├── ical/
@@ -795,10 +796,26 @@ del mismo nombre de bus. Todo contesta en JSON.
 | `ListOccurrences(from, to, calendar_ids, cursor, limit)` | `store.calendar` | Las veces de los eventos de todas las cuentas que se ven en `[from, to)` (RFC 3339, hasta 400 días), por comienzo: `{items: [{event_id, occurrence_id, calendar_id, title, start, end, all_day, floating, color}], next_cursor, truncated}`. |
 | `GetEvent(event_id, occurrence_id)` | `store.calendar` | Un evento entero —o una vez suya— leído de su iCalendar en el momento, o `null`. |
 | `ListTasks(calendar_ids, include_completed, cursor, limit)` | `store.calendar` | Las tareas por vencimiento: `{items: [{task_id, calendar_id, title, due, all_day, status, priority, completed, done, color}], next_cursor}`. |
+| `ListMailboxes(account_id)` | `store.email` | Las casillas: `[{id, name, display_name, role}]`. `role` es `inbox`, `sent`, `drafts`, `trash`, `archive`, `junk` u `other`. |
+| `ListMessages(account_id, mailbox_id, cursor, limit)` | `store.email` | Una página por fecha, de la más nueva, de una casilla o de todas (`0`). |
+| `SearchMessages(account_id, query, mailbox_id, cursor, limit)` | `store.email` | Lo mismo, buscando en asunto, remitente, destinatarios y en el texto de los cuerpos que ya se trajeron. |
+| `GetMessage(account_id, message_id)` | `store.email` | Un mensaje con su texto, su HTML **ya saneado** y sus adjuntos, o `null`. Sin cuerpo todavía si no se trajo: la aplicación lo pide a `AccountsSync.GetMessage`. |
+| `ListAttachments(account_id, message_id)` | `store.email` | Qué adjuntos tiene, sin su contenido. |
 | `GetStatus()` | nada | El estado, recortado según quién pregunta (abajo). |
 | `SetStoreEnabled(account_id, enabled)` | límite | Enciende o apaga. Apagar borra. |
 | `ClearStore(account_id)` | límite | Borra y, si está encendida, la vuelve a crear vacía con otra clave; lo de cada área encendida se vuelve a traer ya. |
 | `RequestSync(account_id)` | límite, y el permiso de cada área que encendería | Deja lista la base y sincroniza ya cada área que tenga. Un área cuyo permiso dice que no queda apagada; `AccessDenied` sólo si no quedó ninguna encendida. |
+
+**El correo se sincroniza solo** (`email_sync.rs`): cada quince minutos, con
+cada `RequestSync` —el botón «Actualizar» de las aplicaciones— y cuando la
+sesión en vivo de la bandeja de entrada recibe un aviso de IDLE. Por casilla
+pide lo mínimo: con CONDSTORE, si `UIDVALIDITY` y `HIGHESTMODSEQ` no cambiaron
+no pide nada más; si no, sólo UID y banderas de los últimos 2000 mensajes de la
+bandeja de entrada (500 de las demás), encabezados sólo de los nuevos y
+banderas sólo de los que cambiaron. Lo que queda fuera de esa ventana se borra
+de la base, que es lo que le pone techo. Los cuerpos de los 25 más nuevos de
+la bandeja de entrada se traen en segundo plano para que abrirlos sea
+instantáneo.
 
 Y dos señales: `StatusChanged`, sin detalle, y **`Changed(area, account_id,
 generation)`**, una por cada lote de la sincronización que cambió algo guardado

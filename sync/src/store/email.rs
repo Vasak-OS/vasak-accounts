@@ -24,6 +24,8 @@
 //! casilla, y cada lote que cambia algo sube la generación del área `email`
 //! en su misma transacción.
 
+use std::collections::HashMap;
+
 use rusqlite::{OptionalExtension, Transaction};
 
 use super::lifecycle::EMAIL_AREA;
@@ -157,6 +159,16 @@ pub enum MessageFlagOp {
     Delete(i64, String), // message_id, flag
 }
 
+/// Las banderas que son columna en `messages`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StoredFlags {
+    pub seen: bool,
+    pub answered: bool,
+    pub flagged: bool,
+    pub draft: bool,
+    pub deleted: bool,
+}
+
 /// Dónde quedó una casilla al terminar: va con el último lote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailboxProgress {
@@ -171,6 +183,77 @@ pub enum Applied {
     Written { net_bytes: i64 },
     /// No se escribió nada: la cuenta crecería más de lo que había lugar.
     OverCap,
+}
+
+/// Escribe un cuerpo y lo pasa al índice de búsqueda.
+fn write_body(transaction: &Transaction, body: MessageBodyRow) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "INSERT INTO message_bodies (message_id, text_body, html_body, truncated, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (message_id) DO UPDATE SET
+                     text_body = excluded.text_body,
+                     html_body = excluded.html_body,
+                     truncated = excluded.truncated,
+                     updated_at = excluded.updated_at",
+            rusqlite::params![
+                body.message_id,
+                body.text_body,
+                body.html_body,
+                body.truncated as i64,
+                now(),
+            ],
+        )
+        .map_err(classify)?;
+
+    // Actualizar índice FTS5 con el cuerpo de texto
+    if let Some(text) = body.text_body {
+        transaction
+            .execute(
+                "DELETE FROM messages_fts WHERE rowid = ?1",
+                [body.message_id],
+            )
+            .map_err(classify)?;
+        transaction
+                .execute(
+                    "INSERT INTO messages_fts (rowid, subject, from_addr, to_addrs, cc_addrs, text_body)
+                     SELECT ?1, subject, from_addr, to_addrs, cc_addrs, ?2
+                     FROM messages WHERE id = ?1",
+                    rusqlite::params![body.message_id, text],
+                )
+                .map_err(classify)?;
+    }
+    Ok(())
+}
+
+/// Escribe un adjunto.
+fn write_attachment(
+    transaction: &Transaction,
+    attachment: MessageAttachmentRow,
+) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "INSERT INTO message_attachments
+                    (message_id, part_number, name, content_type, size, inline, content_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT (message_id, part_number) DO UPDATE SET
+                     name = excluded.name,
+                     content_type = excluded.content_type,
+                     size = excluded.size,
+                     inline = excluded.inline,
+                     content_id = excluded.content_id",
+            rusqlite::params![
+                attachment.message_id,
+                &attachment.part_number,
+                attachment.name,
+                &attachment.content_type,
+                attachment.size,
+                attachment.inline as i64,
+                attachment.content_id,
+            ],
+        )
+        .map_err(classify)?;
+    Ok(())
 }
 
 fn now() -> String {
@@ -325,25 +408,149 @@ impl Store {
     }
 
     /// Guarda el `modseq` de una casilla (al terminar su vuelta).
+    ///
+    /// Sólo si cambió, y **sin subir la generación**: es dónde quedó la
+    /// sincronización, no algo que lea ninguna aplicación. Subirla en cada
+    /// vuelta haría que todas relean una lista idéntica.
     pub fn set_mailbox_modseq(
         &mut self,
         name: &str,
         modseq: Option<String>,
     ) -> Result<(), StoreError> {
-        let changed = self
-            .connection
+        self.connection
             .execute(
-                "UPDATE mailboxes SET modseq = ?1, updated_at = ?2 WHERE name = ?3",
+                "UPDATE mailboxes SET modseq = ?1, updated_at = ?2
+                 WHERE name = ?3 AND modseq IS NOT ?1",
                 rusqlite::params![modseq, now(), name],
             )
-            .map_err(classify)?
-            > 0;
-        if changed {
-            let generation = bump_generation(&self.connection, EMAIL_AREA)?;
-            self.note_change(EMAIL_AREA, generation);
-        }
+            .map_err(classify)?;
         Ok(())
     }
+
+    /// Las banderas guardadas de cada UID de una casilla.
+    pub fn stored_flags(&self, mailbox_id: i64) -> Result<HashMap<u64, StoredFlags>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare_cached(
+                "SELECT uid, flags_seen, flags_answered, flags_flagged, flags_draft, flags_deleted
+                 FROM messages WHERE mailbox_id = ?1",
+            )
+            .map_err(classify)?;
+        let rows = statement
+            .query_map([mailbox_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    StoredFlags {
+                        seen: row.get(1)?,
+                        answered: row.get(2)?,
+                        flagged: row.get(3)?,
+                        draft: row.get(4)?,
+                        deleted: row.get(5)?,
+                    },
+                ))
+            })
+            .map_err(classify)?;
+        rows.collect::<Result<_, _>>().map_err(classify)
+    }
+
+    /// Cambia las banderas de unos mensajes ya guardados, en una transacción.
+    /// Devuelve cuántos cambiaron; la generación sube sólo si fue alguno.
+    pub fn update_flags(
+        &mut self,
+        mailbox_id: i64,
+        changes: &[(u64, StoredFlags)],
+    ) -> Result<usize, StoreError> {
+        if changes.is_empty() {
+            return Ok(0);
+        }
+        let transaction = self.connection.transaction().map_err(classify)?;
+        let mut changed = 0;
+        {
+            let mut statement = transaction
+                .prepare_cached(
+                    "UPDATE messages SET flags_seen = ?1, flags_answered = ?2, flags_flagged = ?3,
+                            flags_draft = ?4, flags_deleted = ?5, updated_at = ?6
+                     WHERE mailbox_id = ?7 AND uid = ?8",
+                )
+                .map_err(classify)?;
+            let stamp = now();
+            for (uid, f) in changes {
+                changed += statement
+                    .execute(rusqlite::params![
+                        f.seen,
+                        f.answered,
+                        f.flagged,
+                        f.draft,
+                        f.deleted,
+                        &stamp,
+                        mailbox_id,
+                        *uid as i64
+                    ])
+                    .map_err(classify)?;
+            }
+        }
+        let generation = if changed > 0 {
+            Some(bump_generation(&transaction, EMAIL_AREA)?)
+        } else {
+            None
+        };
+        transaction.commit().map_err(classify)?;
+        if let Some(generation) = generation {
+            self.note_change(EMAIL_AREA, generation);
+        }
+        Ok(changed)
+    }
+
+    /// Borra una tanda de los mensajes de una casilla **sin** borrar la
+    /// casilla: es lo que se hace cuando el servidor cambió el `UIDVALIDITY`
+    /// y los UID guardados ya no apuntan a nada. Se llama hasta que devuelve
+    /// cero.
+    pub fn clear_mailbox_chunk(&mut self, mailbox_id: i64) -> Result<usize, StoreError> {
+        let transaction = self.connection.transaction().map_err(classify)?;
+        let removed = transaction
+            .execute(
+                "DELETE FROM messages WHERE id IN
+                   (SELECT id FROM messages WHERE mailbox_id = ?1 LIMIT ?2)",
+                rusqlite::params![mailbox_id, WRITE_BATCH_ROWS as i64],
+            )
+            .map_err(classify)?;
+        let generation = if removed > 0 {
+            Some(bump_generation(&transaction, EMAIL_AREA)?)
+        } else {
+            None
+        };
+        transaction.commit().map_err(classify)?;
+        if let Some(generation) = generation {
+            self.note_change(EMAIL_AREA, generation);
+        }
+        Ok(removed)
+    }
+
+    /// Los mensajes más nuevos de una casilla que todavía no tienen cuerpo:
+    /// `(id, uid)`, del más nuevo al más viejo.
+    pub fn messages_without_body(
+        &self,
+        mailbox_id: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, u64)>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare_cached(
+                "SELECT m.id, m.uid FROM messages m
+                 LEFT JOIN message_bodies b ON b.message_id = m.id
+                 WHERE m.mailbox_id = ?1 AND b.message_id IS NULL
+                 ORDER BY m.sort_key DESC, m.id DESC
+                 LIMIT ?2",
+            )
+            .map_err(classify)?;
+        let rows = statement
+            .query_map(rusqlite::params![mailbox_id, limit as i64], |row| {
+                Ok((row.get(0)?, row.get::<_, i64>(1)? as u64))
+            })
+            .map_err(classify)?;
+        rows.collect::<Result<_, _>>().map_err(classify)
+    }
+
 
     /// Aplica un lote de operaciones sobre mensajes. Devuelve cuántos bytes
     /// netos de mensajes crudos se sumaron (negativo si borró más de lo que
@@ -433,7 +640,12 @@ impl Store {
                         )
                         .map_err(classify)?;
 
-                    // Poblar índice FTS5 usando el cuerpo ya guardado en message_bodies
+                    // Poblar índice FTS5 usando el cuerpo ya guardado en message_bodies.
+                    // Si el mensaje ya estaba, su fila del índice se saca antes:
+                    // FTS5 no acepta dos filas con el mismo `rowid`.
+                    transaction
+                        .execute("DELETE FROM messages_fts WHERE rowid = ?1", [msg_id])
+                        .map_err(classify)?;
                     transaction
                         .execute(
                             "INSERT INTO messages_fts (rowid, subject, from_addr, to_addrs, cc_addrs, text_body)
@@ -466,42 +678,25 @@ impl Store {
 
     /// Guarda el cuerpo de un mensaje (cuando se abre).
     pub fn upsert_message_body(&mut self, body: MessageBodyRow) -> Result<(), StoreError> {
-        self.with_transaction_email(|transaction| {
-            transaction
-                .execute(
-                    "INSERT INTO message_bodies (message_id, text_body, html_body, truncated, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT (message_id) DO UPDATE SET
-                         text_body = excluded.text_body,
-                         html_body = excluded.html_body,
-                         truncated = excluded.truncated,
-                         updated_at = excluded.updated_at",
-                    rusqlite::params![
-                        body.message_id,
-                        body.text_body,
-                        body.html_body,
-                        body.truncated as i64,
-                        now(),
-                    ],
-                )
-                .map_err(classify)?;
+        self.with_transaction_email(|transaction| write_body(transaction, body))
+    }
 
-            // Actualizar índice FTS5 con el cuerpo de texto
-            if let Some(text) = body.text_body {
-                transaction
-                    .execute(
-                        "DELETE FROM messages_fts WHERE rowid = ?1",
-                        [body.message_id],
-                    )
-                    .map_err(classify)?;
-                transaction
-                    .execute(
-                        "INSERT INTO messages_fts (rowid, subject, from_addr, to_addrs, cc_addrs, text_body)
-                         SELECT ?1, subject, from_addr, to_addrs, cc_addrs, ?2
-                         FROM messages WHERE id = ?1",
-                        rusqlite::params![body.message_id, text],
-                    )
-                    .map_err(classify)?;
+    /// Guarda los cuerpos —y los adjuntos— de varios mensajes en **una**
+    /// transacción, con una sola subida de generación: traer de a tandas en
+    /// segundo plano no puede despertar a las aplicaciones una vez por mensaje.
+    pub fn store_opened(
+        &mut self,
+        opened: Vec<(MessageBodyRow, Vec<MessageAttachmentRow>)>,
+    ) -> Result<(), StoreError> {
+        if opened.is_empty() {
+            return Ok(());
+        }
+        self.with_transaction_email(|transaction| {
+            for (body, attachments) in opened {
+                write_body(transaction, body)?;
+                for attachment in attachments {
+                    write_attachment(transaction, attachment)?;
+                }
             }
             Ok(())
         })
@@ -512,31 +707,7 @@ impl Store {
         &mut self,
         attachment: MessageAttachmentRow,
     ) -> Result<(), StoreError> {
-        self.with_transaction_email(|transaction| {
-            transaction
-                .execute(
-                    "INSERT INTO message_attachments
-                        (message_id, part_number, name, content_type, size, inline, content_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                     ON CONFLICT (message_id, part_number) DO UPDATE SET
-                         name = excluded.name,
-                         content_type = excluded.content_type,
-                         size = excluded.size,
-                         inline = excluded.inline,
-                         content_id = excluded.content_id",
-                    rusqlite::params![
-                        attachment.message_id,
-                        &attachment.part_number,
-                        attachment.name,
-                        &attachment.content_type,
-                        attachment.size,
-                        attachment.inline as i64,
-                        attachment.content_id,
-                    ],
-                )
-                .map_err(classify)?;
-            Ok(())
-        })
+        self.with_transaction_email(|transaction| write_attachment(transaction, attachment))
     }
 
     /// Guarda una bandera extra.

@@ -55,6 +55,7 @@ use crate::broker::{self, BrokerError};
 use crate::calendar_sync::{CalendarScheduler, CalendarSync, CALENDAR_TICK};
 use crate::contacts_sync::{ContactsScheduler, ContactsSync, CONTACTS_TICK};
 use crate::dav::webdav::{HttpPolicy, Limits};
+use crate::email_sync::{EmailScheduler, EmailSync, EMAIL_TICK};
 use crate::dav_sync::BrokerCredentials;
 use crate::ical::recurrence::ExpansionLimits;
 use crate::store::calendar_read::{self, GlobalId, ListCursor, Range};
@@ -95,6 +96,21 @@ const AREA_RESOURCES: [(&str, &str); 3] = [
 /// Hasta cuánto del nombre de las cuentas va al diálogo de permiso de una
 /// lectura que junta todas.
 const MAX_DIALOG_DETAIL: usize = 256;
+
+/// Por donde se le pide a la sincronización de correo una vuelta de una
+/// cuenta desde fuera de esta interfaz: la sesión en vivo de la bandeja de
+/// entrada, cuando el servidor avisa por IDLE, o cuando la aplicación marcó,
+/// movió o borró algo.
+static EMAIL_NUDGE: std::sync::OnceLock<mpsc::Sender<String>> = std::sync::OnceLock::new();
+
+/// Pide una vuelta del correo de una cuenta, sin esperar. Si la fila está
+/// llena, se descarta: la cuenta ya tiene una vuelta pedida, o la revisión de
+/// siempre la va a alcanzar.
+pub fn nudge_email(account_id: &str) {
+    if let Some(queue) = EMAIL_NUDGE.get() {
+        let _ = queue.try_send(account_id.to_string());
+    }
+}
 
 /// El objeto de D-Bus.
 pub struct StoreApi<K: KeySource> {
@@ -678,16 +694,8 @@ impl<K: KeySource> StoreApi<K> {
         if let Some(ref mut body) = msg.as_mut() {
             const MAX_BODY_SIZE: usize = 256 * 1024; // 256 KB
 
-            if let Some(ref mut text) = body.text_body {
-                if text.len() > MAX_BODY_SIZE {
-                    text.truncate(MAX_BODY_SIZE);
-                    body.truncated = true;
-                }
-            }
-
-            if let Some(ref mut html) = body.html_body {
-                if html.len() > MAX_BODY_SIZE {
-                    html.truncate(MAX_BODY_SIZE);
+            for field in [&mut body.text_body, &mut body.html_body].into_iter().flatten() {
+                if truncate_at_char(field, MAX_BODY_SIZE) {
                     body.truncated = true;
                 }
             }
@@ -958,6 +966,21 @@ fn paginate<T: Serialize>(
 
 /// El nombre único de quien mandó el mensaje. Lo pone el bus; en una conexión
 /// punto a punto, lo que diga el otro lado (las pruebas).
+/// Corta un texto a lo sumo en `max` bytes **sin partir un carácter**:
+/// `String::truncate` en el medio de una «ñ» hace caer el proceso, y el texto
+/// lo escribió un desconocido. Devuelve si cortó.
+pub fn truncate_at_char(text: &mut String, max: usize) -> bool {
+    if text.len() <= max {
+        return false;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    true
+}
+
 fn sender_of(header: &Header<'_>) -> Option<String> {
     header.sender().map(|s| s.to_string())
 }
@@ -1106,6 +1129,7 @@ impl StoreService<SecretServiceKeys> {
             Arc::new(access::SystemClock),
         ));
         let (email, email_pending) = mpsc::channel(PENDING_REQUESTS);
+        let _ = EMAIL_NUDGE.set(email.clone());
         let (contacts, contacts_pending) = mpsc::channel(PENDING_REQUESTS);
         let (calendar, calendar_pending) = mpsc::channel(PENDING_REQUESTS);
         let service = Self::serve(
@@ -1186,14 +1210,8 @@ impl StoreService<SecretServiceKeys> {
                 let _ = StoreApi::<SecretServiceKeys>::status_changed(&emitter).await;
             });
         });
-        // TODO: Implementar EmailSync cuando exista el módulo
-        // Por ahora solo respondemos a RequestSync sin hacer sincronización real
-        tokio::spawn(async move {
-            let mut requests = requests;
-            while let Some(_account_id) = requests.recv().await {
-                notify();
-            }
-        });
+        let sync = EmailSync::new(Arc::clone(&self.manager), notify);
+        tokio::spawn(Arc::new(EmailScheduler::new(sync)).run(EMAIL_TICK, requests));
     }
 
     /// Escucha los cambios de `Locked` del llavero y vuelve a pasar la tabla.

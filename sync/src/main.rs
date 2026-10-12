@@ -30,21 +30,20 @@
 //! correo y vive en `message.rs`, con su propia discusión escrita arriba.
 //!
 //! Prepara además una base **cifrada** por cuenta —el almacén local de
-//! `store/`, publicado en `ar.net.vasak.os.AccountsStore`— y guarda ahí los
-//! **contactos** y el **calendario** —eventos y tareas— de las cuentas que los
-//! piden (`contacts_sync.rs`, `calendar_sync.rs`), que las aplicaciones leen
-//! por esa interfaz con el permiso `store.contacts` o `store.calendar`
-//! (`access.rs`). El correo todavía no pasa por ahí: lo que dicen los dos
-//! párrafos que siguen sigue siendo cierto hasta que pase.
+//! `store/`, publicado en `ar.net.vasak.os.AccountsStore`— y guarda ahí el
+//! **correo**, los **contactos** y el **calendario** de las cuentas que los
+//! piden (`email_sync.rs`, `contacts_sync.rs`, `calendar_sync.rs`), que las
+//! aplicaciones leen por esa interfaz con el permiso `store.email`,
+//! `store.contacts` o `store.calendar` (`access.rs`). Es de donde leen las
+//! aplicaciones para no esperar a la red; se mantiene al día solo, en segundo
+//! plano.
 //!
-//! **La lista vive en memoria, no en un archivo.** Un caché en disco guardaría el
-//! remitente y el asunto de todo el correo de la persona en texto plano, para
-//! siempre, en un archivo que nadie recuerda que existe. A cambio ahorraría los
-//! dos segundos de la primera lista — que igual se rehace sola en cuanto la
-//! cuenta se conecta, cosa que pasa al arrancar la sesión.
-//!
-//! **Los cuerpos no se guardan en ninguna parte**: se traen del servidor cuando
-//! alguien abre un mensaje.
+//! **Lo de acá, en cambio, vive en memoria**: la lista de la bandeja de entrada
+//! que mantiene la conexión en IDLE, para contar el sin leer y avisar de lo que
+//! llega al instante. Cada aviso del servidor le pide además una vuelta al
+//! almacén. Sin el almacén encendido no se escribe nada en disco: un caché en
+//! claro guardaría el remitente y el asunto de todo el correo de la persona,
+//! para siempre, en un archivo que nadie recuerda que existe.
 //!
 //! ── Lo que gana la aplicación de correo con esto ────────────────────────────
 //!
@@ -66,6 +65,7 @@ mod compose;
 mod contacts_sync;
 mod dav;
 mod dav_sync;
+mod email_sync;
 mod html;
 mod ical;
 mod images;
@@ -776,6 +776,9 @@ impl Service {
             .await
             .map_err(zbus::fdo::Error::Failed)?;
         drop(reader);
+        // Y que el almacén se entere sin esperar su vuelta: las aplicaciones
+        // leen de ahí.
+        store_api::nudge_email(&account_id);
 
         // La lista en memoria es la de la de entrada. Si de ahí salió algo, se
         // saca ya en vez de esperar la próxima vuelta: la ventana lo acaba de
@@ -881,6 +884,7 @@ impl Service {
             .mark_read(&broker, &account, &mailbox, uid)
             .await
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo marcar: {e}")))?;
+        store_api::nudge_email(&account_id);
 
         // Y acá también, para que la lista no muestre en negrita algo que el
         // servidor ya sabe que se leyó. La próxima vuelta del bucle lo confirma.
@@ -1535,17 +1539,19 @@ async fn account_session(
         );
     }
 
+    let mut woke;
     loop {
         if notifies {
             // Esperar a que el servidor diga algo. Vuelve por novedad o porque
             // hay que renovar; en los dos casos se vuelve a contar, que es
             // barato y evita depender de interpretar bien cada aviso.
-            session
+            woke = session
                 .idle(IDLE_RENEWAL)
                 .await
                 .map_err(|e| SessionEnd::Dropped(e.to_string()))?;
         } else {
             tokio::time::sleep(POLL_INTERVAL).await;
+            woke = imap::IdleWake::TimedOut;
         }
 
         // Pedirle el token al servicio en cada vuelta es lo que lo mantiene
@@ -1584,6 +1590,13 @@ async fn account_session(
         let status = read_mailbox_status(&mut session, messages).await;
         publish_status(service, emitter, account, status).await;
         list_inbox(&mut session, service, emitter, account, messages).await?;
+
+        // Lo que avisó el servidor también tiene que llegar al almacén, que es
+        // lo que leen las aplicaciones, sin esperar a su intervalo. Sólo si la
+        // espera terminó por un aviso: la renovación no trae novedades.
+        if woke == imap::IdleWake::Changed {
+            store_api::nudge_email(&account.id);
+        }
     }
 }
 

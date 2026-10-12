@@ -340,6 +340,78 @@ pub fn is_seen(reply: &str) -> bool {
     upper[from..end].split_whitespace().any(|b| b == "\\SEEN")
 }
 
+/// Las banderas de un mensaje, como vienen en `FETCH`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UidFlags {
+    pub uid: u32,
+    /// Tal como las escribió el servidor: `\Seen`, `$Forwarded`, …
+    pub flags: Vec<String>,
+}
+
+/// Lo que el almacén guarda de un mensaje sin su cuerpo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderRecord {
+    pub uid: u32,
+    pub flags: Vec<String>,
+    pub size: u64,
+    /// Los encabezados pedidos, como texto.
+    pub headers: String,
+}
+
+/// El número de un código de respuesta: `* OK [HIGHESTMODSEQ 715194045007]`.
+///
+/// Sólo dentro de los corchetes de una respuesta sin etiqueta: el mismo texto
+/// en el asunto de un mensaje no puede pasar por el estado de la casilla.
+pub fn response_code_number(line: &str, code: &str) -> Option<u64> {
+    if !line.starts_with("* ") {
+        return None;
+    }
+    let open = line.find('[')?;
+    let close = open + line[open..].find(']')?;
+    let inside = &line[open + 1..close];
+    let mut words = inside.split_ascii_whitespace();
+    if !words.next()?.eq_ignore_ascii_case(code) {
+        return None;
+    }
+    words.next()?.parse().ok()
+}
+
+/// Las banderas de `FLAGS (...)` de una respuesta de `FETCH`.
+pub fn flags_from(reply: &str) -> Vec<String> {
+    let upper = reply.to_ascii_uppercase();
+    let Some(start) = upper.find("FLAGS (") else {
+        return Vec::new();
+    };
+    let from = start + "FLAGS (".len();
+    let Some(end) = reply[from..].find(')').map(|f| from + f) else {
+        return Vec::new();
+    };
+    reply[from..end]
+        .split_ascii_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+/// El `RFC822.SIZE` de una respuesta de `FETCH`.
+pub fn rfc822_size_from(reply: &str) -> Option<u64> {
+    let upper = reply.to_ascii_uppercase();
+    let at = upper.find("RFC822.SIZE ")? + "RFC822.SIZE ".len();
+    let digits: String = reply[at..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
+/// Si un texto es un conjunto de secuencia de IMAP y nada más: dígitos, `:`,
+/// `,` y `*`. Lo que va en un comando sin comillas no puede traer otra cosa.
+pub fn is_sequence_set(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, ':' | ',' | '*'))
+}
+
 /// El rango de secuencia de los últimos `count` mensajes de una casilla.
 ///
 /// `None` si la casilla está vacía: pedir `1:0` es un error de sintaxis, y un
@@ -388,6 +460,14 @@ pub struct Session<F = Transport> {
     /// de hoy: quien tenga una lista vieja tiene que tirarla. Sin esto, un
     /// «borrar» le puede caer a otro mensaje.
     uidvalidity: Option<u32>,
+    /// El `HIGHESTMODSEQ` de la última casilla que se abrió (CONDSTORE,
+    /// RFC 7162). Si no cambió desde la vuelta anterior, nada de la casilla
+    /// cambió —ni mensajes ni banderas— y no hace falta pedir nada más.
+    highest_modseq: Option<u64>,
+    /// El `UIDNEXT` de la última casilla que se abrió: el UID que va a tener
+    /// el próximo mensaje. Sin CONDSTORE es lo más barato que dice si llegó
+    /// algo.
+    uid_next: Option<u32>,
 }
 
 impl Session<Transport> {
@@ -439,6 +519,8 @@ impl Session<Transport> {
             tag: 0,
             capabilities: Vec::new(),
             uidvalidity: None,
+            highest_modseq: None,
+            uid_next: None,
         };
 
         let greeting = session.read_line().await?;
@@ -558,6 +640,126 @@ impl<F: AsyncRead + AsyncWrite + Unpin + Send> Session<F> {
         self.uidvalidity
     }
 
+    /// Cierra la sesión con cortesía: `LOGOUT`, sin esperar más que el tope de
+    /// siempre. Lo que conteste no cambia nada; el socket se cierra igual al
+    /// soltar la sesión.
+    pub async fn logout(&mut self) -> Result<(), ImapError> {
+        let tag = self.next_tag();
+        self.write_line(&format!("{tag} LOGOUT")).await?;
+        Self::with_timeout("cerrar la sesión", async {
+            loop {
+                let line = self.read_line().await?;
+                if tagged_status(&line, &tag).is_some() {
+                    return Ok(());
+                }
+            }
+        })
+        .await
+    }
+
+    /// El `HIGHESTMODSEQ` de la casilla abierta, si el servidor sabe CONDSTORE.
+    pub fn highest_modseq(&self) -> Option<u64> {
+        self.highest_modseq
+    }
+
+    /// El `UIDNEXT` de la casilla abierta, si el servidor lo dijo.
+    pub fn uid_next(&self) -> Option<u32> {
+        self.uid_next
+    }
+
+    /// Si el servidor sabe CONDSTORE (RFC 7162), o QRESYNC, que lo incluye.
+    pub fn supports_condstore(&self) -> bool {
+        self.capabilities
+            .iter()
+            .any(|c| c == "CONDSTORE" || c == "QRESYNC")
+    }
+
+    /// El UID y las banderas de los mensajes de un rango de secuencia de la
+    /// casilla abierta.
+    ///
+    /// Es lo más barato que se le puede pedir a un servidor sobre una casilla
+    /// —unas decenas de bytes por mensaje— y alcanza para saber qué llegó, qué
+    /// se fue y qué cambió de banderas sin traer ningún encabezado.
+    pub async fn uid_flags(&mut self, range: &str) -> Result<Vec<UidFlags>, ImapError> {
+        if !is_sequence_set(range) {
+            return Err(ImapError::Failed("el rango no es válido".into()));
+        }
+        let tag = self.next_tag();
+        self.write_line(&format!("{tag} FETCH {range} (UID FLAGS)"))
+            .await?;
+
+        Self::with_timeout("las banderas de la casilla", async {
+            let mut found = Vec::new();
+            loop {
+                let (line, _) = self.read_response().await?;
+                if line.starts_with("* ") && line.to_ascii_uppercase().contains(" FETCH ") {
+                    if let Some(uid) = uid_from(&line) {
+                        found.push(UidFlags {
+                            uid,
+                            flags: flags_from(&line),
+                        });
+                    }
+                }
+                match tagged_status(&line, &tag) {
+                    Some(TaggedStatus::Ok) => return Ok(found),
+                    Some(TaggedStatus::No(d)) | Some(TaggedStatus::Bad(d)) => {
+                        return Err(ImapError::Failed(format!("FETCH falló: {d}")))
+                    }
+                    None => continue,
+                }
+            }
+        })
+        .await
+    }
+
+    /// Los encabezados que guarda el almacén, de unos UID puntuales.
+    ///
+    /// Más campos que la lista en memoria —destinatarios, `Message-ID`,
+    /// tamaño—, porque el almacén es lo que leen las aplicaciones para
+    /// responder, buscar y agrupar sin volver al servidor. `BODY.PEEK`, como
+    /// siempre: traer no marca como leído.
+    pub async fn header_records(&mut self, uids: &[u32]) -> Result<Vec<HeaderRecord>, ImapError> {
+        if uids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let list = uids
+            .iter()
+            .map(|u| u.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let tag = self.next_tag();
+        self.write_line(&format!(
+            "{tag} UID FETCH {list} (UID FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS \
+             (FROM TO CC REPLY-TO SUBJECT DATE MESSAGE-ID CONTENT-TYPE)])"
+        ))
+        .await?;
+
+        Self::with_timeout("los encabezados", async {
+            let mut records = Vec::new();
+            loop {
+                let (line, literals) = self.read_response().await?;
+                // Igual que en la lista: un `FETCH` sin literal es un aviso de
+                // banderas intercalado, no un mensaje.
+                if let (Some(uid), Some(block)) = (uid_from(&line), literals.first()) {
+                    records.push(HeaderRecord {
+                        uid,
+                        flags: flags_from(&line),
+                        size: rfc822_size_from(&line).unwrap_or(block.len() as u64),
+                        headers: crate::message::decode_text(block, ""),
+                    });
+                }
+                match tagged_status(&line, &tag) {
+                    Some(TaggedStatus::Ok) => return Ok(records),
+                    Some(TaggedStatus::No(d)) | Some(TaggedStatus::Bad(d)) => {
+                        return Err(ImapError::Failed(format!("no se pudo listar: {d}")))
+                    }
+                    None => continue,
+                }
+            }
+        })
+        .await
+    }
+
     /// Enumera las casillas del servidor.
     ///
     /// `LIST "" "*"`: todas, desde la raíz. Las que el servidor marca
@@ -603,7 +805,19 @@ impl<F: AsyncRead + AsyncWrite + Unpin + Send> Session<F> {
             .ok_or_else(|| ImapError::Failed("el nombre de la casilla no es válido".into()))?;
 
         let tag = self.next_tag();
-        self.write_line(&format!("{tag} {command} {name}")).await?;
+        // Con CONDSTORE se pide que la apertura traiga el `HIGHESTMODSEQ`. Sin
+        // el parámetro, un servidor puede no mandarlo hasta que algún comando
+        // lo habilite.
+        let condstore = if self.supports_condstore() {
+            " (CONDSTORE)"
+        } else {
+            ""
+        };
+        self.write_line(&format!("{tag} {command} {name}{condstore}"))
+            .await?;
+        // Lo de la casilla anterior no vale para ésta.
+        self.highest_modseq = None;
+        self.uid_next = None;
 
         Self::with_timeout("abrir la casilla", async {
             let mut messages = 0;
@@ -614,6 +828,12 @@ impl<F: AsyncRead + AsyncWrite + Unpin + Send> Session<F> {
                 }
                 if let Some(v) = uidvalidity_from(&line) {
                     self.uidvalidity = Some(v);
+                }
+                if let Some(v) = response_code_number(&line, "HIGHESTMODSEQ") {
+                    self.highest_modseq = Some(v);
+                }
+                if let Some(v) = response_code_number(&line, "UIDNEXT") {
+                    self.uid_next = u32::try_from(v).ok();
                 }
                 match tagged_status(&line, &tag) {
                     Some(TaggedStatus::Ok) => return Ok(messages),
@@ -1336,6 +1556,8 @@ mod tests {
             tag: 0,
             capabilities: Vec::new(),
             uidvalidity: None,
+            highest_modseq: None,
+            uid_next: None,
         };
         (session, task)
     }
