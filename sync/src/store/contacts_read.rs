@@ -1292,4 +1292,318 @@ mod tests {
             Some(StoreError::Missing)
         );
     }
+
+    // ── Las tarjetas crudas (`ListContactCards`) ───────────────────────────
+
+    /// Todas las páginas de tarjetas, desde el principio, con un tope de bytes
+    /// a elección. Devuelve cada página entera, para mirar sus cursores.
+    fn all_card_pages(
+        connection: &Connection,
+        address_book: Option<i64>,
+        limit: usize,
+        byte_cap: usize,
+    ) -> Vec<Page<ContactCard>> {
+        let mut pages = Vec::new();
+        let mut cursor: Option<Cursor> = None;
+        for _ in 0..1000 {
+            let page =
+                cards_page(connection, address_book, cursor.as_ref(), limit, byte_cap).unwrap();
+            let next = page.next_cursor.clone();
+            pages.push(page);
+            match next {
+                Some(next) => cursor = Cursor::decode(&next).unwrap(),
+                None => return pages,
+            }
+        }
+        panic!("la lista de tarjetas no termina");
+    }
+
+    fn card_ids(pages: &[Page<ContactCard>]) -> Vec<String> {
+        pages
+            .iter()
+            .flat_map(|p| p.items.iter().map(|c| c.id.clone()))
+            .collect()
+    }
+
+    /// Las tarjetas salen en el mismo orden que la lista —por nombre, y el
+    /// `id` desempata— y página por página con el mismo cursor: quien pasa
+    /// de `ListContacts` a `ListContactCards` no ve otra lista.
+    #[test]
+    fn las_tarjetas_salen_en_el_orden_y_con_el_cursor_de_la_lista() {
+        let temp = TempDir::new("tarjetas-orden");
+        let mut store = open_store(&temp);
+        let b = book(&mut store, "https://x/a/", "A");
+        // Desordenadas al guardar, con empates de nombre y mayúsculas mezcladas.
+        let mut rows: Vec<Box<ContactRow>> = (0..23)
+            .rev()
+            .map(|n| named(n, &format!("Contacto {:02}", n % 9)))
+            .collect();
+        rows.push(named(50, "ana"));
+        rows.push(named(51, "Beto"));
+        add(&mut store, &b, rows);
+
+        let mut card_cursor: Option<Cursor> = None;
+        let mut list_cursor: Option<Cursor> = None;
+        let mut cards = Vec::new();
+        let mut summaries = Vec::new();
+        for _ in 0..100 {
+            let c = list_cards(store.connection(), None, card_cursor.as_ref(), 4).unwrap();
+            let l = list_contacts(store.connection(), None, list_cursor.as_ref(), 4).unwrap();
+            assert_eq!(
+                c.next_cursor, l.next_cursor,
+                "el mismo cursor en cada página"
+            );
+            cards.extend(c.items.into_iter().map(|c| c.id));
+            summaries.extend(l.items.into_iter().map(|c| c.id));
+            let Some(next) = c.next_cursor else { break };
+            card_cursor = Cursor::decode(&next).unwrap();
+            list_cursor = card_cursor.clone();
+        }
+        assert_eq!(cards.len(), 25);
+        assert_eq!(cards, summaries, "el mismo orden que ListContacts");
+
+        // Y el cursor de una sirve para la otra.
+        let first = list_contacts(store.connection(), None, None, 10).unwrap();
+        let after = Cursor::decode(first.next_cursor.as_deref().unwrap()).unwrap();
+        let rest: Vec<String> = list_cards(store.connection(), None, after.as_ref(), 1000)
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(rest, summaries[10..].to_vec());
+    }
+
+    /// Una tarjeta sin nada que mostrar se guarda pero no sale como tarjeta,
+    /// igual que en la lista.
+    #[test]
+    fn las_tarjetas_sin_nombre_no_se_devuelven() {
+        let temp = TempDir::new("tarjetas-sin-nombre");
+        let mut store = open_store(&temp);
+        let b = book(&mut store, "https://x/a/", "A");
+        let mut empty = named(1, "x");
+        empty.contact = vcard::Contact::default();
+        empty.raw_vcard = "BEGIN:VCARD\r\nEND:VCARD".into();
+        add(&mut store, &b, vec![empty, named(2, "Ana")]);
+
+        let page = list_cards(store.connection(), None, None, 100).unwrap();
+        let hrefs: Vec<&str> = page.items.iter().map(|c| c.href.as_str()).collect();
+        assert_eq!(hrefs, vec!["https://x/a/2.vcf"]);
+        assert_eq!(page.next_cursor, None);
+    }
+
+    /// Con una libreta, sólo sus tarjetas; sin libreta, las de todas.
+    #[test]
+    fn las_tarjetas_de_una_libreta_son_solo_las_suyas() {
+        let temp = TempDir::new("tarjetas-libreta");
+        let mut store = open_store(&temp);
+        let a = book(&mut store, "https://x/a/", "Trabajo");
+        let b = book(&mut store, "https://x/b/", "Casa");
+        add(&mut store, &a, vec![named(1, "Ana"), named(2, "Beto")]);
+        add(
+            &mut store,
+            &b,
+            vec![row("https://x/b/1.vcf", "Carla", "c@x.com")],
+        );
+
+        let only_b = list_cards(store.connection(), Some(b.id), None, 100).unwrap();
+        assert_eq!(only_b.items.len(), 1);
+        assert_eq!(only_b.items[0].href, "https://x/b/1.vcf");
+        assert_eq!(only_b.items[0].address_book_id, b.id.to_string());
+
+        let only_a = list_cards(store.connection(), Some(a.id), None, 100).unwrap();
+        let hrefs: Vec<&str> = only_a.items.iter().map(|c| c.href.as_str()).collect();
+        assert_eq!(hrefs, vec!["https://x/a/1.vcf", "https://x/a/2.vcf"]);
+        assert!(only_a
+            .items
+            .iter()
+            .all(|c| c.address_book_id == a.id.to_string()));
+
+        assert_eq!(
+            list_cards(store.connection(), None, None, 100)
+                .unwrap()
+                .items
+                .len(),
+            3
+        );
+        // Una libreta que no existe no trae nada, sin error.
+        let none = list_cards(store.connection(), Some(a.id + b.id + 100), None, 100).unwrap();
+        assert!(none.items.is_empty());
+        assert_eq!(none.next_cursor, None);
+    }
+
+    /// Se pide uno más de los que entran para saber si hay otra página: hay
+    /// cursor sólo si queda algo, y nunca uno que lleve a una página vacía.
+    #[test]
+    fn el_cursor_de_las_tarjetas_aparece_solo_si_quedan_mas() {
+        let temp = TempDir::new("tarjetas-mas");
+        let mut store = open_store(&temp);
+        let b = book(&mut store, "https://x/a/", "A");
+        add(
+            &mut store,
+            &b,
+            vec![named(0, "C 0"), named(1, "C 1"), named(2, "C 2")],
+        );
+
+        let exact = list_cards(store.connection(), None, None, 3).unwrap();
+        assert_eq!(exact.items.len(), 3);
+        assert_eq!(exact.next_cursor, None, "justas: no hay otra página");
+
+        let wide = list_cards(store.connection(), None, None, 10).unwrap();
+        assert_eq!(wide.items.len(), 3);
+        assert_eq!(wide.next_cursor, None);
+
+        let short = list_cards(store.connection(), None, None, 2).unwrap();
+        assert_eq!(short.items.len(), 2);
+        let next = Cursor::decode(short.next_cursor.as_deref().expect("queda una")).unwrap();
+        let last = list_cards(store.connection(), None, next.as_ref(), 2).unwrap();
+        assert_eq!(last.items.len(), 1);
+        assert_eq!(last.items[0].href, "https://x/a/2.vcf");
+        assert_eq!(last.next_cursor, None);
+    }
+
+    /// Una página que llega al tope de bytes se corta **antes** de la tarjeta
+    /// que no entra, con el cursor apuntándola: la siguiente empieza por ella
+    /// y no se pierde ni se repite ninguna. Cada página entra en su tope.
+    #[test]
+    fn la_pagina_de_tarjetas_se_corta_antes_de_la_que_no_entra() {
+        let temp = TempDir::new("tarjetas-bytes");
+        let mut store = open_store(&temp);
+        let b = book(&mut store, "https://x/a/", "A");
+        add(
+            &mut store,
+            &b,
+            (0..10).map(|n| named(n, &format!("C {n}"))).collect(),
+        );
+        let all = list_cards(store.connection(), None, None, 1000).unwrap();
+        assert_eq!(all.items.len(), 10);
+        let one = json_len(&all.items[0]) + 1;
+        // Entran tres y media: la cuarta no.
+        let cap = 2 + one * 3 + one / 2;
+
+        let first = cards_page(store.connection(), None, None, 1000, cap).unwrap();
+        assert_eq!(first.items, all.items[..3].to_vec());
+        let next = Cursor::decode(first.next_cursor.as_deref().expect("se cortó")).unwrap();
+        let second = cards_page(store.connection(), None, next.as_ref(), 1000, cap).unwrap();
+        assert_eq!(
+            second.items[0], all.items[3],
+            "la siguiente empieza por la que no entró"
+        );
+
+        let pages = all_card_pages(store.connection(), None, 1000, cap);
+        for page in &pages {
+            assert!(json_len(&page.items) <= cap, "una página pasó su tope");
+        }
+        let all_ids: Vec<String> = all.items.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(card_ids(&pages), all_ids);
+    }
+
+    /// Una tarjeta que sola no entra en ninguna página se saltea, y la lista
+    /// sigue después de ella: ni un error, ni una página que vuelve siempre
+    /// igual, ni el final de la lista antes de tiempo.
+    #[test]
+    fn una_tarjeta_que_sola_no_entra_se_saltea_y_la_lista_sigue() {
+        let temp = TempDir::new("tarjetas-grande");
+        let mut store = open_store(&temp);
+        let b = book(&mut store, "https://x/a/", "A");
+        let mut big = named(2, "C 2");
+        big.raw_vcard = format!(
+            "BEGIN:VCARD\r\nFN:C 2\r\nNOTE:{}\r\nEND:VCARD",
+            "x".repeat(2000)
+        );
+        add(
+            &mut store,
+            &b,
+            vec![
+                named(0, "C 0"),
+                named(1, "C 1"),
+                big,
+                named(3, "C 3"),
+                named(4, "C 4"),
+            ],
+        );
+        let hrefs = |pages: &[Page<ContactCard>]| -> Vec<String> {
+            pages
+                .iter()
+                .flat_map(|p| p.items.iter().map(|c| c.href.clone()))
+                .collect()
+        };
+        let expected = vec![
+            "https://x/a/0.vcf",
+            "https://x/a/1.vcf",
+            "https://x/a/3.vcf",
+            "https://x/a/4.vcf",
+        ];
+        // Con lugar para varias por página.
+        assert_eq!(
+            hrefs(&all_card_pages(store.connection(), None, 1000, 600)),
+            expected
+        );
+        // De a una: la página de la salteada vuelve vacía y con cursor.
+        let one_by_one = all_card_pages(store.connection(), None, 1, 600);
+        assert_eq!(hrefs(&one_by_one), expected);
+        assert!(
+            one_by_one
+                .iter()
+                .any(|p| p.items.is_empty() && p.next_cursor.is_some()),
+            "la página de la salteada no es el final"
+        );
+        // Y si la salteada es la última, la lista termina después de ella.
+        let other = book(&mut store, "https://x/b/", "B");
+        let mut big_last = row("https://x/b/9.vcf", "Z 9", "z@x.com");
+        big_last.raw_vcard = format!(
+            "BEGIN:VCARD\r\nFN:Z 9\r\nNOTE:{}\r\nEND:VCARD",
+            "x".repeat(2000)
+        );
+        add(
+            &mut store,
+            &other,
+            vec![row("https://x/b/0.vcf", "Z 0", "z0@x.com"), big_last],
+        );
+        let ending = all_card_pages(store.connection(), Some(other.id), 1000, 600);
+        assert_eq!(hrefs(&ending), vec!["https://x/b/0.vcf"]);
+        assert_eq!(ending.last().unwrap().next_cursor, None);
+    }
+
+    /// La tarjeta vuelve tal cual se guardó, byte por byte: fin de línea
+    /// `\r\n`, líneas plegadas, acentos, una foto en base64, propiedades que
+    /// el almacén no interpreta. Quien la lee es quien la entiende.
+    #[test]
+    fn la_tarjeta_vuelve_byte_por_byte_como_la_mando_el_servidor() {
+        let temp = TempDir::new("tarjetas-cruda");
+        let mut store = open_store(&temp);
+        let b = book(&mut store, "https://x/a/", "A");
+        let raw = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:u-1\r\nFN:Ñandú Pérez \"el\" \\ ✓\r\n\
+                   N:Pérez;Ñandú;;;\r\nADR;TYPE=home:;;Av. Siempre Viva 742;Springfield;;1234;AR\r\n\
+                   BDAY:1990-05-17\r\nNOTE:una nota larga que se pliega en dos l\r\n íneas\r\n\
+                   PHOTO;ENCODING=b;TYPE=JPEG:/9j/4AAQSkZJRgABAQAAAQABAAD/2wBD\r\n\
+                   X-SOCIALPROFILE;TYPE=mastodon:https://mastodon.social/@x\r\n\
+                   item1.X-ABLabel:_$!<Spouse>!$_\r\nEND:VCARD\r\n";
+        add(
+            &mut store,
+            &b,
+            vec![Box::new(ContactRow {
+                href: "https://x/a/ñandú%201.vcf".into(),
+                etag: None,
+                contact: vcard::contact_from(raw, "https://x/a/ñandú%201.vcf").unwrap(),
+                raw_vcard: raw.into(),
+            })],
+        );
+        let page = list_cards(store.connection(), None, None, 10).unwrap();
+        assert_eq!(page.items.len(), 1);
+        let card = &page.items[0];
+        assert_eq!(card.vcard.as_bytes(), raw.as_bytes());
+        assert_eq!(card.href, "https://x/a/ñandú%201.vcf");
+        assert_eq!(card.address_book_id, b.id.to_string());
+        // Y por el JSON que sale al bus, también.
+        let json = to_capped_json(&page, MAX_PAGE_REPLY_BYTES).unwrap();
+        let back: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(back["items"][0]["vcard"].as_str().unwrap(), raw);
+        let keys: Vec<&String> = back["items"][0].as_object().unwrap().keys().collect();
+        assert_eq!(
+            keys.len(),
+            4,
+            "sólo id, address_book_id, href y vcard: {keys:?}"
+        );
+    }
 }
