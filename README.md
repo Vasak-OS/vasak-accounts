@@ -563,12 +563,15 @@ texto. Es la aplicación más expuesta del escritorio —lo que muestra lo escri
 cualquiera que sepa la dirección de la persona— y es la que menos tiene para
 perder. Ésa es la razón de que el correo se lea por acá y no desde la ventana.
 
-**La lista vive en memoria, no en un archivo.** Un caché en disco guardaría el
-remitente y el asunto de todo el correo de la persona en texto plano, para
-siempre, en un archivo que nadie recuerda que existe. A cambio ahorraría los dos
-segundos de la primera lista, que igual se rehace sola en cuanto la cuenta se
-conecta — cosa que pasa al arrancar la sesión. Los cuerpos no se guardan en
-ninguna parte: se traen cuando alguien abre un mensaje.
+**Dos lugares, con dos garantías distintas.** La lista de la bandeja de entrada
+que mantiene la conexión en IDLE vive **en memoria**: es la que cuenta el sin leer
+y avisa al instante, y no toca el disco. Lo que leen las aplicaciones está en el
+**almacén cifrado** (SQLCipher, clave en el llavero, una base por cuenta y
+apagable): ahí se guardan los encabezados de una ventana de mensajes por casilla
+y los cuerpos de los 25 más nuevos de la bandeja de entrada (ver más abajo). Sin
+el almacén encendido no se escribe nada de correo en disco: un caché en claro
+guardaría el remitente y el asunto de todo el correo de la persona, para
+siempre, en un archivo que nadie recuerda que existe.
 
 **Todo se trae con `BODY.PEEK`.** `BODY` a secas marca el mensaje como leído por
 el solo hecho de mirarlo, y que abrir la aplicación vacíe el contador de sin leer

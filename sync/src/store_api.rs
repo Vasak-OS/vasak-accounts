@@ -108,7 +108,42 @@ static EMAIL_NUDGE: std::sync::OnceLock<mpsc::Sender<String>> = std::sync::OnceL
 /// siempre la va a alcanzar.
 pub fn nudge_email(account_id: &str) {
     if let Some(queue) = EMAIL_NUDGE.get() {
-        let _ = queue.try_send(account_id.to_string());
+        enqueue(queue, EMAIL_AREA, account_id);
+    }
+}
+
+/// Los pedidos que esperan lugar en una fila llena, por área y cuenta.
+static WAITING: std::sync::Mutex<Vec<(&'static str, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Pone a una cuenta en la fila de su área sin bloquear. Si la fila está
+/// llena —otra cuenta está tardando—, el pedido **no se pierde**: espera su
+/// lugar en una tarea aparte. Uno solo por área y cuenta, así que un aluvión
+/// de avisos de la misma cuenta no junta tareas.
+fn enqueue(queue: &mpsc::Sender<String>, area: &'static str, account_id: &str) {
+    match queue.try_send(account_id.to_string()) {
+        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+        Err(mpsc::error::TrySendError::Full(account)) => {
+            // Sin runtime no hay quién espere: pasa sólo fuera del servicio.
+            let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+                return;
+            };
+            {
+                let Ok(mut waiting) = WAITING.lock() else {
+                    return;
+                };
+                if waiting.iter().any(|(a, id)| *a == area && *id == account) {
+                    return;
+                }
+                waiting.push((area, account.clone()));
+            }
+            let queue = queue.clone();
+            runtime.spawn(async move {
+                let _ = queue.send(account.clone()).await;
+                if let Ok(mut waiting) = WAITING.lock() {
+                    waiting.retain(|(a, id)| !(*a == area && *id == account));
+                }
+            });
+        }
     }
 }
 
@@ -934,10 +969,8 @@ impl<K: KeySource> StoreApi<K> {
             CALENDAR_AREA => &self.calendar,
             _ => &None,
         };
-        if let Some(queue) = queue {
-            if queue.try_send(account_id.to_string()).is_err() {
-                tracing::debug!("ya hay bastantes pedidos de sincronización en la fila");
-            }
+        if let (Some(queue), Some(area)) = (queue, SYNCED_AREAS.iter().find(|a| **a == area)) {
+            enqueue(queue, area, account_id);
         }
     }
 }
@@ -3103,8 +3136,8 @@ mod tests {
     ///
     /// La fila es global y se fija una sola vez: ésta es la única prueba que la
     /// fija.
-    #[test]
-    fn avisar_al_correo_pide_una_vuelta_sin_bloquear() {
+    #[tokio::test]
+    async fn avisar_al_correo_pide_una_vuelta_sin_bloquear_y_sin_perderla() {
         // Antes de que haya fila, avisar no hace nada y no falla.
         if EMAIL_NUDGE.get().is_none() {
             nudge_email("nadie");
@@ -3112,13 +3145,15 @@ mod tests {
         let (queue, mut pending) = mpsc::channel(1);
         assert!(EMAIL_NUDGE.set(queue).is_ok(), "otra prueba fijó la fila");
 
+        // La fila es de uno: «otra» no entra, pero no se pierde. Y avisar
+        // dos veces de la misma cuenta mientras espera no la pone dos veces.
         nudge_email("cuenta");
         nudge_email("otra");
-        assert_eq!(pending.try_recv().unwrap(), "cuenta");
-        assert!(
-            pending.try_recv().is_err(),
-            "la fila estaba llena: se descarta"
-        );
+        nudge_email("otra");
+        assert_eq!(pending.recv().await.unwrap(), "cuenta");
+        assert_eq!(pending.recv().await.unwrap(), "otra");
+        tokio::task::yield_now().await;
+        assert!(pending.try_recv().is_err(), "«otra» quedó una sola vez");
     }
 
     /// Sin el almacén de la sesión —una cuenta sin almacén, o antes de que el

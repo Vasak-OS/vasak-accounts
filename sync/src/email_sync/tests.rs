@@ -885,6 +885,38 @@ async fn una_casilla_que_no_abre_no_corta_la_vuelta() {
     );
 }
 
+/// Si la conexión se corta a mitad de la vuelta, la vuelta se corta: no se
+/// siguen mandando comandos a una sesión que ya no sirve, ni se termina como
+/// «al día» sin haber traído nada.
+#[tokio::test]
+async fn un_corte_a_mitad_de_la_vuelta_la_corta() {
+    let fixture = Fixture::new("correo-corte").await;
+    let (mut session, task) = with_server_caps(
+        "* OK listo",
+        &["IMAP4REV1", "CONDSTORE"],
+        vec![
+            (
+                "LIST \"\" \"*\"",
+                vec![
+                    "* LIST (\\HasNoChildren) \"/\" \"INBOX\"",
+                    "* LIST (\\HasNoChildren \\Sent) \"/\" \"Enviados\"",
+                    "{tag} OK LIST completado",
+                ],
+            ),
+            // El servidor recibe el EXAMINE y se va sin contestar.
+            ("EXAMINE \"INBOX\" (CONDSTORE)", vec![]),
+        ],
+    );
+    let result = sync_session(&fixture.manager, ACCOUNT, &mut session).await;
+    drop(session);
+    let received = task.await.unwrap();
+    assert!(
+        matches!(result, Err(RoundError::Imap(ImapError::Failed(_)))),
+        "la vuelta siguió como si nada: {result:?}"
+    );
+    assert_eq!(received.len(), 2, "siguió mandando comandos: {received:#?}");
+}
+
 /// Con el llavero bloqueado la base no se abre: no se le pide nada al
 /// servicio de cuentas ni al servidor, y el intento no cuenta como hecho.
 #[tokio::test]

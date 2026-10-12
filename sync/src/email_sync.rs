@@ -579,9 +579,12 @@ where
         let role = store_role(listing.role);
         match sync_mailbox(manager, account_id, session, mailbox, role, &mut report).await {
             Ok(()) => {}
-            // Una casilla que no abre —se borró recién, permisos del
-            // servidor— no corta la vuelta de las demás.
-            Err(RoundError::Imap(ImapError::Failed(detail))) => {
+            // Una casilla que el servidor se niega a abrir —se borró recién,
+            // permisos— no corta la vuelta de las demás. **Sólo eso**: un
+            // corte o un tiempo vencido dejan la sesión inservible, y seguir
+            // sería esperar el tope una vez por casilla y terminar la vuelta
+            // como «al día» sin haber traído nada.
+            Err(RoundError::Imap(ImapError::Refused(detail))) => {
                 tracing::info!(
                     "'{account_id}': «{}» no se pudo mirar: {detail}",
                     mailbox.name
@@ -733,9 +736,18 @@ where
         };
         match session.fetch_body(uid).await {
             Ok((raw, truncated)) => opened.push(opened_rows(message_id, &raw, truncated)),
-            Err(e @ ImapError::Desynced(_)) => return Err(RoundError::Imap(e)),
-            // Uno que no se pudo traer —se borró recién— no frena a los demás.
-            Err(e) => tracing::debug!("'{account_id}': un cuerpo no se pudo traer: {e}"),
+            // Uno que el servidor no da —se borró recién— no frena a los demás.
+            Err(ImapError::Refused(e)) => {
+                tracing::debug!("'{account_id}': un cuerpo no se pudo traer: {e}")
+            }
+            // Cualquier otra cosa es la conexión: se corta la vuelta, y lo ya
+            // traído se guarda igual.
+            Err(e) => {
+                let _ = manager
+                    .with_store(account_id, move |s| s.store_opened(opened))
+                    .await;
+                return Err(RoundError::Imap(e));
+            }
         }
     }
     report.bodies += opened.len();

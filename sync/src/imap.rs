@@ -97,6 +97,13 @@ pub enum ImapError {
     /// otra. Se distingue de `Failed` porque un fallo cualquiera deja la sesión
     /// utilizable y éste no.
     Desynced(String),
+    /// El servidor contestó `NO` o `BAD` a **este** comando: la casilla no
+    /// existe, no se puede abrir, el mensaje ya no está. La sesión sigue
+    /// sirviendo y se puede seguir con lo próximo. Se distingue de `Failed`,
+    /// que también cubre un corte, un tiempo vencido o un error de escritura:
+    /// después de eso la sesión ya no sirve y seguir mandando comandos es
+    /// esperar el tope una vez por comando.
+    Refused(String),
     Failed(String),
 }
 
@@ -105,7 +112,7 @@ impl std::fmt::Display for ImapError {
         match self {
             ImapError::Rejected(d) => write!(f, "el servidor rechazó las credenciales: {d}"),
             ImapError::Desynced(d) => write!(f, "la conexión quedó desincronizada: {d}"),
-            ImapError::Failed(d) => write!(f, "{d}"),
+            ImapError::Refused(d) | ImapError::Failed(d) => write!(f, "{d}"),
         }
     }
 }
@@ -869,7 +876,7 @@ impl<F: AsyncRead + AsyncWrite + Unpin + Send> Session<F> {
                 match tagged_status(&line, &tag) {
                     Some(TaggedStatus::Ok) => return Ok(messages),
                     Some(TaggedStatus::No(d)) | Some(TaggedStatus::Bad(d)) => {
-                        return Err(ImapError::Failed(format!(
+                        return Err(ImapError::Refused(format!(
                             "no se pudo abrir «{mailbox}»: {d}"
                         )))
                     }
@@ -1231,7 +1238,7 @@ impl<F: AsyncRead + AsyncWrite + Unpin + Send> Session<F> {
                         return Ok((raw, truncated));
                     }
                     Some(TaggedStatus::No(d)) | Some(TaggedStatus::Bad(d)) => {
-                        return Err(ImapError::Failed(format!("no se pudo traer: {d}")))
+                        return Err(ImapError::Refused(format!("no se pudo traer: {d}")))
                     }
                     None => continue,
                 }
