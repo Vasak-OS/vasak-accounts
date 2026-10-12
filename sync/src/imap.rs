@@ -1480,7 +1480,7 @@ impl<F: AsyncRead + AsyncWrite + Unpin + Send> Session<F> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt as _, BufReader};
 
@@ -1500,13 +1500,27 @@ mod tests {
     /// `script` son pares de «lo que se espera recibir» y «lo que se contesta».
     /// El servidor de mentira comprueba que el comando contenga lo esperado y
     /// falla la prueba si no, así que el orden de los comandos queda fijado.
-    fn with_server(
+    pub(crate) fn with_server(
         greeting: &str,
         script: Vec<(&'static str, Vec<&'static str>)>,
     ) -> (
         Session<tokio::io::DuplexStream>,
         tokio::task::JoinHandle<Vec<String>>,
     ) {
+        with_server_caps(greeting, &[], script)
+    }
+
+    /// Lo mismo, con las capacidades que el servidor ya anunció: las que
+    /// cambian qué se manda, como CONDSTORE al abrir una casilla.
+    pub(crate) fn with_server_caps(
+        greeting: &str,
+        capabilities: &[&str],
+        script: Vec<(&'static str, Vec<&'static str>)>,
+    ) -> (
+        Session<tokio::io::DuplexStream>,
+        tokio::task::JoinHandle<Vec<String>>,
+    ) {
+        let capabilities: Vec<String> = capabilities.iter().map(|c| c.to_string()).collect();
         let (client, server) = tokio::io::duplex(64 * 1024);
         let greeting = greeting.to_string();
 
@@ -1560,7 +1574,7 @@ mod tests {
             stream: client,
             pending: Vec::new(),
             tag: 0,
-            capabilities: Vec::new(),
+            capabilities,
             uidvalidity: None,
             highest_modseq: None,
             uid_next: None,
@@ -2333,5 +2347,341 @@ mod tests {
             serde_json::to_string(&MoveOutcome::OldCopyKept).unwrap(),
             "\"sin_borrar_el_viejo\""
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Lo que usa la sincronización de correo al almacén
+    // -----------------------------------------------------------------------
+
+    /// Una línea de guion que no es `'static` todavía: el servidor de mentira
+    /// las quiere así, y hay que calcular el largo de los literales.
+    fn leak(text: String) -> &'static str {
+        Box::leak(text.into_boxed_str())
+    }
+
+    #[test]
+    fn el_numero_de_un_codigo_de_respuesta_se_lee_entre_corchetes() {
+        assert_eq!(
+            response_code_number(
+                "* OK [HIGHESTMODSEQ 715194045007] lo más alto",
+                "HIGHESTMODSEQ"
+            ),
+            Some(715_194_045_007)
+        );
+        assert_eq!(
+            response_code_number("* OK [UIDNEXT 4392] el que sigue", "UIDNEXT"),
+            Some(4392)
+        );
+        // Sin distinguir mayúsculas en el código.
+        assert_eq!(response_code_number("* OK [uidnext 7]", "UIDNEXT"), Some(7));
+        // Otro código, o sin número.
+        assert_eq!(
+            response_code_number("* OK [UIDVALIDITY 3]", "UIDNEXT"),
+            None
+        );
+        assert_eq!(
+            response_code_number("* OK [HIGHESTMODSEQ]", "HIGHESTMODSEQ"),
+            None
+        );
+        assert_eq!(
+            response_code_number("* OK [HIGHESTMODSEQ x]", "HIGHESTMODSEQ"),
+            None
+        );
+    }
+
+    /// El estado de la casilla sale sólo de una respuesta sin etiqueta y de
+    /// adentro de los corchetes: el mismo texto suelto, o en la respuesta de
+    /// un comando, no dice nada de la casilla.
+    #[test]
+    fn un_codigo_fuera_de_lugar_no_se_toma() {
+        assert_eq!(
+            response_code_number("a1 OK [HIGHESTMODSEQ 5] listo", "HIGHESTMODSEQ"),
+            None
+        );
+        assert_eq!(
+            response_code_number("* OK HIGHESTMODSEQ 5", "HIGHESTMODSEQ"),
+            None
+        );
+        assert_eq!(response_code_number("+ [UIDNEXT 9]", "UIDNEXT"), None);
+        assert_eq!(
+            response_code_number("* OK [HIGHESTMODSEQ 5", "HIGHESTMODSEQ"),
+            None
+        );
+    }
+
+    /// Un asunto lo escribe cualquiera. Que diga «[HIGHESTMODSEQ 99]» no puede
+    /// hacer creer que la casilla no cambió.
+    #[test]
+    fn un_asunto_con_el_texto_del_codigo_no_pasa_por_el_estado_de_la_casilla() {
+        let line = "* 3 FETCH (UID 9 FLAGS () ENVELOPE (NIL \"[HIGHESTMODSEQ 99] hola\" NIL))";
+        assert_eq!(response_code_number(line, "HIGHESTMODSEQ"), None);
+        let line = "* 3 FETCH (UID 9 BODY[HEADER.FIELDS (SUBJECT)] \"[UIDNEXT 1]\")";
+        assert_eq!(response_code_number(line, "UIDNEXT"), None);
+    }
+
+    #[test]
+    fn las_banderas_de_un_fetch_se_leen_tal_como_vienen() {
+        assert_eq!(
+            flags_from("* 1 FETCH (UID 5 FLAGS (\\Seen $Forwarded \\Flagged))"),
+            vec!["\\Seen", "$Forwarded", "\\Flagged"]
+        );
+        assert_eq!(
+            flags_from("* 1 FETCH (flags (\\seen) UID 5)"),
+            vec!["\\seen"]
+        );
+        assert!(flags_from("* 1 FETCH (UID 5 FLAGS ())").is_empty());
+        assert!(flags_from("* 1 FETCH (UID 5)").is_empty());
+        // Sin el paréntesis que cierra: nada, no lo que siga.
+        assert!(flags_from("* 1 FETCH (UID 5 FLAGS (\\Seen").is_empty());
+    }
+
+    #[test]
+    fn el_tamano_de_un_fetch_se_lee_de_rfc822_size() {
+        assert_eq!(
+            rfc822_size_from("* 1 FETCH (UID 5 RFC822.SIZE 2048 FLAGS ())"),
+            Some(2048)
+        );
+        assert_eq!(rfc822_size_from("* 1 FETCH (uid 5 rfc822.size 7)"), Some(7));
+        assert_eq!(rfc822_size_from("* 1 FETCH (UID 5 FLAGS ())"), None);
+        assert_eq!(rfc822_size_from("* 1 FETCH (RFC822.SIZE x)"), None);
+    }
+
+    #[test]
+    fn un_conjunto_de_secuencia_es_solo_numeros_dos_puntos_comas_y_asterisco() {
+        for good in ["1", "1:5", "1,3,5:*", "*", "1990:2000"] {
+            assert!(is_sequence_set(good), "{good}");
+        }
+    }
+
+    /// Va crudo en el comando: un espacio o un salto de línea adentro serían
+    /// otro comando, con lo que el servidor haga con él.
+    #[test]
+    fn lo_que_no_es_un_conjunto_de_secuencia_se_rechaza() {
+        for bad in [
+            "",
+            "1 5",
+            "1:5 (BODY[])",
+            "uno",
+            "1;2",
+            "1:5\r\na2 LOGOUT",
+            "1:5\n",
+            "-1",
+        ] {
+            assert!(!is_sequence_set(bad), "pasó: {bad:?}");
+        }
+    }
+
+    /// Con CONDSTORE anunciado, la apertura lo pide y se queda con el
+    /// `HIGHESTMODSEQ` y el `UIDNEXT`, que son lo que deja saltear una casilla
+    /// que no cambió.
+    #[tokio::test]
+    async fn abrir_con_condstore_lo_pide_y_lee_el_estado_de_la_casilla() {
+        let (mut session, task) = with_server_caps(
+            "* OK listo",
+            &["IMAP4REV1", "CONDSTORE"],
+            vec![
+                (
+                    "EXAMINE \"INBOX\" (CONDSTORE)",
+                    vec![
+                        "* 3 EXISTS",
+                        "* OK [UIDVALIDITY 42] válido",
+                        "* OK [UIDNEXT 120] el que sigue",
+                        "* OK [HIGHESTMODSEQ 9000] lo más alto",
+                        "{tag} OK [READ-ONLY] EXAMINE completado",
+                    ],
+                ),
+                (
+                    "EXAMINE \"Sent\" (CONDSTORE)",
+                    vec![
+                        "* 0 EXISTS",
+                        "* OK [UIDVALIDITY 43] válido",
+                        "{tag} OK [READ-ONLY] EXAMINE completado",
+                    ],
+                ),
+            ],
+        );
+
+        assert_eq!(session.examine("INBOX").await.unwrap(), 3);
+        assert_eq!(session.uidvalidity(), Some(42));
+        assert_eq!(session.uid_next(), Some(120));
+        assert_eq!(session.highest_modseq(), Some(9000));
+
+        // La casilla siguiente no dijo ninguno de los dos: no puede quedar
+        // con los de la anterior, o se saltearía sin haber mirado.
+        assert_eq!(session.examine("Sent").await.unwrap(), 0);
+        assert_eq!(session.uidvalidity(), Some(43));
+        assert_eq!(session.uid_next(), None);
+        assert_eq!(session.highest_modseq(), None);
+        assert_eq!(task.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn qresync_tambien_cuenta_como_condstore() {
+        let (mut session, task) = with_server_caps(
+            "* OK listo",
+            &["IMAP4REV1", "QRESYNC"],
+            vec![("(CONDSTORE)", vec!["* 1 EXISTS", "{tag} OK completado"])],
+        );
+        assert!(session.supports_condstore());
+        session.examine("INBOX").await.unwrap();
+        assert_eq!(task.await.unwrap().len(), 1);
+    }
+
+    /// Un servidor que no lo anunció puede contestar `BAD` a un parámetro que
+    /// no conoce: sin la capacidad no se manda.
+    #[tokio::test]
+    async fn sin_condstore_la_apertura_no_lo_pide() {
+        let (mut session, task) = with_server_caps(
+            "* OK listo",
+            &["IMAP4REV1", "IDLE"],
+            vec![(
+                "EXAMINE \"INBOX\"",
+                vec!["* 2 EXISTS", "* OK [UIDNEXT 5]", "{tag} OK completado"],
+            )],
+        );
+        assert!(!session.supports_condstore());
+        assert_eq!(session.examine("INBOX").await.unwrap(), 2);
+        assert_eq!(session.uid_next(), Some(5));
+        assert_eq!(session.highest_modseq(), None);
+        let received = task.await.unwrap();
+        assert!(
+            !received[0].contains("CONDSTORE"),
+            "lo pidió: {}",
+            received[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn las_banderas_de_una_ventana_salen_con_su_uid() {
+        let (mut session, task) = with_server(
+            "* OK listo",
+            vec![(
+                "FETCH 1:3 (UID FLAGS)",
+                vec![
+                    "* 1 FETCH (UID 10 FLAGS (\\Seen))",
+                    "* 2 FETCH (FLAGS () UID 11)",
+                    // Un aviso sin UID no dice de qué mensaje es.
+                    "* 3 FETCH (FLAGS (\\Deleted))",
+                    "* 4 EXISTS",
+                    "{tag} OK FETCH completado",
+                ],
+            )],
+        );
+
+        let found = session.uid_flags("1:3").await.unwrap();
+        task.await.unwrap();
+        assert_eq!(
+            found,
+            vec![
+                UidFlags {
+                    uid: 10,
+                    flags: vec!["\\Seen".into()],
+                },
+                UidFlags {
+                    uid: 11,
+                    flags: vec![],
+                },
+            ]
+        );
+    }
+
+    /// Un rango que no es un rango no llega al servidor: lo primero que el
+    /// servidor recibe es el comando que sigue.
+    #[tokio::test]
+    async fn un_rango_invalido_no_se_manda() {
+        let (mut session, task) =
+            with_server("* OK listo", vec![("LOGOUT", vec!["{tag} OK chau"])]);
+        assert!(matches!(
+            session.uid_flags("1:5 (BODY[])").await,
+            Err(ImapError::Failed(_))
+        ));
+        assert!(matches!(
+            session.uid_flags("1:5\r\na9 LOGOUT").await,
+            Err(ImapError::Failed(_))
+        ));
+        session.logout().await.unwrap();
+        let received = task.await.unwrap();
+        assert_eq!(received.len(), 1, "se escribió algo antes: {received:?}");
+        assert!(!received[0].contains("FETCH"));
+    }
+
+    #[tokio::test]
+    async fn un_fetch_de_banderas_rechazado_es_un_error() {
+        let (mut session, task) = with_server(
+            "* OK listo",
+            vec![(
+                "FETCH 1:2 (UID FLAGS)",
+                vec!["{tag} NO no hay casilla abierta"],
+            )],
+        );
+        assert!(matches!(
+            session.uid_flags("1:2").await,
+            Err(ImapError::Failed(_))
+        ));
+        task.await.unwrap();
+    }
+
+    /// Los encabezados de los UID pedidos. Un `FETCH` intercalado sin literal
+    /// —un aviso de banderas de otro mensaje— no es un mensaje, aunque traiga
+    /// UID.
+    #[tokio::test]
+    async fn los_encabezados_salen_de_los_fetch_con_literal() {
+        let headers = "From: Ana <ana@x.com>\r\nSubject: Hola";
+        // El servidor de mentira agrega el CRLF de cada línea: va en el literal.
+        let announce = leak(format!(
+            "* 1 FETCH (UID 5 FLAGS (\\Seen) RFC822.SIZE 2048 BODY[HEADER.FIELDS (FROM SUBJECT)] {{{}}}",
+            headers.len() + 2
+        ));
+        let (mut session, task) = with_server(
+            "* OK listo",
+            vec![(
+                "UID FETCH 5,9 (UID FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS",
+                vec![
+                    "* 7 FETCH (UID 9 FLAGS (\\Flagged))",
+                    announce,
+                    headers,
+                    ")",
+                    "{tag} OK FETCH completado",
+                ],
+            )],
+        );
+
+        let records = session.header_records(&[5, 9]).await.unwrap();
+        let received = task.await.unwrap();
+
+        assert_eq!(records.len(), 1, "el aviso de banderas no es un mensaje");
+        let record = &records[0];
+        assert_eq!(record.uid, 5);
+        assert_eq!(record.flags, vec!["\\Seen"]);
+        assert_eq!(record.size, 2048);
+        assert!(record.headers.contains("Subject: Hola"));
+        assert!(record.headers.contains("From: Ana <ana@x.com>"));
+        // Con `BODY.PEEK`: traer los encabezados no marca como leído.
+        assert!(received[0].contains("BODY.PEEK["));
+    }
+
+    #[tokio::test]
+    async fn sin_uid_no_se_piden_encabezados() {
+        let (mut session, task) =
+            with_server("* OK listo", vec![("LOGOUT", vec!["{tag} OK chau"])]);
+        assert!(session.header_records(&[]).await.unwrap().is_empty());
+        session.logout().await.unwrap();
+        let received = task.await.unwrap();
+        assert_eq!(received.len(), 1, "se pidió algo: {received:?}");
+    }
+
+    #[tokio::test]
+    async fn cerrar_la_sesion_manda_logout_y_espera_su_respuesta() {
+        let (mut session, task) = with_server(
+            "* OK listo",
+            vec![(
+                "LOGOUT",
+                vec!["* BYE hasta luego", "{tag} OK LOGOUT completado"],
+            )],
+        );
+        session.logout().await.unwrap();
+        let received = task.await.unwrap();
+        assert_eq!(received.len(), 1);
+        assert!(received[0].ends_with(" LOGOUT"));
     }
 }

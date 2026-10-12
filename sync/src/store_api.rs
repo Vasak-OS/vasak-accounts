@@ -2925,4 +2925,155 @@ mod tests {
         );
         assert_eq!(w.state().await, StoreState::Open, "y vuelve a abrir");
     }
+
+    // -----------------------------------------------------------------------
+    // GetMessage y el corte de los cuerpos largos
+    // -----------------------------------------------------------------------
+
+    /// Un mensaje con un cuerpo de texto de más de 256 KiB, escrito como lo
+    /// escribe la sincronización. Devuelve su `id`.
+    async fn with_long_message(api: &Api, text: String) -> i64 {
+        use crate::store::email::{
+            MailboxListing, MailboxRole, MessageBodyRow, MessageOp, MessageRow,
+        };
+        api.manager
+            .with_store("cuenta", move |store| {
+                let inbox = store
+                    .upsert_mailboxes(&[MailboxListing {
+                        name: "INBOX".into(),
+                        display_name: "INBOX".into(),
+                        role: MailboxRole::Inbox,
+                    }])?
+                    .remove(0)
+                    .id;
+                store.apply_messages(
+                    vec![MessageOp::Upsert(Box::new(MessageRow {
+                        mailbox_id: inbox,
+                        uid: 1,
+                        message_id: Some("<largo@x>".into()),
+                        from_addr: "ana@x.com".into(),
+                        to_addrs: "yo@x.com".into(),
+                        cc_addrs: String::new(),
+                        bcc_addrs: String::new(),
+                        reply_to: None,
+                        subject: "Largo".into(),
+                        date_ts: 100,
+                        sort_key: 100,
+                        flags_seen: false,
+                        flags_answered: false,
+                        flags_flagged: false,
+                        flags_draft: false,
+                        flags_deleted: false,
+                        has_attachments: false,
+                        size: 300_000,
+                    }))],
+                    inbox,
+                )?;
+                let id: i64 = store
+                    .connection()
+                    .query_row("SELECT id FROM messages WHERE uid = 1", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                store.upsert_message_body(MessageBodyRow {
+                    message_id: id,
+                    text_body: Some(text.clone()),
+                    html_body: Some(format!("<p>{text}</p>")),
+                    truncated: false,
+                })?;
+                Ok(id)
+            })
+            .await
+            .unwrap()
+    }
+
+    /// **El corte de 256 KiB no puede caer en el medio de una «ñ».**
+    ///
+    /// El cuerpo lo escribió un desconocido. Cortarlo con `String::truncate`
+    /// en un byte que no es borde de carácter hace caer el proceso que
+    /// atiende el pedido: con un mensaje armado a propósito, alcanza con que
+    /// la aplicación lo abra.
+    #[tokio::test]
+    async fn get_message_corta_un_cuerpo_largo_sin_partir_un_caracter() {
+        const MAX: usize = 256 * 1024;
+        let mut api = Api::new(
+            "api-cuerpo-largo",
+            vec![account("cuenta", false)],
+            Answer::Allow,
+        )
+        .await;
+        // La «ñ» ocupa los bytes MAX-1 y MAX: el corte cae entre los dos.
+        let text = format!("{}ñ{}", "a".repeat(MAX - 1), "b".repeat(1000));
+        assert!(!text.is_char_boundary(MAX));
+        let id = with_long_message(&api, text).await;
+        let (client, _service) = api.client(":1.7").await;
+
+        let reply = tokio::time::timeout(
+            Duration::from_secs(10),
+            call(&client, "GetMessage", &("cuenta", id)),
+        )
+        .await
+        .expect("GetMessage no contestó: el servicio se cayó al cortar el cuerpo");
+        let message: serde_json::Value =
+            serde_json::from_str(&reply.expect("GetMessage falló")).unwrap();
+
+        let body = message["text_body"].as_str().unwrap();
+        assert_eq!(body.len(), MAX - 1, "se corta antes de la «ñ», no después");
+        assert!(body.chars().all(|c| c == 'a'));
+        assert!(message["html_body"].as_str().unwrap().len() <= MAX);
+        assert_eq!(message["truncated"], true);
+    }
+
+    #[test]
+    fn truncate_at_char_no_corta_lo_que_entra() {
+        let mut text = String::from("canción");
+        assert!(!truncate_at_char(&mut text, 100));
+        let exact = text.len();
+        assert!(!truncate_at_char(&mut text, exact));
+        assert_eq!(text, "canción");
+    }
+
+    #[test]
+    fn truncate_at_char_retrocede_hasta_el_borde_de_un_caracter() {
+        // «ó» son dos bytes (5 y 6); «🎵» son cuatro.
+        let mut text = String::from("canción");
+        assert!(truncate_at_char(&mut text, 6));
+        assert_eq!(text, "canci");
+
+        let mut text = String::from("a🎵b");
+        assert!(truncate_at_char(&mut text, 4));
+        assert_eq!(text, "a");
+
+        let mut text = String::from("abc");
+        assert!(truncate_at_char(&mut text, 2));
+        assert_eq!(text, "ab");
+
+        let mut text = String::from("ñ");
+        assert!(truncate_at_char(&mut text, 1));
+        assert_eq!(text, "");
+    }
+
+    /// El aviso de la sesión en vivo —IDLE, marcar, mover— pide una vuelta del
+    /// correo sin esperar: con la fila llena se descarta en vez de frenar a
+    /// quien avisa, que es la conexión con el servidor.
+    ///
+    /// La fila es global y se fija una sola vez: ésta es la única prueba que la
+    /// fija.
+    #[test]
+    fn avisar_al_correo_pide_una_vuelta_sin_bloquear() {
+        // Antes de que haya fila, avisar no hace nada y no falla.
+        if EMAIL_NUDGE.get().is_none() {
+            nudge_email("nadie");
+        }
+        let (queue, mut pending) = mpsc::channel(1);
+        assert!(EMAIL_NUDGE.set(queue).is_ok(), "otra prueba fijó la fila");
+
+        nudge_email("cuenta");
+        nudge_email("otra");
+        assert_eq!(pending.try_recv().unwrap(), "cuenta");
+        assert!(
+            pending.try_recv().is_err(),
+            "la fila estaba llena: se descarta"
+        );
+    }
 }

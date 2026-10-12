@@ -745,3 +745,6 @@ impl<K: KeySource> AreaSync for EmailSync<K> {
 
 /// Decide cuándo le toca a cada cuenta.
 pub type EmailScheduler<K> = dav_sync::DavScheduler<EmailSync<K>>;
+
+#[cfg(test)]
+mod tests;

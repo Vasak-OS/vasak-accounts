@@ -741,7 +741,7 @@ impl Store {
 mod tests {
     use crate::store::email::{
         MailboxListing, MailboxRole, MessageAttachmentRow, MessageBodyRow, MessageFlagRow,
-        MessageOp, MessageRow,
+        MessageOp, MessageRow, StoredFlags, WRITE_BATCH_ROWS,
     };
     use crate::store::key::tests::fake_keyring;
     use crate::store::paths::tests::TempDir;
@@ -1232,5 +1232,382 @@ mod tests {
         eprintln!("gen_despues = {}", gen_despues);
 
         assert!(gen_despues > gen_antes);
+    }
+
+    // -----------------------------------------------------------------------
+    // Lo que usa la sincronización de correo (`email_sync.rs`)
+    // -----------------------------------------------------------------------
+
+    fn message(mailbox_id: i64, uid: u64, subject: &str, sort_key: i64) -> MessageRow {
+        MessageRow {
+            mailbox_id,
+            uid,
+            message_id: Some(format!("<m{uid}@x>")),
+            from_addr: "Ana <ana@x.com>".into(),
+            to_addrs: "yo@x.com".into(),
+            cc_addrs: String::new(),
+            bcc_addrs: String::new(),
+            reply_to: None,
+            subject: subject.into(),
+            date_ts: sort_key,
+            sort_key,
+            flags_seen: false,
+            flags_answered: false,
+            flags_flagged: false,
+            flags_draft: false,
+            flags_deleted: false,
+            has_attachments: false,
+            size: 100,
+        }
+    }
+
+    fn upsert(store: &mut Store, row: MessageRow) {
+        let mailbox_id = row.mailbox_id;
+        store
+            .apply_messages(vec![MessageOp::Upsert(Box::new(row))], mailbox_id)
+            .unwrap();
+    }
+
+    fn id_of(store: &Store, mailbox_id: i64, uid: u64) -> i64 {
+        store
+            .connection
+            .query_row(
+                "SELECT id FROM messages WHERE mailbox_id = ?1 AND uid = ?2",
+                rusqlite::params![mailbox_id, uid as i64],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn generation(store: &Store) -> u64 {
+        crate::store::read_generation(&store.connection, crate::store::lifecycle::EMAIL_AREA)
+            .unwrap()
+    }
+
+    /// La generación es la hora en microsegundos o la anterior más uno, lo que
+    /// sea mayor. Para poder contar subidas, se la pone muy por delante de la
+    /// hora: desde ahí cada subida es exactamente `+1`.
+    fn pin_generation(store: &Store) -> u64 {
+        const AHEAD: u64 = 4_000_000_000_000_000_000;
+        store
+            .connection
+            .execute(
+                "INSERT INTO store_meta (key, value) VALUES ('generation.email', ?1)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [AHEAD.to_string()],
+            )
+            .unwrap();
+        assert_eq!(generation(store), AHEAD);
+        AHEAD
+    }
+
+    fn count(store: &Store, sql: &str, mailbox_id: i64) -> i64 {
+        store
+            .connection
+            .query_row(sql, [mailbox_id], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn inbox(store: &mut Store) -> i64 {
+        store
+            .upsert_mailboxes(&[mailbox("INBOX", MailboxRole::Inbox)])
+            .unwrap()[0]
+            .id
+    }
+
+    /// La sincronización vuelve a escribir un mensaje que ya estaba —cambió el
+    /// asunto en otra vuelta, o se rehízo la casilla— y ese mensaje ya tenía
+    /// cuerpo, así que ya tenía su fila en el índice de búsqueda. FTS5 no
+    /// acepta dos filas con el mismo `rowid`: sin sacar la vieja antes, el lote
+    /// entero falla y la casilla no se termina de sincronizar nunca.
+    #[test]
+    fn volver_a_guardar_un_mensaje_con_cuerpo_no_choca_con_el_indice() {
+        let (_, mut store) = make_store();
+        let inbox = inbox(&mut store);
+        upsert(&mut store, message(inbox, 1, "Viejo asunto", 100));
+        let id = id_of(&store, inbox, 1);
+        store
+            .upsert_message_body(MessageBodyRow {
+                message_id: id,
+                text_body: Some("cuerpo indexado".into()),
+                html_body: None,
+                truncated: false,
+            })
+            .unwrap();
+
+        let again = store.apply_messages(
+            vec![MessageOp::Upsert(Box::new(message(
+                inbox,
+                1,
+                "Asunto nuevo",
+                100,
+            )))],
+            inbox,
+        );
+        assert!(
+            again.is_ok(),
+            "volver a guardar el mensaje falló: {:?}",
+            again.err()
+        );
+
+        // Y el índice quedó con una sola fila, la del asunto nuevo.
+        let found = |term: &str| -> Vec<i64> {
+            store
+                .connection
+                .prepare("SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?1")
+                .unwrap()
+                .query_map([term], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(found("nuevo"), vec![id]);
+        assert!(
+            found("viejo").is_empty(),
+            "quedó la fila vieja en el índice"
+        );
+        assert_eq!(
+            found("indexado"),
+            vec![id],
+            "se perdió el cuerpo del índice"
+        );
+    }
+
+    #[test]
+    fn las_banderas_guardadas_se_leen_por_uid() {
+        let (_, mut store) = make_store();
+        let inbox = inbox(&mut store);
+        let mut seen = message(inbox, 7, "Leído", 100);
+        seen.flags_seen = true;
+        seen.flags_flagged = true;
+        upsert(&mut store, seen);
+        upsert(&mut store, message(inbox, 9, "Nuevo", 200));
+
+        let flags = store.stored_flags(inbox).unwrap();
+        assert_eq!(flags.len(), 2);
+        assert_eq!(
+            flags[&7],
+            StoredFlags {
+                seen: true,
+                flagged: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(flags[&9], StoredFlags::default());
+        // Otra casilla no ve las de ésta.
+        assert!(store.stored_flags(inbox + 1000).unwrap().is_empty());
+    }
+
+    /// Cambiar banderas despierta a las aplicaciones sólo si algo cambió: una
+    /// vuelta que no encontró nada no puede hacerlas releer la lista.
+    #[test]
+    fn cambiar_banderas_sube_la_generacion_solo_si_cambio_algo() {
+        let (_, mut store) = make_store();
+        let inbox = inbox(&mut store);
+        upsert(&mut store, message(inbox, 1, "Uno", 100));
+        store.take_changes();
+        let before = pin_generation(&store);
+
+        let read = StoredFlags {
+            seen: true,
+            ..Default::default()
+        };
+        assert_eq!(store.update_flags(inbox, &[(1, read)]).unwrap(), 1);
+        assert_eq!(store.stored_flags(inbox).unwrap()[&1], read);
+        assert_eq!(generation(&store), before + 1);
+        assert_eq!(store.take_changes().len(), 1);
+
+        // Un UID que no está: nada cambia y la generación no sube.
+        assert_eq!(store.update_flags(inbox, &[(99, read)]).unwrap(), 0);
+        assert_eq!(store.update_flags(inbox, &[]).unwrap(), 0);
+        assert_eq!(generation(&store), before + 1);
+        assert!(store.take_changes().is_empty());
+    }
+
+    /// Cuando el servidor cambia el `UIDVALIDITY` se vacía la casilla, pero la
+    /// casilla sigue: la sincronización la vuelve a llenar en la misma vuelta.
+    #[test]
+    fn vaciar_una_casilla_deja_la_casilla() {
+        let (_, mut store) = make_store();
+        store
+            .upsert_mailboxes(&[
+                mailbox("INBOX", MailboxRole::Inbox),
+                mailbox("Sent", MailboxRole::Sent),
+            ])
+            .unwrap();
+        let boxes = store.mailboxes().unwrap();
+        let (inbox, sent) = (boxes[0].id, boxes[1].id);
+        let total = WRITE_BATCH_ROWS as u64 + 3;
+        for chunk in (1..=total).collect::<Vec<_>>().chunks(WRITE_BATCH_ROWS) {
+            let ops = chunk
+                .iter()
+                .map(|uid| MessageOp::Upsert(Box::new(message(inbox, *uid, "x", *uid as i64))))
+                .collect();
+            store.apply_messages(ops, inbox).unwrap();
+        }
+        upsert(&mut store, message(sent, 1, "enviado", 1));
+        let before = pin_generation(&store);
+
+        // De a tandas: la primera se lleva un lote entero, la segunda el resto.
+        assert_eq!(store.clear_mailbox_chunk(inbox).unwrap(), WRITE_BATCH_ROWS);
+        assert_eq!(store.clear_mailbox_chunk(inbox).unwrap(), 3);
+        assert_eq!(store.clear_mailbox_chunk(inbox).unwrap(), 0);
+        assert_eq!(
+            generation(&store),
+            before + 2,
+            "una subida por tanda que borró"
+        );
+
+        let names: Vec<String> = store
+            .mailboxes()
+            .unwrap()
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+        assert_eq!(names, vec!["INBOX", "Sent"], "la casilla tenía que quedar");
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM messages WHERE mailbox_id = ?1",
+                inbox
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM messages WHERE mailbox_id = ?1",
+                sent
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn los_mensajes_sin_cuerpo_salen_del_mas_nuevo_al_mas_viejo() {
+        let (_, mut store) = make_store();
+        let inbox = inbox(&mut store);
+        for (uid, key) in [(1, 300), (2, 100), (3, 500), (4, 200)] {
+            upsert(&mut store, message(inbox, uid, "x", key));
+        }
+        // El más nuevo ya tiene cuerpo: no se vuelve a traer.
+        let with_body = id_of(&store, inbox, 3);
+        store
+            .upsert_message_body(MessageBodyRow {
+                message_id: with_body,
+                text_body: Some("ya está".into()),
+                html_body: None,
+                truncated: false,
+            })
+            .unwrap();
+
+        let pending = store.messages_without_body(inbox, 2).unwrap();
+        assert_eq!(
+            pending,
+            vec![(id_of(&store, inbox, 1), 1), (id_of(&store, inbox, 4), 4)]
+        );
+        assert_eq!(store.messages_without_body(inbox, 10).unwrap().len(), 3);
+        assert!(store.messages_without_body(inbox, 0).unwrap().is_empty());
+    }
+
+    /// Traer veinticinco cuerpos en segundo plano no puede despertar a las
+    /// aplicaciones veinticinco veces: una transacción, una subida.
+    #[test]
+    fn guardar_varios_cuerpos_sube_la_generacion_una_sola_vez() {
+        let (_, mut store) = make_store();
+        let inbox = inbox(&mut store);
+        let mut opened = Vec::new();
+        for uid in 1..=5 {
+            upsert(&mut store, message(inbox, uid, "x", uid as i64));
+            let id = id_of(&store, inbox, uid);
+            opened.push((
+                MessageBodyRow {
+                    message_id: id,
+                    text_body: Some(format!("cuerpo{uid}")),
+                    html_body: Some("<p>hola</p>".into()),
+                    truncated: false,
+                },
+                vec![MessageAttachmentRow {
+                    message_id: id,
+                    part_number: "2".into(),
+                    name: Some("a.pdf".into()),
+                    content_type: "application/pdf".into(),
+                    size: 0,
+                    inline: false,
+                    content_id: None,
+                }],
+            ));
+        }
+        store.take_changes();
+        let before = pin_generation(&store);
+
+        store.store_opened(opened).unwrap();
+
+        assert_eq!(generation(&store), before + 1);
+        assert_eq!(store.take_changes().len(), 1);
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM message_bodies WHERE ?1 > 0",
+                1
+            ),
+            5
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM message_attachments WHERE ?1 > 0",
+                1
+            ),
+            5
+        );
+        assert!(store.messages_without_body(inbox, 10).unwrap().is_empty());
+
+        // Nada que guardar: nada se escribe ni se avisa.
+        store.store_opened(Vec::new()).unwrap();
+        assert_eq!(generation(&store), before + 1);
+    }
+
+    /// El token de una casilla es dónde quedó la sincronización, no algo que
+    /// lea una aplicación: guardarlo no sube la generación, y guardar el mismo
+    /// no escribe nada.
+    #[test]
+    fn guardar_el_token_de_una_casilla_no_sube_la_generacion() {
+        let (_, mut store) = make_store();
+        inbox(&mut store);
+        store.take_changes();
+        let before = generation(&store);
+        let updated_at = |store: &Store| -> String {
+            store
+                .connection
+                .query_row(
+                    "SELECT updated_at FROM mailboxes WHERE name = 'INBOX'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+
+        store
+            .set_mailbox_modseq("INBOX", Some("v1 7 100 3 2".into()))
+            .unwrap();
+        assert_eq!(
+            store.mailboxes().unwrap()[0].modseq.as_deref(),
+            Some("v1 7 100 3 2")
+        );
+        assert_eq!(generation(&store), before);
+        assert!(store.take_changes().is_empty());
+
+        // El mismo token otra vez: no se toca la fila.
+        let stamp = updated_at(&store);
+        store
+            .set_mailbox_modseq("INBOX", Some("v1 7 100 3 2".into()))
+            .unwrap();
+        assert_eq!(updated_at(&store), stamp);
+
+        // Y se puede volver a dejar sin token.
+        store.set_mailbox_modseq("INBOX", None).unwrap();
+        assert_eq!(store.mailboxes().unwrap()[0].modseq, None);
+        assert_eq!(generation(&store), before);
     }
 }
