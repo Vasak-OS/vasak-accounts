@@ -24,6 +24,8 @@
 //! casilla, y cada lote que cambia algo sube la generación del área `email`
 //! en su misma transacción.
 
+use std::collections::HashMap;
+
 use rusqlite::{OptionalExtension, Transaction};
 
 use super::lifecycle::EMAIL_AREA;
@@ -157,6 +159,16 @@ pub enum MessageFlagOp {
     Delete(i64, String), // message_id, flag
 }
 
+/// Las banderas que son columna en `messages`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StoredFlags {
+    pub seen: bool,
+    pub answered: bool,
+    pub flagged: bool,
+    pub draft: bool,
+    pub deleted: bool,
+}
+
 /// Dónde quedó una casilla al terminar: va con el último lote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailboxProgress {
@@ -171,6 +183,77 @@ pub enum Applied {
     Written { net_bytes: i64 },
     /// No se escribió nada: la cuenta crecería más de lo que había lugar.
     OverCap,
+}
+
+/// Escribe un cuerpo y lo pasa al índice de búsqueda.
+fn write_body(transaction: &Transaction, body: MessageBodyRow) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "INSERT INTO message_bodies (message_id, text_body, html_body, truncated, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (message_id) DO UPDATE SET
+                     text_body = excluded.text_body,
+                     html_body = excluded.html_body,
+                     truncated = excluded.truncated,
+                     updated_at = excluded.updated_at",
+            rusqlite::params![
+                body.message_id,
+                body.text_body,
+                body.html_body,
+                body.truncated as i64,
+                now(),
+            ],
+        )
+        .map_err(classify)?;
+
+    // Actualizar índice FTS5 con el cuerpo de texto
+    if let Some(text) = body.text_body {
+        transaction
+            .execute(
+                "DELETE FROM messages_fts WHERE rowid = ?1",
+                [body.message_id],
+            )
+            .map_err(classify)?;
+        transaction
+                .execute(
+                    "INSERT INTO messages_fts (rowid, subject, from_addr, to_addrs, cc_addrs, text_body)
+                     SELECT ?1, subject, from_addr, to_addrs, cc_addrs, ?2
+                     FROM messages WHERE id = ?1",
+                    rusqlite::params![body.message_id, text],
+                )
+                .map_err(classify)?;
+    }
+    Ok(())
+}
+
+/// Escribe un adjunto.
+fn write_attachment(
+    transaction: &Transaction,
+    attachment: MessageAttachmentRow,
+) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "INSERT INTO message_attachments
+                    (message_id, part_number, name, content_type, size, inline, content_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT (message_id, part_number) DO UPDATE SET
+                     name = excluded.name,
+                     content_type = excluded.content_type,
+                     size = excluded.size,
+                     inline = excluded.inline,
+                     content_id = excluded.content_id",
+            rusqlite::params![
+                attachment.message_id,
+                &attachment.part_number,
+                attachment.name,
+                &attachment.content_type,
+                attachment.size,
+                attachment.inline as i64,
+                attachment.content_id,
+            ],
+        )
+        .map_err(classify)?;
+    Ok(())
 }
 
 fn now() -> String {
@@ -325,24 +408,197 @@ impl Store {
     }
 
     /// Guarda el `modseq` de una casilla (al terminar su vuelta).
+    ///
+    /// Sólo si cambió, y **sin subir la generación**: es dónde quedó la
+    /// sincronización, no algo que lea ninguna aplicación. Subirla en cada
+    /// vuelta haría que todas relean una lista idéntica.
     pub fn set_mailbox_modseq(
         &mut self,
         name: &str,
         modseq: Option<String>,
     ) -> Result<(), StoreError> {
-        let changed = self
-            .connection
+        self.connection
             .execute(
-                "UPDATE mailboxes SET modseq = ?1, updated_at = ?2 WHERE name = ?3",
+                "UPDATE mailboxes SET modseq = ?1, updated_at = ?2
+                 WHERE name = ?3 AND modseq IS NOT ?1",
                 rusqlite::params![modseq, now(), name],
+            )
+            .map_err(classify)?;
+        Ok(())
+    }
+
+    /// Marca como leído un mensaje guardado, por el nombre de su casilla y su
+    /// UID: lo que hizo la aplicación en el servidor se ve en el almacén en el
+    /// acto, sin esperar a la próxima vuelta. Devuelve si cambió algo.
+    pub fn mark_seen(&mut self, mailbox: &str, uid: u64) -> Result<bool, StoreError> {
+        let transaction = self.connection.transaction().map_err(classify)?;
+        let changed = transaction
+            .execute(
+                "UPDATE messages SET flags_seen = 1, updated_at = ?1
+                 WHERE uid = ?2 AND flags_seen = 0
+                   AND mailbox_id = (SELECT id FROM mailboxes WHERE name = ?3)",
+                rusqlite::params![now(), uid as i64, mailbox],
             )
             .map_err(classify)?
             > 0;
-        if changed {
-            let generation = bump_generation(&self.connection, EMAIL_AREA)?;
+        let generation = if changed {
+            Some(bump_generation(&transaction, EMAIL_AREA)?)
+        } else {
+            None
+        };
+        transaction.commit().map_err(classify)?;
+        if let Some(generation) = generation {
             self.note_change(EMAIL_AREA, generation);
         }
-        Ok(())
+        Ok(changed)
+    }
+
+    /// Saca del almacén un mensaje que se movió o se borró en el servidor.
+    /// Donde llegó lo trae la próxima vuelta. Devuelve si estaba.
+    pub fn forget_message(&mut self, mailbox: &str, uid: u64) -> Result<bool, StoreError> {
+        let transaction = self.connection.transaction().map_err(classify)?;
+        let removed = transaction
+            .execute(
+                "DELETE FROM messages
+                 WHERE uid = ?1 AND mailbox_id = (SELECT id FROM mailboxes WHERE name = ?2)",
+                rusqlite::params![uid as i64, mailbox],
+            )
+            .map_err(classify)?
+            > 0;
+        let generation = if removed {
+            Some(bump_generation(&transaction, EMAIL_AREA)?)
+        } else {
+            None
+        };
+        transaction.commit().map_err(classify)?;
+        if let Some(generation) = generation {
+            self.note_change(EMAIL_AREA, generation);
+        }
+        Ok(removed)
+    }
+
+    /// Las banderas guardadas de cada UID de una casilla.
+    pub fn stored_flags(&self, mailbox_id: i64) -> Result<HashMap<u64, StoredFlags>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare_cached(
+                "SELECT uid, flags_seen, flags_answered, flags_flagged, flags_draft, flags_deleted
+                 FROM messages WHERE mailbox_id = ?1",
+            )
+            .map_err(classify)?;
+        let rows = statement
+            .query_map([mailbox_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    StoredFlags {
+                        seen: row.get(1)?,
+                        answered: row.get(2)?,
+                        flagged: row.get(3)?,
+                        draft: row.get(4)?,
+                        deleted: row.get(5)?,
+                    },
+                ))
+            })
+            .map_err(classify)?;
+        rows.collect::<Result<_, _>>().map_err(classify)
+    }
+
+    /// Cambia las banderas de unos mensajes ya guardados, en una transacción.
+    /// Devuelve cuántos cambiaron; la generación sube sólo si fue alguno.
+    pub fn update_flags(
+        &mut self,
+        mailbox_id: i64,
+        changes: &[(u64, StoredFlags)],
+    ) -> Result<usize, StoreError> {
+        if changes.is_empty() {
+            return Ok(0);
+        }
+        let transaction = self.connection.transaction().map_err(classify)?;
+        let mut changed = 0;
+        {
+            let mut statement = transaction
+                .prepare_cached(
+                    "UPDATE messages SET flags_seen = ?1, flags_answered = ?2, flags_flagged = ?3,
+                            flags_draft = ?4, flags_deleted = ?5, updated_at = ?6
+                     WHERE mailbox_id = ?7 AND uid = ?8",
+                )
+                .map_err(classify)?;
+            let stamp = now();
+            for (uid, f) in changes {
+                changed += statement
+                    .execute(rusqlite::params![
+                        f.seen,
+                        f.answered,
+                        f.flagged,
+                        f.draft,
+                        f.deleted,
+                        &stamp,
+                        mailbox_id,
+                        *uid as i64
+                    ])
+                    .map_err(classify)?;
+            }
+        }
+        let generation = if changed > 0 {
+            Some(bump_generation(&transaction, EMAIL_AREA)?)
+        } else {
+            None
+        };
+        transaction.commit().map_err(classify)?;
+        if let Some(generation) = generation {
+            self.note_change(EMAIL_AREA, generation);
+        }
+        Ok(changed)
+    }
+
+    /// Borra una tanda de los mensajes de una casilla **sin** borrar la
+    /// casilla: es lo que se hace cuando el servidor cambió el `UIDVALIDITY`
+    /// y los UID guardados ya no apuntan a nada. Se llama hasta que devuelve
+    /// cero.
+    pub fn clear_mailbox_chunk(&mut self, mailbox_id: i64) -> Result<usize, StoreError> {
+        let transaction = self.connection.transaction().map_err(classify)?;
+        let removed = transaction
+            .execute(
+                "DELETE FROM messages WHERE id IN
+                   (SELECT id FROM messages WHERE mailbox_id = ?1 LIMIT ?2)",
+                rusqlite::params![mailbox_id, WRITE_BATCH_ROWS as i64],
+            )
+            .map_err(classify)?;
+        let generation = if removed > 0 {
+            Some(bump_generation(&transaction, EMAIL_AREA)?)
+        } else {
+            None
+        };
+        transaction.commit().map_err(classify)?;
+        if let Some(generation) = generation {
+            self.note_change(EMAIL_AREA, generation);
+        }
+        Ok(removed)
+    }
+
+    /// Los mensajes más nuevos de una casilla que todavía no tienen cuerpo:
+    /// `(id, uid)`, del más nuevo al más viejo.
+    pub fn messages_without_body(
+        &self,
+        mailbox_id: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, u64)>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare_cached(
+                "SELECT m.id, m.uid FROM messages m
+                 LEFT JOIN message_bodies b ON b.message_id = m.id
+                 WHERE m.mailbox_id = ?1 AND b.message_id IS NULL
+                 ORDER BY m.sort_key DESC, m.id DESC
+                 LIMIT ?2",
+            )
+            .map_err(classify)?;
+        let rows = statement
+            .query_map(rusqlite::params![mailbox_id, limit as i64], |row| {
+                Ok((row.get(0)?, row.get::<_, i64>(1)? as u64))
+            })
+            .map_err(classify)?;
+        rows.collect::<Result<_, _>>().map_err(classify)
     }
 
     /// Aplica un lote de operaciones sobre mensajes. Devuelve cuántos bytes
@@ -365,7 +621,7 @@ impl Store {
         let mut net_bytes: i64 = 0;
         for op in &ops {
             if let MessageOp::Upsert(m) = op {
-                net_bytes += m.size;
+                net_bytes = net_bytes.saturating_add(m.size);
             }
         }
 
@@ -433,7 +689,12 @@ impl Store {
                         )
                         .map_err(classify)?;
 
-                    // Poblar índice FTS5 usando el cuerpo ya guardado en message_bodies
+                    // Poblar índice FTS5 usando el cuerpo ya guardado en message_bodies.
+                    // Si el mensaje ya estaba, su fila del índice se saca antes:
+                    // FTS5 no acepta dos filas con el mismo `rowid`.
+                    transaction
+                        .execute("DELETE FROM messages_fts WHERE rowid = ?1", [msg_id])
+                        .map_err(classify)?;
                     transaction
                         .execute(
                             "INSERT INTO messages_fts (rowid, subject, from_addr, to_addrs, cc_addrs, text_body)
@@ -466,42 +727,25 @@ impl Store {
 
     /// Guarda el cuerpo de un mensaje (cuando se abre).
     pub fn upsert_message_body(&mut self, body: MessageBodyRow) -> Result<(), StoreError> {
-        self.with_transaction_email(|transaction| {
-            transaction
-                .execute(
-                    "INSERT INTO message_bodies (message_id, text_body, html_body, truncated, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT (message_id) DO UPDATE SET
-                         text_body = excluded.text_body,
-                         html_body = excluded.html_body,
-                         truncated = excluded.truncated,
-                         updated_at = excluded.updated_at",
-                    rusqlite::params![
-                        body.message_id,
-                        body.text_body,
-                        body.html_body,
-                        body.truncated as i64,
-                        now(),
-                    ],
-                )
-                .map_err(classify)?;
+        self.with_transaction_email(|transaction| write_body(transaction, body))
+    }
 
-            // Actualizar índice FTS5 con el cuerpo de texto
-            if let Some(text) = body.text_body {
-                transaction
-                    .execute(
-                        "DELETE FROM messages_fts WHERE rowid = ?1",
-                        [body.message_id],
-                    )
-                    .map_err(classify)?;
-                transaction
-                    .execute(
-                        "INSERT INTO messages_fts (rowid, subject, from_addr, to_addrs, cc_addrs, text_body)
-                         SELECT ?1, subject, from_addr, to_addrs, cc_addrs, ?2
-                         FROM messages WHERE id = ?1",
-                        rusqlite::params![body.message_id, text],
-                    )
-                    .map_err(classify)?;
+    /// Guarda los cuerpos —y los adjuntos— de varios mensajes en **una**
+    /// transacción, con una sola subida de generación: traer de a tandas en
+    /// segundo plano no puede despertar a las aplicaciones una vez por mensaje.
+    pub fn store_opened(
+        &mut self,
+        opened: Vec<(MessageBodyRow, Vec<MessageAttachmentRow>)>,
+    ) -> Result<(), StoreError> {
+        if opened.is_empty() {
+            return Ok(());
+        }
+        self.with_transaction_email(|transaction| {
+            for (body, attachments) in opened {
+                write_body(transaction, body)?;
+                for attachment in attachments {
+                    write_attachment(transaction, attachment)?;
+                }
             }
             Ok(())
         })
@@ -512,31 +756,7 @@ impl Store {
         &mut self,
         attachment: MessageAttachmentRow,
     ) -> Result<(), StoreError> {
-        self.with_transaction_email(|transaction| {
-            transaction
-                .execute(
-                    "INSERT INTO message_attachments
-                        (message_id, part_number, name, content_type, size, inline, content_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                     ON CONFLICT (message_id, part_number) DO UPDATE SET
-                         name = excluded.name,
-                         content_type = excluded.content_type,
-                         size = excluded.size,
-                         inline = excluded.inline,
-                         content_id = excluded.content_id",
-                    rusqlite::params![
-                        attachment.message_id,
-                        &attachment.part_number,
-                        attachment.name,
-                        &attachment.content_type,
-                        attachment.size,
-                        attachment.inline as i64,
-                        attachment.content_id,
-                    ],
-                )
-                .map_err(classify)?;
-            Ok(())
-        })
+        self.with_transaction_email(|transaction| write_attachment(transaction, attachment))
     }
 
     /// Guarda una bandera extra.
@@ -570,8 +790,8 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use crate::store::email::{
-        MailboxListing, MailboxRole, MessageAttachmentRow, MessageBodyRow, MessageFlagRow,
-        MessageOp, MessageRow,
+        Applied, MailboxListing, MailboxRole, MessageAttachmentRow, MessageBodyRow, MessageFlagRow,
+        MessageOp, MessageRow, StoredFlags, WRITE_BATCH_ROWS,
     };
     use crate::store::key::tests::fake_keyring;
     use crate::store::paths::tests::TempDir;
@@ -1062,5 +1282,480 @@ mod tests {
         eprintln!("gen_despues = {}", gen_despues);
 
         assert!(gen_despues > gen_antes);
+    }
+
+    // -----------------------------------------------------------------------
+    // Lo que usa la sincronización de correo (`email_sync.rs`)
+    // -----------------------------------------------------------------------
+
+    fn message(mailbox_id: i64, uid: u64, subject: &str, sort_key: i64) -> MessageRow {
+        MessageRow {
+            mailbox_id,
+            uid,
+            message_id: Some(format!("<m{uid}@x>")),
+            from_addr: "Ana <ana@x.com>".into(),
+            to_addrs: "yo@x.com".into(),
+            cc_addrs: String::new(),
+            bcc_addrs: String::new(),
+            reply_to: None,
+            subject: subject.into(),
+            date_ts: sort_key,
+            sort_key,
+            flags_seen: false,
+            flags_answered: false,
+            flags_flagged: false,
+            flags_draft: false,
+            flags_deleted: false,
+            has_attachments: false,
+            size: 100,
+        }
+    }
+
+    fn upsert(store: &mut Store, row: MessageRow) {
+        let mailbox_id = row.mailbox_id;
+        store
+            .apply_messages(vec![MessageOp::Upsert(Box::new(row))], mailbox_id)
+            .unwrap();
+    }
+
+    fn id_of(store: &Store, mailbox_id: i64, uid: u64) -> i64 {
+        store
+            .connection
+            .query_row(
+                "SELECT id FROM messages WHERE mailbox_id = ?1 AND uid = ?2",
+                rusqlite::params![mailbox_id, uid as i64],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn generation(store: &Store) -> u64 {
+        crate::store::read_generation(&store.connection, crate::store::lifecycle::EMAIL_AREA)
+            .unwrap()
+    }
+
+    /// La generación es la hora en microsegundos o la anterior más uno, lo que
+    /// sea mayor. Para poder contar subidas, se la pone muy por delante de la
+    /// hora: desde ahí cada subida es exactamente `+1`.
+    fn pin_generation(store: &Store) -> u64 {
+        const AHEAD: u64 = 4_000_000_000_000_000_000;
+        store
+            .connection
+            .execute(
+                "INSERT INTO store_meta (key, value) VALUES ('generation.email', ?1)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [AHEAD.to_string()],
+            )
+            .unwrap();
+        assert_eq!(generation(store), AHEAD);
+        AHEAD
+    }
+
+    fn count(store: &Store, sql: &str, mailbox_id: i64) -> i64 {
+        store
+            .connection
+            .query_row(sql, [mailbox_id], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn inbox(store: &mut Store) -> i64 {
+        store
+            .upsert_mailboxes(&[mailbox("INBOX", MailboxRole::Inbox)])
+            .unwrap()[0]
+            .id
+    }
+
+    /// La sincronización vuelve a escribir un mensaje que ya estaba —cambió el
+    /// asunto en otra vuelta, o se rehízo la casilla— y ese mensaje ya tenía
+    /// cuerpo, así que ya tenía su fila en el índice de búsqueda. FTS5 no
+    /// acepta dos filas con el mismo `rowid`: sin sacar la vieja antes, el lote
+    /// entero falla y la casilla no se termina de sincronizar nunca.
+    #[test]
+    fn volver_a_guardar_un_mensaje_con_cuerpo_no_choca_con_el_indice() {
+        let (_, mut store) = make_store();
+        let inbox = inbox(&mut store);
+        upsert(&mut store, message(inbox, 1, "Viejo asunto", 100));
+        let id = id_of(&store, inbox, 1);
+        store
+            .upsert_message_body(MessageBodyRow {
+                message_id: id,
+                text_body: Some("cuerpo indexado".into()),
+                html_body: None,
+                truncated: false,
+            })
+            .unwrap();
+
+        let again = store.apply_messages(
+            vec![MessageOp::Upsert(Box::new(message(
+                inbox,
+                1,
+                "Asunto nuevo",
+                100,
+            )))],
+            inbox,
+        );
+        assert!(
+            again.is_ok(),
+            "volver a guardar el mensaje falló: {:?}",
+            again.err()
+        );
+
+        // Y el índice quedó con una sola fila, la del asunto nuevo.
+        let found = |term: &str| -> Vec<i64> {
+            store
+                .connection
+                .prepare("SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?1")
+                .unwrap()
+                .query_map([term], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(found("nuevo"), vec![id]);
+        assert!(
+            found("viejo").is_empty(),
+            "quedó la fila vieja en el índice"
+        );
+        assert_eq!(
+            found("indexado"),
+            vec![id],
+            "se perdió el cuerpo del índice"
+        );
+    }
+
+    #[test]
+    fn las_banderas_guardadas_se_leen_por_uid() {
+        let (_, mut store) = make_store();
+        let inbox = inbox(&mut store);
+        let mut seen = message(inbox, 7, "Leído", 100);
+        seen.flags_seen = true;
+        seen.flags_flagged = true;
+        upsert(&mut store, seen);
+        upsert(&mut store, message(inbox, 9, "Nuevo", 200));
+
+        let flags = store.stored_flags(inbox).unwrap();
+        assert_eq!(flags.len(), 2);
+        assert_eq!(
+            flags[&7],
+            StoredFlags {
+                seen: true,
+                flagged: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(flags[&9], StoredFlags::default());
+        // Otra casilla no ve las de ésta.
+        assert!(store.stored_flags(inbox + 1000).unwrap().is_empty());
+    }
+
+    /// Cambiar banderas despierta a las aplicaciones sólo si algo cambió: una
+    /// vuelta que no encontró nada no puede hacerlas releer la lista.
+    #[test]
+    fn cambiar_banderas_sube_la_generacion_solo_si_cambio_algo() {
+        let (_, mut store) = make_store();
+        let inbox = inbox(&mut store);
+        upsert(&mut store, message(inbox, 1, "Uno", 100));
+        store.take_changes();
+        let before = pin_generation(&store);
+
+        let read = StoredFlags {
+            seen: true,
+            ..Default::default()
+        };
+        assert_eq!(store.update_flags(inbox, &[(1, read)]).unwrap(), 1);
+        assert_eq!(store.stored_flags(inbox).unwrap()[&1], read);
+        assert_eq!(generation(&store), before + 1);
+        assert_eq!(store.take_changes().len(), 1);
+
+        // Un UID que no está: nada cambia y la generación no sube.
+        assert_eq!(store.update_flags(inbox, &[(99, read)]).unwrap(), 0);
+        assert_eq!(store.update_flags(inbox, &[]).unwrap(), 0);
+        assert_eq!(generation(&store), before + 1);
+        assert!(store.take_changes().is_empty());
+    }
+
+    /// Cuando el servidor cambia el `UIDVALIDITY` se vacía la casilla, pero la
+    /// casilla sigue: la sincronización la vuelve a llenar en la misma vuelta.
+    #[test]
+    fn vaciar_una_casilla_deja_la_casilla() {
+        let (_, mut store) = make_store();
+        store
+            .upsert_mailboxes(&[
+                mailbox("INBOX", MailboxRole::Inbox),
+                mailbox("Sent", MailboxRole::Sent),
+            ])
+            .unwrap();
+        let boxes = store.mailboxes().unwrap();
+        let (inbox, sent) = (boxes[0].id, boxes[1].id);
+        let total = WRITE_BATCH_ROWS as u64 + 3;
+        for chunk in (1..=total).collect::<Vec<_>>().chunks(WRITE_BATCH_ROWS) {
+            let ops = chunk
+                .iter()
+                .map(|uid| MessageOp::Upsert(Box::new(message(inbox, *uid, "x", *uid as i64))))
+                .collect();
+            store.apply_messages(ops, inbox).unwrap();
+        }
+        upsert(&mut store, message(sent, 1, "enviado", 1));
+        let before = pin_generation(&store);
+
+        // De a tandas: la primera se lleva un lote entero, la segunda el resto.
+        assert_eq!(store.clear_mailbox_chunk(inbox).unwrap(), WRITE_BATCH_ROWS);
+        assert_eq!(store.clear_mailbox_chunk(inbox).unwrap(), 3);
+        assert_eq!(store.clear_mailbox_chunk(inbox).unwrap(), 0);
+        assert_eq!(
+            generation(&store),
+            before + 2,
+            "una subida por tanda que borró"
+        );
+
+        let names: Vec<String> = store
+            .mailboxes()
+            .unwrap()
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+        assert_eq!(names, vec!["INBOX", "Sent"], "la casilla tenía que quedar");
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM messages WHERE mailbox_id = ?1",
+                inbox
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM messages WHERE mailbox_id = ?1",
+                sent
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn los_mensajes_sin_cuerpo_salen_del_mas_nuevo_al_mas_viejo() {
+        let (_, mut store) = make_store();
+        let inbox = inbox(&mut store);
+        for (uid, key) in [(1, 300), (2, 100), (3, 500), (4, 200)] {
+            upsert(&mut store, message(inbox, uid, "x", key));
+        }
+        // El más nuevo ya tiene cuerpo: no se vuelve a traer.
+        let with_body = id_of(&store, inbox, 3);
+        store
+            .upsert_message_body(MessageBodyRow {
+                message_id: with_body,
+                text_body: Some("ya está".into()),
+                html_body: None,
+                truncated: false,
+            })
+            .unwrap();
+
+        let pending = store.messages_without_body(inbox, 2).unwrap();
+        assert_eq!(
+            pending,
+            vec![(id_of(&store, inbox, 1), 1), (id_of(&store, inbox, 4), 4)]
+        );
+        assert_eq!(store.messages_without_body(inbox, 10).unwrap().len(), 3);
+        assert!(store.messages_without_body(inbox, 0).unwrap().is_empty());
+    }
+
+    /// Traer veinticinco cuerpos en segundo plano no puede despertar a las
+    /// aplicaciones veinticinco veces: una transacción, una subida.
+    #[test]
+    fn guardar_varios_cuerpos_sube_la_generacion_una_sola_vez() {
+        let (_, mut store) = make_store();
+        let inbox = inbox(&mut store);
+        let mut opened = Vec::new();
+        for uid in 1..=5 {
+            upsert(&mut store, message(inbox, uid, "x", uid as i64));
+            let id = id_of(&store, inbox, uid);
+            opened.push((
+                MessageBodyRow {
+                    message_id: id,
+                    text_body: Some(format!("cuerpo{uid}")),
+                    html_body: Some("<p>hola</p>".into()),
+                    truncated: false,
+                },
+                vec![MessageAttachmentRow {
+                    message_id: id,
+                    part_number: "2".into(),
+                    name: Some("a.pdf".into()),
+                    content_type: "application/pdf".into(),
+                    size: 0,
+                    inline: false,
+                    content_id: None,
+                }],
+            ));
+        }
+        store.take_changes();
+        let before = pin_generation(&store);
+
+        store.store_opened(opened).unwrap();
+
+        assert_eq!(generation(&store), before + 1);
+        assert_eq!(store.take_changes().len(), 1);
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM message_bodies WHERE ?1 > 0",
+                1
+            ),
+            5
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM message_attachments WHERE ?1 > 0",
+                1
+            ),
+            5
+        );
+        assert!(store.messages_without_body(inbox, 10).unwrap().is_empty());
+
+        // Nada que guardar: nada se escribe ni se avisa.
+        store.store_opened(Vec::new()).unwrap();
+        assert_eq!(generation(&store), before + 1);
+    }
+
+    /// El token de una casilla es dónde quedó la sincronización, no algo que
+    /// lea una aplicación: guardarlo no sube la generación, y guardar el mismo
+    /// no escribe nada.
+    #[test]
+    fn guardar_el_token_de_una_casilla_no_sube_la_generacion() {
+        let (_, mut store) = make_store();
+        inbox(&mut store);
+        store.take_changes();
+        let before = generation(&store);
+        let updated_at = |store: &Store| -> String {
+            store
+                .connection
+                .query_row(
+                    "SELECT updated_at FROM mailboxes WHERE name = 'INBOX'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+
+        store
+            .set_mailbox_modseq("INBOX", Some("v1 7 100 3 2".into()))
+            .unwrap();
+        assert_eq!(
+            store.mailboxes().unwrap()[0].modseq.as_deref(),
+            Some("v1 7 100 3 2")
+        );
+        assert_eq!(generation(&store), before);
+        assert!(store.take_changes().is_empty());
+
+        // El mismo token otra vez: no se toca la fila.
+        let stamp = updated_at(&store);
+        store
+            .set_mailbox_modseq("INBOX", Some("v1 7 100 3 2".into()))
+            .unwrap();
+        assert_eq!(updated_at(&store), stamp);
+
+        // Y se puede volver a dejar sin token.
+        store.set_mailbox_modseq("INBOX", None).unwrap();
+        assert_eq!(store.mailboxes().unwrap()[0].modseq, None);
+        assert_eq!(generation(&store), before);
+    }
+
+    /// Lo que la aplicación marcó como leído en el servidor se ve en el
+    /// almacén en el acto. Marcar lo que ya estaba leído, o algo que no está,
+    /// no escribe nada ni despierta a nadie.
+    #[test]
+    fn marcar_como_leido_cambia_solo_lo_que_hace_falta() {
+        let (_, mut store) = make_store();
+        store
+            .upsert_mailboxes(&[
+                mailbox("INBOX", MailboxRole::Inbox),
+                mailbox("Sent", MailboxRole::Sent),
+            ])
+            .unwrap();
+        let boxes = store.mailboxes().unwrap();
+        let (inbox, sent) = (boxes[0].id, boxes[1].id);
+        upsert(&mut store, message(inbox, 7, "x", 1));
+        upsert(&mut store, message(sent, 7, "x", 1));
+        store.take_changes();
+        let before = pin_generation(&store);
+
+        assert!(store.mark_seen("INBOX", 7).unwrap());
+        assert!(store.stored_flags(inbox).unwrap()[&7].seen);
+        assert!(
+            !store.stored_flags(sent).unwrap()[&7].seen,
+            "se marcó el de otra casilla con el mismo UID"
+        );
+        assert_eq!(generation(&store), before + 1);
+        assert_eq!(store.take_changes().len(), 1);
+
+        // Ya leído, un UID que no está, una casilla que no está.
+        assert!(!store.mark_seen("INBOX", 7).unwrap());
+        assert!(!store.mark_seen("INBOX", 8).unwrap());
+        assert!(!store.mark_seen("Desconocida", 7).unwrap());
+        assert_eq!(generation(&store), before + 1);
+        assert!(store.take_changes().is_empty());
+    }
+
+    /// Un mensaje que la aplicación movió o borró sale del almacén en el acto,
+    /// sólo de su casilla.
+    #[test]
+    fn olvidar_un_mensaje_lo_saca_solo_de_su_casilla() {
+        let (_, mut store) = make_store();
+        store
+            .upsert_mailboxes(&[
+                mailbox("INBOX", MailboxRole::Inbox),
+                mailbox("Sent", MailboxRole::Sent),
+            ])
+            .unwrap();
+        let boxes = store.mailboxes().unwrap();
+        let (inbox, sent) = (boxes[0].id, boxes[1].id);
+        upsert(&mut store, message(inbox, 7, "x", 1));
+        upsert(&mut store, message(inbox, 8, "y", 2));
+        upsert(&mut store, message(sent, 7, "x", 1));
+        store.take_changes();
+        let before = pin_generation(&store);
+
+        assert!(store.forget_message("INBOX", 7).unwrap());
+        let left: Vec<u64> = store.stored_flags(inbox).unwrap().into_keys().collect();
+        assert_eq!(left, vec![8]);
+        assert_eq!(store.stored_flags(sent).unwrap().len(), 1);
+        assert_eq!(generation(&store), before + 1);
+        assert_eq!(store.take_changes().len(), 1);
+
+        assert!(!store.forget_message("INBOX", 7).unwrap());
+        assert!(!store.forget_message("Desconocida", 8).unwrap());
+        assert_eq!(generation(&store), before + 1);
+        assert!(store.take_changes().is_empty());
+    }
+
+    /// El tamaño de cada mensaje lo dice el servidor. Dos que dicen
+    /// `i64::MAX` no pueden hacer caer el proceso al sumarlos.
+    #[test]
+    fn dos_tamanos_enormes_no_desbordan_la_cuenta_del_lote() {
+        let (_, mut store) = make_store();
+        let inbox = inbox(&mut store);
+        let mut a = message(inbox, 1, "a", 1);
+        a.size = i64::MAX;
+        let mut b = message(inbox, 2, "b", 2);
+        b.size = i64::MAX;
+
+        let applied = store.apply_messages(
+            vec![
+                MessageOp::Upsert(Box::new(a)),
+                MessageOp::Upsert(Box::new(b)),
+            ],
+            inbox,
+        );
+        assert!(
+            matches!(
+                applied,
+                Ok(Applied::Written {
+                    net_bytes: i64::MAX
+                })
+            ),
+            "{applied:?}"
+        );
+        assert_eq!(store.stored_flags(inbox).unwrap().len(), 2);
     }
 }
