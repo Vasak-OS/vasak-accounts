@@ -1495,9 +1495,6 @@ mod tests {
         assert_eq!(card_ids(&pages), all_ids);
     }
 
-    /// Una tarjeta que sola no entra en ninguna página se saltea, y la lista
-    /// sigue después de ella: ni un error, ni una página que vuelve siempre
-    /// igual, ni el final de la lista antes de tiempo.
     /// Una tarjeta que entra justa en el tope —su JSON y su coma son el tope—
     /// no termina la lista: sale sola en su página.
     #[test]
@@ -1517,6 +1514,9 @@ mod tests {
         );
     }
 
+    /// Una tarjeta que sola no entra en ninguna página se saltea, y la lista
+    /// sigue después de ella: ni un error, ni una página que vuelve siempre
+    /// igual, ni el final de la lista antes de tiempo.
     #[test]
     fn una_tarjeta_que_sola_no_entra_se_saltea_y_la_lista_sigue() {
         let temp = TempDir::new("tarjetas-grande");
