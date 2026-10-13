@@ -287,22 +287,31 @@ impl DesktopSink {
     }
 }
 
+/// La tarjeta de un recordatorio: de qué aplicación es, su ícono y su entrada de
+/// menú, con el texto ya armado. Separada del envío real para poder comprobar
+/// cómo se presenta sin un bus detrás. Cada recordatorio es nuevo
+/// (`replaces: 0`) y no lleva botones.
+fn reminder_card<'a>(title: &'a str, body: &'a str) -> notifications::Card<'a> {
+    notifications::Card {
+        app_name: APP_NAME,
+        icon: ICON,
+        desktop_entry: DESKTOP_ENTRY,
+        replaces: 0,
+        title,
+        body,
+        actions: &[],
+    }
+}
+
 impl ReminderSink for DesktopSink {
     async fn show(&self, reminder: &DueReminder) {
-        let now = Utc::now().timestamp();
-        let (title, body) =
-            reminder_text(&reminder.title, reminder.starts_at, now, reminder.all_day);
-        let card = notifications::Card {
-            app_name: APP_NAME,
-            icon: ICON,
-            desktop_entry: DESKTOP_ENTRY,
-            // Cada recordatorio es nuevo: no reemplaza a ninguno.
-            replaces: 0,
-            title: &title,
-            body: &body,
-            actions: &[],
-        };
-        let _ = notifications::show(&self.connection, &card).await;
+        let (title, body) = reminder_text(
+            &reminder.title,
+            reminder.starts_at,
+            Utc::now().timestamp(),
+            reminder.all_day,
+        );
+        let _ = notifications::show(&self.connection, &reminder_card(&title, &body)).await;
     }
 }
 
@@ -367,6 +376,21 @@ mod tests {
     impl RecordingSink {
         fn fired(&self) -> Vec<DueReminder> {
             self.0.lock().unwrap().clone()
+        }
+    }
+
+    // Para compartir el sink con la tarea del bucle y mirarlo desde afuera.
+    impl ReminderSink for Arc<RecordingSink> {
+        async fn show(&self, reminder: &DueReminder) {
+            (**self).show(reminder).await;
+        }
+    }
+
+    /// Deja correr a las demás tareas unas cuantas veces: con el reloj pausado,
+    /// una sola cesión no alcanza para que el bucle complete una pasada.
+    async fn settle() {
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
         }
     }
 
@@ -513,5 +537,167 @@ mod tests {
     fn un_evento_sin_titulo_no_deja_el_cuerpo_cojo() {
         let (_, body) = reminder_text("   ", 10_900, 10_000, false);
         assert!(body.starts_with("(sin título) —"));
+    }
+
+    /// Un evento que empieza dentro del minuto se dice «ahora», no «en 0».
+    #[test]
+    fn el_texto_de_un_evento_que_empieza_ahora() {
+        assert_eq!(
+            reminder_text("Standup", 1_000, 1_000, false).1,
+            "Standup — ahora"
+        );
+        // El borde de un minuto todavía cuenta como ahora.
+        assert_eq!(reminder_text("X", 1_060, 1_000, false).1, "X — ahora");
+    }
+
+    /// La tarjeta dice de qué aplicación es el cartel, su ícono y su entrada de
+    /// menú, y no lleva botones ni reemplaza a ninguno.
+    #[test]
+    fn la_tarjeta_dice_de_que_aplicacion_es() {
+        let card = reminder_card("Recordatorio", "Reunión — en 15 minutos");
+        assert_eq!(card.app_name, "VasakOS Calendario");
+        assert_eq!(card.icon, "appointment-soon");
+        assert_eq!(card.desktop_entry, "vasak-calendar");
+        assert_eq!(card.replaces, 0);
+        assert!(card.actions.is_empty());
+        assert_eq!(card.title, "Recordatorio");
+        assert_eq!(card.body, "Reunión — en 15 minutos");
+    }
+
+    #[test]
+    fn el_reloj_de_sistema_da_una_hora() {
+        let clock = system_clock();
+        assert!(clock().timestamp() > 0);
+    }
+
+    /// El sink de escritorio manda el cartel por el bus: contra un servidor de
+    /// notificaciones falso por una conexión punto a punto, se comprueba que
+    /// llega con el nombre de la aplicación y el texto del recordatorio. Cubre
+    /// también `notifications::show`, que es a donde delega.
+    #[tokio::test]
+    async fn el_sink_de_escritorio_manda_el_cartel_al_bus() {
+        use std::collections::HashMap;
+        use std::sync::Mutex as StdMutex;
+        use zbus::zvariant::OwnedValue;
+
+        #[derive(Clone)]
+        struct Received {
+            app_name: String,
+            summary: String,
+            body: String,
+        }
+
+        struct FakeNotifications {
+            last: Arc<StdMutex<Option<Received>>>,
+        }
+
+        #[zbus::interface(name = "org.freedesktop.Notifications")]
+        impl FakeNotifications {
+            #[allow(clippy::too_many_arguments)]
+            async fn notify(
+                &self,
+                app_name: String,
+                _replaces_id: u32,
+                _app_icon: String,
+                summary: String,
+                body: String,
+                _actions: Vec<String>,
+                _hints: HashMap<String, OwnedValue>,
+                _expire_timeout: i32,
+            ) -> u32 {
+                *self.last.lock().unwrap() = Some(Received {
+                    app_name,
+                    summary,
+                    body,
+                });
+                88
+            }
+        }
+
+        let (server_end, client_end) = tokio::net::UnixStream::pair().unwrap();
+        let server = zbus::connection::Builder::unix_stream(server_end)
+            .server(zbus::Guid::generate())
+            .unwrap()
+            .p2p()
+            .build();
+        let client = zbus::connection::Builder::unix_stream(client_end)
+            .p2p()
+            .build();
+        let (server, client) = tokio::join!(server, client);
+        let (server, client) = (server.unwrap(), client.unwrap());
+
+        let last = Arc::new(StdMutex::new(None));
+        server
+            .object_server()
+            .at(
+                "/org/freedesktop/Notifications",
+                FakeNotifications {
+                    last: Arc::clone(&last),
+                },
+            )
+            .await
+            .unwrap();
+
+        let sink = DesktopSink::new(client);
+        sink.show(&reminder(1000, "DISPLAY")).await;
+
+        let got = last
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("no llegó ningún cartel al servidor de notificaciones");
+        assert_eq!(got.app_name, "VasakOS Calendario");
+        assert_eq!(got.summary, "Recordatorio");
+        assert!(got.body.contains("Reunión"), "cuerpo: {}", got.body);
+    }
+
+    /// El bucle entero, con el reloj pausado: avisa cuando el sueño vence al
+    /// cruzar un disparo, y también cuando lo despierta un `Changed` (el `wake`),
+    /// sin esperar al sueño.
+    #[tokio::test(start_paused = true)]
+    async fn el_bucle_avisa_al_vencer_el_sueno_y_al_despertarlo() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        let now = Arc::new(AtomicI64::new(1000));
+        let reading = Arc::clone(&now);
+        let clock: Clock = Arc::new(move || {
+            chrono::DateTime::from_timestamp(reading.load(Ordering::SeqCst), 0).unwrap()
+        });
+
+        let source = FakeSource {
+            alarms: vec![reminder(1100, "DISPLAY"), reminder(5000, "DISPLAY")],
+        };
+        let sink = Arc::new(RecordingSink::default());
+        let wake = Arc::new(tokio::sync::Notify::new());
+
+        let handle = tokio::spawn(run(
+            source,
+            Arc::clone(&sink),
+            Arc::clone(&clock),
+            Arc::clone(&wake),
+        ));
+
+        // Primera pasada: el borde arranca en 1000, nada vence, duerme hasta el
+        // primer disparo (1100, o sea 100 s).
+        settle().await;
+        assert!(sink.fired().is_empty(), "disparó algo antes de tiempo");
+
+        // El reloj avanza más allá del primer disparo y el sueño vence: la pasada
+        // lo avisa, una sola vez.
+        now.store(1200, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(200)).await;
+        settle().await;
+        assert_eq!(sink.fired().len(), 1);
+        assert_eq!(sink.fired()[0].fires_at, 1100);
+
+        // Un `Changed` despierta al bucle sin esperar al sueño: movemos el reloj
+        // más allá del segundo disparo y lo tocamos.
+        now.store(6000, Ordering::SeqCst);
+        wake.notify_one();
+        settle().await;
+        assert_eq!(sink.fired().len(), 2);
+        assert_eq!(sink.fired()[1].fires_at, 5000);
+
+        handle.abort();
     }
 }

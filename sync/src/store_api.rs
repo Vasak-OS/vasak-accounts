@@ -2973,6 +2973,58 @@ mod tests {
         assert_eq!((area.as_str(), account_id.as_str()), ("calendar", "cuenta"));
     }
 
+    /// El origen de recordatorios del planificador lee el almacén de las cuentas
+    /// con calendario **encendido**, y saltea las apagadas. Es lo que alimenta a
+    /// `reminders.rs` (vasak-calendar#11, decisión #6).
+    #[tokio::test]
+    async fn store_source_lee_solo_las_cuentas_encendidas() {
+        use crate::reminders::{ReminderSource, StoreSource};
+
+        let mut api = Api::new(
+            "api-reminders-source",
+            vec![
+                with_calendar("cuenta", "Trabajo"),
+                with_calendar("otra", "Casa"),
+            ],
+            Answer::Allow,
+        )
+        .await;
+        api.with_calendar_data("cuenta", "c").await;
+        api.with_calendar_data("otra", "o").await;
+
+        // Sólo se enciende «cuenta»: «otra» tiene datos pero su área está apagada.
+        let (client, _service) = api.client(":1.7").await;
+        call_unit(&client, "RequestSync", &("cuenta",))
+            .await
+            .unwrap();
+        assert!(api.settings().is_active("cuenta", CALENDAR_AREA));
+        assert!(!api.settings().is_active("otra", CALENDAR_AREA));
+
+        let source = StoreSource::new(Arc::clone(&api.manager));
+        // Una franja ancha: desde antes de todo hasta bien después (2100).
+        let horizon = 4_102_444_800_i64;
+        let due = source.due(0, horizon, 100).await;
+
+        assert!(
+            !due.is_empty(),
+            "no trajo ningún recordatorio de la cuenta encendida"
+        );
+        assert!(
+            due.iter().all(|r| r.account_id == "cuenta"),
+            "trajo recordatorios de una cuenta apagada"
+        );
+        assert!(due
+            .iter()
+            .all(|r| matches!(r.action.as_str(), "DISPLAY" | "AUDIO")));
+        // Ordenados por hora de disparo.
+        assert!(due.windows(2).all(|w| w[0].fires_at <= w[1].fires_at));
+
+        // El próximo después de 0 es el primer disparo que trajo, y pasado el
+        // horizonte ya no queda ninguno.
+        assert_eq!(source.next_after(0).await, Some(due[0].fires_at));
+        assert_eq!(source.next_after(horizon).await, None);
+    }
+
     /// El sincronizador con el llavero de verdad encima: el
     /// [`SecretServiceKeys`] de verdad, conectado por una conexión punto a
     /// punto al llavero falso de `key.rs` ([`fake_keyring`]), una base de
