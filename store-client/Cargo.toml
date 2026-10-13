@@ -1,0 +1,24 @@
+# La pieza compartida que verifica, del lado del consumidor, que quien tiene el
+# nombre del sincronizador sea de verdad el servicio instalado —y no un proceso
+# de la sesión que lo tomó mientras el servicio no estaba—. Se publica para que
+# las cuatro aplicaciones del almacén (correo, calendario, contactos y el
+# escritorio) no repitan la comprobación. Ver `src/lib.rs`.
+[package]
+name = "vasak-accounts-store-client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Verifica, antes de confiar en el almacén de cuentas, que el dueño del nombre del sincronizador sea el binario del servicio"
+repository = "https://github.com/Vasak-OS/vasak-accounts"
+
+[dependencies]
+# Para resolver el dueño del nombre y su pid por el bus (`GetNameOwner`,
+# `GetConnectionUnixProcessID`). El mismo zbus del espacio de trabajo: no suma
+# ninguna crate al candado que no esté ya.
+zbus.workspace = true
+
+[dev-dependencies]
+# Las pruebas son asíncronas y, las de bus real, levantan un `dbus-daemon`
+# propio y toman el nombre desde el mismo proceso de prueba.
+tokio = { workspace = true }
