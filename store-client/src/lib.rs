@@ -26,10 +26,9 @@
 //!    (`:1.42`). Lo da el bus, no se puede inventar. Sin dueño, no se confía.
 //! 2. `GetConnectionUnixProcessID(`dueño`)` → su **pid**.
 //! 3. `/proc/<pid>/exe` tiene que ser [`INSTALLED_EXECUTABLE`]. Ese enlace lo
-//!    mantiene el núcleo y **no se puede falsear**: apunta al binario que el
-//!    proceso está ejecutando de verdad. Como respaldo, cuando el `exe` no se
-//!    puede leer, que el cgroup del proceso nombre a [`INSTALLED_UNIT`] —un
-//!    respaldo **más débil**, ver abajo—.
+//!    mantiene el núcleo y **no se puede falsear** entre procesos del mismo
+//!    usuario: apunta al binario que el proceso está ejecutando de verdad. Es la
+//!    única comprobación, y es suficiente.
 //!
 //! Y, lo importante, **las llamadas siguientes van dirigidas al nombre único
 //! verificado**, no al nombre bien conocido: si el nombre cambia de dueño
@@ -39,6 +38,14 @@
 //!
 //! **Comparar el uid no alcanza:** quien ataca corre como el mismo usuario.
 //!
+//! **Nada de cgroup.** Se evaluó respaldar la comprobación con el cgroup del
+//! dueño (que nombre a `vasak-accounts-sync.service`) para cuando el `exe` no se
+//! pueda leer, y se descartó: el mismo atacante de igual uid forja ese cgroup
+//! con `systemd-run --user --unit=vasak-accounts-sync.service …`, así que un
+//! proceso con el `exe` equivocado pasaría —justo el agujero que esto cierra—.
+//! El `exe` es no forjable y basta; cualquier respaldo que no lo sea es un
+//! bypass.
+//!
 //! ── Falla cerrado ─────────────────────────────────────────────────────────
 //!
 //! Cualquier cosa que impida comprobar —el nombre sin dueño, el bus que no
@@ -46,17 +53,19 @@
 //! [`TrustError`] y significa **no confiar**. El consumidor lo trata como «el
 //! almacén no está disponible» y cae a su camino de error de siempre.
 //!
-//! ── Lo que el respaldo de cgroup no da ────────────────────────────────────
+//! ── El pid crudo y por qué alcanza ─────────────────────────────────────────
 //!
-//! El `exe` es la comprobación fuerte: para que `/proc/<pid>/exe` diga
-//! `/usr/bin/vasak-accounts-sync`, el proceso tiene que **ser** ese binario.
-//! El cgroup, en cambio, lo puede forjar el mismo atacante de igual uid:
-//! `systemd-run --user --unit=vasak-accounts-sync.service …` pone a un proceso
-//! cualquiera en un cgroup con ese nombre. Por eso el cgroup es sólo un
-//! respaldo para cuando el `exe` no se puede leer (sistemas endurecidos con
-//! Yama o un `hidepid` alto), y entre procesos del mismo usuario —el caso de
-//! esta amenaza— el `exe` siempre se puede leer. La revisión de seguridad
-//! puede quitar el respaldo: está aislado en [`process_in_unit`].
+//! `GetConnectionUnixProcessID` da un pid, y entre que el bus lo da y que se lee
+//! `/proc/<pid>/exe` ese pid **podría** reciclarse. No hace falta cerrar esa
+//! carrera con un pidfd como hace `access.rs` del lado del servicio: lo que se
+//! devuelve, y a lo que el consumidor dirige sus llamadas, es el **nombre
+//! único** del dueño, que el bus no reasigna nunca. Para que un impostor sirva
+//! datos tendría que ser el dueño de esa conexión, no sólo heredar un pid; y si
+//! el dueño terminó, su nombre único se va con él y las llamadas fallan (falla
+//! cerrado). El pid sólo se usa para leer un `exe`: en el peor caso de reciclado
+//! se rechaza a un dueño legítimo (otra lectura reintenta) o se lee el `exe` de
+//! un tercero que igual no es el servicio y también se rechaza. En ningún caso
+//! el reciclado le deja a un impostor servir datos.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -77,16 +86,13 @@ pub const STORE_INTERFACE: &str = "ar.net.vasak.os.AccountsStore";
 /// compara `/proc/<pid>/exe` del dueño del nombre.
 pub const INSTALLED_EXECUTABLE: &str = "/usr/bin/vasak-accounts-sync";
 
-/// La unidad de systemd del servicio, para el respaldo por cgroup.
-pub const INSTALLED_UNIT: &str = "vasak-accounts-sync.service";
-
 /// Un futuro en una caja, para que el rasgo [`OwnerResolver`] tenga métodos
 /// asíncronos sin arrastrar `async-trait`. Es el mismo molde que usa
 /// `sync/src/access.rs` del otro lado. Público para que un consumidor pueda
 /// implementar [`OwnerResolver`] con un backend propio.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// La identidad que se espera del dueño del nombre: su binario y su unidad.
+/// La identidad que se espera del dueño del nombre: su binario.
 ///
 /// [`ServiceIdentity::installed`] es la de producción. Las pruebas construyen
 /// una que apunta a otro binario para ejercitar el camino que **sí** confía sin
@@ -95,8 +101,6 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub struct ServiceIdentity {
     /// El binario que el dueño del nombre tiene que estar ejecutando.
     pub executable: PathBuf,
-    /// La unidad de systemd, para el respaldo por cgroup.
-    pub unit: String,
 }
 
 impl ServiceIdentity {
@@ -104,7 +108,6 @@ impl ServiceIdentity {
     pub fn installed() -> Self {
         Self {
             executable: PathBuf::from(INSTALLED_EXECUTABLE),
-            unit: INSTALLED_UNIT.to_owned(),
         }
     }
 }
@@ -124,11 +127,10 @@ pub enum TrustError {
     NoOwner,
     /// No se pudo preguntarle al bus quién es el dueño o cuál es su pid.
     Bus(String),
-    /// El dueño existe pero su proceso ya no se puede leer (`/proc/<pid>` se
+    /// El dueño existe pero su `/proc/<pid>/exe` no se puede leer (el proceso se
     /// fue entre que el bus dio el pid y que lo miramos).
     ProcessGone(u32),
-    /// El dueño es otro proceso, no el servicio: su `exe` no coincide y su
-    /// cgroup tampoco lo respalda.
+    /// El dueño es otro proceso, no el servicio: su `exe` no coincide.
     WrongOwner {
         /// El pid del dueño del nombre.
         pid: u32,
@@ -206,22 +208,21 @@ where
     Ok(owner)
 }
 
-/// La comprobación sobre un pid: primero el `exe`, después el cgroup.
+/// La comprobación sobre un pid: su `/proc/<pid>/exe` tiene que ser el binario
+/// del servicio, y nada más. El `exe` lo mantiene el núcleo y no lo puede
+/// falsear otro proceso del mismo uid; cualquier otra señal (el cgroup, p. ej.)
+/// sí se puede forjar y sería un bypass, así que no se usa. Ver la cabecera.
 fn verify_pid(pid: u32, identity: &ServiceIdentity) -> Result<(), TrustError> {
-    let executable = process_executable(pid);
-    if let Some(exe) = &executable {
-        if same_executable(exe, &identity.executable) {
-            return Ok(());
-        }
-    }
-    match process_in_unit(pid, &identity.unit) {
-        Some(true) => Ok(()),
-        // El cgroup se leyó y no nombra la unidad: es otro proceso.
-        Some(false) => Err(TrustError::WrongOwner { pid, executable }),
-        // Ni el `exe` ni el cgroup se pudieron leer: el proceso se fue.
-        None if executable.is_none() => Err(TrustError::ProcessGone(pid)),
-        // El `exe` se leyó (y no coincidió) pero el cgroup no: es otro proceso.
-        None => Err(TrustError::WrongOwner { pid, executable }),
+    match process_executable(pid) {
+        Some(exe) if same_executable(&exe, &identity.executable) => Ok(()),
+        // El `exe` se leyó y no es el servicio: es otro proceso.
+        Some(exe) => Err(TrustError::WrongOwner {
+            pid,
+            executable: Some(exe),
+        }),
+        // El `exe` no se pudo leer: el proceso se fue, o no se deja ver. Falla
+        // cerrado.
+        None => Err(TrustError::ProcessGone(pid)),
     }
 }
 
@@ -247,13 +248,6 @@ fn same_executable(found: &Path, expected: &Path) -> bool {
         (Ok(a), Ok(b)) => a == b,
         _ => false,
     }
-}
-
-/// Si el cgroup de un pid nombra a `unit`. `None` si no se puede leer
-/// `/proc/<pid>/cgroup`. Respaldo débil: ver la cabecera del módulo.
-fn process_in_unit(pid: u32, unit: &str) -> Option<bool> {
-    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
-    Some(cgroup.lines().any(|line| line.contains(unit)))
 }
 
 /// Resuelve al dueño de un nombre por el bus de sesión, con `GetNameOwner` y

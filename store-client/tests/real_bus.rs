@@ -150,7 +150,6 @@ async fn el_servicio_de_verdad_en_un_bus_real_es_de_confianza() {
     let identity = ServiceIdentity {
         executable: std::fs::read_link(format!("/proc/{}/exe", std::process::id()))
             .expect("el proceso de prueba tiene exe"),
-        unit: "ninguna.service".to_owned(),
     };
     let resolver = DbusOwnerResolver::new(&connection)
         .await

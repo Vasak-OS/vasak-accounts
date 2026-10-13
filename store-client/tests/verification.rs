@@ -105,7 +105,6 @@ async fn el_dueno_cuyo_exe_coincide_es_de_confianza() {
     // pasaría si ese proceso fuera el servicio instalado.
     let identity = ServiceIdentity {
         executable: servicio.executable(),
-        unit: "ninguna.service".to_owned(),
     };
 
     let owner = trusted_owner(&resolver, SERVICE_NAME, &identity)
@@ -162,8 +161,8 @@ async fn un_error_del_bus_al_pedir_el_pid_no_es_de_confianza() {
 
 #[tokio::test]
 async fn un_pid_que_no_existe_no_es_de_confianza() {
-    // El pid máximo de Linux es 2^22; éste no puede existir, así que ni el `exe`
-    // ni el cgroup se pueden leer: falla cerrado como «el proceso se fue».
+    // El pid máximo de Linux es 2^22; éste no puede existir, así que el `exe` no
+    // se puede leer: falla cerrado como «el proceso se fue».
     let resolver = FakeResolver {
         owner: Some(":1.3".to_owned()),
         pid: u32::MAX,
@@ -173,41 +172,10 @@ async fn un_pid_que_no_existe_no_es_de_confianza() {
 }
 
 #[tokio::test]
-async fn el_respaldo_por_cgroup_reconoce_la_unidad_del_proceso() {
-    // El cgroup del propio proceso de prueba existe y se puede leer; se busca en
-    // él una hoja que exista de verdad, para ejercitar la rama del respaldo sin
-    // depender de que el servicio esté corriendo.
-    let pid = std::process::id();
-    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
-        .expect("el cgroup del proceso de prueba se tiene que poder leer");
-    let hoja = cgroup
-        .lines()
-        .next()
-        .and_then(|l| l.rsplit('/').next())
-        .filter(|s| !s.is_empty())
-        .expect("el cgroup tiene que tener al menos una hoja");
-
-    let resolver = FakeResolver {
-        owner: Some(":1.1".to_owned()),
-        pid,
-    };
-    // Un exe que no coincide fuerza a caer al respaldo; la unidad es la hoja del
-    // cgroup de verdad del proceso de prueba.
-    let identity = ServiceIdentity {
-        executable: PathBuf::from("/usr/bin/no-existe-este-binario"),
-        unit: hoja.to_owned(),
-    };
-
-    let owner = trusted_owner(&resolver, SERVICE_NAME, &identity)
-        .await
-        .expect("el respaldo por cgroup tenía que reconocer la unidad");
-    assert_eq!(owner, ":1.1");
-}
-
-#[tokio::test]
-async fn un_proceso_vivo_que_no_es_el_servicio_ni_esta_en_su_unidad_se_rechaza() {
-    // exe que no coincide y una unidad de cgroup que el proceso no tiene: la rama
-    // «el cgroup se leyó y no nombra la unidad».
+async fn un_proceso_vivo_cuyo_exe_no_es_el_servicio_se_rechaza() {
+    // Un proceso de verdad, con un `exe` que se lee de verdad, pero que no es el
+    // binario esperado: se rechaza aunque el proceso exista. El cgroup ya no
+    // participa —no hay respaldo que un atacante del mismo uid pueda forjar—.
     let impostor = Impostor::start();
     let resolver = FakeResolver {
         owner: Some(":1.5".to_owned()),
@@ -215,7 +183,6 @@ async fn un_proceso_vivo_que_no_es_el_servicio_ni_esta_en_su_unidad_se_rechaza()
     };
     let identity = ServiceIdentity {
         executable: PathBuf::from("/usr/bin/no-existe-este-binario"),
-        unit: "unidad-que-ningun-proceso-tiene-12345.service".to_owned(),
     };
     let resultado = trusted_owner(&resolver, SERVICE_NAME, &identity).await;
     assert!(matches!(resultado, Err(TrustError::WrongOwner { .. })));
@@ -245,5 +212,4 @@ fn los_mensajes_de_error_no_llevan_la_ruta_del_dueno() {
 fn la_identidad_por_omision_es_la_del_servicio_instalado() {
     let por_omision = ServiceIdentity::default();
     assert_eq!(por_omision.executable, PathBuf::from(INSTALLED_EXECUTABLE));
-    assert_eq!(por_omision.unit, ServiceIdentity::installed().unit);
 }
