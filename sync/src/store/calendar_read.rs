@@ -902,6 +902,113 @@ pub fn account_tasks(
 }
 
 // ---------------------------------------------------------------------------
+// Los recordatorios que toca mostrar
+// ---------------------------------------------------------------------------
+
+/// Un recordatorio guardado que llegó a su hora, con lo que hace falta para
+/// avisarlo. Lo lee el planificador de `reminders.rs`, no una aplicación: va con
+/// el nombre del evento ya resuelto, no con identificadores para volver a pedir.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DueReminder {
+    pub account_id: String,
+    /// Qué recordatorio es, dentro de la base de la cuenta: su ocurrencia
+    /// (`object_id`, `recurrence_id`) y cuál de los recordatorios de ella
+    /// (`position`). Con la cuenta, lo identifica en todo el servicio.
+    pub object_id: i64,
+    pub recurrence_id: i64,
+    pub position: i64,
+    /// Cuándo dispara, en segundos UTC. **La zona ya está resuelta acá**: la
+    /// expansión la metió al guardar (un `TRIGGER` relativo contra el comienzo
+    /// con su `TZID`, o un disparo absoluto), así que comparar contra la hora de
+    /// ahora no vuelve a mirar ninguna zona.
+    pub fires_at: i64,
+    /// `DISPLAY`, `AUDIO`, `EMAIL`, en mayúsculas.
+    pub action: String,
+    /// El título del evento, el de la excepción si esa vez lo cambió.
+    pub title: String,
+    /// Cuándo ocurre el evento al que avisa, en segundos UTC.
+    pub starts_at: i64,
+    pub all_day: bool,
+    /// Si la hora del evento es la de quien mira: sin zona, o con una que no se
+    /// pudo resolver.
+    pub floating: bool,
+}
+
+/// Los recordatorios de una cuenta que disparan en la franja `(since, now]`.
+///
+/// La franja es **abierta por abajo y cerrada por arriba** a propósito, y es lo
+/// que evita los dos errores clásicos:
+///
+/// - **Nada viejo al arrancar.** El planificador empieza con `since` en la hora
+///   de encender: un recordatorio de esta mañana cae antes de `since` y no
+///   dispara. Es la misma regla que el correo —no hay novedad sin una marca con
+///   qué comparar—, con la marca puesta en el tiempo y no en una lista anterior.
+/// - **Sin repetir al resincronizar.** Una vez avisado, el recordatorio cae en
+///   `since` (que la pasada corrió hasta `now`), y `fires_at > since` lo deja
+///   fuera. Que el sync vuelva a traer el mismo `VALARM` no lo repite, porque su
+///   hora de disparo no cambió.
+///
+/// Sólo los que un escritorio dibuja —`DISPLAY` y `AUDIO`—, nunca `EMAIL`: ése
+/// pide mandar un correo, que no es lo que hace un cartel. Ordenados por hora de
+/// disparo, con un tope por si una resincronización dejó muchos juntos.
+pub fn due_reminders(
+    connection: &Connection,
+    account_id: &str,
+    since: i64,
+    now: i64,
+    limit: usize,
+) -> Result<Vec<DueReminder>, StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT a.object_id, a.recurrence_id, a.position, a.fires_at, a.action,
+                    coalesce(t.summary, c.summary), o.starts_at, o.all_day, c.zone
+               FROM alarms a INDEXED BY alarms_by_time
+               JOIN occurrences o
+                 ON o.object_id = a.object_id AND o.recurrence_id = a.recurrence_id
+               JOIN calendar_objects c ON c.id = a.object_id
+               LEFT JOIN object_titles t
+                 ON t.object_id = o.object_id AND t.position = o.title
+              WHERE a.fires_at > ? AND a.fires_at <= ?
+                AND a.action IN ('DISPLAY', 'AUDIO')
+              ORDER BY a.fires_at, a.object_id, a.recurrence_id, a.position
+              LIMIT ?",
+        )
+        .map_err(classify)?;
+    let rows = statement
+        .query_map(rusqlite::params![since, now, limit as i64], |row| {
+            let zone: String = row.get(8)?;
+            Ok(DueReminder {
+                account_id: account_id.to_string(),
+                object_id: row.get(0)?,
+                recurrence_id: row.get(1)?,
+                position: row.get(2)?,
+                fires_at: row.get(3)?,
+                action: row.get(4)?,
+                title: row.get(5)?,
+                starts_at: row.get(6)?,
+                all_day: row.get(7)?,
+                floating: floating(&zone),
+            })
+        })
+        .map_err(classify)?;
+    rows.collect::<Result<_, _>>().map_err(classify)
+}
+
+/// La próxima hora de disparo después de `now`, o nada si no queda ninguna. Es
+/// lo que dice cuánto dormir hasta el siguiente recordatorio en vez de
+/// despertarse por reloj. Sale del índice `alarms_by_time`.
+pub fn next_reminder_at(connection: &Connection, now: i64) -> Result<Option<i64>, StoreError> {
+    connection
+        .query_row(
+            "SELECT min(fires_at) FROM alarms
+              WHERE fires_at > ? AND action IN ('DISPLAY', 'AUDIO')",
+            [now],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .map_err(classify)
+}
+
+// ---------------------------------------------------------------------------
 // Un evento entero
 // ---------------------------------------------------------------------------
 
@@ -1236,6 +1343,15 @@ mod tests {
         format!(
             "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:{uid}\r\nSUMMARY:Suelto {uid}\r\n\
              DTSTART:{start}\r\nDURATION:PT1H\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+    }
+
+    fn with_alarm(uid: &str, start: &str, action: &str, trigger: &str) -> String {
+        format!(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:{uid}\r\nSUMMARY:Evento {uid}\r\n\
+             DTSTART:{start}\r\nDURATION:PT1H\r\n\
+             BEGIN:VALARM\r\nACTION:{action}\r\nTRIGGER:{trigger}\r\nEND:VALARM\r\n\
+             END:VEVENT\r\nEND:VCALENDAR\r\n"
         )
     }
 
@@ -2375,5 +2491,128 @@ mod tests {
         let json = serde_json::to_value(&stored.rows[1].1).unwrap();
         assert_eq!(json["recurring"], false);
         assert_eq!(json["shown_once"], false);
+    }
+
+    // -----------------------------------------------------------------------
+    // Los recordatorios que toca mostrar
+    // -----------------------------------------------------------------------
+
+    /// Un recordatorio no se trae antes de su hora, se trae una vez cuando la
+    /// franja la cruza, y no se repite cuando el borde ya pasó (una
+    /// resincronización que vuelve a traer el mismo `VALARM`).
+    #[test]
+    fn due_reminders_dispara_una_vez_y_no_antes_ni_de_nuevo() {
+        let temp = TempDir::new("due-una-vez");
+        let store = store_with(
+            &temp,
+            &[(
+                "https://x/c/e.ics",
+                &with_alarm("e", "20260926T100000Z", "DISPLAY", "-PT15M"),
+            )],
+        );
+        let fires = at("2026-09-26T09:45:00Z");
+
+        // Arrancar después del disparo no lo desentierra: la franja
+        // `(borde, ahora]` con los dos del mismo lado está vacía.
+        let boot =
+            due_reminders(store.connection(), "cuenta", fires + 600, fires + 600, 50).unwrap();
+        assert!(
+            boot.is_empty(),
+            "el arranque desenterró un recordatorio viejo"
+        );
+
+        // El servicio encendió antes; una pasada que cruza el disparo lo trae
+        // una vez, con su nombre y sus horas.
+        let crossed =
+            due_reminders(store.connection(), "cuenta", fires - 3600, fires + 60, 50).unwrap();
+        assert_eq!(crossed.len(), 1);
+        assert_eq!(crossed[0].fires_at, fires);
+        assert_eq!(crossed[0].action, "DISPLAY");
+        assert_eq!(crossed[0].title, "Evento e");
+        assert_eq!(crossed[0].starts_at, at("2026-09-26T10:00:00Z"));
+        assert!(!crossed[0].all_day);
+
+        // Corrido el borde más allá del disparo, no vuelve a salir.
+        let again =
+            due_reminders(store.connection(), "cuenta", fires + 60, fires + 7200, 50).unwrap();
+        assert!(
+            again.is_empty(),
+            "el recordatorio se repitió con el borde ya pasado"
+        );
+    }
+
+    /// Una serie da un recordatorio por ocurrencia, cada uno a su hora.
+    #[test]
+    fn due_reminders_uno_por_ocurrencia_de_una_serie() {
+        let temp = TempDir::new("due-serie");
+        // `weekly` trae un VALARM DISPLAY a -PT10M.
+        let store = store_with(
+            &temp,
+            &[("https://x/c/s.ics", &weekly("s", "20260901T090000Z"))],
+        );
+
+        let due = due_reminders(
+            store.connection(),
+            "cuenta",
+            at("2026-09-01T00:00:00Z"),
+            at("2026-09-16T00:00:00Z"),
+            50,
+        )
+        .unwrap();
+
+        let times: Vec<i64> = due.iter().map(|r| r.fires_at).collect();
+        assert_eq!(
+            times,
+            vec![
+                at("2026-09-01T08:50:00Z"),
+                at("2026-09-08T08:50:00Z"),
+                at("2026-09-15T08:50:00Z"),
+            ]
+        );
+        assert!(due.iter().all(|r| r.title == "Semanal s"));
+    }
+
+    /// Un `VALARM` de tipo `EMAIL` no se dibuja: pide mandar un correo, no poner
+    /// un cartel. Tampoco cuenta para el próximo sueño.
+    #[test]
+    fn due_reminders_no_trae_los_de_correo() {
+        let temp = TempDir::new("due-email");
+        let store = store_with(
+            &temp,
+            &[(
+                "https://x/c/m.ics",
+                &with_alarm("m", "20260926T100000Z", "EMAIL", "-PT15M"),
+            )],
+        );
+        let due = due_reminders(
+            store.connection(),
+            "cuenta",
+            0,
+            at("2027-01-01T00:00:00Z"),
+            50,
+        )
+        .unwrap();
+        assert!(due.is_empty(), "un VALARM EMAIL se trajo como cartel");
+        assert_eq!(next_reminder_at(store.connection(), 0).unwrap(), None);
+    }
+
+    /// `next_reminder_at` da el próximo disparo después de una hora, y nada
+    /// cuando ya no queda ninguno.
+    #[test]
+    fn next_reminder_at_da_el_proximo_y_despues_nada() {
+        let temp = TempDir::new("next-proximo");
+        let store = store_with(
+            &temp,
+            &[(
+                "https://x/c/e.ics",
+                &with_alarm("e", "20260926T100000Z", "DISPLAY", "-PT15M"),
+            )],
+        );
+        let fires = at("2026-09-26T09:45:00Z");
+        assert_eq!(
+            next_reminder_at(store.connection(), fires - 1).unwrap(),
+            Some(fires)
+        );
+        assert_eq!(next_reminder_at(store.connection(), fires).unwrap(), None);
     }
 }

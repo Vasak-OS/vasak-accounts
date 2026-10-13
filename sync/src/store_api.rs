@@ -58,6 +58,7 @@ use crate::dav::webdav::{HttpPolicy, Limits};
 use crate::dav_sync::BrokerCredentials;
 use crate::email_sync::{EmailScheduler, EmailSync, EMAIL_TICK};
 use crate::ical::recurrence::ExpansionLimits;
+use crate::reminders;
 use crate::store::calendar_read::{self, GlobalId, ListCursor, Range};
 use crate::store::contacts_read::{self, Cursor, InvalidArgument};
 use crate::store::email_read::{self, Cursor as EmailCursor};
@@ -1254,7 +1255,10 @@ impl StoreService<SecretServiceKeys> {
         .await?;
         service.watch_keyring();
         service.watch_departures(connection.clone(), access);
-        service.forward_changes();
+        // El planificador de recordatorios primero, para pasarle a
+        // `forward_changes` con qué despertarlo cuando el calendario cambie.
+        let reminders = service.start_reminders(connection.clone());
+        service.forward_changes(Some(reminders));
         service.sync_email(email_pending);
         service.sync_contacts(contacts_pending);
         service.sync_calendar(calendar_pending);
@@ -1411,12 +1415,19 @@ impl<K: KeySource> StoreService<K> {
     }
 
     /// Cada lote que cambió algo, como señal `Changed`, en el orden en que se
-    /// escribieron.
-    fn forward_changes(&self) {
+    /// escribieron. De paso, cuando el que cambió es el calendario, despierta al
+    /// planificador de recordatorios (`wake`): puede haber aparecido uno más
+    /// cercano y hay que reprogramar sin esperar al techo del sueño.
+    fn forward_changes(&self, wake: Option<Arc<tokio::sync::Notify>>) {
         let mut changes = self.manager.subscribe_changes();
         let emitter = self.emitter.clone();
         tokio::spawn(async move {
             while let Some(change) = changes.recv().await {
+                if change.area == CALENDAR_AREA {
+                    if let Some(wake) = &wake {
+                        wake.notify_one();
+                    }
+                }
                 let _ = StoreApi::<K>::changed(
                     &emitter,
                     change.area,
@@ -1426,6 +1437,24 @@ impl<K: KeySource> StoreService<K> {
                 .await;
             }
         });
+    }
+
+    /// Arranca el planificador de recordatorios del calendario en su tarea
+    /// (`reminders.rs`, `vasak-calendar#11`, decisión #6): lee los `VALARM`
+    /// guardados, los agenda por su hora y los avisa con la ventana cerrada.
+    /// Devuelve con qué despertarlo cuando el sync traiga un cambio de
+    /// calendario.
+    fn start_reminders(&self, connection: zbus::Connection) -> Arc<tokio::sync::Notify> {
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let source = reminders::StoreSource::new(Arc::clone(&self.manager));
+        let sink = reminders::DesktopSink::new(connection);
+        tokio::spawn(reminders::run(
+            source,
+            sink,
+            reminders::system_clock(),
+            Arc::clone(&wake),
+        ));
+        wake
     }
 
     /// Lo que hay que hacer cada vez que se leen las cuentas.
@@ -2377,7 +2406,7 @@ mod tests {
     async fn changed_sale_por_el_bus_una_vez_por_lote() {
         let mut api = Api::new("api-changed", vec![with_contacts("cuenta")], Answer::Allow).await;
         let (client, service) = api.client(":1.7").await;
-        service.forward_changes();
+        service.forward_changes(None);
         let rule = zbus::MatchRule::builder()
             .msg_type(zbus::message::Type::Signal)
             .interface(IFACE)
@@ -2928,7 +2957,7 @@ mod tests {
         )
         .await;
         let (client, service) = api.client(":1.7").await;
-        service.forward_changes();
+        service.forward_changes(None);
         let rule = zbus::MatchRule::builder()
             .msg_type(zbus::message::Type::Signal)
             .interface(IFACE)
