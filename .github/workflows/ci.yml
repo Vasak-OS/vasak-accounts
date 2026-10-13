@@ -33,4 +33,4 @@ jobs:
       # llega a los tokens, y el sincronizador parsea lo que manda un servidor
       # de correo cualquiera. Estaban escritas —405 pruebas— y no las corría
       # nadie: hoy una de ellas puede romperse y mergearse sin que nadie lo note.
-      pruebas_rust: -p vasak-accounts -p vasak-accounts-sync
+      pruebas_rust: -p vasak-accounts -p vasak-accounts-sync -p vasak-accounts-store-client
