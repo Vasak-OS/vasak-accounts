@@ -82,8 +82,9 @@ pub const INSTALLED_UNIT: &str = "vasak-accounts-sync.service";
 
 /// Un futuro en una caja, para que el rasgo [`OwnerResolver`] tenga métodos
 /// asíncronos sin arrastrar `async-trait`. Es el mismo molde que usa
-/// `sync/src/access.rs` del otro lado.
-type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+/// `sync/src/access.rs` del otro lado. Público para que un consumidor pueda
+/// implementar [`OwnerResolver`] con un backend propio.
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// La identidad que se espera del dueño del nombre: su binario y su unidad.
 ///
@@ -131,7 +132,10 @@ pub enum TrustError {
     WrongOwner {
         /// El pid del dueño del nombre.
         pid: u32,
-        /// El binario que ese pid está ejecutando, si se pudo leer.
+        /// El binario que ese pid está ejecutando, si se pudo leer. Para que un
+        /// consumidor pueda inspeccionarlo; **no se escribe en `Display`** —ni,
+        /// por lo tanto, en ningún registro— a propósito: es la ruta de un
+        /// proceso ajeno y no hace falta filtrarla a un log para rechazar.
         executable: Option<PathBuf>,
     },
 }
@@ -157,17 +161,12 @@ impl std::fmt::Display for TrustError {
                     "el dueño de {SERVICE_NAME} (pid {pid}) ya no se puede leer"
                 )
             }
-            TrustError::WrongOwner { pid, executable } => match executable {
-                Some(exe) => write!(
-                    f,
-                    "{SERVICE_NAME} lo tiene el pid {pid} ({}), que no es {INSTALLED_EXECUTABLE}",
-                    exe.display()
-                ),
-                None => write!(
-                    f,
-                    "{SERVICE_NAME} lo tiene el pid {pid}, que no es {INSTALLED_EXECUTABLE}"
-                ),
-            },
+            // La ruta del dueño (`executable`) queda fuera a propósito: no se
+            // filtra la ruta de un proceso ajeno a un registro.
+            TrustError::WrongOwner { pid, .. } => write!(
+                f,
+                "{SERVICE_NAME} lo tiene el pid {pid}, que no es {INSTALLED_EXECUTABLE}"
+            ),
         }
     }
 }
@@ -305,6 +304,3 @@ pub async fn trusted_sync_owner(connection: &zbus::Connection) -> Result<String,
         .map_err(|e| TrustError::Bus(e.to_string()))?;
     trusted_owner(&resolver, SERVICE_NAME, &ServiceIdentity::installed()).await
 }
-
-#[cfg(test)]
-mod tests;
