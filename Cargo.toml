@@ -16,10 +16,10 @@
 # permisos y sirve para ejercitarlo de punta a punta.
 [workspace]
 resolver = "2"
-members = ["common", "daemon", "sync"]
+members = ["common", "daemon", "store-client", "sync"]
 
 [workspace.package]
-version = "0.20.0"
+version = "0.21.0"
 edition = "2021"
 authors = ["Vasak Group", "Joaquin (Pato) Decima"]
 license = "GPL-3.0-only"
