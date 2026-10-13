@@ -58,6 +58,7 @@ use crate::dav::webdav::{HttpPolicy, Limits};
 use crate::dav_sync::BrokerCredentials;
 use crate::email_sync::{EmailScheduler, EmailSync, EMAIL_TICK};
 use crate::ical::recurrence::ExpansionLimits;
+use crate::reminders;
 use crate::store::calendar_read::{self, GlobalId, ListCursor, Range};
 use crate::store::contacts_read::{self, Cursor, InvalidArgument};
 use crate::store::email_read::{self, Cursor as EmailCursor};
@@ -1254,7 +1255,10 @@ impl StoreService<SecretServiceKeys> {
         .await?;
         service.watch_keyring();
         service.watch_departures(connection.clone(), access);
-        service.forward_changes();
+        // El planificador de recordatorios primero, para pasarle a
+        // `forward_changes` con qué despertarlo cuando el calendario cambie.
+        let reminders = service.start_reminders(connection.clone());
+        service.forward_changes(Some(reminders));
         service.sync_email(email_pending);
         service.sync_contacts(contacts_pending);
         service.sync_calendar(calendar_pending);
@@ -1411,12 +1415,19 @@ impl<K: KeySource> StoreService<K> {
     }
 
     /// Cada lote que cambió algo, como señal `Changed`, en el orden en que se
-    /// escribieron.
-    fn forward_changes(&self) {
+    /// escribieron. De paso, cuando el que cambió es el calendario, despierta al
+    /// planificador de recordatorios (`wake`): puede haber aparecido uno más
+    /// cercano y hay que reprogramar sin esperar al techo del sueño.
+    fn forward_changes(&self, wake: Option<Arc<tokio::sync::Notify>>) {
         let mut changes = self.manager.subscribe_changes();
         let emitter = self.emitter.clone();
         tokio::spawn(async move {
             while let Some(change) = changes.recv().await {
+                if change.area == CALENDAR_AREA {
+                    if let Some(wake) = &wake {
+                        wake.notify_one();
+                    }
+                }
                 let _ = StoreApi::<K>::changed(
                     &emitter,
                     change.area,
@@ -1426,6 +1437,24 @@ impl<K: KeySource> StoreService<K> {
                 .await;
             }
         });
+    }
+
+    /// Arranca el planificador de recordatorios del calendario en su tarea
+    /// (`reminders.rs`, `vasak-calendar#11`, decisión #6): lee los `VALARM`
+    /// guardados, los agenda por su hora y los avisa con la ventana cerrada.
+    /// Devuelve con qué despertarlo cuando el sync traiga un cambio de
+    /// calendario.
+    fn start_reminders(&self, connection: zbus::Connection) -> Arc<tokio::sync::Notify> {
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let source = reminders::StoreSource::new(Arc::clone(&self.manager));
+        let sink = reminders::DesktopSink::new(connection);
+        tokio::spawn(reminders::run(
+            source,
+            sink,
+            reminders::system_clock(),
+            Arc::clone(&wake),
+        ));
+        wake
     }
 
     /// Lo que hay que hacer cada vez que se leen las cuentas.
@@ -2377,7 +2406,7 @@ mod tests {
     async fn changed_sale_por_el_bus_una_vez_por_lote() {
         let mut api = Api::new("api-changed", vec![with_contacts("cuenta")], Answer::Allow).await;
         let (client, service) = api.client(":1.7").await;
-        service.forward_changes();
+        service.forward_changes(None);
         let rule = zbus::MatchRule::builder()
             .msg_type(zbus::message::Type::Signal)
             .interface(IFACE)
@@ -2928,7 +2957,7 @@ mod tests {
         )
         .await;
         let (client, service) = api.client(":1.7").await;
-        service.forward_changes();
+        service.forward_changes(None);
         let rule = zbus::MatchRule::builder()
             .msg_type(zbus::message::Type::Signal)
             .interface(IFACE)
@@ -2942,6 +2971,58 @@ mod tests {
         api.with_calendar_data("cuenta", "c").await;
         let (area, account_id, _) = next_changed(&mut signals).await;
         assert_eq!((area.as_str(), account_id.as_str()), ("calendar", "cuenta"));
+    }
+
+    /// El origen de recordatorios del planificador lee el almacén de las cuentas
+    /// con calendario **encendido**, y saltea las apagadas. Es lo que alimenta a
+    /// `reminders.rs` (vasak-calendar#11, decisión #6).
+    #[tokio::test]
+    async fn store_source_lee_solo_las_cuentas_encendidas() {
+        use crate::reminders::{ReminderSource, StoreSource};
+
+        let mut api = Api::new(
+            "api-reminders-source",
+            vec![
+                with_calendar("cuenta", "Trabajo"),
+                with_calendar("otra", "Casa"),
+            ],
+            Answer::Allow,
+        )
+        .await;
+        api.with_calendar_data("cuenta", "c").await;
+        api.with_calendar_data("otra", "o").await;
+
+        // Sólo se enciende «cuenta»: «otra» tiene datos pero su área está apagada.
+        let (client, _service) = api.client(":1.7").await;
+        call_unit(&client, "RequestSync", &("cuenta",))
+            .await
+            .unwrap();
+        assert!(api.settings().is_active("cuenta", CALENDAR_AREA));
+        assert!(!api.settings().is_active("otra", CALENDAR_AREA));
+
+        let source = StoreSource::new(Arc::clone(&api.manager));
+        // Una franja ancha: desde antes de todo hasta bien después (2100).
+        let horizon = 4_102_444_800_i64;
+        let due = source.due(0, horizon, 100).await;
+
+        assert!(
+            !due.is_empty(),
+            "no trajo ningún recordatorio de la cuenta encendida"
+        );
+        assert!(
+            due.iter().all(|r| r.account_id == "cuenta"),
+            "trajo recordatorios de una cuenta apagada"
+        );
+        assert!(due
+            .iter()
+            .all(|r| matches!(r.action.as_str(), "DISPLAY" | "AUDIO")));
+        // Ordenados por hora de disparo.
+        assert!(due.windows(2).all(|w| w[0].fires_at <= w[1].fires_at));
+
+        // El próximo después de 0 es el primer disparo que trajo, y pasado el
+        // horizonte ya no queda ninguno.
+        assert_eq!(source.next_after(0).await, Some(due[0].fires_at));
+        assert_eq!(source.next_after(horizon).await, None);
     }
 
     /// El sincronizador con el llavero de verdad encima: el

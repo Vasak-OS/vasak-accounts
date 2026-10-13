@@ -76,6 +76,7 @@ mod notifications;
 mod outbox;
 mod preferences;
 mod query;
+mod reminders;
 mod smtp;
 mod store;
 mod store_api;
@@ -1350,19 +1351,25 @@ async fn publish_messages(
     // en la próxima sesión. Es una vez por aviso, o sea unas pocas por día.
     let detail = preferences::read().notification_detail;
     let (title, body) = notifications::notification_text(&just_arrived, account_id, detail);
+    // Preguntado cada vez y no una: el servidor de notificaciones se puede
+    // reiniciar —o cambiar por otro— sin que este servicio se entere, y la
+    // respuesta viene de un método que ya está conectado.
+    let actions: &[(&str, &str)] = if notifications::supports_actions(emitter.connection()).await {
+        &[(notifications::OPEN_ACTION, "Abrir")]
+    } else {
+        &[]
+    };
     let mut shown_notifications = service.shown_notifications.lock().await;
-    if let Some(id) = notifications::show(
-        emitter.connection(),
-        shown_notifications.previous(account_id),
-        &title,
-        &body,
-        // Preguntado cada vez y no una: el servidor de notificaciones se puede
-        // reiniciar —o cambiar por otro— sin que este servicio se entere, y la
-        // respuesta viene de un método que ya está conectado.
-        notifications::supports_actions(emitter.connection()).await,
-    )
-    .await
-    {
+    let card = notifications::Card {
+        app_name: notifications::MAIL_APP_NAME,
+        icon: notifications::MAIL_ICON,
+        desktop_entry: notifications::MAIL_DESKTOP_ENTRY,
+        replaces: shown_notifications.previous(account_id),
+        title: &title,
+        body: &body,
+        actions,
+    };
+    if let Some(id) = notifications::show(emitter.connection(), &card).await {
         shown_notifications.remember(account_id, id);
     }
 }

@@ -33,12 +33,18 @@ use crate::preferences::NotificationDetail;
 /// El identificador del botón, con el que vuelve la señal.
 ///
 /// No se ve: lo que se lee en pantalla es la etiqueta que va al lado.
-const OPEN_ACTION: &str = "abrir";
+pub(crate) const OPEN_ACTION: &str = "abrir";
+
+/// Cómo se presenta el cartel de correo: nombre de origen, ícono y entrada de
+/// menú. Antes vivían dentro de `show`, cableados; ahora `show` sirve también a
+/// los recordatorios del calendario (ver [`Card`]) y cada quien trae el suyo.
+pub(crate) const MAIL_APP_NAME: &str = "VasakOS Correo";
+pub(crate) const MAIL_ICON: &str = "internet-mail";
 
 /// La entrada del menú de la aplicación de correo, sin el `.desktop`.
 ///
 /// La declara el cartel para que el escritorio sepa de qué aplicación es.
-const DESKTOP_ENTRY: &str = "vasak-mail";
+pub(crate) const MAIL_DESKTOP_ENTRY: &str = "vasak-mail";
 
 /// El programa que abre el botón.
 ///
@@ -173,7 +179,7 @@ const MAX_TEXT: usize = 80;
 ///
 /// **Se acorta primero y se escapa después.** Al revés, el corte puede caer en
 /// medio de un `&amp;` y el cartel muestra `&am`.
-fn for_notification(text: &str) -> String {
+pub(crate) fn for_notification(text: &str) -> String {
     let mut cut = MAX_TEXT.min(text.len());
     while cut > 0 && !text.is_char_boundary(cut) {
         cut -= 1;
@@ -276,6 +282,31 @@ pub fn open_mail_app() {
     }
 }
 
+/// Una tarjeta lista para mostrar.
+///
+/// Junta lo que cambia de un aviso a otro —de qué aplicación es, su ícono, su
+/// texto, sus botones— para que [`show`] sirva igual al correo que a los
+/// recordatorios del calendario. Antes esto estaba cableado al correo.
+pub struct Card<'a> {
+    /// El nombre que el servidor muestra como origen del aviso.
+    pub app_name: &'a str,
+    /// El ícono, por nombre del tema y no por ruta: lo resuelve el tema, así
+    /// que sigue al escritorio en vez de quedar fijo.
+    pub icon: &'a str,
+    /// La entrada de menú (`.desktop`, sin la extensión) de la aplicación: el
+    /// escritorio agrupa el aviso con su ventana, y la configuración de
+    /// notificaciones por aplicación lo encuentra.
+    pub desktop_entry: &'a str,
+    /// El cartel que se reemplaza, o `0` para uno nuevo.
+    pub replaces: u32,
+    pub title: &'a str,
+    pub body: &'a str,
+    /// Los botones, de a pares `(identificador, etiqueta)`: el identificador
+    /// vuelve en `ActionInvoked`, la etiqueta es lo que se lee. Vacío, sin
+    /// botones.
+    pub actions: &'a [(&'a str, &'a str)],
+}
+
 /// Muestra el cartel por el bus de sesión.
 ///
 /// `org.freedesktop.Notifications.Notify` directo y no un cliente aparte: el
@@ -284,28 +315,22 @@ pub fn open_mail_app() {
 ///
 /// Devuelve el identificador que dio el servidor, para poder reemplazar este
 /// cartel la próxima vez. Si algo falla devuelve `None` y no pasa nada más: no
-/// poder avisar no puede tumbar la sincronización del correo, que es lo que la
-/// persona sí necesita.
-pub async fn show(
-    connection: &zbus::Connection,
-    replaces: u32,
-    title: &str,
-    body: &str,
-    with_action: bool,
-) -> Option<u32> {
-    // Los botones van de a pares: primero el identificador con el que vuelve la
-    // señal, después lo que se lee en pantalla.
-    let actions: Vec<&str> = if with_action {
-        vec![OPEN_ACTION, "Abrir"]
-    } else {
-        Vec::new()
-    };
+/// poder avisar no puede tumbar la sincronización, que es lo que la persona sí
+/// necesita.
+pub async fn show(connection: &zbus::Connection, card: &Card<'_>) -> Option<u32> {
+    // Los botones van planos: identificador con el que vuelve la señal, etiqueta
+    // que se lee, y así de a pares.
+    let mut actions: Vec<&str> = Vec::with_capacity(card.actions.len() * 2);
+    for (id, label) in card.actions {
+        actions.push(id);
+        actions.push(label);
+    }
 
     let mut hints: HashMap<&str, zbus::zvariant::Value> = HashMap::new();
-    // Con qué aplicación es este cartel. Sirve para que el escritorio lo agrupe
-    // con la ventana de correo, y para que la configuración de notificaciones
-    // por aplicación lo encuentre.
-    hints.insert("desktop-entry", zbus::zvariant::Value::from(DESKTOP_ENTRY));
+    hints.insert(
+        "desktop-entry",
+        zbus::zvariant::Value::from(card.desktop_entry),
+    );
 
     let reply = connection
         .call_method(
@@ -314,13 +339,11 @@ pub async fn show(
             Some(SERVICE),
             "Notify",
             &(
-                "VasakOS Correo",
-                replaces,
-                // El icono por nombre y no por ruta: lo resuelve el tema, así
-                // que sigue al escritorio en vez de quedar fijo.
-                "internet-mail",
-                title,
-                body,
+                card.app_name,
+                card.replaces,
+                card.icon,
+                card.title,
+                card.body,
                 actions,
                 hints,
                 // Que lo decida el servidor de notificaciones, que es quien
