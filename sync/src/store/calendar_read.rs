@@ -366,6 +366,10 @@ pub enum StoredPart {
 /// comienzo, con la superposición, el calendario y el cursor adentro de él.
 /// Los parámetros: el piso, `to`, `from`, `from`, los del cursor y el límite.
 /// Aparte para que una prueba mire su plan.
+///
+/// Un objeto borrado local que todavía no subió (`pending_op = 'delete'`) no
+/// aparece en la lista: la persona lo borró, aunque el empuje no lo haya
+/// confirmado. Uno creado o editado local (`pending_op = 'put'`) sí se ve.
 pub fn occurrences_sql(
     part: StoredPart,
     calendars: Option<&[i64]>,
@@ -402,7 +406,8 @@ pub fn occurrences_sql(
            JOIN calendars k ON k.id = o.calendar_id
            LEFT JOIN object_titles t ON t.object_id = o.object_id AND t.position = o.title
           WHERE {starts}
-            AND (o.ends_at > ? OR (o.ends_at <= o.starts_at AND o.starts_at >= ?)){}{}
+            AND (o.ends_at > ? OR (o.ends_at <= o.starts_at AND o.starts_at >= ?))
+            AND (c.pending_op IS NULL OR c.pending_op != 'delete'){}{}
           ORDER BY o.starts_at, o.object_id, o.recurrence_id
           LIMIT ?",
         calendar_filter("o.calendar_id", calendars),
@@ -633,6 +638,7 @@ fn series_batch(
                 AND (c.starts_at IS NULL OR c.starts_at < ?1)
                 AND NOT (c.expanded_from IS NOT NULL AND c.expanded_from <= ?2 - c.span
                          AND c.expanded_to >= ?1)
+                AND (c.pending_op IS NULL OR c.pending_op != 'delete')
                 AND c.id > ?3{}
               ORDER BY c.id
               LIMIT ?4",
@@ -849,7 +855,8 @@ pub fn account_tasks(
                 c.completed_at, c.done, c.sort_key, k.color
            FROM calendar_objects c
            JOIN calendars k ON k.id = c.calendar_id
-          WHERE c.component = 'VTODO'{}{}{}
+          WHERE c.component = 'VTODO'
+            AND (c.pending_op IS NULL OR c.pending_op != 'delete'){}{}{}
           ORDER BY c.sort_key, c.id
           LIMIT ?",
         if include_done { "" } else { " AND c.done = 0" },
@@ -970,6 +977,7 @@ pub fn due_reminders(
                  ON t.object_id = o.object_id AND t.position = o.title
               WHERE a.fires_at > ? AND a.fires_at <= ?
                 AND a.action IN ('DISPLAY', 'AUDIO')
+                AND (c.pending_op IS NULL OR c.pending_op != 'delete')
               ORDER BY a.fires_at, a.object_id, a.recurrence_id, a.position
               LIMIT ?",
         )
@@ -1187,7 +1195,8 @@ pub fn get_event(
         connection
             .query_row(
                 "SELECT calendar_id, raw_ical, zone FROM calendar_objects
-                  WHERE id = ?1 AND component = 'VEVENT'",
+                  WHERE id = ?1 AND component = 'VEVENT'
+                    AND (pending_op IS NULL OR pending_op != 'delete')",
                 [id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -2614,5 +2623,158 @@ mod tests {
             Some(fires)
         );
         assert_eq!(next_reminder_at(store.connection(), fires).unwrap(), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // La lectura respeta `pending_op`
+    // -----------------------------------------------------------------------
+
+    /// Un evento borrado local sin confirmar (`pending_op = 'delete'`) no sale
+    /// en la lista de ocurrencias, ni en el detalle, ni en los recordatorios;
+    /// uno creado local (`pending_op = 'put'`) sí se ve.
+    #[test]
+    fn la_lectura_oculta_un_evento_borrado_local_y_muestra_uno_creado() {
+        use super::super::lifecycle::CALENDAR_AREA;
+        let temp = TempDir::new("leer-pending-evento");
+        let mut store = open_store(&temp);
+        let cal = calendar(&mut store, "https://x/c/");
+        let w = window();
+        store
+            .apply_calendar_objects(
+                &cal,
+                &[
+                    ObjectOp::Upsert(object(
+                        "https://x/c/vive.ics",
+                        &with_alarm("vive", "20260915T120000Z", "DISPLAY", "-PT10M"),
+                        w,
+                    )),
+                    ObjectOp::Upsert(object(
+                        "https://x/c/muere.ics",
+                        &with_alarm("muere", "20260916T120000Z", "DISPLAY", "-PT10M"),
+                        w,
+                    )),
+                ],
+                w,
+                None,
+                CalendarRoom::UNLIMITED,
+            )
+            .unwrap();
+        // «muere» (id 2) se borra local; «nuevo» (id 3) se crea local.
+        store
+            .enqueue_delete(
+                CALENDAR_AREA,
+                &cal.href,
+                "https://x/c/muere.ics",
+                Some("\"1\""),
+            )
+            .unwrap();
+        store
+            .enqueue_calendar_put(
+                &cal,
+                &object(
+                    "https://x/c/nuevo.ics",
+                    &single("nuevo", "20260917T120000Z"),
+                    w,
+                ),
+                w,
+            )
+            .unwrap();
+
+        // La lista de ocurrencias: «vive» y «nuevo», nunca «muere».
+        let rows = account_occurrences(
+            store.connection(),
+            "cuenta",
+            range("2026-09-14T00:00:00Z", "2026-09-22T00:00:00Z"),
+            None,
+            None,
+            100,
+            &ExpansionLimits::DEFAULT,
+        )
+        .unwrap();
+        let shown: Vec<String> = rows.rows.iter().map(|(_, i)| i.title.clone()).collect();
+        assert_eq!(shown, vec!["Evento vive", "Suelto nuevo"]);
+
+        // El detalle: «muere» (id 2) no se devuelve; «vive» (id 1) sí.
+        assert!(
+            get_event(
+                store.connection(),
+                "cuenta",
+                2,
+                None,
+                &ExpansionLimits::DEFAULT
+            )
+            .unwrap()
+            .is_none(),
+            "el detalle devolvió un evento borrado local"
+        );
+        assert!(get_event(
+            store.connection(),
+            "cuenta",
+            1,
+            None,
+            &ExpansionLimits::DEFAULT
+        )
+        .unwrap()
+        .is_some());
+
+        // Los recordatorios: el de «muere» no dispara.
+        let due = due_reminders(
+            store.connection(),
+            "cuenta",
+            at("2026-09-01T00:00:00Z"),
+            at("2026-10-01T00:00:00Z"),
+            50,
+        )
+        .unwrap();
+        let fired: Vec<String> = due.iter().map(|r| r.title.clone()).collect();
+        assert_eq!(fired, vec!["Evento vive"]);
+    }
+
+    /// Una tarea borrada local sin confirmar no se lista; las demás (y una
+    /// creada local) sí.
+    #[test]
+    fn la_lista_de_tareas_oculta_una_borrada_local() {
+        use super::super::lifecycle::CALENDAR_AREA;
+        let todo = |uid: &str, due: &str| {
+            format!(
+                "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:{uid}\r\nSUMMARY:{uid}\r\n\
+                 DUE:{due}\r\nEND:VTODO\r\nEND:VCALENDAR\r\n"
+            )
+        };
+        let temp = TempDir::new("leer-pending-tarea");
+        let mut store = open_store(&temp);
+        let cal = calendar(&mut store, "https://x/c/");
+        let w = window();
+        store
+            .apply_calendar_objects(
+                &cal,
+                &[
+                    ObjectOp::Upsert(object(
+                        "https://x/c/a.ics",
+                        &todo("queda", "20261001T100000Z"),
+                        w,
+                    )),
+                    ObjectOp::Upsert(object(
+                        "https://x/c/b.ics",
+                        &todo("borrada", "20261002T100000Z"),
+                        w,
+                    )),
+                ],
+                w,
+                None,
+                CalendarRoom::UNLIMITED,
+            )
+            .unwrap();
+        store
+            .enqueue_delete(CALENDAR_AREA, &cal.href, "https://x/c/b.ics", Some("\"1\""))
+            .unwrap();
+
+        let names: Vec<String> = account_tasks(store.connection(), "cuenta", None, true, None, 10)
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|(_, t)| t.title)
+            .collect();
+        assert_eq!(names, vec!["queda"]);
     }
 }
