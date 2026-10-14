@@ -190,6 +190,13 @@ pub enum DavError {
     /// vuelve a intentar.
     #[cfg_attr(not(test), allow(dead_code))]
     Conflict,
+    /// La precondición de ETag de una escritura no sirve: el ETag está vacío
+    /// —emitiría un `If-Match:` vacío, que un servidor tolerante ignora, y la
+    /// escritura pasaría a ser incondicional— o trae bytes que no se pueden
+    /// mandar en una cabecera. Es un uso indebido del lado del cliente, no una
+    /// respuesta del servidor: no se reintenta, lo arregla quien llama.
+    #[cfg_attr(not(test), allow(dead_code))]
+    BadPrecondition,
     /// La respuesta pasó el tope.
     BodyTooLarge(usize),
     /// No se pudo hablar con el servidor. El detalle, recortado, es para el
@@ -230,6 +237,10 @@ impl std::fmt::Display for DavError {
             DavError::Conflict => f.write_str(
                 "el recurso cambió en el servidor desde la última vez, y no se escribió para no \
                  pisar ese cambio",
+            ),
+            DavError::BadPrecondition => f.write_str(
+                "la precondición de la escritura no es utilizable, así que no se mandó para no \
+                 escribir sin condición",
             ),
             DavError::BodyTooLarge(cap) => write!(
                 f,
@@ -637,7 +648,10 @@ pub enum Precondition {
     /// (`If-None-Match: *`).
     Create,
     /// Reemplazar lo que hay: el ETag guardado tiene que seguir siendo el del
-    /// servidor (`If-Match: "<etag>"`).
+    /// servidor (`If-Match: "<etag>"`). El ETag no puede estar vacío ni traer
+    /// bytes inservibles: [`DavClient::put`] lo rechaza con
+    /// [`DavError::BadPrecondition`] antes de tocar la red, porque un `If-Match`
+    /// vacío volvería la escritura incondicional.
     Replace(String),
 }
 
@@ -695,6 +709,24 @@ impl HttpPolicy {
     fn https_only(&self) -> bool {
         true
     }
+}
+
+/// Valida el ETag de una precondición y lo deja listo para la cabecera.
+///
+/// Rechaza, **antes de tocar la red**, lo que haría la escritura incondicional
+/// o la trabaría: un ETag vacío —o sólo espacios— emitiría un `If-Match:` vacío,
+/// malformado por RFC 7232, que un servidor tolerante ignora, y la escritura
+/// pasaría a pisar un cambio que no vimos; y uno con bytes de control o fuera de
+/// ASCII (el ETag viene del `getetag` del servidor, y [`storable`] sólo le mira
+/// el largo) no arma una cabecera válida: sin esto saldría como un error de red,
+/// que [`DavError::is_retryable`] reintentaría en un bucle. Usar
+/// [`reqwest::header::HeaderValue::from_str`] es exactamente la regla de la capa
+/// de cabeceras, así que no rechaza de más.
+fn usable_etag(etag: &str) -> Result<reqwest::header::HeaderValue, DavError> {
+    if etag.trim().is_empty() {
+        return Err(DavError::BadPrecondition);
+    }
+    reqwest::header::HeaderValue::from_str(etag).map_err(|_| DavError::BadPrecondition)
 }
 
 /// Una respuesta ya leída entera, con tope.
@@ -835,17 +867,24 @@ impl DavClient {
             return Err(DavError::ForeignOrigin);
         }
 
+        // La precondición no es opcional, y tampoco vale un ETag inservible:
+        // un `If-Match` vacío o con bytes raros se construye igual pero un
+        // servidor tolerante lo ignora, y la escritura pasaría a ser
+        // incondicional. Se valida **antes** de tocar la red.
+        let if_match = match &precondition {
+            Precondition::Create => None,
+            Precondition::Replace(etag) => Some(usable_etag(etag)?),
+        };
+
         let builder = self
             .http
             .request(Method::Put.to_reqwest(), url.clone())
             .header(reqwest::header::AUTHORIZATION, self.authorization.clone())
             .header(reqwest::header::CONTENT_TYPE, content_type)
             .body(body);
-        // La precondición no es opcional: sin ella no hay forma de armar la
-        // escritura.
-        let builder = match &precondition {
-            Precondition::Create => builder.header(reqwest::header::IF_NONE_MATCH, "*"),
-            Precondition::Replace(etag) => builder.header(reqwest::header::IF_MATCH, etag.as_str()),
+        let builder = match if_match {
+            None => builder.header(reqwest::header::IF_NONE_MATCH, "*"),
+            Some(etag) => builder.header(reqwest::header::IF_MATCH, etag),
         };
 
         let response = builder
@@ -893,6 +932,9 @@ impl DavClient {
         if url.origin() != self.home.origin() {
             return Err(DavError::ForeignOrigin);
         }
+        // Un `If-Match` vacío o inservible borraría sin condición: se rechaza
+        // antes de tocar la red, igual que en `put`.
+        let if_match = usable_etag(if_match)?;
 
         let response = self
             .http
@@ -1915,6 +1957,7 @@ mod tests {
             DavError::Redirect(302),
             DavError::Status(507),
             DavError::Conflict,
+            DavError::BadPrecondition,
             DavError::BodyTooLarge(16 * 1024 * 1024),
             DavError::network(server_text),
             DavError::bad_xml(server_text),
@@ -1932,6 +1975,7 @@ mod tests {
                 | DavError::Redirect(_)
                 | DavError::Status(_)
                 | DavError::Conflict
+                | DavError::BadPrecondition
                 | DavError::BodyTooLarge(_)
                 | DavError::Network(_)
                 | DavError::BadXml(_)
@@ -2076,6 +2120,68 @@ mod tests {
         assert!(
             other.requests().is_empty(),
             "no se tocó la red del otro servidor"
+        );
+    }
+
+    /// **Una precondición con ETag vacío no sale**: un `If-Match` vacío está
+    /// malformado por RFC 7232, un servidor tolerante lo ignora, y la escritura
+    /// pasaría a ser incondicional —pisaría o borraría un cambio que no vimos—.
+    /// Se rechaza del lado del cliente **antes de tocar la red**, no es
+    /// reintentable, y no depende de que el servidor lo detecte.
+    #[tokio::test]
+    async fn una_precondicion_vacia_no_toca_la_red() {
+        let server = FakeDav::start().await;
+        let client = client_for(&server);
+        let card = server.collection_url(0).join("ana.vcf").unwrap();
+
+        for empty in ["", "   "] {
+            assert_eq!(
+                client
+                    .put(
+                        &card,
+                        "x".into(),
+                        Precondition::Replace(empty.into()),
+                        VCARD,
+                    )
+                    .await,
+                Err(DavError::BadPrecondition)
+            );
+            assert_eq!(
+                client.delete(&card, empty).await,
+                Err(DavError::BadPrecondition)
+            );
+        }
+        assert!(
+            server.requests().is_empty(),
+            "una precondición vacía no llega a la red"
+        );
+        assert!(!DavError::BadPrecondition.is_retryable());
+    }
+
+    /// **Un ETag con bytes de control tampoco sale.** Viene del `getetag` del
+    /// servidor, que `storable` sólo mide en largo; sin este chequeo armaría una
+    /// cabecera inválida y saldría como un error de red, que `is_retryable`
+    /// reintentaría en un bucle. Se rechaza como uso indebido, sin tocar la red.
+    #[tokio::test]
+    async fn un_etag_con_bytes_de_control_se_rechaza_sin_reintentar() {
+        let server = FakeDav::start().await;
+        let client = client_for(&server);
+        let card = server.collection_url(0).join("ana.vcf").unwrap();
+        let bad = "\"v\n1\"";
+
+        assert_eq!(
+            client
+                .put(&card, "x".into(), Precondition::Replace(bad.into()), VCARD)
+                .await,
+            Err(DavError::BadPrecondition)
+        );
+        assert_eq!(
+            client.delete(&card, bad).await,
+            Err(DavError::BadPrecondition)
+        );
+        assert!(
+            server.requests().is_empty(),
+            "un ETag inservible no llega a la red"
         );
     }
 
