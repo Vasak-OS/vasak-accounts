@@ -400,9 +400,9 @@ dependencies = [
 
 [[package]]
 name = "equivalent"
-version = "1.0.2"
+version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
+checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 
 [[package]]
 name = "errno"
@@ -1663,9 +1663,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "log",
  "once_cell",
@@ -2428,7 +2428,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vasak-accounts"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "chrono",
  "dirs",
@@ -2449,7 +2449,7 @@ dependencies = [
 
 [[package]]
 name = "vasak-accounts-common"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "roxmltree",
  "tokio",
@@ -2458,7 +2458,7 @@ dependencies = [
 
 [[package]]
 name = "vasak-accounts-store-client"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "tokio",
  "zbus",
@@ -2466,7 +2466,7 @@ dependencies = [
 
 [[package]]
 name = "vasak-accounts-sync"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "ammonia",
  "base64 0.23.1",

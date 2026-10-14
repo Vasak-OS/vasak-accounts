@@ -184,6 +184,12 @@ pub enum DavError {
     Redirect(u16),
     /// Cualquier otro estado que no se esperaba.
     Status(u16),
+    /// `412 Precondition Failed`: el recurso cambió en el servidor desde la
+    /// última vez que se lo vio, y la escritura no se hizo para no pisar ese
+    /// cambio. La cola de operaciones (PR siguiente) resuelve el conflicto y
+    /// vuelve a intentar.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Conflict,
     /// La respuesta pasó el tope.
     BodyTooLarge(usize),
     /// No se pudo hablar con el servidor. El detalle, recortado, es para el
@@ -221,6 +227,10 @@ impl std::fmt::Display for DavError {
                  pedido lleva la credencial"
             ),
             DavError::Status(status) => write!(f, "el servidor respondió {status}"),
+            DavError::Conflict => f.write_str(
+                "el recurso cambió en el servidor desde la última vez, y no se escribió para no \
+                 pisar ese cambio",
+            ),
             DavError::BodyTooLarge(cap) => write!(
                 f,
                 "el servidor mandó más de {cap} bytes, que es lo que se lee de una vez"
@@ -270,6 +280,20 @@ impl DavError {
     /// diario.
     pub fn network(detail: impl std::fmt::Display) -> Self {
         DavError::Network(clipped(&detail.to_string(), MAX_ERROR_DETAIL_BYTES))
+    }
+
+    /// Si conviene volver a intentar la operación más tarde, o es un rechazo
+    /// que se repetiría igual.
+    ///
+    /// Reintentables: un corte de red, un `423 Locked` (otra cosa está tocando
+    /// el recurso ahora mismo) y un `507 Insufficient Storage` (el servidor está
+    /// sin espacio por el momento). No reintentables: una credencial que no vale,
+    /// un conflicto de ETag —lo resuelve la cola, no el reintento a secas—, un
+    /// origen ajeno o un estado inesperado. La cola de operaciones (PR siguiente)
+    /// es la que decide la espera entre reintentos; acá sólo se clasifica.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, DavError::Network(_) | DavError::Status(423 | 507))
     }
 
     /// Lo que va al diario: el texto fijo y, si hay, el detalle recortado. **No
@@ -551,33 +575,83 @@ pub fn href_for_request(url: &url::Url) -> String {
 // El cliente
 // ---------------------------------------------------------------------------
 
-/// Los únicos métodos HTTP que conoce el cliente: **los dos de lectura**.
+/// Los métodos HTTP que conoce el cliente: los dos de lectura y los dos de
+/// escritura que llegan con `vasak-accounts#23`.
 ///
-/// Un tipo y no un texto para que escribir en el servidor —`PUT`, `DELETE`,
-/// `PROPPATCH`— no se pueda hacer sin agregar una variante acá, y la prueba
-/// `el_cliente_no_tiene_ningun_metodo_de_escritura` lo fija. Escribir llega
-/// con la cola de operaciones (PR 7 de `vasak-accounts#23`), que es la que
-/// decide qué gana en un conflicto.
+/// Un tipo y no un texto para que escribir en el servidor no se pueda hacer sin
+/// agregar una variante acá. La escritura entra con `PUT` y `DELETE`, y **sólo
+/// por [`DavClient::put`] y [`DavClient::delete`]**, que exigen una precondición
+/// de ETag: la prueba `el_cliente_solo_escribe_con_precondicion` lo fija.
+/// `PROPPATCH`, `MKCOL`, `MKCALENDAR`, `MOVE`… quedan afuera a propósito (fuera
+/// del alcance de M2). Qué gana en un conflicto lo decide la cola de
+/// operaciones (PR siguiente), no este cliente.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
     Propfind,
     Report,
+    // Sin construir fuera de las pruebas hasta que la cola de operaciones use
+    // `put`/`delete` (PR siguiente de `vasak-accounts#23`).
+    #[cfg_attr(not(test), allow(dead_code))]
+    Put,
+    #[cfg_attr(not(test), allow(dead_code))]
+    Delete,
 }
 
 impl Method {
     #[cfg(test)]
-    pub const ALL: [Method; 2] = [Method::Propfind, Method::Report];
+    pub const ALL: [Method; 4] = [
+        Method::Propfind,
+        Method::Report,
+        Method::Put,
+        Method::Delete,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Method::Propfind => "PROPFIND",
             Method::Report => "REPORT",
+            Method::Put => "PUT",
+            Method::Delete => "DELETE",
         }
     }
 
     fn to_reqwest(self) -> reqwest::Method {
         reqwest::Method::from_bytes(self.as_str().as_bytes()).expect("es un método válido")
     }
+}
+
+/// La condición que **obliga** a toda escritura a no pisar un cambio del
+/// servidor.
+///
+/// No hay forma de escribir sin una: [`DavClient::put`] la pide por parámetro y
+/// [`DavClient::delete`] pide siempre el ETag. Sin precondición, un `PUT` que
+/// cree un recurso pisaría el que otro cliente acaba de crear con el mismo
+/// nombre, y uno que lo reemplace pisaría un cambio que todavía no vimos. Es
+/// escritura conservadora (decisión 3 de `vasak-accounts#23`): el servidor
+/// rechaza con `412` y la cola resuelve, en vez de perder datos en silencio.
+// Sin usar fuera de las pruebas hasta la cola de operaciones (PR siguiente).
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Precondition {
+    /// Crear algo nuevo: el recurso **no** tiene que existir todavía
+    /// (`If-None-Match: *`).
+    Create,
+    /// Reemplazar lo que hay: el ETag guardado tiene que seguir siendo el del
+    /// servidor (`If-Match: "<etag>"`).
+    Replace(String),
+}
+
+/// Lo que deja un `PUT` que salió bien.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PutOutcome {
+    /// El servidor devolvió el ETag del recurso recién escrito: se guarda y la
+    /// próxima vuelta no lo trae de nuevo.
+    Etag(String),
+    /// El servidor **no** devolvió un ETag utilizable (está permitido por el
+    /// RFC, o vino uno desmedido): no se puede asumir ninguno, así que el
+    /// recurso queda marcado para traer su ETag en la próxima vuelta.
+    NeedsRefetch,
 }
 
 /// Qué se deja hablar sin cifrar. En el programa, **nada**: esto existe para
@@ -729,6 +803,123 @@ impl DavClient {
             status: status.as_u16(),
             body,
         })
+    }
+
+    /// Escribe un recurso con `PUT`, **siempre con una precondición de ETag**.
+    ///
+    /// No reusa [`DavClient::request`] a propósito: aquel fija `Depth` y el
+    /// `Content-Type` de XML, que no van en una escritura. Conserva, eso sí,
+    /// todas sus defensas: sólo el origen de la cuenta (una redirección en una
+    /// escritura mandaría la credencial **y el cuerpo** a otro servidor, así que
+    /// no se sigue y se trata como error), la `Authorization` marcada como
+    /// sensible, y no leer el cuerpo de la respuesta —sólo su cabecera `ETag`—,
+    /// que es el tope más firme contra un servidor que quiera inflar la memoria
+    /// con la respuesta a una escritura.
+    ///
+    /// `content_type` es `text/calendar; charset=utf-8` o
+    /// `text/vcard; charset=utf-8`. El estado se mapea: `412` es un
+    /// [`DavError::Conflict`]; `401`, una credencial que no vale; una
+    /// redirección se rechaza; cualquier otro estado que no sea éxito vuelve
+    /// como [`DavError::Status`], que [`DavError::is_retryable`] clasifica.
+    // Todavía sin llamador en el binario: la cola de operaciones que lo usa es
+    // el PR siguiente de `vasak-accounts#23`. Por ahora lo ejercitan las pruebas.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn put(
+        &self,
+        url: &url::Url,
+        body: String,
+        precondition: Precondition,
+        content_type: &str,
+    ) -> Result<PutOutcome, DavError> {
+        if url.origin() != self.home.origin() {
+            return Err(DavError::ForeignOrigin);
+        }
+
+        let builder = self
+            .http
+            .request(Method::Put.to_reqwest(), url.clone())
+            .header(reqwest::header::AUTHORIZATION, self.authorization.clone())
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .body(body);
+        // La precondición no es opcional: sin ella no hay forma de armar la
+        // escritura.
+        let builder = match &precondition {
+            Precondition::Create => builder.header(reqwest::header::IF_NONE_MATCH, "*"),
+            Precondition::Replace(etag) => builder.header(reqwest::header::IF_MATCH, etag.as_str()),
+        };
+
+        let response = builder
+            .send()
+            .await
+            .map_err(|e| DavError::network(e.without_url()))?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(DavError::Unauthorized);
+        }
+        if status.is_redirection() {
+            return Err(DavError::Redirect(status.as_u16()));
+        }
+        if status == reqwest::StatusCode::PRECONDITION_FAILED {
+            return Err(DavError::Conflict);
+        }
+        if !status.is_success() {
+            return Err(DavError::Status(status.as_u16()));
+        }
+
+        // Sólo la cabecera: el cuerpo de un `PUT` no interesa, y no leerlo es el
+        // tope más firme —cero bytes— contra un servidor que lo infle. Si el
+        // ETag no vino, o vino desmedido, `storable` da `None` y el recurso
+        // queda para traer su ETag en la próxima vuelta.
+        let etag = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok());
+        match storable(etag) {
+            Some(etag) => Ok(PutOutcome::Etag(etag)),
+            None => Ok(PutOutcome::NeedsRefetch),
+        }
+    }
+
+    /// Borra un recurso con `DELETE`, **siempre con `If-Match`**: nunca a ciegas.
+    ///
+    /// Las mismas defensas que [`DavClient::put`]. Un `404` es **éxito**: si ya
+    /// no está, el borrado llegó a destino, y una reejecución de la cola no
+    /// tiene que fallar por eso (es idempotente). `412` es un conflicto —cambió
+    /// desde la última vez que se lo vio—, y el resto se mapea igual que en el
+    /// `PUT`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn delete(&self, url: &url::Url, if_match: &str) -> Result<(), DavError> {
+        if url.origin() != self.home.origin() {
+            return Err(DavError::ForeignOrigin);
+        }
+
+        let response = self
+            .http
+            .request(Method::Delete.to_reqwest(), url.clone())
+            .header(reqwest::header::AUTHORIZATION, self.authorization.clone())
+            .header(reqwest::header::IF_MATCH, if_match)
+            .send()
+            .await
+            .map_err(|e| DavError::network(e.without_url()))?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(DavError::Unauthorized);
+        }
+        if status.is_redirection() {
+            return Err(DavError::Redirect(status.as_u16()));
+        }
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        if status == reqwest::StatusCode::PRECONDITION_FAILED {
+            return Err(DavError::Conflict);
+        }
+        if !status.is_success() {
+            return Err(DavError::Status(status.as_u16()));
+        }
+        Ok(())
     }
 }
 
@@ -1723,6 +1914,7 @@ mod tests {
             DavError::Unauthorized,
             DavError::Redirect(302),
             DavError::Status(507),
+            DavError::Conflict,
             DavError::BodyTooLarge(16 * 1024 * 1024),
             DavError::network(server_text),
             DavError::bad_xml(server_text),
@@ -1739,6 +1931,7 @@ mod tests {
                 | DavError::Unauthorized
                 | DavError::Redirect(_)
                 | DavError::Status(_)
+                | DavError::Conflict
                 | DavError::BodyTooLarge(_)
                 | DavError::Network(_)
                 | DavError::BadXml(_)
@@ -1784,23 +1977,38 @@ mod tests {
 
     // ── El cliente ─────────────────────────────────────────────────────────
 
-    /// **El cliente sólo lee.** Escribir en el servidor —`PUT`, `DELETE`,
-    /// `PROPPATCH`, `MOVE`— tiene que ser una decisión que se ve en el código,
-    /// no un texto que alguien pasa. El `match` de abajo no tiene comodín: una
-    /// variante nueva no compila sin pasar por acá.
+    /// **El cliente sólo escribe con una precondición de ETag, y sólo con `PUT`
+    /// y `DELETE`.** Escribir en el servidor tiene que ser una decisión que se
+    /// ve en el código, no un texto que alguien pasa; y cuando escribe, no pisa
+    /// nunca un cambio del servidor sin darse cuenta. El `match` de abajo no
+    /// tiene comodín: una variante nueva no compila sin pasar por acá, y una de
+    /// escritura que se agregue fuera de `PUT`/`DELETE` —`PROPPATCH`, `MKCOL`,
+    /// `MOVE`…, fuera del alcance de M2— rompe la prueba.
+    ///
+    /// Que la precondición sea **obligatoria** lo fija el tipo: [`DavClient::put`]
+    /// pide una [`Precondition`] por parámetro —y el enum no tiene ninguna
+    /// variante «sin precondición»— y [`DavClient::delete`] pide siempre el
+    /// `If-Match`. Que además viaje en el pedido lo comprueba
+    /// `toda_escritura_lleva_una_precondicion`.
     #[test]
-    fn el_cliente_no_tiene_ningun_metodo_de_escritura() {
+    fn el_cliente_solo_escribe_con_precondicion() {
         for method in Method::ALL {
-            let read_only = match method {
-                Method::Propfind | Method::Report => true,
+            let writes = match method {
+                Method::Propfind | Method::Report => false,
+                Method::Put | Method::Delete => true,
             };
-            assert!(read_only);
+            // Sólo `PUT` y `DELETE` escriben; ningún otro verbo de escritura
+            // entró.
+            assert_eq!(
+                writes,
+                matches!(method.as_str(), "PUT" | "DELETE"),
+                "{}",
+                method.as_str()
+            );
             assert!(
                 !matches!(
                     method.as_str(),
-                    "PUT"
-                        | "POST"
-                        | "DELETE"
+                    "POST"
                         | "PATCH"
                         | "PROPPATCH"
                         | "MKCOL"
@@ -1814,7 +2022,314 @@ mod tests {
                 method.as_str()
             );
         }
-        assert_eq!(Method::ALL.len(), 2);
+        assert_eq!(Method::ALL.len(), 4);
+
+        // La precondición es un valor que hay que elegir: las dos formas, y nada
+        // más. El `match` sin comodín hace que una tercera no compile sin pasar
+        // por acá.
+        for precondition in [Precondition::Create, Precondition::Replace("\"v1\"".into())] {
+            match precondition {
+                Precondition::Create | Precondition::Replace(_) => {}
+            }
+        }
+    }
+
+    // ── La escritura (PUT/DELETE) contra el servidor de mentira ──────────────
+
+    use crate::dav::fake::FakeDav;
+
+    /// Un cliente apuntado al servidor de mentira.
+    fn client_for(server: &FakeDav) -> DavClient {
+        let credential = DavCredential {
+            home: server.home_url(),
+            username: "ana".into(),
+            secret: Zeroizing::new("el-secreto".into()),
+            auth: AuthKind::Password,
+        };
+        DavClient::new(&credential, Limits::DEFAULT, HttpPolicy::plain_loopback()).unwrap()
+    }
+
+    const VCARD: &str = "text/vcard; charset=utf-8";
+
+    /// **Una escritura a otro origen no sale**, igual que una lectura: el cliente
+    /// de una cuenta sólo escribe en el servidor de esa cuenta. Si no, una
+    /// redirección —o una dirección mal resuelta— mandaría la credencial y el
+    /// cuerpo a otro lado. Se rechaza **antes** de tocar la red: el otro
+    /// servidor no recibe nada.
+    #[tokio::test]
+    async fn una_escritura_a_otro_origen_no_sale() {
+        let server = FakeDav::start().await;
+        let other = FakeDav::start().await;
+        let client = client_for(&server);
+        let foreign = other.collection_url(0).join("ana.vcf").unwrap();
+
+        assert_eq!(
+            client
+                .put(&foreign, "x".into(), Precondition::Create, VCARD)
+                .await,
+            Err(DavError::ForeignOrigin)
+        );
+        assert_eq!(
+            client.delete(&foreign, "\"v1\"").await,
+            Err(DavError::ForeignOrigin)
+        );
+        assert!(
+            other.requests().is_empty(),
+            "no se tocó la red del otro servidor"
+        );
+    }
+
+    /// **Toda escritura lleva una precondición en el pedido**: crear va con
+    /// `If-None-Match: *`, reemplazar y borrar van con `If-Match`. Es lo que
+    /// obliga al servidor a rechazar con `412` en vez de pisar un cambio. Y el
+    /// `Content-Type` es el del formato, no el XML de las lecturas.
+    #[tokio::test]
+    async fn toda_escritura_lleva_una_precondicion() {
+        let server = FakeDav::start().await;
+        let client = client_for(&server);
+        let card = server.collection_url(0).join("ana.vcf").unwrap();
+
+        // Crear.
+        client
+            .put(&card, "uno".into(), Precondition::Create, VCARD)
+            .await
+            .unwrap();
+        let created = server.requests().pop().unwrap();
+        assert_eq!(created.method, "PUT");
+        assert_eq!(created.if_none_match, "*");
+        assert!(created.if_match.is_empty());
+        assert_eq!(created.content_type, VCARD);
+        assert!(created.has_precondition());
+
+        // Reemplazar.
+        let etag = server.state().collections[0].resources["ana.vcf"]
+            .etag
+            .clone();
+        client
+            .put(
+                &card,
+                "dos".into(),
+                Precondition::Replace(etag.clone()),
+                VCARD,
+            )
+            .await
+            .unwrap();
+        let replaced = server.requests().pop().unwrap();
+        assert_eq!(replaced.if_match, etag);
+        assert!(replaced.if_none_match.is_empty());
+
+        // Borrar.
+        let etag = server.state().collections[0].resources["ana.vcf"]
+            .etag
+            .clone();
+        client.delete(&card, &etag).await.unwrap();
+        let deleted = server.requests().pop().unwrap();
+        assert_eq!(deleted.method, "DELETE");
+        assert_eq!(deleted.if_match, etag);
+        assert!(deleted.has_precondition());
+    }
+
+    /// Un `PUT` que crea devuelve el `ETag` del recurso recién escrito, y el
+    /// recurso queda en el servidor.
+    #[tokio::test]
+    async fn un_put_que_crea_devuelve_el_etag() {
+        let server = FakeDav::start().await;
+        let client = client_for(&server);
+        let card = server.collection_url(0).join("ana.vcf").unwrap();
+
+        let outcome = client
+            .put(&card, "uno".into(), Precondition::Create, VCARD)
+            .await
+            .unwrap();
+        let stored = server.state().collections[0].resources["ana.vcf"]
+            .etag
+            .clone();
+        assert_eq!(outcome, PutOutcome::Etag(stored));
+        assert_eq!(
+            server.state().collections[0].resources["ana.vcf"].data,
+            "uno"
+        );
+    }
+
+    /// **Un `PUT` sin `ETag` en la respuesta pide volver a traerlo**, en vez de
+    /// inventar uno: el RFC permite no mandarlo, y asumir uno dejaría el recurso
+    /// con un ETag que el servidor no tiene.
+    #[tokio::test]
+    async fn un_put_sin_etag_de_respuesta_pide_refetch() {
+        let server = FakeDav::start().await;
+        server.state().omit_put_etag = true;
+        let client = client_for(&server);
+        let card = server.collection_url(0).join("ana.vcf").unwrap();
+
+        let outcome = client
+            .put(&card, "uno".into(), Precondition::Create, VCARD)
+            .await
+            .unwrap();
+        assert_eq!(outcome, PutOutcome::NeedsRefetch);
+        // Pero el recurso se escribió igual.
+        assert!(server.state().collections[0]
+            .resources
+            .contains_key("ana.vcf"));
+    }
+
+    /// **Un `412` es un conflicto, no un error cualquiera**: crear sobre algo que
+    /// ya existe, o reemplazar con un `If-Match` que no coincide. La cola
+    /// resuelve el conflicto; no se pierde lo del servidor.
+    #[tokio::test]
+    async fn un_put_que_choca_es_conflicto() {
+        let server = FakeDav::start().await;
+        let client = client_for(&server);
+        let card = server.collection_url(0).join("ana.vcf").unwrap();
+
+        client
+            .put(&card, "uno".into(), Precondition::Create, VCARD)
+            .await
+            .unwrap();
+
+        // Crear de nuevo: ya existe.
+        assert_eq!(
+            client
+                .put(&card, "otra".into(), Precondition::Create, VCARD)
+                .await,
+            Err(DavError::Conflict)
+        );
+        // Reemplazar con un ETag viejo.
+        assert_eq!(
+            client
+                .put(
+                    &card,
+                    "otra".into(),
+                    Precondition::Replace("\"viejo\"".into()),
+                    VCARD,
+                )
+                .await,
+            Err(DavError::Conflict)
+        );
+        // Y el contenido del servidor sigue siendo el primero.
+        assert_eq!(
+            server.state().collections[0].resources["ana.vcf"].data,
+            "uno"
+        );
+    }
+
+    /// **Borrar lo que ya no está es éxito** (idempotente): un `404` en un
+    /// `DELETE` quiere decir que el recurso ya no está, que es justo lo que se
+    /// buscaba. Una reejecución de la cola no tiene que fallar por eso.
+    #[tokio::test]
+    async fn un_delete_de_lo_ya_borrado_es_exito() {
+        let server = FakeDav::start().await;
+        let client = client_for(&server);
+        let missing = server.collection_url(0).join("fantasma.vcf").unwrap();
+
+        assert_eq!(client.delete(&missing, "\"v9\"").await, Ok(()));
+    }
+
+    /// Un `DELETE` con un `If-Match` que no coincide es un conflicto, y no borra.
+    #[tokio::test]
+    async fn un_delete_con_etag_que_no_coincide_es_conflicto() {
+        let server = FakeDav::start().await;
+        let client = client_for(&server);
+        let card = server.collection_url(0).join("ana.vcf").unwrap();
+        client
+            .put(&card, "uno".into(), Precondition::Create, VCARD)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            client.delete(&card, "\"otro\"").await,
+            Err(DavError::Conflict)
+        );
+        assert!(server.state().collections[0]
+            .resources
+            .contains_key("ana.vcf"));
+    }
+
+    /// Un `401` en una escritura es una credencial que no vale, igual que en una
+    /// lectura: manda a reconectar, no a reintentar.
+    #[tokio::test]
+    async fn un_401_en_una_escritura_es_credencial() {
+        let server = FakeDav::start().await;
+        server.state().force_write_status = Some(401);
+        let client = client_for(&server);
+        let card = server.collection_url(0).join("ana.vcf").unwrap();
+
+        assert_eq!(
+            client
+                .put(&card, "x".into(), Precondition::Create, VCARD)
+                .await,
+            Err(DavError::Unauthorized)
+        );
+        assert_eq!(
+            client.delete(&card, "\"v1\"").await,
+            Err(DavError::Unauthorized)
+        );
+    }
+
+    /// **Una redirección en una escritura se rechaza**, no se sigue: seguirla
+    /// mandaría la credencial y el cuerpo adonde diga el servidor.
+    #[tokio::test]
+    async fn una_redireccion_en_una_escritura_se_rechaza() {
+        let server = FakeDav::start().await;
+        server.state().force_write_status = Some(302);
+        let client = client_for(&server);
+        let card = server.collection_url(0).join("ana.vcf").unwrap();
+
+        assert_eq!(
+            client
+                .put(&card, "x".into(), Precondition::Create, VCARD)
+                .await,
+            Err(DavError::Redirect(302))
+        );
+        assert_eq!(
+            client.delete(&card, "\"v1\"").await,
+            Err(DavError::Redirect(302))
+        );
+    }
+
+    /// Un estado inesperado en una escritura vuelve como [`DavError::Status`],
+    /// que es lo que la cola clasifica con [`DavError::is_retryable`].
+    #[tokio::test]
+    async fn un_estado_inesperado_en_una_escritura_vuelve_como_status() {
+        let server = FakeDav::start().await;
+        server.state().force_write_status = Some(500);
+        let client = client_for(&server);
+        let card = server.collection_url(0).join("ana.vcf").unwrap();
+
+        assert_eq!(
+            client
+                .put(&card, "x".into(), Precondition::Create, VCARD)
+                .await,
+            Err(DavError::Status(500))
+        );
+        assert_eq!(
+            client.delete(&card, "\"v1\"").await,
+            Err(DavError::Status(500))
+        );
+    }
+
+    /// **El mapeo de estados dice qué se reintenta y qué no.** Un corte de red,
+    /// un `423 Locked` y un `507` son pasajeros y se reintentan; un conflicto de
+    /// ETag lo resuelve la cola (no el reintento a secas), y una credencial que
+    /// no vale, un origen ajeno o un estado inesperado se repetirían igual.
+    #[test]
+    fn el_mapeo_de_estados_de_escritura_clasifica_reintentos() {
+        for retryable in [
+            DavError::network("se cortó"),
+            DavError::Status(423),
+            DavError::Status(507),
+        ] {
+            assert!(retryable.is_retryable(), "{retryable:?}");
+        }
+        for firm in [
+            DavError::Conflict,
+            DavError::Unauthorized,
+            DavError::ForeignOrigin,
+            DavError::Status(500),
+            DavError::Status(404),
+            DavError::Redirect(302),
+        ] {
+            assert!(!firm.is_retryable(), "{firm:?}");
+        }
     }
 
     /// Sólo `https`. `http` no se acepta ni siquiera contra la propia máquina
