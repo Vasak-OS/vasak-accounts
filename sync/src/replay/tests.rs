@@ -196,6 +196,25 @@ impl Fixture {
             .unwrap()
     }
 
+    /// La copia del servidor guardada en la op de un objeto: su ETag y su crudo.
+    /// `(None, None)` si todavía no se trajo.
+    async fn server_copy(&self, name: &str) -> (Option<String>, Option<Vec<u8>>) {
+        let href = self.object_url(name);
+        self.manager
+            .with_store(ACCOUNT, move |store| {
+                Ok(store
+                    .connection()
+                    .query_row(
+                        "SELECT server_etag, server_raw FROM pending_dav_ops WHERE object_href = ?1",
+                        [href],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap_or((None, None)))
+            })
+            .await
+            .unwrap()
+    }
+
     /// El estado de la op de un objeto (`ready`/`conflict`), o `None` si ya no
     /// hay op.
     async fn op_state(&self, name: &str) -> Option<String> {
@@ -285,6 +304,149 @@ async fn un_412_deja_la_op_en_conflicto_y_no_pierde_lo_local() {
         f.server.state().collections[0].resources["a.ics"].data,
         event("a", "Del servidor", "20260928T150000Z")
     );
+}
+
+/// **M3**: ante un `412`, además de dejar el conflicto, se trae la versión del
+/// servidor del recurso —su ETag y su crudo— y se guarda cifrada en la op para
+/// que M3 muestre «local vs. servidor».
+#[tokio::test]
+async fn un_412_trae_y_guarda_la_copia_del_servidor() {
+    let f = Fixture::new("replay-copia-412").await;
+    // El servidor tiene otra versión del recurso.
+    let server_raw = event("a", "Del servidor", "20260928T150000Z");
+    f.server.put(0, "a.ics", &server_raw);
+    let server_etag = f.server.state().collections[0].resources["a.ics"]
+        .etag
+        .clone();
+    // Local cree que el ETag es otro: un reemplazo que va a chocar.
+    f.enqueue_put(
+        "a.ics",
+        &event("a", "Mía", "20260928T140000Z"),
+        Some("\"viejo\""),
+    )
+    .await;
+
+    let report = f.replay().await;
+    assert_eq!(report.conflicts, 1);
+    assert_eq!(f.op_state("a.ics").await.as_deref(), Some("conflict"));
+
+    // La copia del servidor quedó guardada, con su ETag y su crudo. El camino de
+    // lectura DAV trae el crudo con los fines de línea normalizados a LF (lo hace
+    // el parseo de XML), así que se compara contra esa forma.
+    let (etag, raw) = f.server_copy("a.ics").await;
+    assert_eq!(etag.as_deref(), Some(server_etag.as_str()));
+    assert_eq!(raw, Some(server_raw.replace("\r\n", "\n").into_bytes()));
+}
+
+/// **M3**: si la traída de la copia del servidor falla, el conflicto queda sin
+/// copia —no se bloquea ni se pierde—, y una vuelta posterior la trae.
+#[tokio::test]
+async fn si_el_fetch_falla_el_conflicto_queda_sin_copia_y_se_reintenta() {
+    let f = Fixture::new("replay-copia-reintento").await;
+    let server_raw = event("a", "Del servidor", "20260928T150000Z");
+    f.server.put(0, "a.ics", &server_raw);
+    let server_etag = f.server.state().collections[0].resources["a.ics"]
+        .etag
+        .clone();
+    // El `multiget` que trae la copia falla en esta vuelta.
+    f.server.state().fail_multiget_from = Some(1);
+    f.enqueue_put(
+        "a.ics",
+        &event("a", "Mía", "20260928T140000Z"),
+        Some("\"viejo\""),
+    )
+    .await;
+
+    let report = f.replay().await;
+    assert_eq!(report.conflicts, 1);
+    assert_eq!(f.op_state("a.ics").await.as_deref(), Some("conflict"));
+    // El conflicto quedó sin copia: la traída falló.
+    assert_eq!(f.server_copy("a.ics").await, (None, None));
+
+    // La próxima vuelta, con el servidor sano, la trae (el reintento del
+    // conflicto sin copia).
+    {
+        let mut state = f.server.state();
+        state.fail_multiget_from = None;
+        state.multigets = 0;
+    }
+    f.replay().await;
+    let (etag, raw) = f.server_copy("a.ics").await;
+    assert_eq!(etag.as_deref(), Some(server_etag.as_str()));
+    assert_eq!(raw, Some(server_raw.replace("\r\n", "\n").into_bytes()));
+}
+
+/// **Seguridad**: `ClearStore` vacía la base entera, y con ella la copia del
+/// servidor del conflicto. Una foto privada del servidor no sobrevive a vaciar la
+/// cuenta.
+#[tokio::test]
+async fn clear_store_borra_la_copia_del_servidor() {
+    let f = Fixture::new("replay-copia-clear").await;
+    f.server
+        .put(0, "a.ics", &event("a", "Del servidor", "20260928T150000Z"));
+    f.enqueue_put(
+        "a.ics",
+        &event("a", "Mía", "20260928T140000Z"),
+        Some("\"viejo\""),
+    )
+    .await;
+    f.replay().await;
+    // La copia está guardada.
+    let (_, raw) = f.server_copy("a.ics").await;
+    assert!(raw.is_some(), "la copia del servidor se guardó");
+
+    f.manager.clear(ACCOUNT).await.unwrap();
+    // La base se rehizo vacía: ni la op ni su copia.
+    assert_eq!(f.pending().await, 0);
+    assert_eq!(f.server_copy("a.ics").await, (None, None));
+}
+
+/// **M3 / disponibilidad**: la re-traída de la copia del servidor está **acotada**
+/// por `MAX_REPLAY_ATTEMPTS`. Un recurso en conflicto que se **borra en el
+/// servidor** —el `multiget` devuelve `Ok(None)` para siempre— no se re-trae en
+/// cada vuelta consumiendo el plazo y postergando el empuje: pasado el tope, deja
+/// de intentarse. Sin el fix, el `multiget` corre una vez por vuelta sin fin.
+#[tokio::test]
+async fn la_re_traida_de_la_copia_esta_acotada() {
+    let f = Fixture::new("replay-copia-acotada").await;
+    f.server
+        .put(0, "a.ics", &event("a", "Del servidor", "20260928T150000Z"));
+    // La traída inline del 412 falla: el conflicto queda SIN copia.
+    f.server.state().fail_multiget_from = Some(1);
+    f.enqueue_put(
+        "a.ics",
+        &event("a", "Mía", "20260928T140000Z"),
+        Some("\"viejo\""),
+    )
+    .await;
+    f.replay().await;
+    assert_eq!(f.op_state("a.ics").await.as_deref(), Some("conflict"));
+    assert_eq!(f.server_copy("a.ics").await, (None, None));
+
+    // El recurso se borra en el servidor: el `multiget` dará `Ok(None)` siempre.
+    f.server.remove(0, "a.ics");
+    {
+        let mut state = f.server.state();
+        state.fail_multiget_from = None;
+        state.multigets = 0;
+    }
+
+    // Muchas más vueltas que el tope: la re-traída no corre en cada una.
+    let rounds = (MAX_REPLAY_ATTEMPTS as usize) + 5;
+    for _ in 0..rounds {
+        f.replay().await;
+    }
+    let multigets = f.server.state().multigets as i64;
+    assert!(
+        multigets < rounds as i64,
+        "la re-traída se acota, no corre cada vuelta ({multigets} de {rounds})"
+    );
+    assert!(
+        multigets <= MAX_REPLAY_ATTEMPTS,
+        "la re-traída no pasa del tope ({multigets})"
+    );
+    // Sigue sin copia: M3 lo mostrará como «copia del servidor no disponible».
+    assert_eq!(f.server_copy("a.ics").await, (None, None));
 }
 
 /// **H2**: un `Create` que choca con un `412` **no** se da por hecho: no se puede

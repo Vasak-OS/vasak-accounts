@@ -25,7 +25,16 @@
 //!   nada**: se conserva el crudo local y la op queda en `conflict` para que M3
 //!   la resuelva de cara a la persona. No se intenta adivinar «es mi creación
 //!   que ya llegó» vs. «hay otro recurso ahí»: adivinar mal pisaría la creación
-//!   local con contenido ajeno en la próxima bajada.
+//!   local con contenido ajeno en la próxima bajada. **Además de marcar el
+//!   conflicto, se trae la versión del servidor** del recurso —su ETag y su
+//!   crudo— por el mismo camino de lectura de un recurso del cliente DAV (un
+//!   `multiget` por `href`), y se guarda cifrada en la op
+//!   ([`capture_server_copy`]) para que M3 muestre «local vs. servidor». La
+//!   traída respeta el plazo de la vuelta y se guarda **condicionada al `id` y la
+//!   `revision`** de la op (como los demás cierres), para no resucitar una foto
+//!   vieja sobre una edición concurrente. Si la traída falla o no entra en el
+//!   plazo, el conflicto queda sin copia y se reintenta la próxima vuelta: una op
+//!   en `conflict` sin copia del servidor se vuelve a intentar al drenar.
 //! - **Red, `423`, `507` (reintentables, [`DavError::is_retryable`])** → la op
 //!   se deja, con un reintento más y el detalle en `last_error`. Vuelve a
 //!   intentarse en la próxima vuelta, respetando el plazo. Tras
@@ -44,7 +53,7 @@
 
 use crate::dav::webdav::{DavClient, DavError, Precondition, PutOutcome};
 use crate::store::key::KeySource;
-use crate::store::lifecycle::StoreManager;
+use crate::store::lifecycle::{StoreManager, CALENDAR_AREA};
 use crate::store::queue::{PendingKind, PendingOp, PendingState};
 use crate::store::StoreError;
 
@@ -91,8 +100,39 @@ pub async fn replay_area<K: KeySource>(
             tracing::info!("'{account_id}': el empuje pasó el plazo de la vuelta; sigue después");
             break;
         }
-        // Una op en conflicto no se reintenta sola: la resuelve M3.
+        // Una op en conflicto no se reintenta sola: la resuelve M3. Pero si
+        // quedó sin la copia del servidor de una vuelta anterior (la traída
+        // falló o no entró en el plazo), se vuelve a intentar traerla ahora: es
+        // lo único que se reintenta de una op en conflicto, y no toca el crudo
+        // local ni reintenta la escritura.
+        //
+        // **Acotada con el mismo tope que las escrituras** ([`MAX_REPLAY_ATTEMPTS`]):
+        // una op en conflicto cuya copia no llega —el recurso se borró en el
+        // servidor y el `multiget` da `Ok(None)` para siempre, o la red falla
+        // vuelta tras vuelta— no puede re-traerse indefinidamente consumiendo el
+        // plazo de cada vuelta y postergando el empuje de las escrituras que la
+        // persona quiere subir. Pasado el tope se deja de intentar la copia; M3
+        // (A2) muestra el conflicto igual, con «copia del servidor no disponible».
         if op.state == PendingState::Conflict {
+            if op.server_etag.is_none()
+                && op.server_raw.is_none()
+                && op.attempts < MAX_REPLAY_ATTEMPTS
+            {
+                if let Ok(object) = url::Url::parse(&op.object_href) {
+                    capture_server_copy(
+                        manager,
+                        account_id,
+                        client,
+                        deadline,
+                        &op.area,
+                        op.id,
+                        op.revision,
+                        &op.collection_href,
+                        &object,
+                    )
+                    .await?;
+                }
+            }
             continue;
         }
         resolve_op(
@@ -139,6 +179,14 @@ async fn resolve_op<K: KeySource>(
         }
     };
 
+    // La identidad de la op, por si un `412` pide traer la copia del servidor
+    // después de cerrar el conflicto: `op` se consume al armar el cierre, así que
+    // se guarda acá lo barato (sin el `payload`).
+    let (id, revision) = (op.id, op.revision);
+    let area = op.area.clone();
+    let collection_href = op.collection_href.clone();
+    let mut server_conflict = false;
+
     let decision = match op.kind {
         PendingKind::Put => {
             let body = match String::from_utf8(op.payload.clone().unwrap_or_default()) {
@@ -165,7 +213,10 @@ async fn resolve_op<K: KeySource>(
                     report.pushed += 1;
                     Close::Put(op, None)
                 }
-                Timed::Done(Err(e)) => on_error(op, e, report),
+                Timed::Done(Err(e)) => {
+                    server_conflict = e == DavError::Conflict;
+                    on_error(op, e, report)
+                }
             }
         }
         PendingKind::Delete => {
@@ -182,11 +233,36 @@ async fn resolve_op<K: KeySource>(
                     report.pushed += 1;
                     Close::Delete(op)
                 }
-                Timed::Done(Err(e)) => on_error(op, e, report),
+                Timed::Done(Err(e)) => {
+                    server_conflict = e == DavError::Conflict;
+                    on_error(op, e, report)
+                }
             }
         }
     };
-    close(manager, account_id, decision).await
+    close(manager, account_id, decision).await?;
+
+    // Un `412` genuino: además de dejar el conflicto, se trae la versión del
+    // servidor para que M3 muestre «local vs. servidor». Va **después** de cerrar
+    // el conflicto —el guardado es condicional al estado `conflict`—, respeta el
+    // plazo y, si falla o no entra, deja el conflicto sin copia (se reintenta la
+    // próxima vuelta). Sólo en un `412`: un error permanente que también escala a
+    // `conflict` no tiene una versión del servidor que mostrar.
+    if server_conflict {
+        capture_server_copy(
+            manager,
+            account_id,
+            client,
+            deadline,
+            &area,
+            id,
+            revision,
+            &collection_href,
+            &url,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Decide qué hacer con el error de una escritura, y cuenta en el informe.
@@ -266,6 +342,116 @@ async fn run<T>(
         Ok(value) => Timed::Done(value),
         Err(_) => Timed::Elapsed,
     }
+}
+
+/// Trae del servidor la versión actual de un recurso —su ETag y su crudo— por el
+/// mismo camino de lectura de un recurso del cliente DAV: un `calendar-multiget`
+/// o un `addressbook-multiget` por `href`, según el área. Reusa la **misma
+/// credencial** del cliente, como el resto del empuje; no pide una nueva.
+///
+/// `Ok(None)` es que el recurso **no volvió**: el servidor lo omitió, lo contestó
+/// con un estado de error o ya no está. Ahí no hay copia que guardar, y el
+/// conflicto queda sin ella (se reintenta la próxima vuelta).
+async fn fetch_server_copy(
+    area: &str,
+    client: &DavClient,
+    collection: &url::Url,
+    object: &url::Url,
+) -> Result<Option<(Option<String>, Vec<u8>)>, DavError> {
+    let hrefs = [object.clone()];
+    let copy = if area == CALENDAR_AREA {
+        crate::dav::caldav::multiget(client, collection, &hrefs)
+            .await?
+            .items
+            .into_iter()
+            .next()
+            .map(|o| (o.etag, o.data.into_bytes()))
+    } else {
+        crate::dav::carddav::multiget(client, collection, &hrefs)
+            .await?
+            .items
+            .into_iter()
+            .next()
+            .map(|c| (c.etag, c.data.into_bytes()))
+    };
+    Ok(copy)
+}
+
+/// Trae la versión del servidor de un recurso en conflicto y la guarda cifrada en
+/// la op, **condicionada al `id` y la `revision`** (ver `Store::store_server_copy`).
+///
+/// Respeta el plazo de la vuelta: si la traída no entra, si falla, o si el
+/// recurso no volvió, **se deja el conflicto sin copia**. El detalle del error no
+/// se registra: el crudo del servidor es dato privado y no tiene por qué terminar
+/// en el diario.
+///
+/// Cuando no se guarda la copia, **se le suma un intento a la op**
+/// (`Store::count_conflict_fetch_attempt`), condicionado a su
+/// `id`/`revision`: así la re-traída queda acotada por [`MAX_REPLAY_ATTEMPTS`] —el
+/// bucle deja de intentarla al llegar al tope— y un recurso borrado en el servidor
+/// (`Ok(None)` permanente) no se re-trae para siempre.
+#[allow(clippy::too_many_arguments)]
+async fn capture_server_copy<K: KeySource>(
+    manager: &StoreManager<K>,
+    account_id: &str,
+    client: &DavClient,
+    deadline: tokio::time::Instant,
+    area: &str,
+    id: i64,
+    revision: i64,
+    collection_href: &str,
+    object: &url::Url,
+) -> Result<(), StoreError> {
+    let stored = match url::Url::parse(collection_href) {
+        // La dirección de la colección no se puede parsear: sin ella no hay a
+        // quién pedirle la copia. Raro, porque se guardó desde una URL válida.
+        Err(_) => false,
+        Ok(collection) => match run(
+            deadline,
+            fetch_server_copy(area, client, &collection, object),
+        )
+        .await
+        {
+            Timed::Elapsed => {
+                tracing::info!(
+                    "'{account_id}': la copia del servidor del conflicto no entró en el plazo; \
+                     se trae la próxima vuelta"
+                );
+                false
+            }
+            // El recurso no volvió (se borró en el servidor, o un error por
+            // recurso): no hay copia que guardar.
+            Timed::Done(Ok(None)) => false,
+            Timed::Done(Err(_)) => {
+                // Sin el detalle: puede venir del servidor y el crudo es privado.
+                tracing::info!(
+                    "'{account_id}': no se pudo traer la copia del servidor del conflicto; \
+                     se reintenta la próxima vuelta"
+                );
+                false
+            }
+            Timed::Done(Ok(Some((server_etag, server_raw)))) => {
+                manager
+                    .with_store(account_id, move |store| {
+                        store.store_server_copy(id, revision, server_etag.as_deref(), &server_raw)
+                    })
+                    .await?
+            }
+        },
+    };
+
+    if !stored {
+        // Acota la re-traída: la próxima vuelta deja de intentarla al llegar al
+        // tope. Condicional a `id`/`revision` y al estado `conflict`, así una
+        // edición nueva que reemplazó la op (vuelta a `ready`, revisión nueva) no
+        // arrastra los intentos de la vieja.
+        manager
+            .with_store(account_id, move |store| {
+                store.count_conflict_fetch_attempt(id, revision)
+            })
+            .await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -491,9 +491,43 @@ ALTER TABLE contacts ADD COLUMN pending_op TEXT
     CHECK (pending_op IN ('put', 'delete'));
 ";
 
+/// v6 (PR A3 de M3, `vasak-accounts#23`): la copia del servidor de un recurso en
+/// conflicto.
+///
+/// Hasta la v5, un `412` dejaba la op en `conflict` y conservaba el crudo local,
+/// pero **no traía la versión del servidor**: M3 no tenía con qué mostrar «local
+/// vs. servidor». Esta migración le suma a `pending_dav_ops` dos columnas,
+/// nulas mientras no se haya traído la copia:
+///
+/// - **`server_etag`**: el ETag del recurso tal como está hoy en el servidor.
+/// - **`server_raw`**: el crudo del recurso del servidor —el iCal o la vCard—,
+///   como lo trae el camino de lectura de un recurso (`calendar-multiget` /
+///   `addressbook-multiget` por href). Un `BLOB`, como `payload`.
+///
+/// Las dos viven **dentro de la base cifrada**, en la misma fila de la op: la
+/// copia del servidor es dato privado de la persona (un evento, una tarjeta), así
+/// que hereda el cifrado del almacén y se borra con la op cuando un `ClearStore`
+/// o un `SetStoreEnabled(false)` rehace la base vacía
+/// (ver `lifecycle::StoreManager::remove_store`). No hace falta ninguna limpieza
+/// aparte: al colgar de `pending_dav_ops`, se va con ella.
+///
+/// Nulas al migrar: una op en conflicto de una base de la v5 queda sin copia, y
+/// la próxima vuelta del empuje la trae (ver `replay::capture_server_copy`).
+const V6: &str = "
+ALTER TABLE pending_dav_ops ADD COLUMN server_etag TEXT;
+ALTER TABLE pending_dav_ops ADD COLUMN server_raw BLOB;
+";
+
 /// Todas las migraciones, en orden.
 pub fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(V1), M::up(V2), M::up(V3), M::up(V4), M::up(V5)])
+    Migrations::new(vec![
+        M::up(V1),
+        M::up(V2),
+        M::up(V3),
+        M::up(V4),
+        M::up(V5),
+        M::up(V6),
+    ])
 }
 
 /// Lleva la base a la última versión. Aplicarlo sobre una base al día no hace
@@ -529,7 +563,7 @@ mod tests {
         let mut connection = Connection::open_in_memory().unwrap();
         apply(&mut connection).unwrap();
         let version = schema_version(&connection).unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
 
         let tables = |c: &Connection| -> Vec<String> {
             let mut statement = c
@@ -652,7 +686,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 5);
+        assert_eq!(schema_version(&connection).unwrap(), 6);
 
         // Lo que había sigue, y la marca nueva es NULL.
         let object_mark: Option<String> = connection
@@ -674,6 +708,57 @@ mod tests {
             .query_row("SELECT count(*) FROM pending_dav_ops", [], |r| r.get(0))
             .unwrap();
         assert_eq!(pending, 0);
+    }
+
+    /// **v5 → v6 no pierde nada**: una op en conflicto de una base del PR 3 de M2
+    /// sigue ahí después de migrar, y las columnas nuevas de la copia del
+    /// servidor le quedan en `NULL` —todavía no se trajo—.
+    #[test]
+    fn de_v5_a_v6_conserva_la_op_y_la_copia_del_servidor_arranca_nula() {
+        let mut connection = at_version(5);
+        assert_eq!(schema_version(&connection).unwrap(), 5);
+        connection
+            .execute(
+                "INSERT INTO pending_dav_ops
+                   (id, area, collection_href, object_href, op, base_etag, payload, state,
+                    created_at, attempts, last_error)
+                 VALUES (1, 'calendar', 'https://x/c/', 'https://x/c/a.ics', 'put', '\"v1\"',
+                    x'0102', 'conflict', 'ayer', 1, 'chocó')",
+                [],
+            )
+            .unwrap();
+
+        apply(&mut connection).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 6);
+
+        // La op sigue, en conflicto, y las columnas nuevas son NULL.
+        let (state, server_etag, server_raw): (String, Option<String>, Option<Vec<u8>>) =
+            connection
+                .query_row(
+                    "SELECT state, server_etag, server_raw FROM pending_dav_ops WHERE id = 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+        assert_eq!(state, "conflict");
+        assert_eq!(server_etag, None);
+        assert_eq!(server_raw, None);
+        // Y se puede escribir la copia del servidor en las columnas nuevas.
+        connection
+            .execute(
+                "UPDATE pending_dav_ops SET server_etag = '\"v9\"', server_raw = x'0304'
+                  WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        let server_raw: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT server_raw FROM pending_dav_ops WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(server_raw.as_deref(), Some(&[3u8, 4u8][..]));
     }
 
     /// La marca `pending_op` sólo acepta los dos valores conocidos, o `NULL`.
@@ -817,7 +902,7 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .unwrap();
-        let all = [V1, V2, V3, V4, V5];
+        let all = [V1, V2, V3, V4, V5, V6];
         Migrations::new(all[..version].iter().map(|sql| M::up(sql)).collect())
             .to_latest(&mut connection)
             .unwrap();
@@ -844,7 +929,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 5);
+        assert_eq!(schema_version(&connection).unwrap(), 6);
         let message: String = connection
             .query_row("SELECT message FROM sync_log", [], |row| row.get(0))
             .unwrap();
@@ -1145,7 +1230,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 5);
+        assert_eq!(schema_version(&connection).unwrap(), 6);
         assert_eq!(found(&connection, "jose"), vec![id]);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_emails"), 1);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_phones"), 1);
@@ -1316,7 +1401,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 5);
+        assert_eq!(schema_version(&connection).unwrap(), 6);
         assert_eq!(found(&connection, "jose"), vec![id]);
         assert_eq!(count(&connection, "SELECT count(*) FROM occurrences"), 2);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_emails"), 1);
