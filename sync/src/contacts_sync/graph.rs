@@ -736,4 +736,612 @@ mod tests {
             Some("https://graph.microsoft.com/v1.0/me/contacts?$skip=100")
         );
     }
+
+    // --- Pruebas definitivas: endpoint falso, paginación y hallazgos de
+    // seguridad. Escritas por qa. ---
+
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use crate::store::key::fake::FakeKeys;
+    use crate::store::lifecycle::{
+        AccountListing, Consent, ListedAccount, Locations, StoreManager,
+    };
+    use crate::store::paths::tests::TempDir;
+
+    const ACCOUNT: &str = "cuenta";
+    /// El token que la credencial lleva al endpoint falso. Lo único que prueba
+    /// «no se le mandó el token a otro host» es que ese host no lo haya recibido.
+    const TOKEN: &str = "token-secreto-de-prueba";
+
+    /// Un pedido HTTP tal como llegó al endpoint falso de Graph.
+    #[derive(Clone)]
+    struct GraphRequest {
+        path: String,
+        authorization: String,
+    }
+
+    /// Lo que el endpoint falso sabe contestar.
+    struct FakeGraphState {
+        /// Respuestas `(estado, cuerpo JSON)` a servir en orden de llegada.
+        responses: VecDeque<(u16, String)>,
+        /// Cada pedido que llegó, con su cabecera `Authorization`: para poder
+        /// decir «este host no recibió el token».
+        requests: Vec<GraphRequest>,
+        /// Si la cola se vacía: con `Some(origin)` se generan páginas únicas sin
+        /// fin (para el tope de páginas); con `None` se contesta 500.
+        auto_next: Option<String>,
+        /// Contador de páginas autogeneradas, para que cada `nextLink` sea único
+        /// y no dispare el deduplicado.
+        auto_count: usize,
+    }
+
+    /// Un servidor HTTP/JSON de mentira en `127.0.0.1`, al estilo de `dav::fake`:
+    /// habla HTTP/1.1 de verdad contra `reqwest`, sirve una cola de respuestas
+    /// JSON y anota cada pedido —incluida la cabecera `Authorization`— para que
+    /// una prueba pueda decir «a este host no se le mandó el token».
+    #[derive(Clone)]
+    struct FakeGraph {
+        state: Arc<Mutex<FakeGraphState>>,
+        port: u16,
+    }
+
+    impl FakeGraph {
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let state = Arc::new(Mutex::new(FakeGraphState {
+                responses: VecDeque::new(),
+                requests: Vec::new(),
+                auto_next: None,
+                auto_count: 0,
+            }));
+            let shared = Arc::clone(&state);
+            tokio::spawn(async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    let state = Arc::clone(&shared);
+                    tokio::spawn(serve_graph(socket, state));
+                }
+            });
+            Self { state, port }
+        }
+
+        fn origin(&self) -> String {
+            format!("http://127.0.0.1:{}", self.port)
+        }
+
+        /// La raíz que la credencial le pasa al sincronizador; en producción es
+        /// [`GRAPH_BASE_URL`]. El host y el puerto de esta URL son el único
+        /// origen al que el sincronizador adjunta el token.
+        fn base_url(&self) -> String {
+            format!("{}/v1.0", self.origin())
+        }
+
+        /// Encola una respuesta JSON con estado 200.
+        fn push(&self, body: impl Into<String>) {
+            self.state
+                .lock()
+                .unwrap()
+                .responses
+                .push_back((200, body.into()));
+        }
+
+        /// Encola una respuesta con un estado arbitrario.
+        fn push_status(&self, status: u16, body: impl Into<String>) {
+            self.state
+                .lock()
+                .unwrap()
+                .responses
+                .push_back((status, body.into()));
+        }
+
+        /// A partir de que se vacíe la cola, generar páginas únicas sin fin: para
+        /// llegar al tope de páginas sin que se dispare el deduplicado.
+        fn auto_paginate(&self) {
+            let origin = self.origin();
+            self.state.lock().unwrap().auto_next = Some(origin);
+        }
+
+        fn requests(&self) -> Vec<GraphRequest> {
+            self.state.lock().unwrap().requests.clone()
+        }
+    }
+
+    async fn serve_graph(mut socket: tokio::net::TcpStream, state: Arc<Mutex<FakeGraphState>>) {
+        let mut buffer = Vec::new();
+        loop {
+            // La cabecera entera.
+            let header_end = loop {
+                if let Some(end) = find(&buffer, b"\r\n\r\n") {
+                    break end;
+                }
+                let mut chunk = [0u8; 8192];
+                match socket.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                }
+            };
+            let head = String::from_utf8_lossy(&buffer[..header_end]).into_owned();
+            let mut lines = head.split("\r\n");
+            let request_line = lines.next().unwrap_or("").to_string();
+            let path = request_line
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .to_string();
+            let mut authorization = String::new();
+            let mut length = 0usize;
+            for line in lines {
+                if let Some((name, value)) = line.split_once(':') {
+                    let name = name.trim().to_ascii_lowercase();
+                    let value = value.trim();
+                    if name == "authorization" {
+                        authorization = value.to_string();
+                    } else if name == "content-length" {
+                        length = value.parse().unwrap_or(0);
+                    }
+                }
+            }
+            let body_start = header_end + 4;
+            while buffer.len() < body_start + length {
+                let mut chunk = [0u8; 8192];
+                match socket.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                }
+            }
+            buffer.drain(..body_start + length);
+
+            let (status, body) = {
+                let mut state = state.lock().unwrap();
+                state.requests.push(GraphRequest {
+                    path: path.clone(),
+                    authorization: authorization.clone(),
+                });
+                match state.responses.pop_front() {
+                    Some(answer) => answer,
+                    None => {
+                        match state.auto_next.clone() {
+                            Some(origin) => {
+                                state.auto_count += 1;
+                                let n = state.auto_count;
+                                (
+                                200,
+                                format!("{{\"value\":[],\"@odata.nextLink\":\"{origin}/auto/{n}\"}}"),
+                            )
+                            }
+                            None => (500, String::new()),
+                        }
+                    }
+                }
+            };
+
+            let out = format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            let mut bytes = out.into_bytes();
+            bytes.extend_from_slice(body.as_bytes());
+            if socket.write_all(&bytes).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    fn client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+            .unwrap()
+    }
+
+    fn credential_for(server: &FakeGraph) -> GraphCredential {
+        GraphCredential {
+            access_token: zeroize::Zeroizing::new(TOKEN.to_string()),
+            user_id: "me".to_string(),
+            base_url: server.base_url(),
+        }
+    }
+
+    /// Un contacto completo, con las tres direcciones, para comprobar la
+    /// conversión de todos los campos de punta a punta.
+    fn contacto_completo_json() -> &'static str {
+        r#"{
+            "id": "AAA-123",
+            "displayName": "Ada Lovelace",
+            "givenName": "Ada",
+            "surname": "Lovelace",
+            "middleName": "Byron",
+            "emailAddresses": [{ "address": "ada@example.com" }],
+            "businessPhones": ["+54 11 5555-0000"],
+            "homePhones": ["+54 11 4444-0000"],
+            "mobilePhone": "+54 9 11 3333-0000",
+            "homeAddress": {
+                "street": "Calle Falsa 123", "city": "Buenos Aires",
+                "state": "CABA", "postalCode": "1000", "countryOrRegion": "Argentina"
+            },
+            "businessAddress": {
+                "street": "Av Trabajo 1", "city": "Cordoba",
+                "state": "CBA", "postalCode": "5000", "countryOrRegion": "Argentina"
+            },
+            "otherAddress": {
+                "street": "Quinta 9", "city": "Rosario",
+                "state": "SF", "postalCode": "2000", "countryOrRegion": "Argentina"
+            },
+            "companyName": "Analytical Engines",
+            "jobTitle": "Matematica",
+            "birthday": "1815-12-10T00:00:00Z",
+            "personalNotes": "La primera programadora"
+        }"#
+    }
+
+    /// El almacén local y el gestor, con la cuenta lista y el área de contactos
+    /// activada, para correr `GraphApiBackend::sync` de punta a punta.
+    struct Fixture {
+        _temp: TempDir,
+        manager: Arc<StoreManager<FakeKeys>>,
+        server: FakeGraph,
+    }
+
+    impl Fixture {
+        async fn new(label: &str) -> Self {
+            let temp = TempDir::new(label);
+            let keys = FakeKeys::default();
+            let manager = Arc::new(StoreManager::new(
+                keys,
+                Ok(Locations {
+                    stores: temp.0.join("data/stores"),
+                    settings: temp.0.join("config/stores.json"),
+                }),
+            ));
+            manager
+                .accounts_listed(
+                    AccountListing::Listed(vec![ListedAccount {
+                        id: ACCOUNT.into(),
+                        display_name: "Trabajo".into(),
+                        capabilities: vec!["contacts".into()],
+                        needs_reauth: false,
+                    }]),
+                    Instant::now(),
+                )
+                .await;
+            assert!(manager
+                .activate_area(CONTACTS_AREA, ACCOUNT, Consent::Granted)
+                .await
+                .unwrap());
+            let server = FakeGraph::start().await;
+            Self {
+                _temp: temp,
+                manager,
+                server,
+            }
+        }
+
+        async fn sync(&self) -> SyncResult {
+            let ctx = SyncContext {
+                manager: &self.manager,
+                account_id: ACCOUNT,
+                notify: Arc::new(|| {}),
+            };
+            GraphApiBackend
+                .sync(ctx, &credential_for(&self.server))
+                .await
+        }
+
+        async fn synced(&self) -> SyncReport {
+            match self.sync().await {
+                SyncResult::Synced(report) => report,
+                other => panic!("la vuelta no terminó bien: {other:?}"),
+            }
+        }
+
+        /// Las vCard crudas guardadas, ordenadas por `href`.
+        async fn stored_vcards(&self) -> Vec<String> {
+            self.manager
+                .with_store(ACCOUNT, |store| {
+                    let c = store.connection();
+                    Ok(c.prepare("SELECT raw_vcard FROM contacts ORDER BY href")
+                        .unwrap()
+                        .query_map([], |row| row.get::<_, String>(0))
+                        .unwrap()
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap())
+                })
+                .await
+                .expect("la base tenía que estar abierta")
+        }
+
+        /// Los nombres de las libretas guardadas.
+        async fn book_names(&self) -> Vec<String> {
+            self.manager
+                .with_store(ACCOUNT, |store| {
+                    let c = store.connection();
+                    Ok(
+                        c.prepare("SELECT display_name FROM address_books ORDER BY display_name")
+                            .unwrap()
+                            .query_map([], |row| row.get::<_, String>(0))
+                            .unwrap()
+                            .collect::<Result<Vec<_>, _>>()
+                            .unwrap(),
+                    )
+                })
+                .await
+                .expect("la base tenía que estar abierta")
+        }
+    }
+
+    /// (1) Paginación: dos páginas con `nextLink` al **mismo host** se siguen,
+    /// todos los contactos se upsertan en «Graph Contacts» y el contacto completo
+    /// se convierte a vCard con todos sus campos.
+    #[tokio::test]
+    async fn la_paginacion_del_mismo_host_trae_y_convierte_todos_los_contactos() {
+        let f = Fixture::new("graph_paginacion").await;
+        let origin = f.server.origin();
+        f.server.push(format!(
+            "{{\"value\":[{completo},{{\"id\":\"BBB\",\"displayName\":\"Bob\"}}],\
+             \"@odata.nextLink\":\"{origin}/v1.0/me/contacts?$skip=100\"}}",
+            completo = contacto_completo_json()
+        ));
+        f.server
+            .push(r#"{"value":[{"id":"CCC","displayName":"Carol"}]}"#);
+
+        let report = f.synced().await;
+        assert_eq!(report.fetched, 3, "tres contactos entre las dos páginas");
+
+        // Se pidieron las dos páginas, y cada pedido llevó el token (la base_url
+        // es el único origen al que se adjunta).
+        let requests = f.server.requests();
+        assert_eq!(requests.len(), 2, "se siguió el nextLink del mismo host");
+        for r in &requests {
+            assert_eq!(r.authorization, format!("Bearer {TOKEN}"));
+        }
+        // La primera URL se arma sobre la base, con `user_id` como segmento de
+        // ruta: `/v1.0/users/me/contacts`.
+        assert!(
+            requests[0].path.starts_with("/v1.0/users/me/contacts"),
+            "la URL inicial sale de la base_url: {}",
+            requests[0].path
+        );
+
+        assert_eq!(f.book_names().await, vec!["Graph Contacts".to_string()]);
+
+        let vcards = f.stored_vcards().await;
+        assert_eq!(vcards.len(), 3);
+        let completo = vcards
+            .iter()
+            .find(|v| v.contains("UID:AAA-123\r\n"))
+            .expect("el contacto completo se guardó");
+        assert!(completo.contains("FN:Ada Lovelace\r\n"));
+        assert!(completo.contains("N:Lovelace;Ada;Byron;;\r\n"));
+        assert!(completo.contains("EMAIL:ada@example.com\r\n"));
+        assert!(completo.contains("TEL;TYPE=WORK:+54 11 5555-0000\r\n"));
+        assert!(completo.contains("TEL;TYPE=HOME:+54 11 4444-0000\r\n"));
+        assert!(completo.contains("TEL;TYPE=CELL:+54 9 11 3333-0000\r\n"));
+        assert!(completo
+            .contains("ADR;TYPE=HOME:;;Calle Falsa 123;Buenos Aires;CABA;1000;Argentina\r\n"));
+        assert!(completo.contains("ADR;TYPE=WORK:;;Av Trabajo 1;Cordoba;CBA;5000;Argentina\r\n"));
+        assert!(completo.contains("ADR;TYPE=OTHER:;;Quinta 9;Rosario;SF;2000;Argentina\r\n"));
+        assert!(completo.contains("ORG:Analytical Engines\r\n"));
+        assert!(completo.contains("TITLE:Matematica\r\n"));
+        assert!(completo.contains("BDAY:1815-12-10\r\n"));
+        assert!(completo.contains("NOTE:La primera programadora\r\n"));
+    }
+
+    /// (2 · H1) Un `nextLink` a **otro host** aborta la sincronización con
+    /// `UntrustedNextLink` y **no** le manda el token a ese host: no hay una
+    /// segunda petición al atacante. Un `nextLink` al mismo host sí se sigue.
+    ///
+    /// Es la prueba clave del arreglo ALTA. Rojo-sin-arreglo: si se quita la
+    /// validación `same_origin` en `fetch_all_contacts`, el sincronizador sigue
+    /// el enlace, el atacante recibe el token y esta prueba falla.
+    #[tokio::test]
+    async fn un_next_link_a_otro_host_aborta_sin_mandar_el_token() {
+        let victima = FakeGraph::start().await;
+        let atacante = FakeGraph::start().await;
+        // La víctima contesta una página con un nextLink al host del atacante.
+        victima.push(format!(
+            "{{\"value\":[{{\"id\":\"AAA\",\"displayName\":\"Ada\"}}],\
+             \"@odata.nextLink\":\"{}/v1.0/me/contacts?$skip=100\"}}",
+            atacante.origin()
+        ));
+
+        let result =
+            GraphApiBackend::fetch_all_contacts(&client(), &credential_for(&victima)).await;
+        assert!(
+            matches!(result, Err(GraphFetchError::UntrustedNextLink)),
+            "un nextLink a otro host tiene que abortar con UntrustedNextLink, dio {result:?}"
+        );
+
+        // La víctima recibió exactamente un pedido, con el token.
+        let de_la_victima = victima.requests();
+        assert_eq!(de_la_victima.len(), 1);
+        assert_eq!(de_la_victima[0].authorization, format!("Bearer {TOKEN}"));
+        // Y el atacante no recibió NADA: ni el pedido ni, por lo tanto, el token.
+        assert!(
+            atacante.requests().is_empty(),
+            "el token no debe viajar al host del nextLink no confiable"
+        );
+    }
+
+    /// (2 · H1) El contrapunto: un `nextLink` al **mismo host** sí se sigue.
+    #[tokio::test]
+    async fn un_next_link_al_mismo_host_se_sigue() {
+        let server = FakeGraph::start().await;
+        let origin = server.origin();
+        server.push(format!(
+            "{{\"value\":[{{\"id\":\"AAA\"}}],\
+             \"@odata.nextLink\":\"{origin}/v1.0/me/contacts?$skip=100\"}}"
+        ));
+        server.push(r#"{"value":[{"id":"BBB"}]}"#);
+
+        let result = GraphApiBackend::fetch_all_contacts(&client(), &credential_for(&server)).await;
+        let contacts = result.expect("el nextLink del mismo host se sigue");
+        assert_eq!(contacts.len(), 2);
+        assert_eq!(server.requests().len(), 2);
+    }
+
+    /// (3 · H2) Un `id` con `\r\n` no puede fabricar propiedades ni partir el
+    /// registro: el `\r\n` del `UID` queda escapado, no se vuelve un salto de
+    /// línea real.
+    ///
+    /// Rojo-sin-arreglo: si el `UID:` vuelve a emitir el `id` crudo
+    /// (`format!("UID:{}\r\n", contact.id)`), el `\r\n` del id abre una línea
+    /// `TEL;TYPE=WORK` y un segundo `UID` reales, y esta prueba falla.
+    #[test]
+    fn un_id_con_salto_de_linea_no_inyecta_propiedades_en_la_vcard() {
+        // El `id` trae CR y LF de verdad (el JSON los produce de los escapes).
+        let contact: GraphContact =
+            serde_json::from_str(r#"{ "id": "AAA\r\nTEL;TYPE=WORK:+1-900-EVIL\r\nUID:AAA" }"#)
+                .expect("JSON con id malicioso");
+        let vcard = GraphApiBackend::contact_to_vcard(&contact);
+
+        // Ninguna línea real fabricada: ni un TEL, ni un segundo UID.
+        let lineas: Vec<&str> = vcard.split("\r\n").collect();
+        assert_eq!(
+            lineas.iter().filter(|l| l.starts_with("UID:")).count(),
+            1,
+            "el id partido no debe fabricar un segundo UID: {vcard:?}"
+        );
+        assert_eq!(
+            lineas.iter().filter(|l| l.starts_with("TEL")).count(),
+            0,
+            "el id partido no debe fabricar un TEL: {vcard:?}"
+        );
+        assert!(
+            !vcard.contains("\r\nTEL;TYPE=WORK:+1-900-EVIL"),
+            "el TEL inyectado no debe quedar como línea propia: {vcard:?}"
+        );
+        // El salto queda escapado como `\n` dentro del valor del UID.
+        assert!(vcard.contains("UID:AAA\\nTEL"));
+    }
+
+    /// (4 · H3) Un campo estructurado que termina en `\` no corre ni funde los
+    /// componentes de `N:` ni de `ADR:`: la barra se escapa como `\\`, así que el
+    /// `;` siguiente sigue siendo separador.
+    ///
+    /// Rojo-sin-arreglo: si `surname`/`street` se emiten sin pasar por
+    /// `escape_vcard_public` (la barra sin duplicar), el `\;` resultante escapa
+    /// el separador, el apellido se come el nombre y el componente se corre.
+    #[test]
+    fn una_barra_final_no_funde_los_componentes_estructurados() {
+        let contact: GraphContact = serde_json::from_str(
+            r#"{
+                "id": "BS",
+                "surname": "Evil\\",
+                "givenName": "Good",
+                "homeAddress": { "street": "Calle\\", "city": "City" }
+            }"#,
+        )
+        .expect("JSON con barra final");
+        let vcard = GraphApiBackend::contact_to_vcard(&contact);
+
+        // La barra final va duplicada, y el `;` siguiente parte el campo.
+        assert!(
+            vcard.contains("N:Evil\\\\;Good;;;\r\n"),
+            "N: con la barra final sin fundir el nombre: {vcard:?}"
+        );
+        assert!(
+            vcard.contains("ADR;TYPE=HOME:;;Calle\\\\;City;;;\r\n"),
+            "ADR: con la barra final sin correr los componentes: {vcard:?}"
+        );
+
+        // Y el parser propio revierte el `N` a sus componentes, cada uno con su
+        // barra final intacta: el apellido no se comió el nombre.
+        let n_value = vcard
+            .lines()
+            .find_map(|l| l.strip_prefix("N:"))
+            .expect("hay una línea N:");
+        let fields = crate::vcard::split_fields(n_value);
+        assert_eq!(fields[0], "Evil\\", "el apellido conserva su barra final");
+        assert_eq!(fields[1], "Good", "el nombre quedó separado del apellido");
+    }
+
+    /// (5 · H4) Un `nextLink` que se repite corta la paginación con
+    /// `PaginationLoop` sin colgarse.
+    #[tokio::test]
+    async fn un_next_link_repetido_corta_el_bucle() {
+        let server = FakeGraph::start().await;
+        let origin = server.origin();
+        let bucle = format!("{origin}/v1.0/me/contacts?$skip=100");
+        server.push(format!("{{\"value\":[],\"@odata.nextLink\":\"{bucle}\"}}"));
+        server.push(format!("{{\"value\":[],\"@odata.nextLink\":\"{bucle}\"}}"));
+
+        let result = GraphApiBackend::fetch_all_contacts(&client(), &credential_for(&server)).await;
+        assert!(
+            matches!(result, Err(GraphFetchError::PaginationLoop)),
+            "un nextLink repetido corta con PaginationLoop, dio {result:?}"
+        );
+    }
+
+    /// (5 · H4) Superar el tope de páginas da `TooManyPages` sin agotar memoria:
+    /// el servidor genera páginas únicas sin fin.
+    #[tokio::test]
+    async fn superar_el_tope_de_paginas_aborta() {
+        let server = FakeGraph::start().await;
+        server.auto_paginate();
+
+        let result = GraphApiBackend::fetch_all_contacts(&client(), &credential_for(&server)).await;
+        assert!(
+            matches!(result, Err(GraphFetchError::TooManyPages)),
+            "pasado el tope de páginas se aborta con TooManyPages, dio {result:?}"
+        );
+        assert_eq!(
+            server.requests().len(),
+            MAX_PAGES,
+            "se pidieron exactamente MAX_PAGES páginas antes de cortar"
+        );
+    }
+
+    /// (6) Bordes: un HTTP de error devuelve un error tipado **sin** el cuerpo
+    /// crudo de Graph.
+    #[tokio::test]
+    async fn un_http_de_error_no_vuelca_el_cuerpo_crudo() {
+        let server = FakeGraph::start().await;
+        server.push_status(500, "cuerpo-secreto-crudo-de-graph");
+
+        let result = GraphApiBackend::fetch_all_contacts(&client(), &credential_for(&server)).await;
+        let err = result.expect_err("un 500 tiene que ser Err");
+        assert!(
+            matches!(err, GraphFetchError::Http(s) if s == reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        assert!(
+            !err.to_string().contains("cuerpo-secreto-crudo-de-graph"),
+            "el cuerpo crudo del error no se muestra: {err}"
+        );
+    }
+
+    /// (6) Bordes: un JSON inválido da `Parse`, no un pánico.
+    #[tokio::test]
+    async fn un_json_invalido_da_error_de_parseo() {
+        let server = FakeGraph::start().await;
+        server.push("esto no es json {{{");
+
+        let result = GraphApiBackend::fetch_all_contacts(&client(), &credential_for(&server)).await;
+        assert!(matches!(result, Err(GraphFetchError::Parse)));
+    }
+
+    /// (6) Bordes, de punta a punta: un contacto sin `id` se descarta; uno con
+    /// sólo `id` y `displayName` se guarda.
+    #[tokio::test]
+    async fn un_contacto_sin_id_se_descarta_en_la_sincronizacion() {
+        let f = Fixture::new("graph_sin_id").await;
+        f.server.push(
+            r#"{"value":[{"id":"","displayName":"Fantasma"},{"id":"keep","displayName":"Solo Nombre"}]}"#,
+        );
+
+        let report = f.synced().await;
+        assert_eq!(report.fetched, 1, "el contacto sin id no se guarda");
+
+        let vcards = f.stored_vcards().await;
+        assert_eq!(vcards.len(), 1);
+        assert!(vcards[0].contains("UID:keep\r\n"));
+        assert!(vcards[0].contains("FN:Solo Nombre\r\n"));
+    }
 }
