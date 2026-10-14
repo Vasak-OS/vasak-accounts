@@ -84,6 +84,10 @@ struct Round {
     report: SyncReport,
     deadline: tokio::time::Instant,
     stored_bytes: u64,
+    /// Las libretas que, después del empuje, siguen con escrituras locales
+    /// pendientes: no se dan por al día (no se guarda su token) hasta que el
+    /// empuje las resuelva.
+    pending_collections: BTreeSet<String>,
 }
 
 impl Round {
@@ -97,6 +101,38 @@ impl Round {
     ) -> Result<T, SyncError> {
         Ok(dav_sync::net(self.deadline, request).await?)
     }
+}
+
+/// Drena la cola de escrituras hacia el servidor y anota en `round` lo que hizo
+/// y qué libretas quedaron con algo por intentar. Extraído de `sync` para no
+/// cargar su complejidad; el empuje de verdad vive en `replay`.
+async fn push_pending<K: KeySource>(
+    manager: &Arc<StoreManager<K>>,
+    account_id: &str,
+    client: &DavClient,
+    round: &mut Round,
+) -> Result<(), StoreError> {
+    let replay = crate::replay::replay_area(
+        manager,
+        account_id,
+        CONTACTS_AREA,
+        client,
+        crate::replay::CONTACTS_CONTENT_TYPE,
+        round.deadline,
+    )
+    .await?;
+    round.report.pushed = replay.pushed;
+    round.report.conflicts = replay.conflicts;
+    round.report.pending = replay.remaining;
+    if replay.remaining > 0 {
+        if let Ok(collections) = manager
+            .with_store(account_id, |s| s.pending_collections(CONTACTS_AREA))
+            .await
+        {
+            round.pending_collections = collections.into_iter().collect();
+        }
+    }
+    Ok(())
 }
 
 /// Backend CardDAV.
@@ -162,7 +198,16 @@ impl CardDavBackend {
             report: SyncReport::default(),
             deadline: tokio::time::Instant::now() + Limits::DEFAULT.max_round,
             stored_bytes: 0,
+            pending_collections: BTreeSet::new(),
         };
+
+        // El empuje primero: se drena la cola de escrituras hacia el servidor
+        // antes de dar la bajada por al día. Las libretas que queden con algo
+        // pendiente no se consideran al día (ver `execute`).
+        if let Err(e) = push_pending(manager, account_id, &client, &mut round).await {
+            set_status(AreaState::Failed, &e.to_string()).await;
+            return SyncResult::Failed(e.to_string());
+        }
 
         let mut seen = BTreeSet::new();
         let (books, foreign) = match round.net(carddav::list_address_books(&client)).await {
@@ -393,7 +438,9 @@ impl CardDavBackend {
 
         // El último lote, aunque esté vacío: es el que guarda el token.
         let settled = MissingStreaks::default().settle(account_id, &stored.href, missing);
-        let settles = settles && !matches!(settled, Settled::Retry(_));
+        // Una libreta con escrituras locales sin confirmar no se da por al día.
+        let has_pending = round.pending_collections.contains(&stored.href);
+        let settles = settles && !has_pending && !matches!(settled, Settled::Retry(_));
         let progress = settles.then_some(BookProgress {
             token: plan.token,
             ctag: plan.ctag,

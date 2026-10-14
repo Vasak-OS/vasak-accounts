@@ -794,6 +794,20 @@ impl Store {
         for op in ops {
             match op {
                 ObjectOp::Delete(href) => {
+                    // La bajada no borra un objeto creado local que todavía no
+                    // subió (`pending_op = 'put'`): el servidor dice que no está
+                    // porque nunca lo tuvo. Un `'delete'` local coincide con el
+                    // borrado del servidor, así que ése sí se aplica.
+                    let mark = super::queue::pending_mark(
+                        &transaction,
+                        "calendar_objects",
+                        "calendar_id",
+                        calendar.id,
+                        href,
+                    )?;
+                    if mark.as_deref() == Some("put") {
+                        continue;
+                    }
                     let gone: Option<(i64, i64)> = transaction
                         .prepare_cached(
                             "SELECT id, octet_length(raw_ical) FROM calendar_objects
@@ -818,6 +832,19 @@ impl Store {
                     }
                 }
                 ObjectOp::Upsert(row) => {
+                    // La bajada no pisa un cambio local sin confirmar: si la
+                    // fila está marcada (`pending_op`), se deja como está hasta
+                    // que el empuje la resuelva.
+                    let mark = super::queue::pending_mark(
+                        &transaction,
+                        "calendar_objects",
+                        "calendar_id",
+                        calendar.id,
+                        &row.href,
+                    )?;
+                    if mark.is_some() {
+                        continue;
+                    }
                     let before: Option<(i64, i64)> = transaction
                         .prepare_cached(
                             "SELECT id, octet_length(raw_ical) FROM calendar_objects
@@ -885,6 +912,62 @@ impl Store {
             net_occurrences,
             net_alarms,
         })
+    }
+
+    /// Encola un `put` de un evento o una tarea: escribe el crudo **ya mismo**
+    /// en la base, marcado con `pending_op = 'put'`, y suma la op con el cuerpo
+    /// y el `base_etag`. La fila queda con `etag = base_etag` (nulo al crear):
+    /// no es el del servidor todavía, y así la bajada no cree que cambió hasta
+    /// que el empuje lo confirme. La ventana con la que se derivó tiene que ser
+    /// la de la base; si la base no tiene ventana, queda `window`.
+    ///
+    /// El calendario tiene que estar en esta base (mismo `id` y dirección), como
+    /// en [`Self::apply_calendar_objects`]; si no, `Err(Missing)`.
+    // Lo que encola es la superficie D-Bus del PR siguiente (`vasak-accounts#23`);
+    // por ahora lo ejercitan las pruebas.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn enqueue_calendar_put(
+        &mut self,
+        calendar: &StoredCalendar,
+        row: &ObjectRow,
+        window: Window,
+    ) -> Result<(), StoreError> {
+        let transaction = self.connection.transaction().map_err(classify)?;
+        let exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM calendars WHERE id = ?1 AND href = ?2)",
+                rusqlite::params![calendar.id, calendar.href],
+                |row| row.get(0),
+            )
+            .map_err(classify)?;
+        if !exists {
+            return Err(StoreError::Missing);
+        }
+        match read_window(&transaction)? {
+            Some(_) => {}
+            None => write_window(&transaction, window)?,
+        }
+        let at = now_text();
+        upsert_object(&transaction, calendar.id, row, &at)?;
+        transaction
+            .execute(
+                "UPDATE calendar_objects SET pending_op = 'put'
+                  WHERE calendar_id = ?1 AND href = ?2",
+                rusqlite::params![calendar.id, row.href],
+            )
+            .map_err(classify)?;
+        super::queue::enqueue_put_op(
+            &transaction,
+            CALENDAR_AREA,
+            &calendar.href,
+            &row.href,
+            row.etag.as_deref(),
+            row.raw_ical.as_bytes(),
+        )?;
+        let generation = bump_generation(&transaction, CALENDAR_AREA)?;
+        transaction.commit().map_err(classify)?;
+        self.note_change(CALENDAR_AREA, generation);
+        Ok(())
     }
 
     /// Las series cuyas ocurrencias guardadas no cubren `target`: las que hay

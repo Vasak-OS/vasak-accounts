@@ -77,10 +77,13 @@ mod outbox;
 mod preferences;
 mod query;
 mod reminders;
-// El lado de la escritura conservadora de iCalendar y vCard. Todavía no lo
-// consume nadie: la cola de cambios y la superficie D-Bus que lo van a usar son
-// los PRs siguientes de este hito (`vasak-accounts#23`), así que por ahora sólo
-// lo ejercitan sus pruebas.
+// La etapa de empuje: drena la cola de escrituras hacia el servidor (ver
+// `store::queue`) en cada vuelta de sincronización, antes de dar la bajada por
+// al día (`vasak-accounts#23`, PR 3 de M2).
+mod replay;
+// El lado de la escritura conservadora de iCalendar y vCard. La superficie
+// D-Bus que arma los parches y encola es el PR siguiente de este hito
+// (`vasak-accounts#23`); por ahora lo ejercitan sus pruebas y la cola.
 #[allow(dead_code)]
 mod serialize;
 mod smtp;

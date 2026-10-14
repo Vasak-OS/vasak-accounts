@@ -1056,6 +1056,7 @@ async fn una_tanda_del_calendario_no_retiene_lo_que_pasa_el_tope() {
         stored_occurrences: 0,
         stored_alarms: 0,
         window: Window::around(Utc.timestamp_opt(TODAY, 0).unwrap()),
+        pending_collections: std::collections::BTreeSet::new(),
     };
     let (objects, missing) = f
         .sync

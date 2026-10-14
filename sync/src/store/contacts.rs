@@ -295,6 +295,19 @@ impl Store {
         for op in ops {
             match op {
                 ContactOp::Delete(href) => {
+                    // La bajada no borra una tarjeta creada local que todavía no
+                    // subió (`pending_op = 'put'`). Un `'delete'` local coincide
+                    // con el borrado del servidor.
+                    let mark = super::queue::pending_mark(
+                        &transaction,
+                        "contacts",
+                        "address_book_id",
+                        book.id,
+                        href,
+                    )?;
+                    if mark.as_deref() == Some("put") {
+                        continue;
+                    }
                     let freed: Option<i64> = transaction
                         .prepare_cached(
                             "DELETE FROM contacts WHERE address_book_id = ?1 AND href = ?2
@@ -309,6 +322,17 @@ impl Store {
                     net -= freed.unwrap_or(0);
                 }
                 ContactOp::Upsert(row) => {
+                    // La bajada no pisa un cambio local sin confirmar.
+                    let mark = super::queue::pending_mark(
+                        &transaction,
+                        "contacts",
+                        "address_book_id",
+                        book.id,
+                        &row.href,
+                    )?;
+                    if mark.is_some() {
+                        continue;
+                    }
                     let replaced: Option<i64> = transaction
                         .prepare_cached(
                             "SELECT octet_length(raw_vcard) FROM contacts
@@ -363,6 +387,56 @@ impl Store {
             self.note_change(CONTACTS_AREA, generation);
         }
         Ok(Applied::Written { net_bytes: net })
+    }
+
+    /// Encola un `put` de una tarjeta: escribe el crudo **ya mismo** en la base,
+    /// marcado con `pending_op = 'put'`, y suma la op con el cuerpo y el
+    /// `base_etag`. La fila queda con `etag = base_etag` (nulo al crear), no con
+    /// el del servidor: así la bajada no cree que cambió hasta que el empuje lo
+    /// confirme.
+    ///
+    /// La libreta tiene que estar en esta base (mismo `id` y dirección), como en
+    /// [`Self::apply_contacts`]; si no, `Err(Missing)`.
+    // Lo que encola es la superficie D-Bus del PR siguiente (`vasak-accounts#23`);
+    // por ahora lo ejercitan las pruebas.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn enqueue_contact_put(
+        &mut self,
+        book: &StoredAddressBook,
+        row: &ContactRow,
+    ) -> Result<(), StoreError> {
+        let transaction = self.connection.transaction().map_err(classify)?;
+        let exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM address_books WHERE id = ?1 AND href = ?2)",
+                rusqlite::params![book.id, book.href],
+                |row| row.get(0),
+            )
+            .map_err(classify)?;
+        if !exists {
+            return Err(StoreError::Missing);
+        }
+        let at = now();
+        upsert_contact(&transaction, book.id, row, &at)?;
+        transaction
+            .execute(
+                "UPDATE contacts SET pending_op = 'put'
+                  WHERE address_book_id = ?1 AND href = ?2",
+                rusqlite::params![book.id, row.href],
+            )
+            .map_err(classify)?;
+        super::queue::enqueue_put_op(
+            &transaction,
+            CONTACTS_AREA,
+            &book.href,
+            &row.href,
+            row.etag.as_deref(),
+            row.raw_vcard.as_bytes(),
+        )?;
+        let generation = bump_generation(&transaction, CONTACTS_AREA)?;
+        transaction.commit().map_err(classify)?;
+        self.note_change(CONTACTS_AREA, generation);
+        Ok(())
     }
 }
 

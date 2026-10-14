@@ -420,9 +420,80 @@ BEGIN
 END;
 ";
 
+/// v5 (PR 3 de M2, `vasak-accounts#23`): la cola de escrituras hacia el
+/// servidor, y la marca de lo que cambió local y todavía no se confirmó.
+///
+/// Hasta la v4 el almacén era de sólo lectura hacia el servidor: la
+/// sincronización traía y nunca mandaba. La escritura conservadora (decisión 3
+/// del taller) necesita dos cosas, y las dos viven **dentro de la base
+/// cifrada** —nunca en un archivo aparte en disco— porque guardan cuerpos
+/// privados (un evento, una tarjeta):
+///
+/// - **`pending_dav_ops`**: una fila por escritura pendiente —un `PUT` o un
+///   `DELETE`— hacia el servidor, con su cuerpo (`payload`), el ETag con el que
+///   se vio por última vez el recurso (`base_etag`, nulo al crear algo nuevo) y
+///   su estado. `op = 'put'` crea o reemplaza; `op = 'delete'` borra. `state`
+///   es `ready` mientras se puede reintentar y `conflict` cuando el servidor la
+///   rechazó con un `412` (el recurso cambió desde `base_etag`): ahí no se pisa
+///   nada, se conserva el crudo local y lo resuelve M3 de cara a la persona.
+///   `attempts` y `last_error` llevan la cuenta de los reintentos reintentables
+///   (red, `423`, `507`). **Una sola op pendiente por objeto** (`UNIQUE`): una
+///   edición nueva reemplaza la que hubiera.
+///
+///   No lleva `account_id`: hay **una base por cuenta** (como `address_books` y
+///   `calendars`), así que la cuenta es implícita. `AUTOINCREMENT` para que el
+///   orden de drenaje sea el de encolado y no se reuse un id.
+///
+/// - **`pending_op`** en `calendar_objects` y `contacts`: la marca de que la
+///   fila guardada es un cambio local sin confirmar. `NULL` es lo normal —al
+///   día con el servidor—; `'put'` es una creación o edición local que todavía
+///   no subió; `'delete'` es un borrado local que todavía no subió. **La
+///   bajada no pisa ni borra una fila marcada** (ver
+///   `apply_calendar_objects` y `apply_contacts`): sin esto, una vuelta de
+///   sincronización entre el encolado y el empuje borraría el cambio local, o
+///   lo volvería a dejar como estaba en el servidor. Si el `PUT` falla, la
+///   caché no queda como `local == servidor`: la marca sigue puesta y la op
+///   viva hasta confirmar.
+///
+/// Que la cola y la marca vivan en la base cifrada da gratis la limpieza de
+/// seguridad: un `ClearStore` o un `SetStoreEnabled(false)` borran el archivo
+/// entero (ver `lifecycle::StoreManager::remove_store`), y con él la cola; una
+/// op con un cuerpo privado no sobrevive a vaciar o apagar la cuenta.
+const V5: &str = "
+CREATE TABLE pending_dav_ops (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    area            TEXT NOT NULL CHECK (area IN ('calendar', 'contacts')),
+    collection_href TEXT NOT NULL,
+    object_href     TEXT NOT NULL,
+    op              TEXT NOT NULL CHECK (op IN ('put', 'delete')),
+    base_etag       TEXT,
+    payload         BLOB,
+    state           TEXT NOT NULL DEFAULT 'ready' CHECK (state IN ('ready', 'conflict')),
+    created_at      TEXT NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT,
+    -- Testigo de versión de la op: sube cada vez que una edición nueva la
+    -- reemplaza (mismo objeto, misma fila por `UNIQUE`, mismo `id`). El empuje
+    -- saca una foto de la op, suelta el almacén para hablar con la red, y recién
+    -- con la respuesta cierra la op **condicionado a este número**: si una
+    -- edición nueva corrió en el medio, la revisión no coincide y no se cierra la
+    -- edición de la persona por error (lost-update).
+    revision        INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (area, object_href)
+) STRICT;
+
+CREATE INDEX pending_dav_ops_by_area ON pending_dav_ops (area, id);
+
+ALTER TABLE calendar_objects ADD COLUMN pending_op TEXT
+    CHECK (pending_op IN ('put', 'delete'));
+
+ALTER TABLE contacts ADD COLUMN pending_op TEXT
+    CHECK (pending_op IN ('put', 'delete'));
+";
+
 /// Todas las migraciones, en orden.
 pub fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(V1), M::up(V2), M::up(V3), M::up(V4)])
+    Migrations::new(vec![M::up(V1), M::up(V2), M::up(V3), M::up(V4), M::up(V5)])
 }
 
 /// Lleva la base a la última versión. Aplicarlo sobre una base al día no hace
@@ -458,7 +529,7 @@ mod tests {
         let mut connection = Connection::open_in_memory().unwrap();
         apply(&mut connection).unwrap();
         let version = schema_version(&connection).unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
 
         let tables = |c: &Connection| -> Vec<String> {
             let mut statement = c
@@ -514,6 +585,8 @@ mod tests {
             "message_flags",
             "messages_fts",
             "messages_fts_forget",
+            "pending_dav_ops",
+            "pending_dav_ops_by_area",
         ] {
             assert!(before.iter().any(|t| t == table), "falta {table}");
         }
@@ -534,6 +607,148 @@ mod tests {
         connection.pragma_update(None, "user_version", 99).unwrap();
         assert!(matches!(apply(&mut connection), Err(StoreError::Schema(_))));
         assert_eq!(schema_version(&connection).unwrap(), 99);
+    }
+
+    /// **v4 → v5 no pierde nada**: un calendario, un objeto y un contacto de una
+    /// base del PR del correo siguen ahí después de migrar, y la columna
+    /// `pending_op` nueva les queda en `NULL` —al día con el servidor—.
+    #[test]
+    fn de_v4_a_v5_se_conserva_lo_que_habia_y_la_marca_arranca_limpia() {
+        let mut connection = at_version(4);
+        assert_eq!(schema_version(&connection).unwrap(), 4);
+        connection
+            .execute(
+                "INSERT INTO calendars (id, href, display_name, components, updated_at)
+                 VALUES (1, 'https://x/c/', 'C', 'VEVENT', 'ayer')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO calendar_objects
+                   (id, calendar_id, href, etag, uid, component, summary, all_day, recurring,
+                    zone, status, done, sort_key, span, expansion, raw_ical, updated_at)
+                 VALUES (1, 1, 'https://x/c/a.ics', '\"v1\"', 'u1', 'VEVENT', 'A', 0, 0,
+                    'utc', '', 0, 0, 0, 'complete', 'BEGIN:VCALENDAR', 'ayer')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO address_books (id, href, display_name, updated_at)
+                 VALUES (1, 'https://x/a/', 'A', 'ayer')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO contacts
+                   (id, address_book_id, href, etag, uid, display_name, sort_key, raw_vcard,
+                    updated_at)
+                 VALUES (1, 1, 'https://x/a/ana.vcf', '\"v1\"', 'u1', 'Ana', 'ana',
+                    'BEGIN:VCARD', 'ayer')",
+                [],
+            )
+            .unwrap();
+
+        apply(&mut connection).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 5);
+
+        // Lo que había sigue, y la marca nueva es NULL.
+        let object_mark: Option<String> = connection
+            .query_row(
+                "SELECT pending_op FROM calendar_objects WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(object_mark, None);
+        let contact_mark: Option<String> = connection
+            .query_row("SELECT pending_op FROM contacts WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(contact_mark, None);
+        // La cola arranca vacía.
+        let pending: i64 = connection
+            .query_row("SELECT count(*) FROM pending_dav_ops", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pending, 0);
+    }
+
+    /// La marca `pending_op` sólo acepta los dos valores conocidos, o `NULL`.
+    #[test]
+    fn la_marca_pending_op_esta_acotada() {
+        let connection = at_version(5);
+        for good in ["put", "delete"] {
+            connection
+                .execute(
+                    "UPDATE calendar_objects SET pending_op = ?1 WHERE 1 = 0",
+                    [good],
+                )
+                .unwrap_or(0);
+        }
+        // Un calendario y un objeto para poder escribir la columna de verdad.
+        connection
+            .execute(
+                "INSERT INTO calendars (id, href, display_name, components, updated_at)
+                 VALUES (1, 'https://x/c/', 'C', 'VEVENT', 'ayer')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO calendar_objects
+                   (id, calendar_id, href, etag, uid, component, summary, all_day, recurring,
+                    zone, status, done, sort_key, span, expansion, raw_ical, updated_at, pending_op)
+                 VALUES (1, 1, 'https://x/c/a.ics', '\"v1\"', 'u1', 'VEVENT', 'A', 0, 0,
+                    'utc', '', 0, 0, 0, 'complete', 'BEGIN:VCALENDAR', 'ayer', 'put')",
+                [],
+            )
+            .unwrap();
+        assert!(
+            connection
+                .execute(
+                    "UPDATE calendar_objects SET pending_op = 'raro' WHERE id = 1",
+                    [],
+                )
+                .is_err(),
+            "un valor desconocido no entra"
+        );
+    }
+
+    /// La columna `op` y el `state` de la cola están acotados a sus valores.
+    #[test]
+    fn la_cola_acota_op_y_estado() {
+        let connection = at_version(5);
+        let insert = "INSERT INTO pending_dav_ops
+            (area, collection_href, object_href, op, created_at)
+            VALUES (?1, 'https://x/c/', ?2, ?3, 'ahora')";
+        connection
+            .execute(insert, ["calendar", "https://x/c/a.ics", "put"])
+            .unwrap();
+        connection
+            .execute(insert, ["contacts", "https://x/a/ana.vcf", "delete"])
+            .unwrap();
+        assert!(
+            connection
+                .execute(insert, ["calendar", "https://x/c/b.ics", "patch"])
+                .is_err(),
+            "una operación desconocida no entra"
+        );
+        assert!(
+            connection
+                .execute(insert, ["archivos", "https://x/c/c.ics", "put"])
+                .is_err(),
+            "un área desconocida no entra"
+        );
+        // Una sola op pendiente por objeto.
+        assert!(
+            connection
+                .execute(insert, ["calendar", "https://x/c/a.ics", "delete"])
+                .is_err(),
+            "no entran dos ops del mismo objeto"
+        );
     }
 
     /// La bitácora no pasa de su tope, y lo que queda es lo último.
@@ -602,7 +817,7 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .unwrap();
-        let all = [V1, V2, V3, V4];
+        let all = [V1, V2, V3, V4, V5];
         Migrations::new(all[..version].iter().map(|sql| M::up(sql)).collect())
             .to_latest(&mut connection)
             .unwrap();
@@ -629,7 +844,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 4);
+        assert_eq!(schema_version(&connection).unwrap(), 5);
         let message: String = connection
             .query_row("SELECT message FROM sync_log", [], |row| row.get(0))
             .unwrap();
@@ -930,7 +1145,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 4);
+        assert_eq!(schema_version(&connection).unwrap(), 5);
         assert_eq!(found(&connection, "jose"), vec![id]);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_emails"), 1);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_phones"), 1);
@@ -1101,7 +1316,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 4);
+        assert_eq!(schema_version(&connection).unwrap(), 5);
         assert_eq!(found(&connection, "jose"), vec![id]);
         assert_eq!(count(&connection, "SELECT count(*) FROM occurrences"), 2);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_emails"), 1);
