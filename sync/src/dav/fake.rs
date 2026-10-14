@@ -26,7 +26,20 @@ pub struct RecordedRequest {
     pub path: String,
     pub depth: String,
     pub authorization: String,
+    /// La precondición de una escritura: `If-Match`, vacío si no vino.
+    pub if_match: String,
+    /// La precondición de una escritura: `If-None-Match`, vacío si no vino.
+    pub if_none_match: String,
+    /// El `Content-Type` del pedido, vacío si no vino.
+    pub content_type: String,
     pub body: String,
+}
+
+impl RecordedRequest {
+    /// Si el pedido trajo alguna de las dos precondiciones de ETag.
+    pub fn has_precondition(&self) -> bool {
+        !self.if_match.is_empty() || !self.if_none_match.is_empty()
+    }
 }
 
 impl RecordedRequest {
@@ -106,6 +119,13 @@ pub struct FakeState {
     pub truncate_sync: Option<usize>,
     /// No contestar nunca: el pedido se lee, se anota y se queda esperando.
     pub stall: bool,
+    /// Contestar un `PUT` que salió bien **sin** la cabecera `ETag`: lo permite
+    /// el RFC, y obliga al cliente a traerlo en la próxima vuelta.
+    pub omit_put_etag: bool,
+    /// Forzar este estado en toda escritura (`PUT`/`DELETE`), antes de mirar la
+    /// precondición: para probar el mapeo de un `401`, una redirección o un
+    /// estado inesperado.
+    pub force_write_status: Option<u16>,
     /// Si está, el `sync-collection` y el `PROPFIND` de una colección
     /// escriben la dirección de cada recurso entera, con este origen delante
     /// (`https://otro:1/dav/ana/personal/a.ics`): un servidor mal configurado
@@ -169,6 +189,8 @@ impl FakeDav {
             multiget_href: None,
             truncate_sync: None,
             stall: false,
+            omit_put_etag: false,
+            force_write_status: None,
             resource_origin: None,
         }));
 
@@ -333,24 +355,31 @@ async fn serve(mut socket: tokio::net::TcpStream, state: Arc<Mutex<FakeState>>) 
             path,
             depth: headers.get("depth").cloned().unwrap_or_default(),
             authorization: headers.get("authorization").cloned().unwrap_or_default(),
+            if_match: headers.get("if-match").cloned().unwrap_or_default(),
+            if_none_match: headers.get("if-none-match").cloned().unwrap_or_default(),
+            content_type: headers.get("content-type").cloned().unwrap_or_default(),
             body,
         };
 
-        let (status, reply, chunked, stall) = {
+        let (status, reply, etag, chunked, stall) = {
             let mut state = state.lock().unwrap();
             state.requests.push(request.clone());
             if let Some(hook) = state.on_request.as_mut() {
                 hook(&request);
             }
-            let (status, mut reply) = answer(&mut state, &request);
+            let Answer {
+                status,
+                mut body,
+                etag,
+            } = answer(&mut state, &request);
             if state.padding > 0 {
-                reply = reply.replacen(
+                body = body.replacen(
                     "<d:multistatus",
                     &format!("<!--{}--><d:multistatus", "x".repeat(state.padding)),
                     1,
                 );
             }
-            (status, reply, state.chunked, state.stall)
+            (status, body, etag, state.chunked, state.stall)
         };
         if stall {
             std::future::pending::<()>().await;
@@ -358,6 +387,9 @@ async fn serve(mut socket: tokio::net::TcpStream, state: Arc<Mutex<FakeState>>) 
 
         let mut out =
             format!("HTTP/1.1 {status} X\r\nContent-Type: application/xml; charset=utf-8\r\n");
+        if let Some(etag) = etag {
+            out.push_str(&format!("ETag: {etag}\r\n"));
+        }
         let bytes = if chunked {
             out.push_str("Transfer-Encoding: chunked\r\n\r\n");
             let mut bytes = out.into_bytes();
@@ -394,7 +426,31 @@ fn ok(prop: &str) -> String {
     format!("<d:propstat><d:prop>{prop}</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>")
 }
 
-fn answer(state: &mut FakeState, request: &RecordedRequest) -> (u16, String) {
+/// La respuesta del servidor de mentira: el estado, el cuerpo y, en una
+/// escritura que salió bien, el `ETag` del recurso para la cabecera.
+struct Answer {
+    status: u16,
+    body: String,
+    etag: Option<String>,
+}
+
+impl From<(u16, String)> for Answer {
+    fn from((status, body): (u16, String)) -> Self {
+        Answer {
+            status,
+            body,
+            etag: None,
+        }
+    }
+}
+
+fn answer(state: &mut FakeState, request: &RecordedRequest) -> Answer {
+    // Las escrituras van aparte: tocan el estado y contestan con el `ETag`.
+    match request.method.as_str() {
+        "PUT" => return put(state, request),
+        "DELETE" => return delete(state, request),
+        _ => {}
+    }
     let book = state
         .collections
         .iter()
@@ -407,7 +463,7 @@ fn answer(state: &mut FakeState, request: &RecordedRequest) -> (u16, String) {
         ("<c:addressbook/>", "c:address-data")
     };
 
-    match (request.method.as_str(), book) {
+    Answer::from(match (request.method.as_str(), book) {
         ("PROPFIND", None) if request.path == state.home => {
             let mut xml = String::from(head);
             xml.push_str(&format!(
@@ -487,7 +543,7 @@ fn answer(state: &mut FakeState, request: &RecordedRequest) -> (u16, String) {
         ("REPORT", Some(index)) if request.is_sync_collection() => {
             let book = &state.collections[index];
             if !book.supports_sync {
-                return (501, String::new());
+                return (501, String::new()).into();
             }
             let token = roxmltree::Document::parse(&request.body)
                 .ok()
@@ -506,8 +562,9 @@ fn answer(state: &mut FakeState, request: &RecordedRequest) -> (u16, String) {
                         return (
                             403,
                             r#"<?xml version="1.0"?><d:error xmlns:d="DAV:"><d:valid-sync-token/></d:error>"#
-                                .into(),
+                                .to_string(),
                         )
+                            .into()
                     }
                 }
             };
@@ -557,7 +614,7 @@ fn answer(state: &mut FakeState, request: &RecordedRequest) -> (u16, String) {
                 .fail_multiget_from
                 .is_some_and(|from| state.multigets >= from)
             {
-                return (500, String::new());
+                return (500, String::new()).into();
             }
             let shown = state.multiget_href;
             let book = &state.collections[index];
@@ -593,5 +650,106 @@ fn answer(state: &mut FakeState, request: &RecordedRequest) -> (u16, String) {
             (207, xml)
         }
         _ => (404, String::new()),
+    })
+}
+
+/// Un `PUT` con precondición de ETag, como lo hace un servidor de verdad.
+///
+/// Sin precondición contesta `428 Precondition Required`: el cliente de VasakOS
+/// siempre manda una, así que ese camino sólo lo tocaría una regresión.
+/// `If-None-Match: *` crea, y choca con `412` si el recurso ya existe;
+/// `If-Match: "<etag>"` reemplaza, y choca con `412` si el recurso no está o su
+/// ETag es otro. Cuando sale bien, sube la versión y contesta con el nuevo
+/// `ETag` —salvo que `omit_put_etag` pida no mandarlo—.
+fn put(state: &mut FakeState, request: &RecordedRequest) -> Answer {
+    if let Some(status) = state.force_write_status {
+        return (status, String::new()).into();
     }
+    let Some(index) = resource_owner(state, &request.path) else {
+        return (404, String::new()).into();
+    };
+    let name = resource_name(state, index, &request.path);
+    let exists = state.collections[index].resources.contains_key(&name);
+    let current = state.collections[index]
+        .resources
+        .get(&name)
+        .map(|r| r.etag.clone());
+
+    let create = request.if_none_match == "*";
+    let replace = (!request.if_match.is_empty()).then(|| request.if_match.clone());
+    let conflict = match (create, &replace) {
+        (true, _) if exists => true,
+        (_, Some(etag)) if current.as_deref() != Some(etag.as_str()) => true,
+        (false, None) => return (428, String::new()).into(),
+        _ => false,
+    };
+    if conflict {
+        return (412, String::new()).into();
+    }
+
+    state.version += 1;
+    let version = state.version;
+    let etag = format!("\"v{version}\"");
+    let book = &mut state.collections[index];
+    book.removed.remove(&name);
+    book.resources.insert(
+        name,
+        FakeResource {
+            etag: etag.clone(),
+            data: request.body.clone(),
+            version,
+        },
+    );
+    let status = if exists { 204 } else { 201 };
+    Answer {
+        status,
+        body: String::new(),
+        etag: (!state.omit_put_etag).then_some(etag),
+    }
+}
+
+/// Un `DELETE` con `If-Match`, como lo hace un servidor de verdad.
+///
+/// Sin `If-Match` contesta `428`. Si el recurso no está, `404` —que el cliente
+/// toma como éxito idempotente—. Si el ETag no coincide, `412`. Si coincide,
+/// borra y contesta `204`.
+fn delete(state: &mut FakeState, request: &RecordedRequest) -> Answer {
+    if let Some(status) = state.force_write_status {
+        return (status, String::new()).into();
+    }
+    let Some(index) = resource_owner(state, &request.path) else {
+        return (404, String::new()).into();
+    };
+    if request.if_match.is_empty() {
+        return (428, String::new()).into();
+    }
+    let name = resource_name(state, index, &request.path);
+    let book = &mut state.collections[index];
+    match book.resources.get(&name) {
+        None => (404, String::new()).into(),
+        Some(resource) if resource.etag != request.if_match => (412, String::new()).into(),
+        Some(_) => {
+            book.resources.remove(&name);
+            state.version += 1;
+            let version = state.version;
+            state.collections[index].removed.insert(name, version);
+            (204, String::new()).into()
+        }
+    }
+}
+
+/// La colección —libreta o calendario— dueña de la ruta de un recurso: la que
+/// es prefijo de la ruta y deja algo después de la última barra.
+fn resource_owner(state: &FakeState, path: &str) -> Option<usize> {
+    state.collections.iter().position(|book| {
+        path.starts_with(&book.path) && path.len() > book.path.len() && !path.ends_with('/')
+    })
+}
+
+/// El nombre del recurso dentro de su colección: lo que va después de la ruta
+/// de la colección.
+fn resource_name(state: &FakeState, index: usize, path: &str) -> String {
+    path.strip_prefix(&state.collections[index].path)
+        .unwrap_or("")
+        .to_string()
 }
