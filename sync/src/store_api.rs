@@ -60,7 +60,7 @@ use crate::email_sync::{EmailScheduler, EmailSync, EMAIL_TICK};
 use crate::ical::recurrence::ExpansionLimits;
 use crate::reminders;
 use crate::serialize::ical::{DateSpec, EventPatch, SerializeError};
-use crate::serialize::vcard::{ContactPatch, Relation};
+use crate::serialize::vcard::{ContactPatch, LabeledValue, Relation};
 use crate::serialize::{ical as ical_write, vcard as vcard_write, Change};
 use crate::store::calendar::{derive_with_occurrences, ObjectRow, Window};
 use crate::store::calendar_read::{self, GlobalId, ListCursor, Range};
@@ -941,11 +941,19 @@ impl<K: KeySource> StoreApi<K> {
     /// (sin `id` en el `payload`), con ETag edita el contacto cuyo `id` va en el
     /// `payload`.
     ///
-    /// `payload`: un objeto JSON con `full_name`, `organization`, `note` de
-    /// texto (ausente no toca, `null` saca, valor fija) y `related` como lista de
+    /// `payload`: un objeto JSON. Los campos de texto `full_name`,
+    /// `organization`, `note` (ausente no toca, `null` saca, un texto fija); las
+    /// listas `emails`, `phones` y `related` (ausente no toca, `null` las saca
+    /// todas, una lista fija el conjunto entero). Cada correo o teléfono es
+    /// `{"value": "...", "label": "..."}` —la etiqueta («casa», «trabajo») va en
+    /// `label` o, si no, en `type`, y es opcional—; cada relación,
     /// `{"label": "...", "value": "..."}`. Al editar, `id` identifica el
     /// contacto. Devuelve `{"contact_id": <id>}`, sin el `href` (la dirección en
     /// el servidor no sale del almacén; el `contact_id` ya alcanza).
+    ///
+    /// Un valor o una etiqueta que inyectaría una línea o un parámetro se escapa
+    /// o se sanea al serializar; un `payload` mal formado da `InvalidArgs` con un
+    /// texto fijo, sin tocar nada y sin pánico.
     ///
     /// Autoriza con `store.contacts` antes de actuar, y respeta el límite por
     /// llamante.
@@ -1470,6 +1478,62 @@ fn related_change(
     }
 }
 
+/// Cómo cambia una lista de datos con etiqueta —correos, teléfonos—: ausente no
+/// se toca, `null` los saca todos, una lista los fija enteros. Cada elemento es
+/// un objeto con `value` de texto (obligatorio) y la etiqueta en `label` o, si
+/// no, en `type` (opcional; vacía si no viene). Cualquier otra forma es un
+/// argumento inválido, con texto fijo que no lleva nada del cuerpo.
+fn labeled_change(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<Change<Vec<LabeledValue>>, StoreError> {
+    match obj.get(key) {
+        None => Ok(Change::Leave),
+        Some(serde_json::Value::Null) => Ok(Change::Clear),
+        Some(serde_json::Value::Array(items)) => {
+            let values = items
+                .iter()
+                .map(|item| {
+                    let map = item.as_object().ok_or_else(|| {
+                        StoreError::InvalidArgument(format!(
+                            "cada elemento de «{key}» es un objeto {{label, value}}"
+                        ))
+                    })?;
+                    let value = map
+                        .get("value")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .ok_or_else(|| {
+                            StoreError::InvalidArgument(format!(
+                                "cada elemento de «{key}» necesita «value» de texto"
+                            ))
+                        })?;
+                    // La etiqueta va en «label» o, para una ventana que la llame
+                    // «type», en «type». Es opcional: un correo sin etiqueta es
+                    // válido y la lectura lo devuelve con la etiqueta vacía.
+                    let label = map
+                        .get("label")
+                        .or_else(|| map.get("type"))
+                        .map(|raw| {
+                            raw.as_str().map(str::to_string).ok_or_else(|| {
+                                StoreError::InvalidArgument(format!(
+                                    "«label» de un elemento de «{key}» es texto"
+                                ))
+                            })
+                        })
+                        .transpose()?
+                        .unwrap_or_default();
+                    Ok(LabeledValue { label, value })
+                })
+                .collect::<Result<Vec<_>, StoreError>>()?;
+            Ok(Change::Set(values))
+        }
+        Some(_) => Err(StoreError::InvalidArgument(format!(
+            "«{key}» es una lista de {{label, value}} o null"
+        ))),
+    }
+}
+
 /// El `id` del objeto que se edita, del cuerpo: un número local positivo.
 fn require_edit_id(obj: &serde_json::Map<String, serde_json::Value>) -> Result<i64, StoreError> {
     let value = obj
@@ -1515,6 +1579,8 @@ fn contact_patch_from(
         full_name: text_change(obj, "full_name")?,
         organization: text_change(obj, "organization")?,
         note: text_change(obj, "note")?,
+        emails: labeled_change(obj, "emails")?,
+        phones: labeled_change(obj, "phones")?,
         related: related_change(obj, "related")?,
     })
 }
