@@ -20,6 +20,7 @@ interface ar.net.vasak.os.AccountsStore
   method PutContact(in s account_id, in s address_book_id, in s payload, in s if_match, out s)
   method PutEvent(in s account_id, in s calendar_id, in s payload, in s if_match, out s)
   method RequestSync(in s account_id)
+  method ResolveConflict(in s account_id, in s area, in s id, in s choice, out s)
   method SearchContacts(in s account_id, in s query, in s cursor, in u limit, out s)
   method SearchMessages(in s account_id, in s query, in x mailbox_id, in s cursor, in u limit, out s)
   method SetStoreEnabled(in s account_id, in b enabled)

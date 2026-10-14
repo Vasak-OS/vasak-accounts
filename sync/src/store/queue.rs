@@ -78,6 +78,31 @@ impl PendingState {
     }
 }
 
+/// Qué decidió la persona sobre un objeto en conflicto, al resolverlo
+/// ([`Store::resolve_conflict`]). La superficie D-Bus (`ResolveConflict`) la
+/// recibe como texto y la pasa ya validada.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictChoice {
+    /// La versión de la persona gana: se re-basa la op sobre el ETag actual del
+    /// servidor y vuelve a `ready`, para que el empuje re-haga el `PUT`/`DELETE`
+    /// con la precondición fresca y pise el servidor.
+    KeepLocal,
+    /// El servidor gana: su copia se adopta en la fila guardada y la op se
+    /// descarta.
+    TakeServer,
+}
+
+impl ConflictChoice {
+    /// La decisión por su nombre en el bus, o `None` si no es ninguna de las dos.
+    pub fn from_str(text: &str) -> Option<Self> {
+        match text {
+            "keep_local" => Some(ConflictChoice::KeepLocal),
+            "take_server" => Some(ConflictChoice::TakeServer),
+            _ => None,
+        }
+    }
+}
+
 /// El estado de sincronización de un objeto guardado, como lo ve una aplicación
 /// que lo lee: para el ícono «sin sincronizar» y para saber si se puede editar.
 ///
@@ -191,6 +216,17 @@ pub(super) fn area_tables(area: &str) -> Option<(&'static str, &'static str, &'s
     match area {
         CALENDAR_AREA => Some(("calendar_objects", "calendars", "calendar_id")),
         CONTACTS_AREA => Some(("contacts", "address_books", "address_book_id")),
+        _ => None,
+    }
+}
+
+/// La columna con el crudo guardado de cada área: el iCal de un evento, la vCard
+/// de un contacto. Es la que adopta la copia del servidor al resolver un
+/// conflicto con `take_server`.
+fn raw_column(area: &str) -> Option<&'static str> {
+    match area {
+        CALENDAR_AREA => Some("raw_ical"),
+        CONTACTS_AREA => Some("raw_vcard"),
         _ => None,
     }
 }
@@ -531,6 +567,171 @@ impl Store {
             )
             .map(|_| ())
             .map_err(classify)
+    }
+
+    /// Aplica la decisión de la persona sobre un objeto en conflicto, por su
+    /// **id local** (el de `GetConflict`): `keep_local` re-basa el cambio local
+    /// para que vuelva a subir, `take_server` adopta la copia del servidor y
+    /// descarta el cambio local. Acotada al área pedida —ninguna consulta cruza
+    /// de área— y con alcance de colección en la escritura.
+    ///
+    /// - **`keep_local`**: la versión de la persona gana. Se re-basa la op:
+    ///   `base_etag` pasa a ser el `server_etag` (el ETag actual del servidor que
+    ///   trajo A3), se limpia la copia del servidor (`server_etag`/`server_raw` a
+    ///   `NULL`) y la op vuelve a `ready` con la revisión subida, para que el
+    ///   empuje re-haga el `PUT`/`DELETE` con la precondición fresca y pise el
+    ///   servidor. **Sin `server_etag`** (la copia todavía no entró) no hay sobre
+    ///   qué re-basar: error, no una escritura incondicional.
+    /// - **`take_server`**: el servidor gana. Se adopta su copia en la fila
+    ///   guardada —su crudo y su ETag—, se limpia la marca `pending_op` y se
+    ///   descarta la op. Un `delete` en conflicto que el servidor todavía tiene
+    ///   deja el objeto vivo con la versión del servidor (misma escritura).
+    ///   **Sin copia del servidor** (`server_raw` nulo) no hay qué adoptar:
+    ///   error, sin perder el cambio local.
+    ///
+    /// Todo cierre va condicionado a `id + revision + state = 'conflict'`, como el
+    /// resto de la cola. Es **idempotente**: si la op ya no está en conflicto
+    /// —otra resolución, o una edición nueva que la reemplazó— no se toca nada y
+    /// se devuelve un error benigno (`InvalidArgument`). Sube la generación para
+    /// que la señal `Changed` recargue la ventana.
+    pub fn resolve_conflict(
+        &mut self,
+        area: &str,
+        id: i64,
+        choice: ConflictChoice,
+    ) -> Result<(), StoreError> {
+        let area_static = area_static(area).ok_or_else(|| {
+            StoreError::InvalidArgument(format!("«{area}» no es un área con cola de escritura"))
+        })?;
+        let (table, coltable, colcol) =
+            area_tables(area).expect("el área tiene tablas si tiene cola");
+        let raw_col = raw_column(area).expect("un área con cola tiene columna de crudo");
+        let transaction = self.connection.transaction().map_err(classify)?;
+
+        // La op en conflicto de este objeto, con su alcance de colección. Sólo del
+        // área pedida: el `JOIN` no cruza de área ni de colección.
+        let sql = format!(
+            "SELECT p.id, p.revision, p.server_etag, p.server_raw, p.object_href,
+                    p.collection_href
+               FROM {table} obj
+               JOIN {coltable} col ON col.id = obj.{colcol}
+               JOIN pending_dav_ops p
+                     ON p.area = ?1 AND p.object_href = obj.href
+                    AND p.collection_href = col.href
+              WHERE obj.id = ?2 AND p.state = 'conflict'"
+        );
+        type Row = (i64, i64, Option<String>, Option<Vec<u8>>, String, String);
+        let found: Option<Row> = transaction
+            .query_row(&sql, rusqlite::params![area, id], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
+            .optional()
+            .map_err(classify)?;
+        // Idempotencia: si ese id ya no está en conflicto —se resolvió antes, o una
+        // edición nueva reemplazó la op— no hay nada que hacer. Error benigno.
+        let Some((op_id, revision, server_etag, server_raw, object_href, collection_href)) = found
+        else {
+            return Err(StoreError::InvalidArgument(
+                "ese objeto ya no está en conflicto".into(),
+            ));
+        };
+
+        let affected = match choice {
+            ConflictChoice::KeepLocal => {
+                // Sin el ETag del servidor no se puede re-basar: re-basar sin
+                // precondición sería un `PUT` incondicional que pisa a ciegas. Un
+                // ETag vacío o en blanco cuenta como ausente —un servidor roto puede
+                // devolver `<getetag></getetag>` tras el 412, y `storable()` lo filtra
+                // por largo, no por vacío—: re-basar con `base_etag = ""` tampoco es
+                // una precondición, así que la invariante se comprueba acá y no
+                // depende sólo de la guarda de `replay` aguas abajo.
+                if server_etag
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+                {
+                    return Err(StoreError::InvalidArgument(
+                        "todavía no se trajo la copia del servidor con qué re-basar".into(),
+                    ));
+                }
+                // `base_etag = server_etag` usa el valor **anterior** de la fila
+                // aunque la misma orden ponga `server_etag = NULL` después: SQLite
+                // evalúa el lado derecho de cada `SET` contra la fila original.
+                transaction
+                    .execute(
+                        "UPDATE pending_dav_ops
+                            SET base_etag = server_etag, server_etag = NULL, server_raw = NULL,
+                                state = 'ready', attempts = 0, last_error = NULL,
+                                revision = revision + 1
+                          WHERE id = ?1 AND revision = ?2 AND state = 'conflict'",
+                        rusqlite::params![op_id, revision],
+                    )
+                    .map_err(classify)?
+            }
+            ConflictChoice::TakeServer => {
+                // Sin la copia del servidor no hay qué adoptar: no se descarta el
+                // cambio local a ciegas.
+                let Some(server_raw) = server_raw else {
+                    return Err(StoreError::InvalidArgument(
+                        "todavía no se trajo la copia del servidor para adoptarla".into(),
+                    ));
+                };
+                // Primero se cierra la op (condicional a id+revision+conflicto): si
+                // se movió, no se toca la fila guardada.
+                let closed = transaction
+                    .execute(
+                        "DELETE FROM pending_dav_ops
+                          WHERE id = ?1 AND revision = ?2 AND state = 'conflict'",
+                        rusqlite::params![op_id, revision],
+                    )
+                    .map_err(classify)?;
+                if closed > 0 {
+                    // La copia del servidor se guarda en la columna de crudo (TEXT):
+                    // se interpreta como texto, igual que `GetConflict` la muestra y
+                    // que la bajada guarda el crudo del servidor. Con alcance de
+                    // colección: no toca el mismo `href` de otra colección.
+                    let server_text = String::from_utf8_lossy(&server_raw).into_owned();
+                    transaction
+                        .execute(
+                            &format!(
+                                "UPDATE {table} SET {raw_col} = ?1, etag = ?2, pending_op = NULL
+                                  WHERE href = ?3
+                                    AND {colcol} = (SELECT id FROM {coltable} WHERE href = ?4)"
+                            ),
+                            rusqlite::params![
+                                server_text,
+                                server_etag,
+                                object_href,
+                                collection_href
+                            ],
+                        )
+                        .map_err(classify)?;
+                }
+                closed
+            }
+        };
+
+        // El cierre condicional no alcanzó la op: se movió entre la lectura y la
+        // escritura (dentro de la misma transacción es un imposible, pero la
+        // guarda es la misma del resto de la cola). Idempotente.
+        if affected == 0 {
+            return Err(StoreError::InvalidArgument(
+                "ese objeto ya no está en conflicto".into(),
+            ));
+        }
+
+        let generation = bump_generation(&transaction, area_static)?;
+        transaction.commit().map_err(classify)?;
+        self.note_change(area_static, generation);
+        Ok(())
     }
 
     /// Deja una op para reintentar más tarde (red, `423`, `507`): suma un
@@ -1086,5 +1287,269 @@ mod tests {
         };
         assert!(!present(&store, book1.id), "la fila de la libreta 1 se fue");
         assert!(present(&store, book2.id), "la de la libreta 2 se conserva");
+    }
+
+    /// El ETag guardado de una fila de contacto por su `href`.
+    fn etag_of(store: &Store, href: &str) -> Option<String> {
+        store
+            .connection()
+            .query_row("SELECT etag FROM contacts WHERE href = ?1", [href], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    /// Deja un contacto al día (sin op), para después borrarlo o chocarlo.
+    fn add_synced(store: &mut Store, book: &super::super::contacts::StoredAddressBook, href: &str) {
+        store
+            .apply_contacts(
+                book,
+                &[ContactOp::Upsert(row(href, "Al Día", "al@x.com"))],
+                None,
+                u64::MAX,
+            )
+            .unwrap();
+    }
+
+    /// Monta un conflicto de `put` con la copia del servidor ya traída, como lo
+    /// dejaría el empuje contra un `412` más A3.
+    fn put_conflict_with_server_copy(
+        store: &mut Store,
+        book: &super::super::contacts::StoredAddressBook,
+    ) {
+        store
+            .enqueue_contact_put(book, &row(HREF, "Mía", "yo@x.com"))
+            .unwrap();
+        let op = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        store.mark_conflict(&op, "cambió en el servidor").unwrap();
+        let op = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        store
+            .store_server_copy(op.id, op.revision, Some("\"srv\""), b"BEGIN:VCARD servidor")
+            .unwrap();
+    }
+
+    fn contact_id(store: &Store, href: &str, book_id: i64) -> i64 {
+        store.contact_id_by_href(book_id, href).unwrap().unwrap()
+    }
+
+    /// **`keep_local`**: la versión local gana. La op se re-basa sobre el ETag del
+    /// servidor (`base_etag = server_etag`), la copia del servidor se limpia, la op
+    /// vuelve a `ready` con la revisión subida, y el crudo local y su marca quedan:
+    /// el empuje la va a re-subir pisando el servidor.
+    #[test]
+    fn resolver_keep_local_rebasa_la_op() {
+        let temp = TempDir::new("resolver-keep-local");
+        let mut store = open_store(&temp);
+        let book = one_book(&mut store);
+        put_conflict_with_server_copy(&mut store, &book);
+        let before = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        let id = contact_id(&store, HREF, book.id);
+
+        store
+            .resolve_conflict(CONTACTS_AREA, id, ConflictChoice::KeepLocal)
+            .unwrap();
+
+        let after = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        assert_eq!(after.state, PendingState::Ready, "vuelve a reintentar");
+        assert_eq!(
+            after.base_etag.as_deref(),
+            Some("\"srv\""),
+            "re-basada sobre el ETag del servidor"
+        );
+        assert_eq!(after.server_etag, None, "la copia del servidor se limpió");
+        assert_eq!(after.server_raw, None);
+        assert_eq!(after.attempts, 0, "los reintentos arrancan de cero");
+        assert!(after.revision > before.revision, "la revisión subió");
+        // El crudo local y su marca quedan: la versión de la persona gana.
+        assert!(raw_of(&store, HREF).is_some_and(|r| r.contains("Mía")));
+        assert_eq!(pending_op_of(&store, HREF).as_deref(), Some("put"));
+    }
+
+    /// **`keep_local` sin copia del servidor**: sin `server_etag` no hay sobre qué
+    /// re-basar —re-basar a ciegas sería un `PUT` incondicional—, así que falla y
+    /// **no toca nada**: la op sigue en conflicto.
+    #[test]
+    fn resolver_keep_local_sin_server_etag_falla() {
+        let temp = TempDir::new("resolver-keep-local-sin-etag");
+        let mut store = open_store(&temp);
+        let book = one_book(&mut store);
+        // Conflicto sin traer la copia del servidor: server_etag queda en NULL.
+        store
+            .enqueue_contact_put(&book, &row(HREF, "Mía", "yo@x.com"))
+            .unwrap();
+        let op = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        store.mark_conflict(&op, "chocó").unwrap();
+        let id = contact_id(&store, HREF, book.id);
+
+        let result = store.resolve_conflict(CONTACTS_AREA, id, ConflictChoice::KeepLocal);
+        assert!(matches!(result, Err(StoreError::InvalidArgument(_))));
+
+        // La op sigue intacta, en conflicto: el `base_etag` no se re-basó (sigue el
+        // local de origen, no el del servidor, que no se trajo).
+        let after = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        assert_eq!(after.state, PendingState::Conflict);
+        assert_eq!(after.base_etag.as_deref(), Some("\"1\""));
+        assert_eq!(after.attempts, 1, "no se re-basó ni se contó un intento");
+    }
+
+    /// **Defensa en profundidad**: un `server_etag` vacío o en blanco —un servidor
+    /// roto que tras el 412 devuelve `<getetag></getetag>`, que `storable()` deja
+    /// pasar por filtrar por largo y no por vacío— cuenta como ausente. `keep_local`
+    /// falla y **no re-basa con `base_etag = ""`**: la invariante «sin ETag del
+    /// servidor no hay sobre qué re-basar» se comprueba acá, sin depender sólo de la
+    /// guarda de `replay` aguas abajo.
+    #[test]
+    fn resolver_keep_local_con_server_etag_vacio_falla() {
+        let temp = TempDir::new("resolver-keep-local-etag-vacio");
+        let mut store = open_store(&temp);
+        let book = one_book(&mut store);
+        store
+            .enqueue_contact_put(&book, &row(HREF, "Mía", "yo@x.com"))
+            .unwrap();
+        let op = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        store.mark_conflict(&op, "chocó").unwrap();
+        let op = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        // El servidor devolvió un ETag vacío: `server_etag = Some("")`.
+        store
+            .store_server_copy(op.id, op.revision, Some(""), b"BEGIN:VCARD servidor")
+            .unwrap();
+        let id = contact_id(&store, HREF, book.id);
+
+        let result = store.resolve_conflict(CONTACTS_AREA, id, ConflictChoice::KeepLocal);
+        assert!(matches!(result, Err(StoreError::InvalidArgument(_))));
+
+        // La op sigue en conflicto, sin re-basar: el `base_etag` no quedó en `""`.
+        let after = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        assert_eq!(after.state, PendingState::Conflict);
+        assert_eq!(after.base_etag.as_deref(), Some("\"1\""));
+    }
+
+    /// **`take_server`**: el servidor gana. Su copia se adopta en la fila guardada
+    /// —su crudo y su ETag—, la marca `pending_op` se limpia y la op se descarta.
+    #[test]
+    fn resolver_take_server_adopta_la_copia_y_borra_la_op() {
+        let temp = TempDir::new("resolver-take-server");
+        let mut store = open_store(&temp);
+        let book = one_book(&mut store);
+        put_conflict_with_server_copy(&mut store, &book);
+        let id = contact_id(&store, HREF, book.id);
+
+        store
+            .resolve_conflict(CONTACTS_AREA, id, ConflictChoice::TakeServer)
+            .unwrap();
+
+        assert_eq!(
+            raw_of(&store, HREF).as_deref(),
+            Some("BEGIN:VCARD servidor"),
+            "la fila guarda el crudo del servidor"
+        );
+        assert_eq!(etag_of(&store, HREF).as_deref(), Some("\"srv\""));
+        assert_eq!(pending_op_of(&store, HREF), None, "la marca se limpió");
+        assert_eq!(
+            store.pending_count(CONTACTS_AREA).unwrap(),
+            0,
+            "la op se fue"
+        );
+    }
+
+    /// **`take_server` sin copia del servidor**: sin `server_raw` no hay qué
+    /// adoptar, así que falla y **no descarta el cambio local**: la op sigue en
+    /// conflicto y el crudo local queda.
+    #[test]
+    fn resolver_take_server_sin_copia_del_servidor_falla() {
+        let temp = TempDir::new("resolver-take-server-sin-copia");
+        let mut store = open_store(&temp);
+        let book = one_book(&mut store);
+        store
+            .enqueue_contact_put(&book, &row(HREF, "Mía", "yo@x.com"))
+            .unwrap();
+        let op = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        store.mark_conflict(&op, "chocó").unwrap();
+        let id = contact_id(&store, HREF, book.id);
+
+        let result = store.resolve_conflict(CONTACTS_AREA, id, ConflictChoice::TakeServer);
+        assert!(matches!(result, Err(StoreError::InvalidArgument(_))));
+
+        assert!(raw_of(&store, HREF).is_some_and(|r| r.contains("Mía")));
+        assert_eq!(pending_op_of(&store, HREF).as_deref(), Some("put"));
+        assert_eq!(
+            store.pending_count(CONTACTS_AREA).unwrap(),
+            1,
+            "la op sigue"
+        );
+    }
+
+    /// **`take_server` de un borrado en conflicto**: el objeto sigue existiendo con
+    /// la versión del servidor —no se borra—, la marca se limpia y la op se va.
+    #[test]
+    fn resolver_take_server_de_un_borrado_deja_la_version_del_servidor() {
+        let temp = TempDir::new("resolver-take-server-borrado");
+        let mut store = open_store(&temp);
+        let book = one_book(&mut store);
+        add_synced(&mut store, &book, HREF);
+        store
+            .enqueue_delete(CONTACTS_AREA, BOOK, HREF, Some("\"1\""))
+            .unwrap();
+        let op = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        store.mark_conflict(&op, "chocó").unwrap();
+        let op = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        store
+            .store_server_copy(
+                op.id,
+                op.revision,
+                Some("\"srv2\""),
+                b"BEGIN:VCARD del servidor",
+            )
+            .unwrap();
+        let id = contact_id(&store, HREF, book.id);
+
+        store
+            .resolve_conflict(CONTACTS_AREA, id, ConflictChoice::TakeServer)
+            .unwrap();
+
+        // El objeto NO se borró: quedó con la versión del servidor.
+        assert_eq!(
+            raw_of(&store, HREF).as_deref(),
+            Some("BEGIN:VCARD del servidor")
+        );
+        assert_eq!(etag_of(&store, HREF).as_deref(), Some("\"srv2\""));
+        assert_eq!(pending_op_of(&store, HREF), None);
+        assert_eq!(store.pending_count(CONTACTS_AREA).unwrap(), 0);
+    }
+
+    /// **Idempotencia**: resolver un objeto que **ya no está en conflicto** —su op
+    /// está en `ready`, no en `conflict`— no rompe ni toca nada: error benigno.
+    #[test]
+    fn resolver_una_op_que_ya_no_esta_en_conflicto_no_rompe() {
+        let temp = TempDir::new("resolver-idempotente");
+        let mut store = open_store(&temp);
+        let book = one_book(&mut store);
+        // La op queda en `ready`, nunca chocó.
+        store
+            .enqueue_contact_put(&book, &row(HREF, "Mía", "yo@x.com"))
+            .unwrap();
+        let id = contact_id(&store, HREF, book.id);
+
+        for choice in [ConflictChoice::KeepLocal, ConflictChoice::TakeServer] {
+            let result = store.resolve_conflict(CONTACTS_AREA, id, choice);
+            assert!(matches!(result, Err(StoreError::InvalidArgument(_))));
+        }
+        // Nada cambió: la op sigue en `ready`, con su crudo y su marca.
+        let after = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        assert_eq!(after.state, PendingState::Ready);
+        assert_eq!(pending_op_of(&store, HREF).as_deref(), Some("put"));
+        assert_eq!(store.pending_count(CONTACTS_AREA).unwrap(), 1);
+    }
+
+    /// Un área sin cola de escritura (correo) es un argumento inválido, **sin tocar
+    /// el disco**.
+    #[test]
+    fn resolver_un_area_sin_cola_es_invalida() {
+        let temp = TempDir::new("resolver-area-mala");
+        let mut store = open_store(&temp);
+        assert!(matches!(
+            store.resolve_conflict("email", 1, ConflictChoice::KeepLocal),
+            Err(StoreError::InvalidArgument(_))
+        ));
     }
 }

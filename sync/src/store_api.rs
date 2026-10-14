@@ -73,6 +73,7 @@ use crate::store::lifecycle::{
     AccountListing, AreaAccount, Consent, ListedAccount, Locations, Status, StoreManager,
     CALENDAR_AREA, CONTACTS_AREA, EMAIL_AREA, SYNCED_AREAS,
 };
+use crate::store::queue::ConflictChoice;
 use crate::store::{paths, Store, StoreError};
 
 /// Dónde se publica la interfaz.
@@ -1114,6 +1115,62 @@ impl<K: KeySource> StoreApi<K> {
             .map_err(read_error)?;
         contacts_read::to_capped_json(&conflict, contacts_read::MAX_CONTACT_BYTES)
             .map_err(read_error)
+    }
+
+    /// Aplica la decisión de la persona sobre un objeto en conflicto: `keep_local`
+    /// —la versión local gana y se vuelve a subir, pisando el servidor— o
+    /// `take_server` —el servidor gana, su copia se adopta en la base y el cambio
+    /// local se descarta—. Devuelve `{}`.
+    ///
+    /// `id` es el número local del objeto (el de `GetConflict`). El orden es
+    /// estricto: se validan `area`, `id` y `choice` **antes de preguntar nada**;
+    /// después se autoriza y se aplica el límite por llamante; recién entonces se
+    /// actúa. Un `area` que no sea `calendar` o `contacts`, un `id` que no sea un
+    /// número local válido, o un `choice` que no sea `keep_local` ni `take_server`
+    /// dan `InvalidArgs` sin tocar disco.
+    ///
+    /// Muta el almacén y, con `keep_local`, re-dispara la escritura remota, así
+    /// que autoriza con el permiso de **lectura** del área (`store.calendar` /
+    /// `store.contacts`) antes de actuar: desde M2 ese permiso significa «ver y
+    /// cambiar». `keep_local` sin la copia del servidor todavía traída, o
+    /// `take_server` sin ella, da `InvalidArgs` sin escribir nada —no se pisa el
+    /// servidor a ciegas ni se descarta el cambio local sin la copia—. Si el
+    /// objeto ya no está en conflicto (otra resolución o una edición nueva), da un
+    /// error benigno sin romper nada.
+    async fn resolve_conflict(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        account_id: String,
+        area: String,
+        id: String,
+        choice: String,
+    ) -> zbus::fdo::Result<String> {
+        let (area_static, resource) = conflict_area(&area)?;
+        let id = contacts_read::parse_id(&id).map_err(invalid)?;
+        let choice = ConflictChoice::from_str(&choice).ok_or_else(|| {
+            zbus::fdo::Error::InvalidArgs(
+                "la decisión de un conflicto es «keep_local» o «take_server»".into(),
+            )
+        })?;
+        let account = self
+            .manager
+            .area_account(area_static, &account_id)
+            .await
+            .map_err(to_fdo)?;
+        self.authorize(&header, resource, &account.display_name)
+            .await?;
+        self.caller_limit(&header, &account_id)?;
+        self.manager
+            .with_store(&account_id, move |store| {
+                store.resolve_conflict(area_static, id, choice)
+            })
+            .await
+            .map_err(read_error)?;
+        // Con `keep_local`, la op volvió a `ready`: el empuje tiene que re-hacer la
+        // escritura re-basada. Con `take_server` no hay nada que empujar, pero
+        // pedir una vuelta no cuesta y deja la cuenta al día.
+        self.ask_for_sync(area_static, &account_id);
+        Ok("{}".to_string())
     }
 
     /// Señal `StatusChanged` — cambió el estado de alguna base.
@@ -2518,6 +2575,7 @@ mod tests {
                 "PutContact",
                 "PutEvent",
                 "RequestSync",
+                "ResolveConflict",
                 "SearchContacts",
                 "SearchMessages",
                 "SetStoreEnabled",
@@ -3132,6 +3190,99 @@ mod tests {
             0,
             "una cuenta sin el área no abre diálogo"
         );
+    }
+
+    /// `ResolveConflict` **valida los argumentos antes de preguntar nada** y
+    /// **autoriza antes de actuar**: un `area`, `id` o `choice` mal formados son
+    /// `InvalidArgs` sin abrir diálogo, y sin permiso contesta `AccessDenied`
+    /// dejando el conflicto intacto.
+    #[tokio::test]
+    async fn resolver_un_conflicto_autoriza_antes_de_actuar() {
+        let mut api = Api::new(
+            "api-resolver-neg",
+            vec![with_contacts("cuenta")],
+            Answer::Deny,
+        )
+        .await;
+        with_a_conflict(&api).await;
+        let (client, _service) = api.client(":1.7").await;
+
+        // Argumentos malos: InvalidArgs, antes de preguntar.
+        for bad in [
+            ("cuenta", "email", "1", "keep_local"),
+            ("cuenta", "contacts", "abc", "keep_local"),
+            ("cuenta", "contacts", "1", "lo-que-sea"),
+        ] {
+            assert_eq!(
+                error_name(&call(&client, "ResolveConflict", &bad).await),
+                INVALID_ARGS
+            );
+        }
+        assert_eq!(
+            api.access.permissions.calls(),
+            0,
+            "un argumento malo no abre diálogo"
+        );
+
+        // Sin permiso: AccessDenied, y el conflicto sigue intacto.
+        assert_eq!(
+            error_name(
+                &call(
+                    &client,
+                    "ResolveConflict",
+                    &("cuenta", "contacts", "1", "take_server")
+                )
+                .await
+            ),
+            ACCESS_DENIED
+        );
+        let still = api
+            .manager
+            .read("cuenta", |c| {
+                conflict_read::list_conflicts(c, CONTACTS_AREA)
+            })
+            .await
+            .unwrap();
+        assert_eq!(still.len(), 1, "el conflicto no se tocó sin permiso");
+    }
+
+    /// Con permiso, `ResolveConflict` resuelve: `take_server` adopta la copia del
+    /// servidor y el conflicto desaparece de la lista.
+    #[tokio::test]
+    async fn resolver_un_conflicto_con_permiso_lo_resuelve() {
+        let mut api = Api::new("api-resolver", vec![with_contacts("cuenta")], Answer::Allow).await;
+        with_a_conflict(&api).await;
+        let (client, _service) = api.client(":1.7").await;
+
+        let before = api
+            .manager
+            .read("cuenta", |c| {
+                conflict_read::list_conflicts(c, CONTACTS_AREA)
+            })
+            .await
+            .unwrap();
+        assert_eq!(before.len(), 1, "el conflicto está antes de resolver");
+        let id = before[0].id.clone();
+
+        assert_eq!(
+            call(
+                &client,
+                "ResolveConflict",
+                &("cuenta", "contacts", id.as_str(), "take_server")
+            )
+            .await
+            .unwrap(),
+            "{}"
+        );
+
+        let after = api
+            .manager
+            .read("cuenta", |c| {
+                conflict_read::list_conflicts(c, CONTACTS_AREA)
+            })
+            .await
+            .unwrap();
+        assert!(after.is_empty(), "el conflicto se resolvió");
     }
 
     /// Con el llavero bloqueado, leer da un error que lo dice, y ningún dato.
