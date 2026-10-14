@@ -59,7 +59,7 @@ use crate::dav_sync::BrokerCredentials;
 use crate::email_sync::{EmailScheduler, EmailSync, EMAIL_TICK};
 use crate::ical::recurrence::ExpansionLimits;
 use crate::reminders;
-use crate::serialize::ical::{DateSpec, EventPatch, SerializeError};
+use crate::serialize::ical::{DateSpec, EventPatch, SerializeError, TaskPatch, TodoStatus};
 use crate::serialize::vcard::{ContactPatch, LabeledValue, Relation};
 use crate::serialize::{ical as ical_write, vcard as vcard_write, Change};
 use crate::store::calendar::{derive_with_occurrences, ObjectRow, Window};
@@ -862,39 +862,15 @@ impl<K: KeySource> StoreApi<K> {
         payload: String,
         if_match: String,
     ) -> zbus::fdo::Result<String> {
-        let calendar_id = contacts_read::parse_id(&calendar_id).map_err(invalid)?;
-        let account = self
-            .manager
-            .area_account(CALENDAR_AREA, &account_id)
-            .await
-            .map_err(to_fdo)?;
-        self.authorize(&header, CALENDAR_RESOURCE, &account.display_name)
-            .await?;
-        self.caller_limit(&header, &account_id)?;
-        self.activate_after_read(CALENDAR_AREA, &account_id, &account)
-            .await;
-        let uid = if if_match.is_empty() {
-            Some(new_uid()?)
-        } else {
-            None
-        };
-        // El `href` que devuelve el encolado se usa para resolver el `id` nuevo,
-        // pero no sale por el bus: la dirección en el servidor no es pública.
-        let (id, _href) = self
-            .manager
-            .with_store(&account_id, move |store| {
-                put_event_in_store(store, calendar_id, &payload, &if_match, uid)
-            })
-            .await
-            .map_err(read_error)?;
-        self.ask_for_sync(CALENDAR_AREA, &account_id);
-        let event_id = GlobalId {
-            account_id: account_id.clone(),
-            id,
-        }
-        .encode();
-        serde_json::to_string(&serde_json::json!({ "event_id": event_id }))
-            .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
+        self.put_calendar_object(
+            &header,
+            CalendarObjectKind::Event,
+            account_id,
+            calendar_id,
+            payload,
+            if_match,
+        )
+        .await
     }
 
     /// Borra un evento o una tarea, **encolando** el borrado hacia el servidor:
@@ -913,29 +889,70 @@ impl<K: KeySource> StoreApi<K> {
         event_id: String,
         if_match: String,
     ) -> zbus::fdo::Result<String> {
-        let event_id = contacts_read::parse_id(&event_id).map_err(invalid)?;
-        let account = self
-            .manager
-            .area_account(CALENDAR_AREA, &account_id)
+        self.delete_calendar_object(
+            &header,
+            account_id,
+            event_id,
+            if_match,
+            "el evento no existe",
+        )
+        .await
+    }
+
+    /// Crea o edita una tarea (`VTODO`) de un calendario, **encolándola** hacia
+    /// el servidor. Espejo de [`Self::put_event`] para una tarea: las tareas
+    /// viven en la misma colección de calendario, así que el `calendar_id`, el
+    /// `if_match` (vacío crea, con ETag edita el objeto cuyo `id` va en el
+    /// `payload`) y el encolado son los mismos. La UI de tareas de `vasak-calendar`
+    /// consume este método.
+    ///
+    /// `payload`: un objeto JSON. Cada campo ausente **no se toca**, `null` lo
+    /// **saca**, un valor lo **fija**: `summary`, `description` de texto; `due`
+    /// como `{"value": "...", "params": ["..."]}` (el vencimiento); `status` uno
+    /// de `NEEDS-ACTION`/`COMPLETED`/`IN-PROCESS`/`CANCELLED`; `percent_complete`
+    /// un entero de 0 a 100; `priority` un entero de 0 a 9. Al editar, `id`
+    /// identifica la tarea. Devuelve `{"task_id": "<cuenta>/<id>"}`, sin el
+    /// `href` (igual que `PutEvent`). Un `payload` mal formado —una fecha que no
+    /// es iCalendar, un estado desconocido, un número fuera de rango— da
+    /// `InvalidArgs` sin tocar nada, nunca un pánico.
+    ///
+    /// Autoriza con `store.calendar` **antes** de actuar, y respeta el límite por
+    /// llamante.
+    async fn put_task(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        account_id: String,
+        calendar_id: String,
+        payload: String,
+        if_match: String,
+    ) -> zbus::fdo::Result<String> {
+        self.put_calendar_object(
+            &header,
+            CalendarObjectKind::Task,
+            account_id,
+            calendar_id,
+            payload,
+            if_match,
+        )
+        .await
+    }
+
+    /// Borra una tarea, **encolando** el borrado hacia el servidor. Un `VTODO` se
+    /// identifica y se borra como cualquier objeto de calendario —`event_target`
+    /// no filtra por componente—, así que comparte la lógica de
+    /// [`Self::delete_event`]; el método propio existe para la claridad del
+    /// contrato (la UI de tareas borra por acá). `task_id` es el número local;
+    /// `if_match` vacío borra sin precondición, con un ETag sólo si no cambió.
+    /// Devuelve `{}`.
+    async fn delete_task(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        account_id: String,
+        task_id: String,
+        if_match: String,
+    ) -> zbus::fdo::Result<String> {
+        self.delete_calendar_object(&header, account_id, task_id, if_match, "la tarea no existe")
             .await
-            .map_err(to_fdo)?;
-        self.authorize(&header, CALENDAR_RESOURCE, &account.display_name)
-            .await?;
-        self.caller_limit(&header, &account_id)?;
-        self.activate_after_read(CALENDAR_AREA, &account_id, &account)
-            .await;
-        let base_etag = (!if_match.is_empty()).then_some(if_match);
-        self.manager
-            .with_store(&account_id, move |store| {
-                let (calendar, href, _raw) = store
-                    .event_target(event_id)?
-                    .ok_or_else(|| StoreError::InvalidArgument("el evento no existe".into()))?;
-                store.enqueue_delete(CALENDAR_AREA, &calendar.href, &href, base_etag.as_deref())
-            })
-            .await
-            .map_err(read_error)?;
-        self.ask_for_sync(CALENDAR_AREA, &account_id);
-        Ok("{}".to_string())
     }
 
     /// Crea o edita un contacto de una libreta, **encolándolo** hacia el
@@ -1193,6 +1210,102 @@ impl<K: KeySource> StoreApi<K> {
 }
 
 impl<K: KeySource> StoreApi<K> {
+    /// Crea o edita un objeto de calendario —un evento o una tarea— encolándolo:
+    /// es el cuerpo común de `PutEvent` y `PutTask`. **El orden es la invariante
+    /// de seguridad** (y no cambia al unificar): se valida el `calendar_id` y se
+    /// resuelve la cuenta **antes** de autorizar; se autoriza **antes** del límite
+    /// por llamante, de abrir la base y de encolar. Lo único que cambia entre tipo
+    /// y tipo —qué `put_*_in_store` serializa y con qué clave responde— lo decide
+    /// [`CalendarObjectKind`]. Devuelve `{"<clave>_id": "<cuenta>/<id>"}`, sin el
+    /// `href` (la dirección en el servidor no es pública).
+    async fn put_calendar_object(
+        &self,
+        header: &Header<'_>,
+        kind: CalendarObjectKind,
+        account_id: String,
+        calendar_id: String,
+        payload: String,
+        if_match: String,
+    ) -> zbus::fdo::Result<String> {
+        let calendar_id = contacts_read::parse_id(&calendar_id).map_err(invalid)?;
+        let account = self
+            .manager
+            .area_account(CALENDAR_AREA, &account_id)
+            .await
+            .map_err(to_fdo)?;
+        self.authorize(header, CALENDAR_RESOURCE, &account.display_name)
+            .await?;
+        self.caller_limit(header, &account_id)?;
+        self.activate_after_read(CALENDAR_AREA, &account_id, &account)
+            .await;
+        let uid = if if_match.is_empty() {
+            Some(new_uid()?)
+        } else {
+            None
+        };
+        // El `href` que devuelve el encolado resuelve el `id` nuevo, pero no sale
+        // por el bus: la dirección en el servidor no es pública.
+        let (id, _href) = self
+            .manager
+            .with_store(&account_id, move |store| {
+                kind.put_in_store(store, calendar_id, &payload, &if_match, uid)
+            })
+            .await
+            .map_err(read_error)?;
+        self.ask_for_sync(CALENDAR_AREA, &account_id);
+        let global = GlobalId {
+            account_id: account_id.clone(),
+            id,
+        }
+        .encode();
+        let mut reply = serde_json::Map::new();
+        reply.insert(
+            kind.reply_key().to_string(),
+            serde_json::Value::String(global),
+        );
+        serde_json::to_string(&serde_json::Value::Object(reply))
+            .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
+    }
+
+    /// Borra un objeto de calendario —un evento o una tarea— encolando el
+    /// borrado: autoriza antes de actuar, respeta el límite por llamante y marca
+    /// la fila guardada. Es lo común entre `DeleteEvent` y `DeleteTask`: un
+    /// `VTODO` se identifica y se borra como cualquier objeto (`event_target` no
+    /// filtra por componente). `missing` es el texto del `InvalidArgs` cuando el
+    /// objeto no existe, para que cada método hable de «el evento» o «la tarea».
+    async fn delete_calendar_object(
+        &self,
+        header: &Header<'_>,
+        account_id: String,
+        object_id: String,
+        if_match: String,
+        missing: &'static str,
+    ) -> zbus::fdo::Result<String> {
+        let object_id = contacts_read::parse_id(&object_id).map_err(invalid)?;
+        let account = self
+            .manager
+            .area_account(CALENDAR_AREA, &account_id)
+            .await
+            .map_err(to_fdo)?;
+        self.authorize(header, CALENDAR_RESOURCE, &account.display_name)
+            .await?;
+        self.caller_limit(header, &account_id)?;
+        self.activate_after_read(CALENDAR_AREA, &account_id, &account)
+            .await;
+        let base_etag = (!if_match.is_empty()).then_some(if_match);
+        self.manager
+            .with_store(&account_id, move |store| {
+                let (calendar, href, _raw) = store
+                    .event_target(object_id)?
+                    .ok_or_else(|| StoreError::InvalidArgument(missing.into()))?;
+                store.enqueue_delete(CALENDAR_AREA, &calendar.href, &href, base_etag.as_deref())
+            })
+            .await
+            .map_err(read_error)?;
+        self.ask_for_sync(CALENDAR_AREA, &account_id);
+        Ok("{}".to_string())
+    }
+
     /// Lo que pasa antes de un comando de control: la cuenta se conoce, y quien
     /// llama no pasó su límite.
     async fn admit_control(
@@ -1729,6 +1842,70 @@ fn event_patch_from(
     })
 }
 
+/// Cómo cambia el estado de una tarea: ausente no se toca, `null` lo saca, un
+/// texto lo fija **sólo si es uno de los estados conocidos** (ver
+/// [`TodoStatus`]). Un texto que no lo es —o uno con una inyección— es un
+/// argumento inválido: no hay forma de que un valor libre termine en la línea
+/// `STATUS:`.
+fn status_change(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<Change<TodoStatus>, StoreError> {
+    match obj.get(key) {
+        None => Ok(Change::Leave),
+        Some(serde_json::Value::Null) => Ok(Change::Clear),
+        Some(serde_json::Value::String(text)) => {
+            TodoStatus::parse(text).map(Change::Set).ok_or_else(|| {
+                StoreError::InvalidArgument(format!("«{key}» no es un estado de tarea"))
+            })
+        }
+        Some(_) => Err(StoreError::InvalidArgument(format!(
+            "«{key}» es texto o null"
+        ))),
+    }
+}
+
+/// Cómo cambia un entero acotado —el porcentaje (0..=100), la prioridad
+/// (0..=9)—: ausente no se toca, `null` lo saca, un entero dentro de `0..=max`
+/// lo fija. Un número fuera de rango, con decimales o negativo es un argumento
+/// inválido. Un entero no puede inyectar una línea (va en decimal), y el dominio
+/// se comprueba acá y, de nuevo, al serializar.
+fn number_change(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    max: u8,
+) -> Result<Change<u8>, StoreError> {
+    match obj.get(key) {
+        None => Ok(Change::Leave),
+        Some(serde_json::Value::Null) => Ok(Change::Clear),
+        Some(serde_json::Value::Number(number)) => number
+            .as_i64()
+            .filter(|value| *value >= 0 && *value <= i64::from(max))
+            .map(|value| Change::Set(value as u8))
+            .ok_or_else(|| {
+                StoreError::InvalidArgument(format!("«{key}» es un entero de 0 a {max}"))
+            }),
+        Some(_) => Err(StoreError::InvalidArgument(format!(
+            "«{key}» es un entero de 0 a {max} o null"
+        ))),
+    }
+}
+
+/// El parche de una tarea, del cuerpo JSON. Espejo de [`event_patch_from`], con
+/// los campos de un `VTODO`.
+fn task_patch_from(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<TaskPatch, StoreError> {
+    Ok(TaskPatch {
+        summary: text_change(obj, "summary")?,
+        description: text_change(obj, "description")?,
+        due: date_change(obj, "due")?,
+        status: status_change(obj, "status")?,
+        percent_complete: number_change(obj, "percent_complete", 100)?,
+        priority: number_change(obj, "priority", 9)?,
+    })
+}
+
 /// El parche de un contacto, del cuerpo JSON.
 fn contact_patch_from(
     obj: &serde_json::Map<String, serde_json::Value>,
@@ -1743,25 +1920,74 @@ fn contact_patch_from(
     })
 }
 
-/// Crea o edita un evento en la base y lo encola: todo en la misma transacción
-/// del almacén (ver `store/queue.rs`). Devuelve el `id` local del objeto y su
-/// `href`. Corre en el hilo de bloqueo, dentro de `with_store`.
-fn put_event_in_store(
+/// El parche de un objeto de calendario ya parseado, del tipo que sea. Agrupa lo
+/// propio de un evento y de una tarea para el camino de escritura común
+/// ([`put_calendar_object_in_store`]): cómo serializar uno nuevo o editado, y los
+/// textos de `InvalidArgs` para que cada tipo hable de «el evento» o «la tarea».
+enum CalendarPatch {
+    Event(EventPatch),
+    Task(TaskPatch),
+}
+
+impl CalendarPatch {
+    /// Arma el crudo de un objeto nuevo.
+    fn new_raw(&self, uid: &str, dtstamp: &str) -> Result<String, SerializeError> {
+        match self {
+            CalendarPatch::Event(patch) => ical_write::new_event(uid, dtstamp, patch),
+            CalendarPatch::Task(patch) => ical_write::new_todo(uid, dtstamp, patch),
+        }
+    }
+
+    /// Aplica el parche sobre el crudo guardado.
+    fn apply(&self, raw: &str) -> Result<String, SerializeError> {
+        match self {
+            CalendarPatch::Event(patch) => ical_write::apply_changes(raw, patch),
+            CalendarPatch::Task(patch) => ical_write::apply_todo_changes(raw, patch),
+        }
+    }
+
+    /// El texto de `InvalidArgs` cuando el objeto a editar no existe.
+    fn missing(&self) -> &'static str {
+        match self {
+            CalendarPatch::Event(_) => "el evento no existe",
+            CalendarPatch::Task(_) => "la tarea no existe",
+        }
+    }
+
+    /// El texto de `InvalidArgs` cuando el objeto no es del calendario indicado.
+    fn wrong_calendar(&self) -> &'static str {
+        match self {
+            CalendarPatch::Event(_) => "el evento no es de ese calendario",
+            CalendarPatch::Task(_) => "la tarea no es de ese calendario",
+        }
+    }
+}
+
+/// Crea o edita un objeto de calendario —un evento o una tarea— en la base y lo
+/// encola: todo en la misma transacción del almacén (ver `store/queue.rs`).
+/// Devuelve el `id` local del objeto y su `href`. Corre en el hilo de bloqueo,
+/// dentro de `with_store`.
+///
+/// Es lo común entre eventos y tareas, que viven en la misma colección: el
+/// encolado, la derivación de lo que se lista y el `href` son los mismos. Lo
+/// único propio de cada tipo —cómo se serializa el crudo y los textos de error—
+/// lo decide [`CalendarPatch`]. `derive_with_occurrences` reconoce el componente
+/// del crudo (un `VTODO` se deriva sin ocurrencias).
+fn put_calendar_object_in_store(
     store: &mut Store,
     calendar_id: i64,
-    payload: &str,
+    obj: &serde_json::Map<String, serde_json::Value>,
     if_match: &str,
     uid: Option<String>,
+    patch: CalendarPatch,
 ) -> Result<(i64, String), StoreError> {
-    let obj = json_object(payload)?;
-    let patch = event_patch_from(&obj)?;
     // La ventana con la que se derivan las ocurrencias es la de la base; si no
     // tiene todavía, la del día, que es con la que la encolará `enqueue`.
     let window = store
         .calendar_window()?
         .unwrap_or_else(|| Window::around(chrono::Utc::now()));
     if if_match.is_empty() {
-        forbid_id_on_create(&obj)?;
+        forbid_id_on_create(obj)?;
         let calendar = store
             .calendar_by_id(calendar_id)?
             .ok_or_else(|| StoreError::InvalidArgument("el calendario no existe".into()))?;
@@ -1769,7 +1995,7 @@ fn put_event_in_store(
             uid.ok_or_else(|| StoreError::InvalidArgument("falta el identificador nuevo".into()))?;
         let href = child_href(&calendar.href, &uid, ".ics");
         let dtstamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-        let raw = ical_write::new_event(&uid, &dtstamp, &patch).map_err(serialize_error)?;
+        let raw = patch.new_raw(&uid, &dtstamp).map_err(serialize_error)?;
         let (index, occurrences) = derive_with_occurrences(&raw, window, &ExpansionLimits::DEFAULT);
         let row = ObjectRow {
             href: href.clone(),
@@ -1784,16 +2010,14 @@ fn put_event_in_store(
             .ok_or(StoreError::Missing)?;
         Ok((id, href))
     } else {
-        let event_id = require_edit_id(&obj)?;
+        let object_id = require_edit_id(obj)?;
         let (calendar, href, raw) = store
-            .event_target(event_id)?
-            .ok_or_else(|| StoreError::InvalidArgument("el evento no existe".into()))?;
+            .event_target(object_id)?
+            .ok_or_else(|| StoreError::InvalidArgument(patch.missing().into()))?;
         if calendar.id != calendar_id {
-            return Err(StoreError::InvalidArgument(
-                "el evento no es de ese calendario".into(),
-            ));
+            return Err(StoreError::InvalidArgument(patch.wrong_calendar().into()));
         }
-        let edited = ical_write::apply_changes(&raw, &patch).map_err(serialize_error)?;
+        let edited = patch.apply(&raw).map_err(serialize_error)?;
         let (index, occurrences) =
             derive_with_occurrences(&edited, window, &ExpansionLimits::DEFAULT);
         let row = ObjectRow {
@@ -1804,8 +2028,74 @@ fn put_event_in_store(
             occurrences,
         };
         store.enqueue_calendar_put(&calendar, &row, window)?;
-        Ok((event_id, href))
+        Ok((object_id, href))
     }
+}
+
+/// Qué tipo de objeto de calendario escribe un `Put`. Decide qué `put_*_in_store`
+/// serializa y con qué clave responde el bus, para que `put_calendar_object` sea
+/// un solo cuerpo compartido entre `PutEvent` y `PutTask`.
+#[derive(Clone, Copy)]
+enum CalendarObjectKind {
+    Event,
+    Task,
+}
+
+impl CalendarObjectKind {
+    /// Serializa y encola, con el `put_*_in_store` del tipo.
+    fn put_in_store(
+        self,
+        store: &mut Store,
+        calendar_id: i64,
+        payload: &str,
+        if_match: &str,
+        uid: Option<String>,
+    ) -> Result<(i64, String), StoreError> {
+        match self {
+            CalendarObjectKind::Event => {
+                put_event_in_store(store, calendar_id, payload, if_match, uid)
+            }
+            CalendarObjectKind::Task => {
+                put_task_in_store(store, calendar_id, payload, if_match, uid)
+            }
+        }
+    }
+
+    /// La clave del `id` en la respuesta JSON: `event_id` o `task_id`.
+    fn reply_key(self) -> &'static str {
+        match self {
+            CalendarObjectKind::Event => "event_id",
+            CalendarObjectKind::Task => "task_id",
+        }
+    }
+}
+
+/// Crea o edita un evento: parsea el parche y serializa un `VEVENT` sobre el
+/// camino común ([`put_calendar_object_in_store`]).
+fn put_event_in_store(
+    store: &mut Store,
+    calendar_id: i64,
+    payload: &str,
+    if_match: &str,
+    uid: Option<String>,
+) -> Result<(i64, String), StoreError> {
+    let obj = json_object(payload)?;
+    let patch = CalendarPatch::Event(event_patch_from(&obj)?);
+    put_calendar_object_in_store(store, calendar_id, &obj, if_match, uid, patch)
+}
+
+/// Crea o edita una tarea (`VTODO`): parsea el parche y serializa un `VTODO`
+/// sobre el mismo camino común que un evento.
+fn put_task_in_store(
+    store: &mut Store,
+    calendar_id: i64,
+    payload: &str,
+    if_match: &str,
+    uid: Option<String>,
+) -> Result<(i64, String), StoreError> {
+    let obj = json_object(payload)?;
+    let patch = CalendarPatch::Task(task_patch_from(&obj)?);
+    put_calendar_object_in_store(store, calendar_id, &obj, if_match, uid, patch)
 }
 
 /// Crea o edita un contacto en la base y lo encola. Como
@@ -2557,6 +2847,7 @@ mod tests {
                 "ClearStore",
                 "DeleteContact",
                 "DeleteEvent",
+                "DeleteTask",
                 "GetConflict",
                 "GetContact",
                 "GetEvent",
@@ -2574,6 +2865,7 @@ mod tests {
                 "ListTasks",
                 "PutContact",
                 "PutEvent",
+                "PutTask",
                 "RequestSync",
                 "ResolveConflict",
                 "SearchContacts",
@@ -4633,6 +4925,207 @@ mod tests {
             Some("delete"),
             "la fila del borrado tiene que quedar marcada hasta confirmar"
         );
+    }
+
+    /// **Las tareas se escriben por el bus como los eventos.** `PutTask` crea un
+    /// `VTODO` (un `Put` sin precondición, con un crudo que es un `VTODO`) y lo
+    /// edita (un `Put` con precondición, fijando el estado y el porcentaje y
+    /// subiendo el `SEQUENCE`), y `DeleteTask` marca la fila y suma un `Delete`.
+    /// Cada lote avisa por `Changed`. Cubre las dos ramas de `put_task_in_store`
+    /// y el camino feliz de `delete_task`.
+    #[tokio::test]
+    async fn las_tareas_se_crean_editan_y_borran_por_el_bus() {
+        let mut api = Api::new(
+            "api-write-tasks",
+            vec![with_calendar("cuenta", "Trabajo")],
+            Answer::Allow,
+        )
+        .await;
+        let (cal_id, t1_href, t1_id) = api
+            .manager
+            .with_store("cuenta", |store| {
+                let cal = calendar(store, "https://x/a/");
+                let w = window();
+                let todo = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:t1\r\nSUMMARY:Vieja\r\n\
+                    DUE:20261001T100000Z\r\nSTATUS:NEEDS-ACTION\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+                store.apply_calendar_objects(
+                    &cal,
+                    &[ObjectOp::Upsert(object("https://x/a/t1.ics", todo, w))],
+                    w,
+                    None,
+                    CalendarRoom::UNLIMITED,
+                )?;
+                let t1 = store
+                    .object_id_by_href(cal.id, "https://x/a/t1.ics")?
+                    .unwrap();
+                Ok((cal.id, "https://x/a/t1.ics".to_string(), t1))
+            })
+            .await
+            .unwrap();
+
+        let (client, service) = api.client(":1.7").await;
+        service.forward_changes(None);
+        let mut signals = changed_stream(&client).await;
+
+        // Crear: un `Put` sin precondición, para un href que no es t1, y el crudo
+        // que se encola es un `VTODO`.
+        let payload = serde_json::json!({
+            "summary": "Comprar pan",
+            "due": { "value": "20261101T090000Z" },
+            "status": "NEEDS-ACTION",
+            "priority": 2
+        })
+        .to_string();
+        let created_json = call(
+            &client,
+            "PutTask",
+            &("cuenta", cal_id.to_string(), payload.as_str(), ""),
+        )
+        .await
+        .unwrap();
+        // La respuesta trae `task_id`, no `event_id`.
+        let created_value: serde_json::Value = serde_json::from_str(&created_json).unwrap();
+        assert!(
+            created_value
+                .get("task_id")
+                .and_then(|v| v.as_str())
+                .is_some(),
+            "la respuesta de PutTask lleva task_id: {created_json}"
+        );
+        let (area, account_id, _) = next_changed(&mut signals).await;
+        assert_eq!((area.as_str(), account_id.as_str()), ("calendar", "cuenta"));
+        let ops = pending_ops_of(&api, "cuenta", CALENDAR_AREA).await;
+        let created = ops
+            .iter()
+            .find(|op| op.object_href != t1_href)
+            .expect("la creación encoló una op");
+        assert_eq!(created.kind, PendingKind::Put);
+        assert_eq!(created.base_etag, None, "crear va sin precondición");
+        let ical = String::from_utf8(created.payload.clone().unwrap()).unwrap();
+        assert!(
+            ical.contains("BEGIN:VTODO"),
+            "el crudo no es un VTODO:\n{ical}"
+        );
+        assert!(ical.contains("PRIORITY:2"), "{ical}");
+
+        // Editar t1: un `Put` con precondición, que fija el estado y el
+        // porcentaje y sube el `SEQUENCE` (no estaba → 1).
+        let payload =
+            format!("{{\"id\":{t1_id},\"status\":\"COMPLETED\",\"percent_complete\":100}}");
+        call(
+            &client,
+            "PutTask",
+            &(
+                "cuenta",
+                cal_id.to_string(),
+                payload.as_str(),
+                "\"etag-t1\"",
+            ),
+        )
+        .await
+        .unwrap();
+        next_changed(&mut signals).await;
+        let ops = pending_ops_of(&api, "cuenta", CALENDAR_AREA).await;
+        let edited = ops
+            .iter()
+            .find(|op| op.object_href == t1_href)
+            .expect("la edición encoló una op");
+        assert_eq!(edited.kind, PendingKind::Put);
+        assert_eq!(edited.base_etag.as_deref(), Some("\"etag-t1\""));
+        let ical = String::from_utf8(edited.payload.clone().unwrap()).unwrap();
+        assert!(ical.contains("STATUS:COMPLETED"), "{ical}");
+        assert!(ical.contains("PERCENT-COMPLETE:100"), "{ical}");
+        assert!(ical.contains("SEQUENCE:1"), "{ical}");
+
+        // Borrar t1: un `Delete`, y la fila marcada «delete».
+        call(
+            &client,
+            "DeleteTask",
+            &("cuenta", t1_id.to_string(), "\"etag-t1\""),
+        )
+        .await
+        .unwrap();
+        next_changed(&mut signals).await;
+        let ops = pending_ops_of(&api, "cuenta", CALENDAR_AREA).await;
+        let deleted = ops
+            .iter()
+            .find(|op| op.object_href == t1_href)
+            .expect("el borrado encoló una op");
+        assert_eq!(deleted.kind, PendingKind::Delete);
+    }
+
+    /// **Las dos escrituras de tareas autorizan antes de actuar y validan antes
+    /// de tocar nada.** Con el permiso en «no», `PutTask` y `DeleteTask`
+    /// contestan `AccessDenied` y no encolan; con el permiso en «sí», un estado
+    /// desconocido y un porcentaje fuera de rango dan `InvalidArgs` sin encolar y
+    /// con el texto fijo —sin un pedazo del cuerpo—.
+    #[tokio::test]
+    async fn las_escrituras_de_tareas_autorizan_y_validan() {
+        // Con el permiso en «no»: ninguna de las dos actúa.
+        let mut denied = Api::new(
+            "api-task-deny",
+            vec![with_calendar("cuenta", "Trabajo")],
+            Answer::Deny,
+        )
+        .await;
+        let cal_id = denied
+            .manager
+            .with_store("cuenta", |store| Ok(calendar(store, "https://x/a/").id))
+            .await
+            .unwrap();
+        let (client, _service) = denied.client(":1.7").await;
+        for (method, result) in [
+            (
+                "PutTask",
+                call(
+                    &client,
+                    "PutTask",
+                    &("cuenta", cal_id.to_string(), "{\"summary\":\"x\"}", ""),
+                )
+                .await,
+            ),
+            (
+                "DeleteTask",
+                call(&client, "DeleteTask", &("cuenta", "1", "")).await,
+            ),
+        ] {
+            assert_eq!(error_name(&result), ACCESS_DENIED, "{method} sin permiso");
+        }
+        assert_eq!(pending_count_of(&denied, "cuenta", CALENDAR_AREA).await, 0);
+
+        // Con el permiso en «sí»: un cuerpo mal formado no toca disco.
+        let mut api = Api::new(
+            "api-task-validate",
+            vec![with_calendar("cuenta", "Trabajo")],
+            Answer::Allow,
+        )
+        .await;
+        let cal_id = api
+            .manager
+            .with_store("cuenta", |store| Ok(calendar(store, "https://x/a/").id))
+            .await
+            .unwrap();
+        let (client, _service) = api.client(":1.7").await;
+        for body in [
+            "{\"status\":\"ALMOST\"}",
+            "{\"percent_complete\":150}",
+            "{\"priority\":42}",
+        ] {
+            let result = call(
+                &client,
+                "PutTask",
+                &("cuenta", cal_id.to_string(), body, ""),
+            )
+            .await;
+            assert_eq!(error_name(&result), INVALID_ARGS, "cuerpo {body}");
+            // El texto del error no repite el cuerpo que se mandó.
+            assert!(
+                !error_message(&result).contains("ALMOST"),
+                "el error repitió el cuerpo: {}",
+                error_message(&result)
+            );
+        }
+        assert_eq!(pending_count_of(&api, "cuenta", CALENDAR_AREA).await, 0);
     }
 
     /// Lo mismo del lado de los contactos: `PutContact` crea (un `Put` sin
