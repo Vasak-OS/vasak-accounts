@@ -844,8 +844,10 @@ impl<K: KeySource> StoreApi<K> {
     ///   de texto; `start`, `end` como `{"value": "...", "params": ["..."]}`. Al
     ///   editar, `id` identifica el evento.
     ///
-    /// Devuelve `{"event_id": "<cuenta>/<id>", "href": "..."}`. Un `payload` mal
-    /// formado —una fecha que no es iCalendar, un parámetro que inyectaría una
+    /// Devuelve `{"event_id": "<cuenta>/<id>"}`. **No devuelve el `href`**: la
+    /// dirección del recurso en el servidor no sale del almacén (igual que
+    /// `GetEvent`), y el `event_id` ya alcanza para volver a leerlo. Un `payload`
+    /// mal formado —una fecha que no es iCalendar, un parámetro que inyectaría una
     /// línea— da `InvalidArgs` sin tocar nada, nunca un pánico.
     ///
     /// Autoriza con `store.calendar` **antes** de actuar, y respeta el límite por
@@ -874,7 +876,9 @@ impl<K: KeySource> StoreApi<K> {
         } else {
             None
         };
-        let (id, href) = self
+        // El `href` que devuelve el encolado se usa para resolver el `id` nuevo,
+        // pero no sale por el bus: la dirección en el servidor no es pública.
+        let (id, _href) = self
             .manager
             .with_store(&account_id, move |store| {
                 put_event_in_store(store, calendar_id, &payload, &if_match, uid)
@@ -882,11 +886,12 @@ impl<K: KeySource> StoreApi<K> {
             .await
             .map_err(read_error)?;
         self.ask_for_sync(CALENDAR_AREA, &account_id);
-        let body = GlobalId {
+        let event_id = GlobalId {
             account_id: account_id.clone(),
             id,
-        };
-        serde_json::to_string(&serde_json::json!({ "event_id": body.encode(), "href": href }))
+        }
+        .encode();
+        serde_json::to_string(&serde_json::json!({ "event_id": event_id }))
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
     }
 
@@ -939,7 +944,8 @@ impl<K: KeySource> StoreApi<K> {
     /// `payload`: un objeto JSON con `full_name`, `organization`, `note` de
     /// texto (ausente no toca, `null` saca, valor fija) y `related` como lista de
     /// `{"label": "...", "value": "..."}`. Al editar, `id` identifica el
-    /// contacto. Devuelve `{"contact_id": <id>, "href": "..."}`.
+    /// contacto. Devuelve `{"contact_id": <id>}`, sin el `href` (la dirección en
+    /// el servidor no sale del almacén; el `contact_id` ya alcanza).
     ///
     /// Autoriza con `store.contacts` antes de actuar, y respeta el límite por
     /// llamante.
@@ -967,7 +973,8 @@ impl<K: KeySource> StoreApi<K> {
         } else {
             None
         };
-        let (id, href) = self
+        // El `href` sólo se usa para resolver el `id` nuevo; no sale por el bus.
+        let (id, _href) = self
             .manager
             .with_store(&account_id, move |store| {
                 put_contact_in_store(store, address_book_id, &payload, &if_match, uid)
@@ -975,7 +982,7 @@ impl<K: KeySource> StoreApi<K> {
             .await
             .map_err(read_error)?;
         self.ask_for_sync(CONTACTS_AREA, &account_id);
-        serde_json::to_string(&serde_json::json!({ "contact_id": id, "href": href }))
+        serde_json::to_string(&serde_json::json!({ "contact_id": id }))
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
     }
 
