@@ -472,6 +472,13 @@ CREATE TABLE pending_dav_ops (
     created_at      TEXT NOT NULL,
     attempts        INTEGER NOT NULL DEFAULT 0,
     last_error      TEXT,
+    -- Testigo de versión de la op: sube cada vez que una edición nueva la
+    -- reemplaza (mismo objeto, misma fila por `UNIQUE`, mismo `id`). El empuje
+    -- saca una foto de la op, suelta el almacén para hablar con la red, y recién
+    -- con la respuesta cierra la op **condicionado a este número**: si una
+    -- edición nueva corrió en el medio, la revisión no coincide y no se cierra la
+    -- edición de la persona por error (lost-update).
+    revision        INTEGER NOT NULL DEFAULT 0,
     UNIQUE (area, object_href)
 ) STRICT;
 

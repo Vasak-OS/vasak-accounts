@@ -195,6 +195,32 @@ impl Fixture {
             .await
             .unwrap()
     }
+
+    /// El estado de la op de un objeto (`ready`/`conflict`), o `None` si ya no
+    /// hay op.
+    async fn op_state(&self, name: &str) -> Option<String> {
+        let href = self.object_url(name);
+        self.manager
+            .with_store(ACCOUNT, move |store| {
+                Ok(store
+                    .connection()
+                    .query_row(
+                        "SELECT state FROM pending_dav_ops WHERE object_href = ?1",
+                        [href],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok())
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn pending_collections(&self) -> Vec<String> {
+        self.manager
+            .with_store(ACCOUNT, |store| store.pending_collections(CALENDAR_AREA))
+            .await
+            .unwrap()
+    }
 }
 
 /// Un `PUT` que crea algo nuevo: el servidor lo escribe, la op se cierra y el
@@ -261,22 +287,31 @@ async fn un_412_deja_la_op_en_conflicto_y_no_pierde_lo_local() {
     );
 }
 
-/// Reintentar un `Create` después de un timeout donde el servidor sí guardó
-/// vuelve con `412` —ya existe—: no es conflicto, se cierra pidiendo refetch.
+/// **H2**: un `Create` que choca con un `412` **no** se da por hecho: no se puede
+/// distinguir «mi creación ya llegó» de «hay OTRO recurso en ese href». Va a
+/// conflicto, y la creación local se conserva —no se pisa con lo ajeno en la
+/// próxima bajada—.
 #[tokio::test]
-async fn un_create_reintentado_que_ya_esta_es_exito_idempotente() {
-    let f = Fixture::new("replay-create-idempotente").await;
-    // Como si el intento anterior hubiera llegado: el recurso ya está.
+async fn un_create_que_choca_412_no_se_pierde_va_a_conflicto() {
+    let f = Fixture::new("replay-create-412").await;
+    // En ese href ya hay OTRO recurso (otro cliente, o mi intento anterior con
+    // contenido distinto).
     f.server
-        .put(0, "a.ics", &event("a", "Reunión", "20260928T140000Z"));
-    // La op es un Create (sin base_etag).
-    f.enqueue_put("a.ics", &event("a", "Reunión", "20260928T140000Z"), None)
-        .await;
+        .put(0, "a.ics", &event("a", "Del servidor", "20260928T150000Z"));
+    // La creación local, distinta, como Create (sin base_etag).
+    let local = event("a", "Mía", "20260928T140000Z");
+    f.enqueue_put("a.ics", &local, None).await;
 
     let report = f.replay().await;
-    assert_eq!(report.pushed, 1, "el create reintentado se da por hecho");
-    assert_eq!(report.conflicts, 0);
-    assert_eq!(f.pending().await, 0);
+    assert_eq!(
+        report.conflicts, 1,
+        "un 412 en create es conflicto, no éxito"
+    );
+    assert_eq!(report.pushed, 0);
+    // La creación local sobrevive, en conflicto, con su crudo intacto.
+    assert_eq!(f.pending().await, 1);
+    assert_eq!(f.op_state("a.ics").await.as_deref(), Some("conflict"));
+    assert_eq!(f.stored_raw("a.ics").await, Some(local));
 }
 
 /// Un `DELETE` con el ETag correcto borra en el servidor y cierra la op; la fila
@@ -324,7 +359,8 @@ async fn un_delete_de_lo_que_ya_no_esta_es_exito() {
     assert_eq!(f.pending().await, 0);
 }
 
-/// Un error reintentable (`507`) deja la op en la cola, con un reintento más.
+/// Un error reintentable (`507`) deja la op en la cola, en `ready`, con un
+/// reintento más: vuelve a intentarse en la próxima vuelta.
 #[tokio::test]
 async fn un_error_reintentable_deja_la_op_para_despues() {
     let f = Fixture::new("replay-reintento").await;
@@ -336,6 +372,31 @@ async fn un_error_reintentable_deja_la_op_para_despues() {
     assert_eq!(report.retried, 1);
     assert_eq!(report.remaining, 1);
     assert_eq!(f.pending().await, 1);
+    assert_eq!(f.op_state("a.ics").await.as_deref(), Some("ready"));
+    // Reintentable: sigue trabando la colección hasta que se resuelva.
+    assert_eq!(f.pending_collections().await, vec![f.calendar.href.clone()]);
+}
+
+/// **H4**: un error **permanente** (un `400` persistente) **no se reintenta para
+/// siempre**: escala a `conflict` en la primera vuelta, así deja de trabar el
+/// token de la colección (disponibilidad). La op no queda en `ready`, y la
+/// colección deja de contar como «no al día».
+#[tokio::test]
+async fn un_error_permanente_escala_a_conflicto_y_no_traba_el_token() {
+    let f = Fixture::new("replay-veneno").await;
+    f.server.state().force_write_status = Some(400);
+    f.enqueue_put("a.ics", &event("a", "Mía", "20260928T140000Z"), None)
+        .await;
+
+    let report = f.replay().await;
+    assert_eq!(report.conflicts, 1);
+    assert_eq!(report.retried, 0);
+    // No sigue en `ready` bloqueando el token.
+    assert_eq!(f.op_state("a.ics").await.as_deref(), Some("conflict"));
+    assert!(
+        f.pending_collections().await.is_empty(),
+        "una op en conflicto no traba la colección"
+    );
 }
 
 /// Un `PUT` que falla deja la op viva y el objeto marcado; una bajada posterior

@@ -93,6 +93,9 @@ pub struct PendingOp {
     pub state: PendingState,
     pub attempts: i64,
     pub last_error: Option<String>,
+    /// Testigo de versión: sube cada vez que una edición nueva reemplaza la op.
+    /// El cierre de una op es condicional a este número (ver [`Store::complete_put`]).
+    pub revision: i64,
 }
 
 /// El nombre estático del área, para subir su generación.
@@ -104,11 +107,17 @@ fn area_static(area: &str) -> Option<&'static str> {
     }
 }
 
-/// La tabla de objetos de un área: la que lleva el crudo y la marca `pending_op`.
-fn object_table(area: &str) -> Option<&'static str> {
+/// Las tablas de un área, para escribir la fila guardada con su alcance de
+/// colección: `(tabla de objetos, tabla de colecciones, columna de colección)`.
+///
+/// El alcance importa: el esquema deja el mismo `href` en dos colecciones
+/// (`UNIQUE (calendar_id, href)` / `UNIQUE (address_book_id, href)`), así que
+/// tocar «el objeto con este href» sin decir **de qué colección** podría borrar
+/// o pisar el de otra. La op guarda su `collection_href`; de ahí sale el `id`.
+fn area_tables(area: &str) -> Option<(&'static str, &'static str, &'static str)> {
     match area {
-        CALENDAR_AREA => Some("calendar_objects"),
-        CONTACTS_AREA => Some("contacts"),
+        CALENDAR_AREA => Some(("calendar_objects", "calendars", "calendar_id")),
+        CONTACTS_AREA => Some(("contacts", "address_books", "address_book_id")),
         _ => None,
     }
 }
@@ -139,7 +148,7 @@ fn insert_pending_op(
                collection_href = excluded.collection_href, op = excluded.op,
                base_etag = excluded.base_etag, payload = excluded.payload,
                state = 'ready', created_at = excluded.created_at, attempts = 0,
-               last_error = NULL",
+               last_error = NULL, revision = revision + 1",
             rusqlite::params![
                 area,
                 collection_href,
@@ -174,12 +183,16 @@ impl Store {
                 "«{area}» no es un área con cola de escritura"
             )));
         };
-        let table = object_table(area).expect("el área tiene tabla si tiene cola");
+        let (table, coltable, colcol) =
+            area_tables(area).expect("el área tiene tablas si tiene cola");
         let transaction = self.connection.transaction().map_err(classify)?;
         transaction
             .execute(
-                &format!("UPDATE {table} SET pending_op = 'delete' WHERE href = ?1"),
-                [object_href],
+                &format!(
+                    "UPDATE {table} SET pending_op = 'delete'
+                      WHERE href = ?1 AND {colcol} = (SELECT id FROM {coltable} WHERE href = ?2)"
+                ),
+                rusqlite::params![object_href, collection_href],
             )
             .map_err(classify)?;
         insert_pending_op(
@@ -203,7 +216,7 @@ impl Store {
             .connection
             .prepare(
                 "SELECT id, area, collection_href, object_href, op, base_etag, payload, state,
-                        attempts, last_error
+                        attempts, last_error, revision
                    FROM pending_dav_ops
                   WHERE area = ?1
                   ORDER BY id",
@@ -224,20 +237,27 @@ impl Store {
                     state: PendingState::from_str(&state).unwrap_or(PendingState::Ready),
                     attempts: row.get(8)?,
                     last_error: row.get(9)?,
+                    revision: row.get(10)?,
                 })
             })
             .map_err(classify)?;
         rows.collect::<Result<_, _>>().map_err(classify)
     }
 
-    /// Las colecciones de un área que todavía tienen algo sin confirmar: una
-    /// colección con ops pendientes **no se da por al día** en la bajada, para
-    /// que el empuje se resuelva primero.
+    /// Las colecciones de un área con escrituras **todavía por intentar**
+    /// (`state = 'ready'`): una colección así **no se da por al día** en la
+    /// bajada, para que el empuje se resuelva primero.
+    ///
+    /// Las ops en `conflict` **no** cuentan: ya no se reintentan solas (las
+    /// resuelve M3), y si siguieran trabando la colección su token no se
+    /// guardaría nunca y la cuenta nunca llegaría a `Synced` (disponibilidad).
+    /// La guarda de la bajada igual protege la fila local marcada.
     pub fn pending_collections(&self, area: &str) -> Result<Vec<String>, StoreError> {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT DISTINCT collection_href FROM pending_dav_ops WHERE area = ?1 ORDER BY 1",
+                "SELECT DISTINCT collection_href FROM pending_dav_ops
+                  WHERE area = ?1 AND state = 'ready' ORDER BY 1",
             )
             .map_err(classify)?;
         let rows = statement
@@ -257,27 +277,53 @@ impl Store {
             .map_err(classify)
     }
 
+    /// Borra la op **sólo si no cambió desde la foto** (mismo `id` y `revision`).
+    /// Devuelve si la borró: `false` quiere decir que una edición nueva la
+    /// reemplazó entre la foto y ahora, y no hay que tocar nada de la edición
+    /// nueva. La base de todos los cierres condicionados.
+    fn close_op(
+        transaction: &rusqlite::Transaction<'_>,
+        op: &PendingOp,
+    ) -> Result<bool, StoreError> {
+        let affected = transaction
+            .execute(
+                "DELETE FROM pending_dav_ops WHERE id = ?1 AND revision = ?2",
+                rusqlite::params![op.id, op.revision],
+            )
+            .map_err(classify)?;
+        Ok(affected > 0)
+    }
+
     /// Cierra un `put` que salió bien. Con `new_etag`, el del recurso recién
     /// escrito: se guarda en la fila y la próxima bajada no la trae de nuevo.
     /// Sin él (el servidor no devolvió un ETag utilizable), se deja la fila con
     /// el ETag en `NULL` para que la bajada traiga el suyo. En los dos casos se
     /// limpia la marca `pending_op` y se borra la op.
+    ///
+    /// **Condicional a la revisión de la op** (`op.revision`): si una edición
+    /// nueva la reemplazó mientras el empuje hablaba con la red, no se cierra ni
+    /// se limpia la marca —se deja viva la edición nueva, que la persona todavía
+    /// quiere subir (lost-update)—. **Con alcance de colección**: no toca el
+    /// objeto del mismo `href` en otra colección.
     pub fn complete_put(
         &mut self,
         op: &PendingOp,
         new_etag: Option<&str>,
     ) -> Result<(), StoreError> {
-        let table = object_table(&op.area)
+        let (table, coltable, colcol) = area_tables(&op.area)
             .ok_or_else(|| StoreError::InvalidArgument("área sin cola".into()))?;
         let transaction = self.connection.transaction().map_err(classify)?;
+        if !Self::close_op(&transaction, op)? {
+            return Ok(());
+        }
         transaction
             .execute(
-                &format!("UPDATE {table} SET etag = ?1, pending_op = NULL WHERE href = ?2"),
-                rusqlite::params![new_etag, op.object_href],
+                &format!(
+                    "UPDATE {table} SET etag = ?1, pending_op = NULL
+                      WHERE href = ?2 AND {colcol} = (SELECT id FROM {coltable} WHERE href = ?3)"
+                ),
+                rusqlite::params![new_etag, op.object_href, op.collection_href],
             )
-            .map_err(classify)?;
-        transaction
-            .execute("DELETE FROM pending_dav_ops WHERE id = ?1", [op.id])
             .map_err(classify)?;
         transaction.commit().map_err(classify)
     }
@@ -285,19 +331,26 @@ impl Store {
     /// Cierra un `delete` que salió bien (o un `404`, idempotente): borra la
     /// fila guardada —con sus derivados, por la cascada— y la op. Sube la
     /// generación: el objeto ya no está de verdad.
+    ///
+    /// **Condicional a la revisión** y **con alcance de colección**, como
+    /// [`Self::complete_put`]: una edición nueva que reemplazó la op se conserva,
+    /// y no se borra el objeto del mismo `href` en otra colección.
     pub fn complete_delete(&mut self, op: &PendingOp) -> Result<(), StoreError> {
-        let table = object_table(&op.area)
+        let (table, coltable, colcol) = area_tables(&op.area)
             .ok_or_else(|| StoreError::InvalidArgument("área sin cola".into()))?;
         let area_static = area_static(&op.area).expect("área con cola");
         let transaction = self.connection.transaction().map_err(classify)?;
+        if !Self::close_op(&transaction, op)? {
+            return Ok(());
+        }
         transaction
             .execute(
-                &format!("DELETE FROM {table} WHERE href = ?1"),
-                [&op.object_href],
+                &format!(
+                    "DELETE FROM {table}
+                      WHERE href = ?1 AND {colcol} = (SELECT id FROM {coltable} WHERE href = ?2)"
+                ),
+                rusqlite::params![op.object_href, op.collection_href],
             )
-            .map_err(classify)?;
-        transaction
-            .execute("DELETE FROM pending_dav_ops WHERE id = ?1", [op.id])
             .map_err(classify)?;
         let generation = bump_generation(&transaction, area_static)?;
         transaction.commit().map_err(classify)?;
@@ -305,22 +358,29 @@ impl Store {
         Ok(())
     }
 
-    /// Deja una op en conflicto (`412`): el recurso cambió en el servidor desde
-    /// `base_etag`. **No se pisa nada**: la fila guardada sigue marcada y la op
-    /// queda en `conflict`, con `last_error` y un reintento más contado. Sube la
-    /// generación para que la señal `Changed` avise, y M3 lo resuelva.
+    /// Deja una op en conflicto: un `412` (el recurso cambió en el servidor desde
+    /// `base_etag`), o un error permanente que no tiene sentido reintimar (ver
+    /// `replay`). **No se pisa nada**: la fila guardada sigue marcada y la op
+    /// queda en `conflict`, con `last_error` y un reintento más contado, para que
+    /// M3 la resuelva. Sube la generación para que la señal `Changed` avise.
+    ///
+    /// Condicional a la revisión: si una edición nueva reemplazó la op, no se la
+    /// marca en conflicto —la nueva arranca limpia en `ready`—.
     pub fn mark_conflict(&mut self, op: &PendingOp, detail: &str) -> Result<(), StoreError> {
         let area_static = area_static(&op.area)
             .ok_or_else(|| StoreError::InvalidArgument("área sin cola".into()))?;
         let transaction = self.connection.transaction().map_err(classify)?;
-        transaction
+        let affected = transaction
             .execute(
                 "UPDATE pending_dav_ops
-                    SET state = 'conflict', attempts = attempts + 1, last_error = ?2
-                  WHERE id = ?1",
-                rusqlite::params![op.id, detail],
+                    SET state = 'conflict', attempts = attempts + 1, last_error = ?3
+                  WHERE id = ?1 AND revision = ?2",
+                rusqlite::params![op.id, op.revision, detail],
             )
             .map_err(classify)?;
+        if affected == 0 {
+            return Ok(());
+        }
         let generation = bump_generation(&transaction, area_static)?;
         transaction.commit().map_err(classify)?;
         self.note_change(area_static, generation);
@@ -330,13 +390,16 @@ impl Store {
     /// Deja una op para reintentar más tarde (red, `423`, `507`): suma un
     /// reintento y guarda el detalle, sin tocar la fila guardada ni la
     /// generación. La op sigue en `ready`.
+    ///
+    /// Condicional a la revisión: si una edición nueva reemplazó la op, no se le
+    /// suma el reintento de la vieja (la nueva arranca en cero).
     pub fn retry_later(&mut self, op: &PendingOp, detail: &str) -> Result<(), StoreError> {
         self.connection
             .execute(
                 "UPDATE pending_dav_ops
-                    SET attempts = attempts + 1, last_error = ?2
-                  WHERE id = ?1",
-                rusqlite::params![op.id, detail],
+                    SET attempts = attempts + 1, last_error = ?3
+                  WHERE id = ?1 AND revision = ?2",
+                rusqlite::params![op.id, op.revision, detail],
             )
             .map(|_| ())
             .map_err(classify)
@@ -387,6 +450,8 @@ pub(super) fn pending_mark(
 
 #[cfg(test)]
 mod tests {
+    use rusqlite::OptionalExtension;
+
     use super::super::contacts::tests::{open_store, row};
     use super::super::contacts::ContactOp;
     use super::super::paths::tests::TempDir;
@@ -609,5 +674,95 @@ mod tests {
         assert_eq!(ops.len(), 1, "una sola op por objeto");
         assert_eq!(ops[0].state, PendingState::Ready);
         assert_eq!(ops[0].attempts, 0);
+        assert!(ops[0].revision > first.revision, "la revisión subió");
+    }
+
+    /// **H1**: cerrar una op con la **foto vieja** después de que una edición
+    /// nueva la reemplazó durante la ventana de red **no pisa la edición nueva**.
+    /// El empuje saca la foto, suelta el almacén, habla con la red y vuelve a
+    /// cerrar; si en el medio la persona volvió a editar, el cierre con la foto
+    /// vieja no debe borrar la op nueva ni limpiar su marca (lost-update).
+    #[test]
+    fn cerrar_con_una_foto_vieja_no_pisa_la_edicion_nueva() {
+        let temp = TempDir::new("cola-lost-update");
+        let mut store = open_store(&temp);
+        let book = one_book(&mut store);
+        // Foto de la op A (lo que el empuje llevaría a la red).
+        store
+            .enqueue_contact_put(&book, &row(HREF, "Ana", "a@x.com"))
+            .unwrap();
+        let snapshot = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+
+        // Entre la foto y el cierre, la persona vuelve a editar el mismo recurso.
+        let edited = row(HREF, "Ana María", "nuevo@x.com");
+        store.enqueue_contact_put(&book, &edited).unwrap();
+
+        // El empuje cierra la op con la foto vieja: NO tiene que tocar la nueva.
+        store.complete_put(&snapshot, Some("\"v2\"")).unwrap();
+
+        // La edición nueva sobrevive: la op sigue (una), y la fila sigue marcada
+        // 'put' con el crudo nuevo.
+        assert_eq!(store.pending_count(CONTACTS_AREA).unwrap(), 1);
+        assert_eq!(pending_op_of(&store, HREF).as_deref(), Some("put"));
+        assert_eq!(raw_of(&store, HREF), Some(edited.raw_vcard));
+    }
+
+    /// **H3**: cerrar una op (borrado o put) **sólo toca su colección**. El
+    /// esquema deja el mismo `href` en dos libretas; borrar en una no puede
+    /// borrar la fila de la otra.
+    #[test]
+    fn cerrar_una_op_no_cruza_de_coleccion() {
+        const BOOK2: &str = "https://x/b/";
+        let temp = TempDir::new("cola-scope");
+        let mut store = open_store(&temp);
+        let books = store
+            .upsert_address_books(&[(BOOK.into(), "A".into()), (BOOK2.into(), "B".into())])
+            .unwrap();
+        let (book1, book2) = (books[0].clone(), books[1].clone());
+        // El MISMO href en las dos libretas.
+        for book in [&book1, &book2] {
+            store
+                .apply_contacts(
+                    book,
+                    &[ContactOp::Upsert(row(HREF, "Ana", "a@x.com"))],
+                    None,
+                    u64::MAX,
+                )
+                .unwrap();
+        }
+
+        // Encolar el borrado en la libreta 1: sólo su fila queda marcada.
+        store
+            .enqueue_delete(CONTACTS_AREA, BOOK, HREF, Some("\"1\""))
+            .unwrap();
+        let mark_book2: Option<String> = store
+            .connection()
+            .query_row(
+                "SELECT pending_op FROM contacts
+                  WHERE href = ?1 AND address_book_id = ?2",
+                rusqlite::params![HREF, book2.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(mark_book2, None, "la libreta 2 no se marca");
+
+        // Cerrar el borrado: se va la fila de la libreta 1, NO la de la 2.
+        let op = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        store.complete_delete(&op).unwrap();
+
+        let present = |store: &Store, book_id: i64| -> bool {
+            store
+                .connection()
+                .query_row(
+                    "SELECT 1 FROM contacts WHERE href = ?1 AND address_book_id = ?2",
+                    rusqlite::params![HREF, book_id],
+                    |_| Ok(()),
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+        };
+        assert!(!present(&store, book1.id), "la fila de la libreta 1 se fue");
+        assert!(present(&store, book2.id), "la de la libreta 2 se conserva");
     }
 }

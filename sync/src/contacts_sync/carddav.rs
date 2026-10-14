@@ -103,6 +103,38 @@ impl Round {
     }
 }
 
+/// Drena la cola de escrituras hacia el servidor y anota en `round` lo que hizo
+/// y qué libretas quedaron con algo por intentar. Extraído de `sync` para no
+/// cargar su complejidad; el empuje de verdad vive en `replay`.
+async fn push_pending<K: KeySource>(
+    manager: &Arc<StoreManager<K>>,
+    account_id: &str,
+    client: &DavClient,
+    round: &mut Round,
+) -> Result<(), StoreError> {
+    let replay = crate::replay::replay_area(
+        manager,
+        account_id,
+        CONTACTS_AREA,
+        client,
+        crate::replay::CONTACTS_CONTENT_TYPE,
+        round.deadline,
+    )
+    .await?;
+    round.report.pushed = replay.pushed;
+    round.report.conflicts = replay.conflicts;
+    round.report.pending = replay.remaining;
+    if replay.remaining > 0 {
+        if let Ok(collections) = manager
+            .with_store(account_id, |s| s.pending_collections(CONTACTS_AREA))
+            .await
+        {
+            round.pending_collections = collections.into_iter().collect();
+        }
+    }
+    Ok(())
+}
+
 /// Backend CardDAV.
 pub struct CardDavBackend;
 
@@ -172,33 +204,9 @@ impl CardDavBackend {
         // El empuje primero: se drena la cola de escrituras hacia el servidor
         // antes de dar la bajada por al día. Las libretas que queden con algo
         // pendiente no se consideran al día (ver `execute`).
-        match crate::replay::replay_area(
-            manager,
-            account_id,
-            CONTACTS_AREA,
-            &client,
-            crate::replay::CONTACTS_CONTENT_TYPE,
-            round.deadline,
-        )
-        .await
-        {
-            Ok(replay) => {
-                round.report.pushed = replay.pushed;
-                round.report.conflicts = replay.conflicts;
-                round.report.pending = replay.remaining;
-                if replay.remaining > 0 {
-                    if let Ok(collections) = manager
-                        .with_store(account_id, |s| s.pending_collections(CONTACTS_AREA))
-                        .await
-                    {
-                        round.pending_collections = collections.into_iter().collect();
-                    }
-                }
-            }
-            Err(e) => {
-                set_status(AreaState::Failed, &e.to_string()).await;
-                return SyncResult::Failed(e.to_string());
-            }
+        if let Err(e) = push_pending(manager, account_id, &client, &mut round).await {
+            set_status(AreaState::Failed, &e.to_string()).await;
+            return SyncResult::Failed(e.to_string());
         }
 
         let mut seen = BTreeSet::new();

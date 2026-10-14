@@ -20,20 +20,27 @@
 //!   el ETag local en `NULL` para que la bajada traiga el suyo. En un `delete`,
 //!   se borra la fila guardada. Un `DELETE` con `404` es éxito idempotente (lo
 //!   mapea el cliente): el recurso ya no está, que es lo que se buscaba.
-//! - **`412 Conflict`** → el recurso cambió en el servidor desde `base_etag`.
-//!   **No se pisa nada**: se conserva el crudo local y la op queda en `conflict`
-//!   para que M3 la resuelva de cara a la persona.
-//! - **Red, `423`, `507` (reintentables)** → la op se deja, con un reintento más
-//!   y el detalle en `last_error`. Vuelve a intentarse en la próxima vuelta,
-//!   respetando el plazo.
-//! - **Cualquier otro error** (credencial, estado inesperado, precondición
-//!   inservible) → la op se deja con el detalle; no se pierde.
+//! - **`412 Conflict`** → el recurso cambió en el servidor desde `base_etag`
+//!   (o un `Create` chocó con algo que ya está en ese `href`). **No se pisa
+//!   nada**: se conserva el crudo local y la op queda en `conflict` para que M3
+//!   la resuelva de cara a la persona. No se intenta adivinar «es mi creación
+//!   que ya llegó» vs. «hay otro recurso ahí»: adivinar mal pisaría la creación
+//!   local con contenido ajeno en la próxima bajada.
+//! - **Red, `423`, `507` (reintentables, [`DavError::is_retryable`])** → la op
+//!   se deja, con un reintento más y el detalle en `last_error`. Vuelve a
+//!   intentarse en la próxima vuelta, respetando el plazo. Tras
+//!   [`MAX_REPLAY_ATTEMPTS`] intentos escala a `conflict`, para no reintentar
+//!   para siempre y trabar el token de la colección.
+//! - **Cualquier otro error** (credencial, estado inesperado, redirección,
+//!   origen ajeno, precondición inservible) → es **permanente**: reintentarlo da
+//!   lo mismo. Escala a `conflict` (lo resuelve M3) en vez de quedar en `ready`
+//!   trabando la colección para siempre (disponibilidad).
 //!
-//! **Idempotencia**: un `Create` reintentado después de un timeout donde el
-//! servidor sí guardó el recurso vuelve con `412` —ya existe—. No es un
-//! conflicto perdido: la op se cierra pidiendo refetch del ETag (ver
-//! [`is_create_already_there`]), y la bajada trae el ETag de verdad. Un `delete`
-//! reejecutado sobre algo que ya no está vuelve con `404`, que es éxito.
+//! **Idempotencia**: un `delete` reejecutado sobre algo que ya no está vuelve
+//! con `404`, que el cliente mapea a éxito. Un `Create` reintentado que el
+//! servidor ya tenía vuelve con `412` y va a `conflict`: la creación local se
+//! conserva y M3 decide, en vez de arriesgarse a pisarla con lo que haya en ese
+//! `href`.
 
 use crate::dav::webdav::{DavClient, DavError, Precondition, PutOutcome};
 use crate::store::key::KeySource;
@@ -58,14 +65,10 @@ pub struct ReplayReport {
     pub remaining: usize,
 }
 
-/// Si un `put` que iba a **crear** chocó con un `412` porque el recurso ya
-/// estaba: casi siempre un reintento de un `Create` que la vez anterior llegó al
-/// servidor pero cuya respuesta no volvió (un timeout). No es un conflicto
-/// perdido —lo que se quería escribir está escrito—: se cierra la op pidiendo el
-/// ETag de verdad en la bajada.
-fn is_create_already_there(op: &PendingOp) -> bool {
-    op.kind == PendingKind::Put && op.base_etag.is_none()
-}
+/// Cuántos intentos reintentables aguanta una op antes de escalar a `conflict`.
+/// Un recurso que falla por red una y otra vez no puede trabar el token de su
+/// colección para siempre: tras esto lo resuelve M3.
+const MAX_REPLAY_ATTEMPTS: i64 = 10;
 
 /// Drena la cola de un área contra el servidor. Devuelve el informe; sólo falla
 /// con un [`StoreError`] si la base se cerró a mitad (el llavero se bloqueó),
@@ -124,64 +127,45 @@ async fn resolve_op<K: KeySource>(
         Ok(url) => url,
         Err(_) => {
             // La dirección guardada no se puede volver a parsear: raro, porque se
-            // guardó desde una URL válida. Se deja la op con el detalle.
-            report.retried += 1;
+            // guardó desde una URL válida. Es permanente: a conflicto, no a
+            // reintentar para siempre.
+            report.conflicts += 1;
             return close(
                 manager,
                 account_id,
-                Close::Retry(op, "dirección inválida".into()),
+                Close::Conflict(op, "dirección inválida".into()),
             )
             .await;
         }
     };
 
-    match op.kind {
+    let decision = match op.kind {
         PendingKind::Put => {
             let body = match String::from_utf8(op.payload.clone().unwrap_or_default()) {
                 Ok(body) => body,
                 Err(_) => {
-                    report.retried += 1;
+                    // Un cuerpo que no es UTF-8 no va a mejorar reintentando: a
+                    // conflicto.
+                    report.conflicts += 1;
                     let detail = "el cuerpo guardado no es UTF-8".into();
-                    return close(manager, account_id, Close::Retry(op, detail)).await;
+                    return close(manager, account_id, Close::Conflict(op, detail)).await;
                 }
             };
             let precondition = match op.base_etag.clone() {
                 Some(etag) => Precondition::Replace(etag),
                 None => Precondition::Create,
             };
-            let result = run(deadline, client.put(&url, body, precondition, content_type)).await;
-            match result {
-                Timed::Elapsed => {
-                    report.retried += 1;
-                    close(
-                        manager,
-                        account_id,
-                        Close::Retry(op, "plazo de la vuelta".into()),
-                    )
-                    .await
-                }
+            match run(deadline, client.put(&url, body, precondition, content_type)).await {
+                Timed::Elapsed => retry_or_escalate(op, "plazo de la vuelta".into(), report),
                 Timed::Done(Ok(PutOutcome::Etag(etag))) => {
                     report.pushed += 1;
-                    close(manager, account_id, Close::Put(op, Some(etag))).await
+                    Close::Put(op, Some(etag))
                 }
                 Timed::Done(Ok(PutOutcome::NeedsRefetch)) => {
                     report.pushed += 1;
-                    close(manager, account_id, Close::Put(op, None)).await
+                    Close::Put(op, None)
                 }
-                Timed::Done(Err(DavError::Conflict)) if is_create_already_there(&op) => {
-                    // Reintento de un `Create` que ya había llegado: lo escrito
-                    // está. Se cierra pidiendo el ETag en la bajada.
-                    report.pushed += 1;
-                    close(manager, account_id, Close::Put(op, None)).await
-                }
-                Timed::Done(Err(DavError::Conflict)) => {
-                    report.conflicts += 1;
-                    close(manager, account_id, Close::Conflict(op)).await
-                }
-                Timed::Done(Err(e)) => {
-                    report.retried += 1;
-                    close(manager, account_id, Close::Retry(op, e.log_text())).await
-                }
+                Timed::Done(Err(e)) => on_error(op, e, report),
             }
         }
         PendingKind::Delete => {
@@ -191,32 +175,50 @@ async fn resolve_op<K: KeySource>(
                 report.pushed += 1;
                 return close(manager, account_id, Close::Delete(op)).await;
             };
-            let result = run(deadline, client.delete(&url, &etag)).await;
-            match result {
-                Timed::Elapsed => {
-                    report.retried += 1;
-                    close(
-                        manager,
-                        account_id,
-                        Close::Retry(op, "plazo de la vuelta".into()),
-                    )
-                    .await
-                }
+            match run(deadline, client.delete(&url, &etag)).await {
+                Timed::Elapsed => retry_or_escalate(op, "plazo de la vuelta".into(), report),
                 // Éxito, y el `404` idempotente, los mapea el cliente a `Ok(())`.
                 Timed::Done(Ok(())) => {
                     report.pushed += 1;
-                    close(manager, account_id, Close::Delete(op)).await
+                    Close::Delete(op)
                 }
-                Timed::Done(Err(DavError::Conflict)) => {
-                    report.conflicts += 1;
-                    close(manager, account_id, Close::Conflict(op)).await
-                }
-                Timed::Done(Err(e)) => {
-                    report.retried += 1;
-                    close(manager, account_id, Close::Retry(op, e.log_text())).await
-                }
+                Timed::Done(Err(e)) => on_error(op, e, report),
             }
         }
+    };
+    close(manager, account_id, decision).await
+}
+
+/// Decide qué hacer con el error de una escritura, y cuenta en el informe.
+///
+/// Un `412` es siempre conflicto: el recurso cambió, o un `Create` chocó con
+/// algo que ya está en ese `href` (no se adivina «es mi creación»). Un error
+/// **reintentable** ([`DavError::is_retryable`]) se reintenta mientras no pase
+/// el tope; **cualquier otro** —credencial, estado inesperado, redirección,
+/// origen ajeno, precondición inservible— es permanente y va a conflicto, para
+/// no quedar en `ready` trabando el token de la colección para siempre.
+fn on_error(op: PendingOp, error: DavError, report: &mut ReplayReport) -> Close {
+    if error == DavError::Conflict {
+        report.conflicts += 1;
+        return Close::Conflict(op, "el recurso cambió en el servidor".into());
+    }
+    if error.is_retryable() {
+        return retry_or_escalate(op, error.log_text(), report);
+    }
+    report.conflicts += 1;
+    Close::Conflict(op, error.log_text())
+}
+
+/// Reintenta mientras la op no haya pasado [`MAX_REPLAY_ATTEMPTS`]; si los pasó,
+/// escala a conflicto para que M3 lo resuelva y la colección pueda asentar su
+/// token.
+fn retry_or_escalate(op: PendingOp, detail: String, report: &mut ReplayReport) -> Close {
+    if op.attempts + 1 < MAX_REPLAY_ATTEMPTS {
+        report.retried += 1;
+        Close::Retry(op, detail)
+    } else {
+        report.conflicts += 1;
+        Close::Conflict(op, detail)
     }
 }
 
@@ -226,8 +228,9 @@ enum Close {
     Put(PendingOp, Option<String>),
     /// `delete` cerrado con éxito.
     Delete(PendingOp),
-    /// Conflicto (`412`): se conserva lo local, la op queda en `conflict`.
-    Conflict(PendingOp),
+    /// Conflicto o error permanente: se conserva lo local, la op queda en
+    /// `conflict` con el detalle.
+    Conflict(PendingOp, String),
     /// Para reintentar, con el detalle.
     Retry(PendingOp, String),
 }
@@ -242,7 +245,7 @@ async fn close<K: KeySource>(
         .with_store(account_id, move |store| match close {
             Close::Put(op, etag) => store.complete_put(&op, etag.as_deref()),
             Close::Delete(op) => store.complete_delete(&op),
-            Close::Conflict(op) => store.mark_conflict(&op, "el recurso cambió en el servidor"),
+            Close::Conflict(op, detail) => store.mark_conflict(&op, &detail),
             Close::Retry(op, detail) => store.retry_later(&op, &detail),
         })
         .await
