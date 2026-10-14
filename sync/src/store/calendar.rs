@@ -655,17 +655,30 @@ impl Store {
     /// llama hasta que devuelve cero.
     pub fn remove_calendar_chunk(&mut self, calendar_id: i64) -> Result<usize, StoreError> {
         let transaction = self.connection.transaction().map_err(classify)?;
+        // No se lleva un cambio local sin confirmar: una fila marcada
+        // (`pending_op`) se deja, igual que el guard de `apply_calendar_objects`
+        // en la bajada. El empuje la resuelve y un re-sync posterior la limpia.
         let removed = transaction
             .execute(
                 "DELETE FROM calendar_objects WHERE id IN
-                   (SELECT id FROM calendar_objects WHERE calendar_id = ?1 LIMIT ?2)",
+                   (SELECT id FROM calendar_objects
+                     WHERE calendar_id = ?1 AND pending_op IS NULL LIMIT ?2)",
                 rusqlite::params![calendar_id, WRITE_BATCH_ROWS as i64],
             )
             .map_err(classify)?;
         let mut changed = removed > 0;
         if removed == 0 {
+            // El calendario se borra sólo cuando no le queda ningún objeto: si
+            // sobreviven filas marcadas, borrarlo las arrastraría por la cascada
+            // (`ON DELETE CASCADE`) y perdería el cambio local que el guard de
+            // arriba acaba de proteger.
             changed |= transaction
-                .execute("DELETE FROM calendars WHERE id = ?1", [calendar_id])
+                .execute(
+                    "DELETE FROM calendars WHERE id = ?1
+                      AND NOT EXISTS
+                        (SELECT 1 FROM calendar_objects WHERE calendar_id = ?1)",
+                    [calendar_id],
+                )
                 .map_err(classify)?
                 > 0;
         }
@@ -1980,5 +1993,59 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(count(&store, "SELECT count(*) FROM occurrences"), before);
+    }
+
+    /// El borrado masivo de un calendario que se fue del servidor no se lleva un
+    /// cambio local sin confirmar: las filas sin marca se borran, la marcada
+    /// (`pending_op`) queda con sus ocurrencias, y el calendario no se borra
+    /// mientras le quede una —la cascada se la llevaría—.
+    #[test]
+    fn el_borrado_masivo_respeta_un_objeto_con_pending_op() {
+        let temp = TempDir::new("cal-remove-pending");
+        let mut store = open_store(&temp);
+        let cal = calendar(&mut store, "https://x/c/");
+        let w = window();
+        store
+            .apply_calendar_objects(
+                &cal,
+                &[
+                    ObjectOp::Upsert(object(
+                        "https://x/c/a.ics",
+                        &weekly("a", "20260901T090000Z"),
+                        w,
+                    )),
+                    ObjectOp::Upsert(object(
+                        "https://x/c/b.ics",
+                        &weekly("b", "20260902T090000Z"),
+                        w,
+                    )),
+                ],
+                w,
+                None,
+                CalendarRoom::UNLIMITED,
+            )
+            .unwrap();
+        // «b» tiene un borrado local todavía sin subir.
+        store
+            .enqueue_delete(CALENDAR_AREA, &cal.href, "https://x/c/b.ics", Some("\"1\""))
+            .unwrap();
+
+        // Se vacía el calendario de a tandas, como un re-sync que lo encuentra
+        // ido del servidor.
+        while store.remove_calendar_chunk(cal.id).unwrap() > 0 {}
+
+        // «a» (sin marca) se fue; «b» (marcada) quedó, con sus ocurrencias.
+        assert_eq!(count(&store, "SELECT count(*) FROM calendar_objects"), 1);
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM calendar_objects WHERE href = 'https://x/c/b.ics'"
+            ),
+            1
+        );
+        assert!(count(&store, "SELECT count(*) FROM occurrences") > 0);
+        // El calendario no se borró: borrarlo se habría llevado «b» por la
+        // cascada.
+        assert_eq!(count(&store, "SELECT count(*) FROM calendars"), 1);
     }
 }
