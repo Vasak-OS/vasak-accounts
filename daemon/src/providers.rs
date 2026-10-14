@@ -1685,6 +1685,85 @@ mod tests {
         );
     }
 
+    /// Una cuenta de Google ofrece el **calendario por CalDAV** disponible, sin
+    /// backend propio.
+    ///
+    /// Google habla CalDAV sobre OAuth2 y el catálogo ya lo trae: Google es
+    /// `kind` OAuth2 (el token lo refresca la fundación OAuth2), y la capacidad
+    /// `calendar` se sirve sobre CalDAV con el alcance de la API de Google y la
+    /// dirección de `apidata.googleusercontent.com`. Esta prueba ata las tres
+    /// cosas —tipo, alcance y dirección— y, sobre todo, fija que la capacidad
+    /// quede **disponible** (ni apagada ni descartada), que es lo que decide que
+    /// la pantalla la ofrezca y que `BeginAuth` la pida.
+    ///
+    /// La verificación de extremo a extremo contra una cuenta de Google real
+    /// está bloqueada por el registro de la aplicación (client_id): ver
+    /// `Vasak-OS/vasak-accounts#99`. Acá se fija lo que sí se puede sin red: el
+    /// catálogo que el flujo lee.
+    #[test]
+    fn una_cuenta_de_google_ofrece_el_calendario_por_caldav() {
+        let directorio =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/providers.d");
+        let google = &cargar(&directorio)["google"];
+
+        // Google habla CalDAV sobre OAuth2: no tiene `kind` propio —es el valor
+        // por omisión— y el calendario se sirve con el token de Google.
+        assert_eq!(google.kind, ProviderKind::Oauth2);
+
+        // El alcance de calendario es el de la API de Google, y nada más.
+        assert_eq!(
+            google
+                .scopes
+                .get(&CapabilityType::Calendar)
+                .map(Vec::as_slice),
+            Some(["https://www.googleapis.com/auth/calendar".to_string()].as_slice()),
+            "el alcance de calendario tiene que ser el de la API de Google"
+        );
+
+        // Y la dirección de servicio es el CalDAV de Google (el home-set con el
+        // correo adentro). Así el alcance y la dirección quedan atados en un
+        // mismo lugar: pedir el alcance sin dónde hablarle sería una capacidad
+        // que se conecta y después no sirve.
+        let url = google
+            .endpoints
+            .get(&CapabilityType::Calendar)
+            .and_then(|e| e.get("url"))
+            .and_then(|v| match v {
+                EndpointValue::Text(url) => Some(url.clone()),
+                _ => None,
+            });
+        assert_eq!(
+            url.as_deref(),
+            Some("https://apidata.googleusercontent.com/caldav/v2/{email}/"),
+            "el calendario de Google se sirve por el CalDAV de Google"
+        );
+
+        // Lo que importa para la pantalla: la capacidad **no** está entre las
+        // apagadas. Es la misma función que usan `ListProviders`, `ListAccounts`
+        // y `BeginAuth`, así que esto es lo que la persona ve.
+        assert!(
+            !google
+                .unavailable_capabilities()
+                .contains(&CapabilityType::Calendar),
+            "el calendario de Google no puede anunciarse apagado: habla CalDAV sobre OAuth2"
+        );
+
+        // Y pedir sólo el calendario lo deja pasar entero: ni se descarta ni el
+        // pedido queda vacío —es lo que `BeginAuth` aplica antes de abrir el
+        // navegador.
+        match google.filter_available(&[CapabilityType::Calendar]) {
+            Ok(filtrado) => {
+                assert_eq!(filtrado.available, vec![CapabilityType::Calendar]);
+                assert!(
+                    filtrado.discarded.is_empty(),
+                    "el calendario de Google no se descarta: {:?}",
+                    filtrado.discarded
+                );
+            }
+            Err(e) => panic!("el calendario de Google tiene que poder pedirse: {e}"),
+        }
+    }
+
     #[test]
     fn el_archivo_de_google_pide_acceso_sin_conexion() {
         let directorio =
