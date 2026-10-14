@@ -646,8 +646,18 @@ impl Store {
         let affected = match choice {
             ConflictChoice::KeepLocal => {
                 // Sin el ETag del servidor no se puede re-basar: re-basar sin
-                // precondición sería un `PUT` incondicional que pisa a ciegas.
-                if server_etag.is_none() {
+                // precondición sería un `PUT` incondicional que pisa a ciegas. Un
+                // ETag vacío o en blanco cuenta como ausente —un servidor roto puede
+                // devolver `<getetag></getetag>` tras el 412, y `storable()` lo filtra
+                // por largo, no por vacío—: re-basar con `base_etag = ""` tampoco es
+                // una precondición, así que la invariante se comprueba acá y no
+                // depende sólo de la guarda de `replay` aguas abajo.
+                if server_etag
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+                {
                     return Err(StoreError::InvalidArgument(
                         "todavía no se trajo la copia del servidor con qué re-basar".into(),
                     ));
@@ -1380,6 +1390,38 @@ mod tests {
         assert_eq!(after.state, PendingState::Conflict);
         assert_eq!(after.base_etag.as_deref(), Some("\"1\""));
         assert_eq!(after.attempts, 1, "no se re-basó ni se contó un intento");
+    }
+
+    /// **Defensa en profundidad**: un `server_etag` vacío o en blanco —un servidor
+    /// roto que tras el 412 devuelve `<getetag></getetag>`, que `storable()` deja
+    /// pasar por filtrar por largo y no por vacío— cuenta como ausente. `keep_local`
+    /// falla y **no re-basa con `base_etag = ""`**: la invariante «sin ETag del
+    /// servidor no hay sobre qué re-basar» se comprueba acá, sin depender sólo de la
+    /// guarda de `replay` aguas abajo.
+    #[test]
+    fn resolver_keep_local_con_server_etag_vacio_falla() {
+        let temp = TempDir::new("resolver-keep-local-etag-vacio");
+        let mut store = open_store(&temp);
+        let book = one_book(&mut store);
+        store
+            .enqueue_contact_put(&book, &row(HREF, "Mía", "yo@x.com"))
+            .unwrap();
+        let op = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        store.mark_conflict(&op, "chocó").unwrap();
+        let op = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        // El servidor devolvió un ETag vacío: `server_etag = Some("")`.
+        store
+            .store_server_copy(op.id, op.revision, Some(""), b"BEGIN:VCARD servidor")
+            .unwrap();
+        let id = contact_id(&store, HREF, book.id);
+
+        let result = store.resolve_conflict(CONTACTS_AREA, id, ConflictChoice::KeepLocal);
+        assert!(matches!(result, Err(StoreError::InvalidArgument(_))));
+
+        // La op sigue en conflicto, sin re-basar: el `base_etag` no quedó en `""`.
+        let after = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        assert_eq!(after.state, PendingState::Conflict);
+        assert_eq!(after.base_etag.as_deref(), Some("\"1\""));
     }
 
     /// **`take_server`**: el servidor gana. Su copia se adopta en la fila guardada
