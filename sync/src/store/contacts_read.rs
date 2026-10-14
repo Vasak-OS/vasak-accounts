@@ -333,8 +333,10 @@ fn cards_page(
         "SELECT c.id, c.address_book_id, c.sort_key, c.href, c.raw_vcard,
                 c.etag, c.pending_op, pdo.state
            FROM contacts c
+           JOIN address_books ab ON ab.id = c.address_book_id
            LEFT JOIN pending_dav_ops pdo
                   ON pdo.area = 'contacts' AND pdo.object_href = c.href
+                 AND pdo.collection_href = ab.href
           WHERE c.display_name != ''
             AND (c.pending_op IS NULL OR c.pending_op != 'delete')",
     );
@@ -541,8 +543,10 @@ pub fn get_contact(connection: &Connection, id: i64) -> Result<Option<ContactDet
         .query_row(
             "SELECT c.address_book_id, c.raw_vcard, c.etag, c.pending_op, pdo.state
                FROM contacts c
+               JOIN address_books ab ON ab.id = c.address_book_id
                LEFT JOIN pending_dav_ops pdo
                       ON pdo.area = 'contacts' AND pdo.object_href = c.href
+                     AND pdo.collection_href = ab.href
               WHERE c.id = ?1 AND c.display_name != ''
                 AND (c.pending_op IS NULL OR c.pending_op != 'delete')",
             [id],
@@ -676,32 +680,93 @@ mod tests {
             &b,
             vec![row("https://x/a/1.vcf", "Ana", "a@x.com")],
         );
-        let card = |store: &Store| {
-            list_cards(store.connection(), None, None, 10)
-                .unwrap()
-                .items
-                .remove(0)
+        // Devuelven sólo los campos escalares que la prueba mira: el valor entero
+        // —con datos de la cuenta— no fluye a un `.unwrap()`/panic, para no
+        // disparar `rust/cleartext-logging`.
+        let card = |store: &Store| -> (String, SyncState) {
+            let Ok(mut page) = list_cards(store.connection(), None, None, 10) else {
+                panic!("no se pudo leer la tarjeta");
+            };
+            let c = page.items.remove(0);
+            (c.etag, c.sync_state)
         };
-        let detail = |store: &Store| get_contact(store.connection(), 1).unwrap().unwrap();
+        let detail = |store: &Store| -> (String, SyncState) {
+            let Ok(Some(d)) = get_contact(store.connection(), 1) else {
+                panic!("no se pudo leer el detalle");
+            };
+            (d.etag, d.sync_state)
+        };
 
         // Al día: trae su ETag y `synced`, en la tarjeta y en el detalle.
-        assert_eq!(card(&store).etag, "\"1\"");
-        assert_eq!(card(&store).sync_state, SyncState::Synced);
-        assert_eq!(detail(&store).etag, "\"1\"");
-        assert_eq!(detail(&store).sync_state, SyncState::Synced);
+        assert_eq!(card(&store), ("\"1\"".to_string(), SyncState::Synced));
+        assert_eq!(detail(&store), ("\"1\"".to_string(), SyncState::Synced));
 
         // Editar local sin confirmar: `pending`.
         store
             .enqueue_contact_put(&b, &row("https://x/a/1.vcf", "Ana María", "a@x.com"))
             .unwrap();
-        assert_eq!(card(&store).sync_state, SyncState::Pending);
-        assert_eq!(detail(&store).sync_state, SyncState::Pending);
+        assert_eq!(card(&store).1, SyncState::Pending);
+        assert_eq!(detail(&store).1, SyncState::Pending);
 
         // La op choca: `conflict`.
         let op = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
         store.mark_conflict(&op, "chocó").unwrap();
-        assert_eq!(card(&store).sync_state, SyncState::Conflict);
-        assert_eq!(detail(&store).sync_state, SyncState::Conflict);
+        assert_eq!(card(&store).1, SyncState::Conflict);
+        assert_eq!(detail(&store).1, SyncState::Conflict);
+    }
+
+    /// **F1 — el `sync_state` se acota por colección.** El esquema deja el mismo
+    /// `href` en dos libretas de una cuenta (`UNIQUE(address_book_id, href)`), y
+    /// `pending_dav_ops` guarda una sola op por `href` (`UNIQUE(area,
+    /// object_href)`). Si el join de `sync_state` uniera sólo por `href`, el
+    /// estado de la op de **una** libreta se pegaría al objeto de la **otra**.
+    ///
+    /// Las dos libretas editan el mismo `href`; la segunda edición pisa la op (su
+    /// `collection_href` queda en la libreta B) y choca. La tarjeta de la libreta
+    /// A, cuya op ya no existe, tiene que verse `pending` —su marca sigue, pero el
+    /// conflicto es de B—, no `conflict`. Sin el `AND pdo.collection_href` se ve
+    /// `conflict` (el estado de la op ajena). Y nunca hay fila de más por objeto.
+    #[test]
+    fn el_sync_state_no_cruza_de_coleccion() {
+        use super::super::lifecycle::CONTACTS_AREA;
+        let temp = TempDir::new("sync-state-scope");
+        let mut store = open_store(&temp);
+        let a = book(&mut store, "https://x/a/", "A");
+        let b = book(&mut store, "https://x/b/", "B");
+        const HREF: &str = "https://x/shared.vcf";
+        // El MISMO href, al día, en las dos libretas.
+        add(&mut store, &a, vec![row(HREF, "En A", "a@x.com")]);
+        add(&mut store, &b, vec![row(HREF, "En B", "b@x.com")]);
+        // Las dos editan; la de B pisa la única op (ON CONFLICT por área+href) y
+        // choca. La marca de A queda, pero su op ya no es la viva.
+        store
+            .enqueue_contact_put(&a, &row(HREF, "En A editada", "a@x.com"))
+            .unwrap();
+        store
+            .enqueue_contact_put(&b, &row(HREF, "En B editada", "b@x.com"))
+            .unwrap();
+        let op = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        store.mark_conflict(&op, "chocó B").unwrap();
+
+        let Ok(page) = list_cards(store.connection(), None, None, 10) else {
+            panic!("no se pudieron leer las tarjetas");
+        };
+        let cards = page.items;
+        // Una fila por objeto: la de A y la de B, sin duplicar.
+        assert_eq!(cards.len(), 2, "una tarjeta por libreta, sin duplicados");
+        // Se extrae el `sync_state` (escalar) antes del `.unwrap()`, así el valor
+        // con datos de la cuenta no fluye al sink (ver `cleartext-logging`).
+        let of = |book_id: i64| {
+            cards
+                .iter()
+                .find(|c| c.address_book_id == book_id.to_string())
+                .map(|c| c.sync_state)
+                .unwrap()
+        };
+        // La de A: su conflicto es ajeno, se ve `pending`, no `conflict`.
+        assert_eq!(of(a.id), SyncState::Pending);
+        // La de B: la op viva es la suya, y chocó.
+        assert_eq!(of(b.id), SyncState::Conflict);
     }
 
     /// Todas las páginas de una lista, desde el principio.

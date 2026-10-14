@@ -217,16 +217,21 @@ mod tests {
             .unwrap();
         make_conflict(&mut store, &book, "https://x/a/choca.vcf", "En Conflicto");
 
-        let conflicts = list_conflicts(store.connection(), CONTACTS_AREA).unwrap();
+        // Se bindea el resultado en vez de encadenar `.unwrap()` sobre la lectura,
+        // para no disparar `rust/cleartext-logging` (ver #88).
+        let Ok(conflicts) = list_conflicts(store.connection(), CONTACTS_AREA) else {
+            panic!("no se pudieron listar los conflictos");
+        };
         assert_eq!(conflicts.len(), 1, "sólo el que chocó");
         assert_eq!(conflicts[0].op, "put");
         assert_eq!(conflicts[0].summary, "En Conflicto");
         assert!(!conflicts[0].has_server_copy, "todavía no se trajo");
 
         // Nada se cruza al calendario, y sin conflictos la lista es vacía.
-        assert!(list_conflicts(store.connection(), CALENDAR_AREA)
-            .unwrap()
-            .is_empty());
+        let Ok(none) = list_conflicts(store.connection(), CALENDAR_AREA) else {
+            panic!("no se pudo listar el calendario");
+        };
+        assert!(none.is_empty());
     }
 
     /// `get_conflict` del objeto en conflicto trae el crudo local y, si A3 ya la
@@ -243,13 +248,17 @@ mod tests {
             .unwrap();
 
         let id = conflicts_first_id(&store);
-        let detail = get_conflict(store.connection(), CONTACTS_AREA, id)
-            .unwrap()
-            .unwrap();
+        let Ok(Some(detail)) = get_conflict(store.connection(), CONTACTS_AREA, id) else {
+            panic!("el conflicto tenía que estar");
+        };
         assert_eq!(detail.op, "put");
-        assert!(detail.local.unwrap().contains("Mía"), "el crudo local");
-        assert_eq!(detail.server.as_deref(), Some("BEGIN:VCARD servidor"));
-        assert_eq!(detail.server_etag.as_deref(), Some("\"srv\""));
+        // `assert!` sin valor: el crudo no fluye a un mensaje de panic.
+        assert!(
+            detail.local.as_deref().is_some_and(|s| s.contains("Mía")),
+            "el crudo local"
+        );
+        assert!(detail.server.as_deref() == Some("BEGIN:VCARD servidor"));
+        assert!(detail.server_etag.as_deref() == Some("\"srv\""));
         assert!(!detail.server_unavailable);
     }
 
@@ -263,9 +272,9 @@ mod tests {
         make_conflict(&mut store, &book, "https://x/a/c.vcf", "Mía");
 
         let id = conflicts_first_id(&store);
-        let detail = get_conflict(store.connection(), CONTACTS_AREA, id)
-            .unwrap()
-            .unwrap();
+        let Ok(Some(detail)) = get_conflict(store.connection(), CONTACTS_AREA, id) else {
+            panic!("el conflicto tenía que estar");
+        };
         assert!(detail.server.is_none());
         assert!(detail.server_etag.is_none());
         assert!(
@@ -286,9 +295,10 @@ mod tests {
             .contact_id_by_href(book.id, "https://x/a/ok.vcf")
             .unwrap()
             .unwrap();
-        assert!(get_conflict(store.connection(), CONTACTS_AREA, id)
-            .unwrap()
-            .is_none());
+        let Ok(found) = get_conflict(store.connection(), CONTACTS_AREA, id) else {
+            panic!("la lectura no tenía que fallar");
+        };
+        assert!(found.is_none());
     }
 
     /// Un **borrado** local en conflicto no trae crudo local («la mía» es
@@ -306,9 +316,9 @@ mod tests {
         store.mark_conflict(&op, "chocó").unwrap();
 
         let id = conflicts_first_id(&store);
-        let detail = get_conflict(store.connection(), CONTACTS_AREA, id)
-            .unwrap()
-            .unwrap();
+        let Ok(Some(detail)) = get_conflict(store.connection(), CONTACTS_AREA, id) else {
+            panic!("el conflicto tenía que estar");
+        };
         assert_eq!(detail.op, "delete");
         assert!(detail.local.is_none(), "un borrado no tiene versión local");
     }
@@ -329,9 +339,9 @@ mod tests {
     }
 
     fn conflicts_first_id(store: &Store) -> i64 {
-        list_conflicts(store.connection(), CONTACTS_AREA).unwrap()[0]
-            .id
-            .parse()
-            .unwrap()
+        let Ok(conflicts) = list_conflicts(store.connection(), CONTACTS_AREA) else {
+            panic!("no se pudieron listar los conflictos");
+        };
+        conflicts[0].id.parse().unwrap()
     }
 }

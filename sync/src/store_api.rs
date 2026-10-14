@@ -3051,6 +3051,89 @@ mod tests {
         );
     }
 
+    /// **Candado del foco #2 — un `id` no cruza de área.** Los `id` locales son
+    /// autoincrement por tabla, así que un contacto y un evento pueden tener el
+    /// mismo número. `GetConflict` con un área trae el objeto **de esa área**, no
+    /// el de la otra con el mismo id.
+    #[tokio::test]
+    async fn get_conflict_no_cruza_de_area_con_el_mismo_id() {
+        let mut both = with_contacts("cuenta");
+        both.capabilities.push("calendar".into());
+        let mut api = Api::new("api-conflictos-id", vec![both], Answer::Allow).await;
+        api.manager
+            .with_store("cuenta", |store| {
+                // Contacto en conflicto: id 1 en `contacts`.
+                let book = store
+                    .upsert_address_books(&[("https://x/a/".into(), "A".into())])?
+                    .remove(0);
+                store.enqueue_contact_put(&book, &row("https://x/a/c.vcf", "Contacto", "c@x.com"))?;
+                let op = store.pending_ops(CONTACTS_AREA)?.remove(0);
+                store.mark_conflict(&op, "chocó")?;
+                // Evento en conflicto: id 1 en `calendar_objects`.
+                let cal = calendar(store, "https://x/c/");
+                let w = window();
+                let raw = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:e1\r\nSUMMARY:Evento\r\n\
+                           DTSTART:20260926T120000Z\r\nDURATION:PT1H\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+                store.apply_calendar_objects(
+                    &cal,
+                    &[ObjectOp::Upsert(object("https://x/c/e.ics", raw, w))],
+                    w,
+                    None,
+                    crate::store::calendar::CalendarRoom::UNLIMITED,
+                )?;
+                store.enqueue_calendar_put(&cal, &object("https://x/c/e.ics", raw, w), w)?;
+                let op = store.pending_ops(CALENDAR_AREA)?.remove(0);
+                store.mark_conflict(&op, "chocó")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let (client, _service) = api.client(":1.7").await;
+
+        // El id 1 del calendario es el evento; el id 1 de contactos, el contacto.
+        let event: serde_json::Value = serde_json::from_str(
+            &call(&client, "GetConflict", &("cuenta", "calendar", "1"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(event["local"].as_str().unwrap().contains("BEGIN:VEVENT"));
+        let contact: serde_json::Value = serde_json::from_str(
+            &call(&client, "GetConflict", &("cuenta", "contacts", "1"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(contact["local"].as_str().unwrap().contains("BEGIN:VCARD"));
+    }
+
+    /// **Candado del foco #2 — el área se ata a la cuenta.** Pedir conflictos de
+    /// calendario de una cuenta que sólo tiene contactos es `InvalidArgs` (la
+    /// cuenta no tiene esa área), **antes** de abrir ningún diálogo.
+    #[tokio::test]
+    async fn los_conflictos_de_un_area_que_la_cuenta_no_tiene_no_preguntan() {
+        let mut api = Api::new(
+            "api-conflictos-area",
+            vec![with_contacts("cuenta")],
+            Answer::Allow,
+        )
+        .await;
+        let (client, _service) = api.client(":1.7").await;
+        assert_eq!(
+            error_name(&call(&client, "ListConflicts", &("cuenta", "calendar")).await),
+            INVALID_ARGS
+        );
+        assert_eq!(
+            error_name(&call(&client, "GetConflict", &("cuenta", "calendar", "1")).await),
+            INVALID_ARGS
+        );
+        assert_eq!(
+            api.access.permissions.calls(),
+            0,
+            "una cuenta sin el área no abre diálogo"
+        );
+    }
+
     /// Con el llavero bloqueado, leer da un error que lo dice, y ningún dato.
     #[tokio::test]
     async fn leer_con_el_llavero_bloqueado_da_un_error_claro_y_ningun_dato() {

@@ -415,6 +415,7 @@ pub fn occurrences_sql(
            LEFT JOIN object_titles t ON t.object_id = o.object_id AND t.position = o.title
            LEFT JOIN pending_dav_ops pdo
                   ON pdo.area = 'calendar' AND pdo.object_href = c.href
+                 AND pdo.collection_href = k.href
           WHERE {starts}
             AND (o.ends_at > ? OR (o.ends_at <= o.starts_at AND o.starts_at >= ?))
             AND (c.pending_op IS NULL OR c.pending_op != 'delete'){}{}
@@ -660,6 +661,7 @@ fn series_batch(
                JOIN calendars k ON k.id = c.calendar_id
                LEFT JOIN pending_dav_ops pdo
                       ON pdo.area = 'calendar' AND pdo.object_href = c.href
+                     AND pdo.collection_href = k.href
               WHERE c.recurring = 1 AND c.component = 'VEVENT'
                 AND (c.starts_at IS NULL OR c.starts_at < ?1)
                 AND NOT (c.expanded_from IS NOT NULL AND c.expanded_from <= ?2 - c.span
@@ -1244,8 +1246,10 @@ pub fn get_event(
             .query_row(
                 "SELECT c.calendar_id, c.raw_ical, c.zone, c.etag, c.pending_op, pdo.state
                    FROM calendar_objects c
+                   JOIN calendars k ON k.id = c.calendar_id
                    LEFT JOIN pending_dav_ops pdo
                           ON pdo.area = 'calendar' AND pdo.object_href = c.href
+                         AND pdo.collection_href = k.href
                   WHERE c.id = ?1 AND c.component = 'VEVENT'
                     AND (c.pending_op IS NULL OR c.pending_op != 'delete')",
                 [id],
@@ -1436,8 +1440,11 @@ mod tests {
                 CalendarRoom::UNLIMITED,
             )
             .unwrap();
-        let read = |store: &Store| {
-            account_occurrences(
+        // Devuelve sólo los campos escalares que la prueba mira (ETag y estado):
+        // el valor entero —con datos de la cuenta— no sale del cierre ni fluye a
+        // un `.unwrap()`/panic, para no disparar `rust/cleartext-logging`.
+        let read = |store: &Store| -> (String, SyncState) {
+            let Ok(mut page) = account_occurrences(
                 store.connection(),
                 "cuenta",
                 range("2026-09-25T00:00:00Z", "2026-09-27T00:00:00Z"),
@@ -1445,28 +1452,28 @@ mod tests {
                 None,
                 100,
                 &ExpansionLimits::DEFAULT,
-            )
-            .unwrap()
-            .rows
-            .remove(0)
-            .1
+            ) else {
+                panic!("no se pudo leer la ocurrencia");
+            };
+            let item = page.rows.remove(0).1;
+            (item.etag, item.sync_state)
         };
 
         // Al día con el servidor: trae su ETag y `synced`.
-        let synced = read(&store);
-        assert_eq!(synced.etag, "\"1\"");
-        assert_eq!(synced.sync_state, SyncState::Synced);
+        let (etag, state) = read(&store);
+        assert_eq!(etag, "\"1\"");
+        assert_eq!(state, SyncState::Synced);
 
         // Editar local sin confirmar: `pending`.
         store
             .enqueue_calendar_put(&cal, &object(href, &single("a", "20260926T130000Z"), w), w)
             .unwrap();
-        assert_eq!(read(&store).sync_state, SyncState::Pending);
+        assert_eq!(read(&store).1, SyncState::Pending);
 
         // La op choca con el servidor: `conflict`.
         let op = store.pending_ops(CALENDAR_AREA).unwrap().remove(0);
         store.mark_conflict(&op, "cambió en el servidor").unwrap();
-        assert_eq!(read(&store).sync_state, SyncState::Conflict);
+        assert_eq!(read(&store).1, SyncState::Conflict);
     }
 
     /// **DTO**: un objeto recién creado local sin confirmar (`enqueue` con etag
@@ -1485,7 +1492,7 @@ mod tests {
         );
         row.etag = None;
         store.enqueue_calendar_put(&cal, &row, w).unwrap();
-        let item = account_occurrences(
+        let Ok(mut page) = account_occurrences(
             store.connection(),
             "cuenta",
             range("2026-09-25T00:00:00Z", "2026-09-27T00:00:00Z"),
@@ -1493,13 +1500,16 @@ mod tests {
             None,
             100,
             &ExpansionLimits::DEFAULT,
-        )
-        .unwrap()
-        .rows
-        .remove(0)
-        .1;
-        assert_eq!(item.etag, "");
-        assert_eq!(item.sync_state, SyncState::Pending);
+        ) else {
+            panic!("no se pudo leer la ocurrencia");
+        };
+        // Sólo los campos escalares salen de la lectura (ver nota de arriba).
+        let (etag, state) = {
+            let item = page.rows.remove(0).1;
+            (item.etag, item.sync_state)
+        };
+        assert_eq!(etag, "");
+        assert_eq!(state, SyncState::Pending);
     }
 
     /// **DTO**: `GetEvent` trae el `etag` y el `sync_state` del objeto, que
@@ -1525,29 +1535,32 @@ mod tests {
                 CalendarRoom::UNLIMITED,
             )
             .unwrap();
-        let read = |store: &Store| {
-            get_event(
+        // Sólo ETag y estado salen de la lectura (ver la nota de
+        // `las_ocurrencias_traen_etag_y_sync_state` sobre `cleartext-logging`).
+        let read = |store: &Store| -> (String, SyncState) {
+            let Ok(Some(event)) = get_event(
                 store.connection(),
                 "cuenta",
                 1,
                 None,
                 &ExpansionLimits::DEFAULT,
-            )
-            .unwrap()
-            .unwrap()
+            ) else {
+                panic!("no se pudo leer el evento");
+            };
+            (event.etag, event.sync_state)
         };
 
-        let synced = read(&store);
-        assert_eq!(synced.etag, "\"1\"");
-        assert_eq!(synced.sync_state, SyncState::Synced);
+        let (etag, state) = read(&store);
+        assert_eq!(etag, "\"1\"");
+        assert_eq!(state, SyncState::Synced);
 
         store
             .enqueue_calendar_put(&cal, &object(href, &single("g", "20260926T130000Z"), w), w)
             .unwrap();
-        assert_eq!(read(&store).sync_state, SyncState::Pending);
+        assert_eq!(read(&store).1, SyncState::Pending);
         let op = store.pending_ops(CALENDAR_AREA).unwrap().remove(0);
         store.mark_conflict(&op, "chocó").unwrap();
-        assert_eq!(read(&store).sync_state, SyncState::Conflict);
+        assert_eq!(read(&store).1, SyncState::Conflict);
     }
 
     fn single(uid: &str, start: &str) -> String {
