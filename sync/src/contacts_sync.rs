@@ -89,6 +89,14 @@ pub struct SyncReport {
     /// Tarjetas pedidas que no volvieron en [`MISSING_ROUNDS`] vueltas
     /// seguidas, y con las que la libreta se dio por al día igual.
     pub missing: usize,
+    /// Escrituras locales que subieron al servidor en esta vuelta (ver
+    /// `replay`).
+    pub pushed: usize,
+    /// Escrituras locales que chocaron con un cambio del servidor (`412`): las
+    /// resuelve M3.
+    pub conflicts: usize,
+    /// Escrituras locales que siguen pendientes al terminar la vuelta.
+    pub pending: usize,
 }
 
 /// La sincronización de contactos de todas las cuentas.

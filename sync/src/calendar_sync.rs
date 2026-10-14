@@ -123,6 +123,14 @@ pub struct CalendarReport {
     /// Objetos guardados cuya expansión pasó un tope o no se entendió: se
     /// guardaron con las ocurrencias que entraron, y quedan marcados.
     pub capped_series: usize,
+    /// Escrituras locales que subieron al servidor en esta vuelta (ver
+    /// `replay`).
+    pub pushed: usize,
+    /// Escrituras locales que chocaron con un cambio del servidor (`412`): las
+    /// resuelve M3.
+    pub conflicts: usize,
+    /// Escrituras locales que siguen pendientes al terminar la vuelta.
+    pub pending: usize,
 }
 
 /// Cómo terminó una vuelta de una cuenta.
@@ -187,6 +195,10 @@ struct Round {
     stored_alarms: u64,
     /// La ventana con la que se expande todo lo de esta vuelta.
     window: Window,
+    /// Las colecciones que, después del empuje, siguen con escrituras locales
+    /// pendientes: no se dan por al día (no se guarda su token) hasta que el
+    /// empuje las resuelva.
+    pending_collections: BTreeSet<String>,
 }
 
 impl Round {
@@ -387,7 +399,31 @@ impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
             stored_occurrences: 0,
             stored_alarms: 0,
             window,
+            pending_collections: BTreeSet::new(),
         };
+
+        // El empuje primero: se drena la cola de escrituras hacia el servidor
+        // antes de dar la bajada por al día. Las colecciones que queden con algo
+        // pendiente no se consideran al día (ver `execute`).
+        let replay = crate::replay::replay_area(
+            &self.manager,
+            account_id,
+            CALENDAR_AREA,
+            &client,
+            crate::replay::CALENDAR_CONTENT_TYPE,
+            round.deadline,
+        )
+        .await?;
+        round.report.pushed = replay.pushed;
+        round.report.conflicts = replay.conflicts;
+        round.report.pending = replay.remaining;
+        if replay.remaining > 0 {
+            round.pending_collections = self
+                .store(account_id, |s| s.pending_collections(CALENDAR_AREA))
+                .await?
+                .into_iter()
+                .collect();
+        }
 
         let mut seen = BTreeSet::new();
         let (calendars, foreign) = round.net(caldav::list_calendars(&client)).await?;
@@ -602,7 +638,11 @@ impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
         // `MissingStreaks`): lo traído se escribe, pero el calendario no queda
         // al día.
         let settled = self.missing.settle(account_id, &stored.href, missing);
-        let settles = settles && !matches!(settled, Settled::Retry(_));
+        // Una colección con escrituras locales sin confirmar no se da por al día:
+        // el token no se guarda hasta que el empuje las resuelva, y la próxima
+        // vuelta vuelve a mirarla.
+        let has_pending = round.pending_collections.contains(&stored.href);
+        let settles = settles && !has_pending && !matches!(settled, Settled::Retry(_));
         let progress = settles.then_some(CalendarProgress {
             token: plan.token,
             ctag: plan.ctag,
