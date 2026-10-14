@@ -244,14 +244,7 @@ trait ComponentPatch {
     /// una de las que este parche conoce. Devuelve `true` si la manejó (ya
     /// escribió lo que correspondía), `false` si no la conoce y hay que dejarla
     /// intacta. El `SEQUENCE` **no** pasa por acá: lo sube el recorrido genérico.
-    fn edit_field(
-        &self,
-        out: &mut Vec<String>,
-        logical: &Logical,
-        name: &str,
-        params: &[String],
-        done: &mut Self::Done,
-    ) -> bool;
+    fn edit_field(&self, ctx: &mut EditContext, done: &mut Self::Done) -> bool;
 
     /// Al cerrar el objetivo: agrega lo que el parche fija y no estaba. En un
     /// orden fijo, para que dos corridas den lo mismo. El `SEQUENCE` lo agrega el
@@ -443,7 +436,16 @@ fn edit_direct<P: ComponentPatch>(
     let params = split_line(&logical.unfolded())
         .map(|(_, params, _)| params)
         .unwrap_or_default();
-    if !patch.edit_field(out, logical, name, &params, done) {
+    let handled = {
+        let mut ctx = EditContext {
+            out: &mut *out,
+            logical,
+            name,
+            params: &params,
+        };
+        patch.edit_field(&mut ctx, done)
+    };
+    if !handled {
         out.extend_from_slice(&logical.physical);
     }
 }
@@ -518,24 +520,47 @@ fn direct_in_target(stack: &[String], target_depth: &Option<usize>) -> bool {
     matches!(target_depth, Some(depth) if *depth == stack.len())
 }
 
-/// Reescribe —o saca, o deja— una propiedad de texto, **conservando sus
-/// parámetros**: al editar el valor no se tira el `LANGUAGE` ni el `ALTREP` que
-/// tenía. Una segunda aparición de la misma propiedad ya fijada se descarta.
-fn put_text(
-    out: &mut Vec<String>,
-    change: &Change<String>,
-    done: &mut bool,
-    name: &str,
-    params: &[String],
-    logical: &Logical,
-) {
+/// El contexto de una edición en el lugar: adónde escribir (`out`) y la línea
+/// cruda que se está mirando (`logical`), con su nombre y sus parámetros ya
+/// partidos. Lo comparten los `put_*` para no arrastrar cinco argumentos cada uno
+/// —y para que el `edit_field` de cada componente sea una línea por propiedad—.
+struct EditContext<'a> {
+    out: &'a mut Vec<String>,
+    logical: &'a Logical,
+    name: &'a str,
+    params: &'a [String],
+}
+
+impl EditContext<'_> {
+    /// Deja la línea como estaba, byte por byte.
+    fn keep(&mut self) {
+        self.out.extend_from_slice(&self.logical.physical);
+    }
+
+    /// Escribe la propiedad con los parámetros que traía el crudo: al editar el
+    /// valor no se tira el `LANGUAGE` ni el `ALTREP` que tenía.
+    fn rewrite(&mut self, value: &str) {
+        self.out
+            .extend(fold(&render(self.name, self.params, value)));
+    }
+
+    /// Escribe la propiedad con parámetros nuevos: una fecha trae su zona, que es
+    /// parte de lo que cambió.
+    fn rewrite_with(&mut self, params: &[String], value: &str) {
+        self.out.extend(fold(&render(self.name, params, value)));
+    }
+}
+
+/// Reescribe —o saca, o deja— una propiedad de texto, conservando sus
+/// parámetros. Una segunda aparición de la misma propiedad ya fijada se descarta.
+fn put_text(ctx: &mut EditContext, change: &Change<String>, done: &mut bool) {
     match change {
-        Change::Leave => out.extend_from_slice(&logical.physical),
+        Change::Leave => ctx.keep(),
         Change::Clear => {}
         Change::Set(text) => {
             if !*done {
                 *done = true;
-                out.extend(fold(&render(name, params, &escape_text(text))));
+                ctx.rewrite(&escape_text(text));
             }
         }
     }
@@ -543,65 +568,46 @@ fn put_text(
 
 /// Reescribe —o saca, o deja— una fecha. A diferencia del texto, los parámetros
 /// vienen con el valor nuevo ([`DateSpec`]): la zona es parte de lo que cambió.
-fn put_date(
-    out: &mut Vec<String>,
-    change: &Change<DateSpec>,
-    done: &mut bool,
-    name: &str,
-    logical: &Logical,
-) {
+fn put_date(ctx: &mut EditContext, change: &Change<DateSpec>, done: &mut bool) {
     match change {
-        Change::Leave => out.extend_from_slice(&logical.physical),
+        Change::Leave => ctx.keep(),
         Change::Clear => {}
         Change::Set(spec) => {
             if !*done {
                 *done = true;
-                out.extend(fold(&render(name, &spec.params, &spec.value)));
+                ctx.rewrite_with(&spec.params, &spec.value);
             }
         }
     }
 }
 
-/// Reescribe —o saca, o deja— el `STATUS` de una tarea, conservando sus
-/// parámetros. El valor es uno de los cuatro fijos de [`TodoStatus`]: no hay
-/// texto libre que pueda inyectar una línea.
-fn put_status(
-    out: &mut Vec<String>,
-    change: &Change<TodoStatus>,
-    done: &mut bool,
-    params: &[String],
-    logical: &Logical,
-) {
+/// Reescribe —o saca, o deja— el `STATUS` de una tarea. El valor es uno de los
+/// cuatro fijos de [`TodoStatus`]: no hay texto libre que pueda inyectar una
+/// línea.
+fn put_status(ctx: &mut EditContext, change: &Change<TodoStatus>, done: &mut bool) {
     match change {
-        Change::Leave => out.extend_from_slice(&logical.physical),
+        Change::Leave => ctx.keep(),
         Change::Clear => {}
         Change::Set(status) => {
             if !*done {
                 *done = true;
-                out.extend(fold(&render("STATUS", params, status.as_ical())));
+                ctx.rewrite(status.as_ical());
             }
         }
     }
 }
 
-/// Reescribe —o saca, o deja— un entero (`PERCENT-COMPLETE`, `PRIORITY`),
-/// conservando sus parámetros. El valor es un número en decimal: no puede
-/// inyectar una línea, y el rango ya lo comprobó [`TaskPatch::validate`].
-fn put_number(
-    out: &mut Vec<String>,
-    change: &Change<u8>,
-    done: &mut bool,
-    name: &str,
-    params: &[String],
-    logical: &Logical,
-) {
+/// Reescribe —o saca, o deja— un entero (`PERCENT-COMPLETE`, `PRIORITY`). El
+/// valor es un número en decimal: no puede inyectar una línea, y el rango ya lo
+/// comprobó [`TaskPatch::validate`].
+fn put_number(ctx: &mut EditContext, change: &Change<u8>, done: &mut bool) {
     match change {
-        Change::Leave => out.extend_from_slice(&logical.physical),
+        Change::Leave => ctx.keep(),
         Change::Clear => {}
         Change::Set(number) => {
             if !*done {
                 *done = true;
-                out.extend(fold(&render(name, params, &number.to_string())));
+                ctx.rewrite(&number.to_string());
             }
         }
     }
@@ -685,34 +691,13 @@ impl ComponentPatch for EventPatch {
         Ok(())
     }
 
-    fn edit_field(
-        &self,
-        out: &mut Vec<String>,
-        logical: &Logical,
-        name: &str,
-        params: &[String],
-        done: &mut Self::Done,
-    ) -> bool {
-        match name {
-            "SUMMARY" => put_text(out, &self.summary, &mut done.summary, name, params, logical),
-            "DESCRIPTION" => put_text(
-                out,
-                &self.description,
-                &mut done.description,
-                name,
-                params,
-                logical,
-            ),
-            "LOCATION" => put_text(
-                out,
-                &self.location,
-                &mut done.location,
-                name,
-                params,
-                logical,
-            ),
-            "DTSTART" => put_date(out, &self.start, &mut done.start, name, logical),
-            "DTEND" => put_date(out, &self.end, &mut done.end, name, logical),
+    fn edit_field(&self, ctx: &mut EditContext, done: &mut Self::Done) -> bool {
+        match ctx.name {
+            "SUMMARY" => put_text(ctx, &self.summary, &mut done.summary),
+            "DESCRIPTION" => put_text(ctx, &self.description, &mut done.description),
+            "LOCATION" => put_text(ctx, &self.location, &mut done.location),
+            "DTSTART" => put_date(ctx, &self.start, &mut done.start),
+            "DTEND" => put_date(ctx, &self.end, &mut done.end),
             _ => return false,
         }
         true
@@ -763,42 +748,14 @@ impl ComponentPatch for TaskPatch {
         Ok(())
     }
 
-    fn edit_field(
-        &self,
-        out: &mut Vec<String>,
-        logical: &Logical,
-        name: &str,
-        params: &[String],
-        done: &mut Self::Done,
-    ) -> bool {
-        match name {
-            "SUMMARY" => put_text(out, &self.summary, &mut done.summary, name, params, logical),
-            "DESCRIPTION" => put_text(
-                out,
-                &self.description,
-                &mut done.description,
-                name,
-                params,
-                logical,
-            ),
-            "DUE" => put_date(out, &self.due, &mut done.due, name, logical),
-            "STATUS" => put_status(out, &self.status, &mut done.status, params, logical),
-            "PERCENT-COMPLETE" => put_number(
-                out,
-                &self.percent_complete,
-                &mut done.percent,
-                "PERCENT-COMPLETE",
-                params,
-                logical,
-            ),
-            "PRIORITY" => put_number(
-                out,
-                &self.priority,
-                &mut done.priority,
-                "PRIORITY",
-                params,
-                logical,
-            ),
+    fn edit_field(&self, ctx: &mut EditContext, done: &mut Self::Done) -> bool {
+        match ctx.name {
+            "SUMMARY" => put_text(ctx, &self.summary, &mut done.summary),
+            "DESCRIPTION" => put_text(ctx, &self.description, &mut done.description),
+            "DUE" => put_date(ctx, &self.due, &mut done.due),
+            "STATUS" => put_status(ctx, &self.status, &mut done.status),
+            "PERCENT-COMPLETE" => put_number(ctx, &self.percent_complete, &mut done.percent),
+            "PRIORITY" => put_number(ctx, &self.priority, &mut done.priority),
             _ => return false,
         }
         true

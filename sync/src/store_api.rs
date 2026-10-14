@@ -862,39 +862,15 @@ impl<K: KeySource> StoreApi<K> {
         payload: String,
         if_match: String,
     ) -> zbus::fdo::Result<String> {
-        let calendar_id = contacts_read::parse_id(&calendar_id).map_err(invalid)?;
-        let account = self
-            .manager
-            .area_account(CALENDAR_AREA, &account_id)
-            .await
-            .map_err(to_fdo)?;
-        self.authorize(&header, CALENDAR_RESOURCE, &account.display_name)
-            .await?;
-        self.caller_limit(&header, &account_id)?;
-        self.activate_after_read(CALENDAR_AREA, &account_id, &account)
-            .await;
-        let uid = if if_match.is_empty() {
-            Some(new_uid()?)
-        } else {
-            None
-        };
-        // El `href` que devuelve el encolado se usa para resolver el `id` nuevo,
-        // pero no sale por el bus: la dirección en el servidor no es pública.
-        let (id, _href) = self
-            .manager
-            .with_store(&account_id, move |store| {
-                put_event_in_store(store, calendar_id, &payload, &if_match, uid)
-            })
-            .await
-            .map_err(read_error)?;
-        self.ask_for_sync(CALENDAR_AREA, &account_id);
-        let event_id = GlobalId {
-            account_id: account_id.clone(),
-            id,
-        }
-        .encode();
-        serde_json::to_string(&serde_json::json!({ "event_id": event_id }))
-            .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
+        self.put_calendar_object(
+            &header,
+            CalendarObjectKind::Event,
+            account_id,
+            calendar_id,
+            payload,
+            if_match,
+        )
+        .await
     }
 
     /// Borra un evento o una tarea, **encolando** el borrado hacia el servidor:
@@ -950,37 +926,15 @@ impl<K: KeySource> StoreApi<K> {
         payload: String,
         if_match: String,
     ) -> zbus::fdo::Result<String> {
-        let calendar_id = contacts_read::parse_id(&calendar_id).map_err(invalid)?;
-        let account = self
-            .manager
-            .area_account(CALENDAR_AREA, &account_id)
-            .await
-            .map_err(to_fdo)?;
-        self.authorize(&header, CALENDAR_RESOURCE, &account.display_name)
-            .await?;
-        self.caller_limit(&header, &account_id)?;
-        self.activate_after_read(CALENDAR_AREA, &account_id, &account)
-            .await;
-        let uid = if if_match.is_empty() {
-            Some(new_uid()?)
-        } else {
-            None
-        };
-        let (id, _href) = self
-            .manager
-            .with_store(&account_id, move |store| {
-                put_task_in_store(store, calendar_id, &payload, &if_match, uid)
-            })
-            .await
-            .map_err(read_error)?;
-        self.ask_for_sync(CALENDAR_AREA, &account_id);
-        let task_id = GlobalId {
-            account_id: account_id.clone(),
-            id,
-        }
-        .encode();
-        serde_json::to_string(&serde_json::json!({ "task_id": task_id }))
-            .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
+        self.put_calendar_object(
+            &header,
+            CalendarObjectKind::Task,
+            account_id,
+            calendar_id,
+            payload,
+            if_match,
+        )
+        .await
     }
 
     /// Borra una tarea, **encolando** el borrado hacia el servidor. Un `VTODO` se
@@ -1256,6 +1210,63 @@ impl<K: KeySource> StoreApi<K> {
 }
 
 impl<K: KeySource> StoreApi<K> {
+    /// Crea o edita un objeto de calendario —un evento o una tarea— encolándolo:
+    /// es el cuerpo común de `PutEvent` y `PutTask`. **El orden es la invariante
+    /// de seguridad** (y no cambia al unificar): se valida el `calendar_id` y se
+    /// resuelve la cuenta **antes** de autorizar; se autoriza **antes** del límite
+    /// por llamante, de abrir la base y de encolar. Lo único que cambia entre tipo
+    /// y tipo —qué `put_*_in_store` serializa y con qué clave responde— lo decide
+    /// [`CalendarObjectKind`]. Devuelve `{"<clave>_id": "<cuenta>/<id>"}`, sin el
+    /// `href` (la dirección en el servidor no es pública).
+    async fn put_calendar_object(
+        &self,
+        header: &Header<'_>,
+        kind: CalendarObjectKind,
+        account_id: String,
+        calendar_id: String,
+        payload: String,
+        if_match: String,
+    ) -> zbus::fdo::Result<String> {
+        let calendar_id = contacts_read::parse_id(&calendar_id).map_err(invalid)?;
+        let account = self
+            .manager
+            .area_account(CALENDAR_AREA, &account_id)
+            .await
+            .map_err(to_fdo)?;
+        self.authorize(header, CALENDAR_RESOURCE, &account.display_name)
+            .await?;
+        self.caller_limit(header, &account_id)?;
+        self.activate_after_read(CALENDAR_AREA, &account_id, &account)
+            .await;
+        let uid = if if_match.is_empty() {
+            Some(new_uid()?)
+        } else {
+            None
+        };
+        // El `href` que devuelve el encolado resuelve el `id` nuevo, pero no sale
+        // por el bus: la dirección en el servidor no es pública.
+        let (id, _href) = self
+            .manager
+            .with_store(&account_id, move |store| {
+                kind.put_in_store(store, calendar_id, &payload, &if_match, uid)
+            })
+            .await
+            .map_err(read_error)?;
+        self.ask_for_sync(CALENDAR_AREA, &account_id);
+        let global = GlobalId {
+            account_id: account_id.clone(),
+            id,
+        }
+        .encode();
+        let mut reply = serde_json::Map::new();
+        reply.insert(
+            kind.reply_key().to_string(),
+            serde_json::Value::String(global),
+        );
+        serde_json::to_string(&serde_json::Value::Object(reply))
+            .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
+    }
+
     /// Borra un objeto de calendario —un evento o una tarea— encolando el
     /// borrado: autoriza antes de actuar, respeta el límite por llamante y marca
     /// la fila guardada. Es lo común entre `DeleteEvent` y `DeleteTask`: un
@@ -2018,6 +2029,44 @@ fn put_calendar_object_in_store(
         };
         store.enqueue_calendar_put(&calendar, &row, window)?;
         Ok((object_id, href))
+    }
+}
+
+/// Qué tipo de objeto de calendario escribe un `Put`. Decide qué `put_*_in_store`
+/// serializa y con qué clave responde el bus, para que `put_calendar_object` sea
+/// un solo cuerpo compartido entre `PutEvent` y `PutTask`.
+#[derive(Clone, Copy)]
+enum CalendarObjectKind {
+    Event,
+    Task,
+}
+
+impl CalendarObjectKind {
+    /// Serializa y encola, con el `put_*_in_store` del tipo.
+    fn put_in_store(
+        self,
+        store: &mut Store,
+        calendar_id: i64,
+        payload: &str,
+        if_match: &str,
+        uid: Option<String>,
+    ) -> Result<(i64, String), StoreError> {
+        match self {
+            CalendarObjectKind::Event => {
+                put_event_in_store(store, calendar_id, payload, if_match, uid)
+            }
+            CalendarObjectKind::Task => {
+                put_task_in_store(store, calendar_id, payload, if_match, uid)
+            }
+        }
+    }
+
+    /// La clave del `id` en la respuesta JSON: `event_id` o `task_id`.
+    fn reply_key(self) -> &'static str {
+        match self {
+            CalendarObjectKind::Event => "event_id",
+            CalendarObjectKind::Task => "task_id",
+        }
     }
 }
 
