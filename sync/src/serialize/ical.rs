@@ -23,7 +23,73 @@
 //! igual.
 
 use super::{detect_eol, escape_text, fold, logical_lines, render, Change, Logical};
-use crate::ical::split_line;
+use crate::ical::{split_line, DateValue};
+
+/// Lo que puede salir mal al serializar.
+///
+/// Un valor o un parámetro vienen de afuera —en el PR de la cola, de la ventana
+/// por D-Bus—, y lo que se escribe se sube al servidor con la credencial de la
+/// persona. Un `\r` o un `\n` incrustado en una fecha o en un parámetro partiría
+/// la línea e inyectaría una propiedad o un componente entero en el cuerpo
+/// CalDAV. Por eso no se filtra en silencio —fabricaría una fecha distinta de la
+/// que se pidió—: se **rechaza**. Los mensajes son fijos y no repiten el valor,
+/// que podría terminar en un registro.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SerializeError {
+    /// La fecha no cumple el formato de iCalendar, o trae caracteres de control.
+    MalformedDate,
+    /// Un parámetro trae un carácter que partiría la línea (`:`, CR o LF).
+    InjectableParam,
+    /// Un identificador (`UID`, `DTSTAMP`) trae un carácter de control.
+    ControlInField,
+}
+
+impl std::fmt::Display for SerializeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SerializeError::MalformedDate => "la fecha no tiene el formato de iCalendar",
+            SerializeError::InjectableParam => "un parámetro tiene un carácter que no se permite",
+            SerializeError::ControlInField => "un identificador tiene un carácter de control",
+        })
+    }
+}
+
+impl std::error::Error for SerializeError {}
+
+/// Si un texto trae algún carácter de control —`\r` y `\n` entre ellos—, que
+/// partiría la línea al escribirla.
+fn has_control(text: &str) -> bool {
+    text.chars().any(char::is_control)
+}
+
+/// Comprueba una fecha antes de escribirla: los parámetros sin control ni dos
+/// puntos, y el valor con un formato de fecha de iCalendar de verdad.
+///
+/// Validar el valor con el **mismo** lector que usa la lectura
+/// ([`DateValue::parse`]) cierra la inyección por el valor: un `20260101T000000Z`
+/// con un `\r\n` y una propiedad pegada detrás no es una fecha, así que no pasa.
+fn validate_date(spec: &DateSpec) -> Result<(), SerializeError> {
+    for param in &spec.params {
+        if has_control(param) || param.contains(':') {
+            return Err(SerializeError::InjectableParam);
+        }
+    }
+    if DateValue::parse(&spec.value, &spec.params).is_none() {
+        return Err(SerializeError::MalformedDate);
+    }
+    Ok(())
+}
+
+/// Comprueba las fechas que el parche fija.
+fn validate_patch(patch: &EventPatch) -> Result<(), SerializeError> {
+    if let Change::Set(spec) = &patch.start {
+        validate_date(spec)?;
+    }
+    if let Change::Set(spec) = &patch.end {
+        validate_date(spec)?;
+    }
+    Ok(())
+}
 
 /// Una fecha para escribir: el valor tal como va y sus parámetros.
 ///
@@ -127,15 +193,17 @@ fn target_ordinal(logicals: &[Logical]) -> Option<usize> {
 /// resto intacto y sube el `SEQUENCE`.
 ///
 /// Un parche vacío devuelve el crudo tal cual —no hay edición, no hay que subir
-/// el `SEQUENCE`—, y un crudo sin `VEVENT` también: no hay qué editar.
-pub fn apply_changes(raw_ical: &str, patch: &EventPatch) -> String {
+/// el `SEQUENCE`—, y un crudo sin `VEVENT` también: no hay qué editar. Una fecha
+/// o un parámetro que inyectaría una línea devuelve `Err` (ver [`SerializeError`]).
+pub fn apply_changes(raw_ical: &str, patch: &EventPatch) -> Result<String, SerializeError> {
     if patch.is_empty() {
-        return raw_ical.to_string();
+        return Ok(raw_ical.to_string());
     }
+    validate_patch(patch)?;
     let eol = detect_eol(raw_ical);
     let logicals = logical_lines(raw_ical);
     let Some(target) = target_ordinal(&logicals) else {
-        return raw_ical.to_string();
+        return Ok(raw_ical.to_string());
     };
 
     let mut out: Vec<String> = Vec::new();
@@ -192,7 +260,7 @@ pub fn apply_changes(raw_ical: &str, patch: &EventPatch) -> String {
 
     let mut text = out.join(eol);
     text.push_str(eol);
-    text
+    Ok(text)
 }
 
 /// Arma un `VEVENT` desde cero, con lo mínimo que exige el estándar más lo que
@@ -201,8 +269,18 @@ pub fn apply_changes(raw_ical: &str, patch: &EventPatch) -> String {
 /// El `UID` y el `DTSTAMP` los da quien llama: el `UID` identifica el evento en
 /// el servidor para siempre, y el `DTSTAMP` es cuándo se armó este objeto. No
 /// lleva `SEQUENCE`: uno nuevo es la versión cero, y el estándar la supone
-/// cuando no está.
-pub fn new_event(uid: &str, dtstamp: &str, patch: &EventPatch) -> String {
+/// cuando no está. Un `UID` o un `DTSTAMP` con caracteres de control, o una
+/// fecha del parche que inyectaría una línea, devuelven `Err`.
+pub fn new_event(uid: &str, dtstamp: &str, patch: &EventPatch) -> Result<String, SerializeError> {
+    if has_control(uid) {
+        return Err(SerializeError::ControlInField);
+    }
+    // El `DTSTAMP` es un instante en UTC: se valida como una fecha de verdad, que
+    // de paso rechaza un `\r\n` incrustado.
+    if DateValue::parse(dtstamp, &[]).is_none() {
+        return Err(SerializeError::ControlInField);
+    }
+    validate_patch(patch)?;
     let eol = "\r\n";
     let mut out: Vec<String> = vec![
         "BEGIN:VCALENDAR".into(),
@@ -218,7 +296,7 @@ pub fn new_event(uid: &str, dtstamp: &str, patch: &EventPatch) -> String {
 
     let mut text = out.join(eol);
     text.push_str(eol);
-    text
+    Ok(text)
 }
 
 /// Qué propiedades del objetivo ya se reescribieron, para no duplicarlas ni
@@ -399,6 +477,16 @@ mod tests {
     use super::*;
     use crate::ical::{events_from, parse_document};
 
+    /// Edita y desenvuelve: las pruebas de camino feliz no esperan error.
+    fn edited(raw: &str, patch: &EventPatch) -> String {
+        apply_changes(raw, patch).unwrap()
+    }
+
+    /// Crea y desenvuelve.
+    fn created(uid: &str, dtstamp: &str, patch: &EventPatch) -> String {
+        new_event(uid, dtstamp, patch).unwrap()
+    }
+
     fn set(text: &str) -> Change<String> {
         Change::Set(text.to_string())
     }
@@ -424,7 +512,7 @@ mod tests {
             summary: set("Reunión movida"),
             ..Default::default()
         };
-        let out = apply_changes(EVENT, &patch);
+        let out = edited(EVENT, &patch);
 
         let before = &events_from(EVENT)[0];
         let after = &events_from(&out)[0];
@@ -445,7 +533,7 @@ mod tests {
             summary: set("Otra cosa"),
             ..Default::default()
         };
-        let out = apply_changes(EVENT, &patch);
+        let out = edited(EVENT, &patch);
         assert!(out.contains("SEQUENCE:4"), "{out}");
         assert!(!out.contains("SEQUENCE:3"));
     }
@@ -456,7 +544,7 @@ mod tests {
     fn sin_sequence_la_primera_edicion_lo_pone_en_uno() {
         let raw =
             "BEGIN:VEVENT\r\nUID:a\r\nSUMMARY:X\r\nDTSTART:20260915T140000Z\r\nEND:VEVENT\r\n";
-        let out = apply_changes(
+        let out = edited(
             raw,
             &EventPatch {
                 summary: set("Y"),
@@ -474,7 +562,7 @@ mod tests {
             X-MICROSOFT-CDO-BUSYSTATUS:BUSY\r\nDTSTART:20260915T140000Z\r\n\
             BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\nSUMMARY:Aviso\r\nEND:VALARM\r\n\
             END:VEVENT\r\n";
-        let out = apply_changes(
+        let out = edited(
             raw,
             &EventPatch {
                 summary: set("Nueva"),
@@ -498,7 +586,7 @@ mod tests {
             END:STANDARD\r\nEND:VTIMEZONE\r\n\
             BEGIN:VEVENT\r\nUID:a\r\nSUMMARY:Vieja\r\n\
             DTSTART;TZID=Romance Standard Time:20260715T090000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
-        let out = apply_changes(
+        let out = edited(
             raw,
             &EventPatch {
                 summary: set("Nueva"),
@@ -520,7 +608,7 @@ mod tests {
             RRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\n\
             BEGIN:VEVENT\r\nUID:s\r\nRECURRENCE-ID:20260922T140000Z\r\nSUMMARY:Excepción\r\n\
             DTSTART:20260922T150000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
-        let out = apply_changes(
+        let out = edited(
             raw,
             &EventPatch {
                 summary: set("Maestro nuevo"),
@@ -539,7 +627,7 @@ mod tests {
     fn se_agrega_lo_que_falta_y_se_saca_lo_que_sobra() {
         let raw = "BEGIN:VEVENT\r\nUID:a\r\nSUMMARY:X\r\nLOCATION:Sala 1\r\n\
             DTSTART:20260915T140000Z\r\nEND:VEVENT\r\n";
-        let out = apply_changes(
+        let out = edited(
             raw,
             &EventPatch {
                 description: set("Agenda del día"),
@@ -555,7 +643,7 @@ mod tests {
     /// título, y al leerlo otra vez vuelve entero.
     #[test]
     fn el_texto_editado_se_escapa_y_vuelve_entero() {
-        let out = apply_changes(
+        let out = edited(
             EVENT,
             &EventPatch {
                 summary: set("Reunión, con Ana; y Marta"),
@@ -573,7 +661,7 @@ mod tests {
     /// que cambió.
     #[test]
     fn cambiar_la_fecha_reemplaza_valor_y_parametros() {
-        let out = apply_changes(
+        let out = edited(
             EVENT,
             &EventPatch {
                 start: Change::Set(DateSpec {
@@ -595,7 +683,7 @@ mod tests {
     #[test]
     fn un_valor_largo_editado_se_pliega() {
         let largo = "Reunión ".repeat(40);
-        let out = apply_changes(
+        let out = edited(
             EVENT,
             &EventPatch {
                 summary: set(&largo),
@@ -608,14 +696,93 @@ mod tests {
         assert_eq!(events_from(&out)[0].title, largo.trim());
     }
 
+    /// **H1 (seguridad): una fecha con `\r\n` incrustado no inyecta líneas.**
+    /// El valor viene de afuera —de la ventana por D-Bus en el PR de la cola— y
+    /// lo que se escribe se sube al servidor con la credencial de la persona. Un
+    /// `20260101T000000Z\r\nATTENDEE:mailto:x\r\nX-:` escrito crudo partiría la
+    /// línea y metería un `ATTENDEE` y una propiedad en el `VEVENT`. Se rechaza,
+    /// no se filtra: filtrar fabricaría una fecha distinta de la que se pidió.
+    #[test]
+    fn una_fecha_con_crlf_incrustado_se_rechaza() {
+        let patch = EventPatch {
+            start: Change::Set(DateSpec {
+                value: "20260101T000000Z\r\nATTENDEE:mailto:x\r\nX-:".into(),
+                params: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            apply_changes(EVENT, &patch),
+            Err(SerializeError::MalformedDate)
+        );
+
+        // Y por `new_event` tampoco pasa: no se arma un evento con la inyección.
+        assert_eq!(
+            new_event("a", "20260101T000000Z", &patch),
+            Err(SerializeError::MalformedDate)
+        );
+    }
+
+    /// Y un parámetro de fecha con `\r\n` o con dos puntos tampoco: partiría la
+    /// línea o se haría pasar por el valor.
+    #[test]
+    fn un_parametro_de_fecha_que_inyecta_se_rechaza() {
+        for param in ["TZID=Europe/Madrid\r\nATTENDEE:mailto:x", "TZID=x:mailto:y"] {
+            let patch = EventPatch {
+                start: Change::Set(DateSpec {
+                    value: "20260101T000000".into(),
+                    params: vec![param.into()],
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                apply_changes(EVENT, &patch),
+                Err(SerializeError::InjectableParam),
+                "{param:?}"
+            );
+        }
+    }
+
+    /// Un `UID` o un `DTSTAMP` con caracteres de control tampoco arma un evento:
+    /// son la misma clase de inyección por otra puerta.
+    #[test]
+    fn un_uid_o_dtstamp_con_control_se_rechaza() {
+        let patch = EventPatch {
+            summary: set("X"),
+            ..Default::default()
+        };
+        assert_eq!(
+            new_event("a\r\nX-:1", "20260101T000000Z", &patch),
+            Err(SerializeError::ControlInField)
+        );
+        assert_eq!(
+            new_event("a", "20260101T000000Z\r\nX-:1", &patch),
+            Err(SerializeError::ControlInField)
+        );
+    }
+
+    /// Una fecha bien formada —con su zona— sí pasa: la validación no es un muro
+    /// para el uso normal.
+    #[test]
+    fn una_fecha_valida_con_zona_pasa() {
+        let patch = EventPatch {
+            start: Change::Set(DateSpec {
+                value: "20261001T100000".into(),
+                params: vec!["TZID=Europe/Madrid".into()],
+            }),
+            ..Default::default()
+        };
+        assert!(apply_changes(EVENT, &patch).is_ok());
+    }
+
     /// Un parche vacío no toca nada —ni el `SEQUENCE`— y un crudo sin `VEVENT`
     /// vuelve igual.
     #[test]
     fn un_parche_vacio_o_sin_vevent_no_cambia_nada() {
-        assert_eq!(apply_changes(EVENT, &EventPatch::default()), EVENT);
+        assert_eq!(edited(EVENT, &EventPatch::default()), EVENT);
         let no_event = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:t\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
         assert_eq!(
-            apply_changes(
+            edited(
                 no_event,
                 &EventPatch {
                     summary: set("X"),
@@ -630,7 +797,7 @@ mod tests {
     /// lee como un evento.
     #[test]
     fn un_evento_nuevo_es_valido_y_se_lee() {
-        let out = new_event(
+        let out = created(
             "nuevo-123",
             "20261001T120000Z",
             &EventPatch {
@@ -657,7 +824,7 @@ mod tests {
     /// parsea sin truncarse.
     #[test]
     fn lo_escrito_es_un_arbol_valido() {
-        let out = new_event(
+        let out = created(
             "x",
             "20261001T120000Z",
             &EventPatch {

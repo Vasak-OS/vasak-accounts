@@ -110,9 +110,13 @@ pub fn apply_changes(raw_vcard: &str, patch: &ContactPatch) -> String {
     let properties: Vec<Property> = logicals.iter().filter_map(property_of).collect();
 
     let editing_related = !matches!(patch.related, Change::Leave);
-    let form = related_form(&properties);
-    // Los grupos de Apple cuyas líneas se sacan al reescribir las relaciones.
-    let apple_groups: Vec<String> = if editing_related && form == RelatedForm::Apple {
+    // Al reescribir las relaciones se sacan **las dos formas**, no sólo la que se
+    // vuelve a escribir. Si el crudo trajera `RELATED` y la forma de Apple a la
+    // vez —malformado—, dejar la de Apple como «desconocida» haría que el nombre
+    // viejo sobreviviera en la copia del servidor; sacarla cierra la decisión 3.
+    // Los grupos de Apple cuyas líneas (`X-ABRELATEDNAMES` y su `X-ABLabel`) se
+    // sacan.
+    let apple_groups: Vec<String> = if editing_related {
         properties
             .iter()
             .filter(|p| p.name == "X-ABRELATEDNAMES")
@@ -162,11 +166,12 @@ pub fn apply_changes(raw_vcard: &str, patch: &ContactPatch) -> String {
                 logical,
             ),
             "NOTE" => put_text(&mut out, &patch.note, &mut done.note, &property, logical),
-            "RELATED" if editing_related && form == RelatedForm::Related => {}
-            "X-ABRELATEDNAMES" if editing_related && form == RelatedForm::Apple => {}
+            // Al editar relaciones se sacan las dos formas; la elegida se vuelve a
+            // escribir en `flush`, la otra no.
+            "RELATED" if editing_related => {}
+            "X-ABRELATEDNAMES" if editing_related => {}
             "X-ABLABEL"
                 if editing_related
-                    && form == RelatedForm::Apple
                     && property
                         .group
                         .as_ref()
@@ -295,9 +300,17 @@ fn push_related(out: &mut Vec<String>, relations: &[Relation]) {
 
 /// Escribe las relaciones en la forma de Apple, con grupos `itemN` nuevos que no
 /// pisan los que ya había.
+///
+/// El número se cuenta en `u64` a partir de `max_item` —que sale del crudo y lo
+/// controla el servidor CardDAV—. Una tarjeta con `item4294967295` haría
+/// desbordar un `u32` (pánico en debug, envoltura en release que **anularía** la
+/// garantía de no pisar), así que `max_item + 1 + offset` en `u64` no desborda y
+/// queda siempre por encima de cualquier `itemN` que la tarjeta ya use (la
+/// lectura sólo cuenta los que entran en un `u32`).
 fn push_apple(out: &mut Vec<String>, relations: &[Relation], max_item: u32) {
+    let base = max_item as u64;
     for (offset, relation) in relations.iter().enumerate() {
-        let group = format!("item{}", max_item + 1 + offset as u32);
+        let group = format!("item{}", base + 1 + offset as u64);
         out.extend(fold(&render(
             &format!("{group}.X-ABRELATEDNAMES"),
             &[],
@@ -311,11 +324,14 @@ fn push_apple(out: &mut Vec<String>, relations: &[Relation], max_item: u32) {
     }
 }
 
-/// Una etiqueta sin saltos de línea ni dos puntos, que partirían la propiedad.
+/// Una etiqueta sin caracteres que partirían la línea o inyectarían un
+/// parámetro: nada de controles ni dos puntos (partirían la propiedad), ni punto
+/// y coma, coma, igual o comillas (un `spouse;PREF=1` metería un parámetro en la
+/// línea `RELATED`).
 fn sanitize_label(label: &str) -> String {
     label
         .chars()
-        .filter(|c| !c.is_control() && *c != ':')
+        .filter(|c| !c.is_control() && !matches!(c, ':' | ';' | ',' | '=' | '"'))
         .collect::<String>()
         .trim()
         .to_string()
@@ -455,6 +471,86 @@ mod tests {
                 value: "Nueva".into()
             }]
         );
+    }
+
+    /// **H2 (seguridad): un `itemN` enorme del servidor no desborda ni pisa.**
+    /// `max_item` sale del crudo, que lo controla el servidor CardDAV. Con
+    /// `item4294967295` (el máximo de un `u32`), contar en `u32` desbordaría
+    /// —pánico en debug, envoltura en release que pondría el grupo nuevo encima
+    /// de uno viejo—. Contando en `u64` no desborda y el grupo nuevo queda por
+    /// encima.
+    #[test]
+    fn un_item_group_enorme_del_servidor_no_desborda_ni_pisa() {
+        let apple = "BEGIN:VCARD\r\nFN:Ana\r\n\
+            item4294967295.X-ABRELATEDNAMES:Vieja\r\nitem4294967295.X-ABLabel:_$!<Spouse>!$_\r\n\
+            END:VCARD\r\n";
+        // No tiene que entrar en pánico (correr esto ya lo prueba).
+        let out = apply_changes(
+            apple,
+            &ContactPatch {
+                related: Change::Set(vec![relation("spouse", "Nueva")]),
+                ..Default::default()
+            },
+        );
+        // El grupo nuevo está por encima del máximo del crudo; la vieja se fue.
+        assert!(
+            out.contains("item4294967296.X-ABRELATEDNAMES:Nueva"),
+            "{out}"
+        );
+        assert!(!out.contains("Vieja"), "{out}");
+        // Y no reusó el mismo grupo que ya existía: no hay dos relaciones.
+        let c = contact_from(&out, "").unwrap();
+        assert_eq!(c.related.len(), 1);
+        assert_eq!(c.related[0].value, "Nueva");
+    }
+
+    /// **H3 (seguridad): una etiqueta con `;` no inyecta un parámetro.** Un
+    /// `label = "spouse;PREF=1"` escrito crudo partiría la línea `RELATED` en
+    /// `TYPE=spouse` más un parámetro `PREF=1` que la persona no puso.
+    #[test]
+    fn una_etiqueta_con_punto_y_coma_no_inyecta_un_parametro() {
+        let out = apply_changes(
+            CARD,
+            &ContactPatch {
+                related: Change::Set(vec![relation("spouse;PREF=1", "Marta")]),
+                ..Default::default()
+            },
+        );
+        assert!(!out.contains(";PREF"), "se inyectó un parámetro: {out}");
+        assert!(!out.contains("PREF=1"), "{out}");
+        // La relación se escribe igual, con la etiqueta saneada en un solo `TYPE`.
+        let c = contact_from(&out, "").unwrap();
+        assert_eq!(c.related.len(), 1);
+        assert_eq!(c.related[0].value, "Marta");
+    }
+
+    /// **H4 (seguridad): editar relaciones no deja residuo de la otra forma.**
+    /// Una tarjeta malformada con `RELATED` **y** la forma de Apple a la vez: al
+    /// editar, se reescribe `RELATED` y la línea de Apple con el nombre viejo
+    /// **no** queda como «desconocida» en la copia del servidor.
+    #[test]
+    fn editar_relaciones_no_deja_residuo_de_la_otra_forma() {
+        let both = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Ana\r\n\
+            RELATED;TYPE=spouse:Marta Vieja\r\n\
+            item1.X-ABRELATEDNAMES:Marta Apple\r\nitem1.X-ABLabel:_$!<Spouse>!$_\r\n\
+            END:VCARD\r\n";
+        let out = apply_changes(
+            both,
+            &ContactPatch {
+                related: Change::Set(vec![relation("spouse", "Marta Nueva")]),
+                ..Default::default()
+            },
+        );
+        assert!(out.contains("RELATED;TYPE=spouse:Marta Nueva"), "{out}");
+        assert!(
+            !out.contains("X-ABRELATEDNAMES"),
+            "quedó la forma de Apple: {out}"
+        );
+        assert!(!out.contains("Marta Apple"), "{out}");
+        assert!(!out.contains("Marta Vieja"), "{out}");
+        let c = contact_from(&out, "").unwrap();
+        assert_eq!(c.related.len(), 1);
+        assert_eq!(c.related[0].value, "Marta Nueva");
     }
 
     /// Las propiedades desconocidas no se pierden: una `PHOTO` y una `X-` salen
