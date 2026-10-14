@@ -284,6 +284,11 @@ impl Provider {
                 .into_iter()
                 .filter(|c| !Self::is_dav_capability(c))
                 .collect(),
+            // Graph se mide igual que OAuth2: la dirección sale de los
+            // `[endpoints]` del archivo, así que una capacidad con `[endpoints.<cap>]`
+            // está disponible y una sin él se muestra apagada. Para Microsoft eso
+            // da calendario y contactos (tienen dirección de Graph), correo (tiene
+            // los servidores de IMAP) y Drive apagado (no tiene dirección todavía).
             ProviderKind::GraphApi => self
                 .capabilities()
                 .into_iter()
@@ -581,7 +586,13 @@ impl UserCredentials {
     }
 }
 
-/// Uno solo, listo para empezar un flujo del tipo pedido.
+/// Uno solo, listo para empezar un flujo de alguno de los tipos aceptados.
+///
+/// Se pasan **todos** los tipos que ese camino sabe conectar, no uno solo: el
+/// flujo de navegador (`BeginAuth`/`CompleteAuth`) acepta `Oauth2` **y** `graph`,
+/// porque Graph es OAuth2 de Microsoft —mismo intercambio de código con PKCE—,
+/// sólo cambian los alcances y las direcciones. Nextcloud, CardDAV y LDAP tienen
+/// cada uno su propio camino y se resuelven con su único tipo.
 ///
 /// Todo se comprueba **antes** de abrir el navegador. Si no, la persona pasa por
 /// toda la pantalla de consentimiento del proveedor para que el fallo aparezca
@@ -589,14 +600,14 @@ impl UserCredentials {
 pub fn resolve(
     uid: u32,
     id: &str,
-    kind: ProviderKind,
+    accepted_kinds: &[ProviderKind],
     capabilities: &[CapabilityType],
 ) -> Result<Provider, CatalogError> {
     let proveedor = load_for(uid)?
         .remove(id)
         .ok_or_else(|| CatalogError::Unknown(id.to_string()))?;
 
-    if proveedor.kind != kind {
+    if !accepted_kinds.contains(&proveedor.kind) {
         return Err(CatalogError::WrongKind {
             provider: id.to_string(),
             esperado: match proveedor.kind {
@@ -1192,15 +1203,29 @@ mod tests {
                         "{id} no debería estar configurado sin dav_url"
                     );
                 }
-                // GraphApi no las tiene: la dirección la escribe la persona y
-                // no se sabe hasta ese momento.
+                // GraphApi se conecta por el flujo de navegador OAuth2, así que
+                // **sí** trae `auth_url` y `token_url` —son los de Microsoft— y
+                // tienen que ser https: por http entregaría el código de
+                // autorización en claro. Lo único que le falta en el paquete es el
+                // client_id, que va en /etc.
                 ProviderKind::GraphApi => {
-                    assert_eq!(proveedor.auth_url, None, "{id} no debería tener auth_url");
-                    assert_eq!(proveedor.token_url, None, "{id} no debería tener token_url");
-                    // GraphApi necesita client_id, auth_url y token_url para estar configurado
+                    for (nombre, url) in [
+                        ("auth_url", &proveedor.auth_url),
+                        ("token_url", &proveedor.token_url),
+                    ] {
+                        let url = url
+                            .as_deref()
+                            .unwrap_or_else(|| panic!("{id} no tiene {nombre}"));
+                        assert!(
+                            url.starts_with("https://"),
+                            "{id}: {nombre}={url} no es https"
+                        );
+                    }
+                    // Sin client_id, el paquete no lo trae: no está configurado
+                    // hasta que alguien deje el suyo en /etc.
                     assert!(
                         !proveedor.is_configured(),
-                        "{id} no debería estar configurado sin client_id, auth_url y token_url"
+                        "{id} no debería estar configurado sin client_id"
                     );
                 }
                 // Ldap no las tiene: la dirección la escribe la persona y
@@ -1262,21 +1287,15 @@ mod tests {
     /// se saque de la tabla en vez de quedar como recuerdo de algo que ya anda.
     #[test]
     fn cada_capacidad_dice_donde_vive() {
-        const SIN_DIRECCION: [(&str, CapabilityType); 5] = [
+        const SIN_DIRECCION: [(&str, CapabilityType); 2] = [
             // Google Drive no habla WebDAV, que es por donde monta el gestor de
             // archivos. Ver Vasak-OS/vasak-file-manager#95.
             ("google", CapabilityType::Drive),
-            // Microsoft no expone CalDAV ni CardDAV: todo pasa por Graph, que es
-            // otra integración y todavía no existe.
-            ("microsoft", CapabilityType::Calendar),
-            ("microsoft", CapabilityType::Contacts),
+            // Microsoft OneDrive por Graph (Files) queda fuera de M4: la capacidad
+            // se ofrece pero no tiene dirección todavía, así que se muestra
+            // apagada hasta que la reciba. El resto de Microsoft ya está cableado:
+            // calendario y contactos por Graph, correo por IMAP.
             ("microsoft", CapabilityType::Drive),
-            // Y su correo está declarado con alcances de Graph —`Mail.ReadWrite`,
-            // `Mail.Send`— mientras el sincronizador habla IMAP con XOAUTH2. Para
-            // IMAP hacen falta otros (`IMAP.AccessAsUser.All`, `SMTP.Send`), así
-            // que poner acá los servidores de Outlook no alcanzaría: hay que
-            // elegir uno de los dos caminos y eso no se decide de paso.
-            ("microsoft", CapabilityType::Email),
         ];
 
         let directorio =
@@ -1700,6 +1719,206 @@ mod tests {
                 capacidad.as_id(),
             );
         }
+    }
+
+    /// Microsoft es `kind=graph` y una cuenta suya **se puede conectar**.
+    ///
+    /// Antes era `oauth2` sin ningún `[endpoints]`, así que todas sus capacidades
+    /// salían «no disponible» y `filter_available` devolvía `NoneAvailable`: la
+    /// cuenta no se conectaba nunca. Con Graph cableado, calendario, contactos y
+    /// correo quedan disponibles y Drive apagado.
+    #[test]
+    fn una_cuenta_de_microsoft_se_puede_conectar() {
+        let directorio =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/providers.d");
+        let microsoft = &cargar(&directorio)["microsoft"];
+
+        assert_eq!(
+            microsoft.kind,
+            ProviderKind::GraphApi,
+            "Microsoft tiene que ser graph: así los contactos van al backend de \
+             Graph y no a CardDAV"
+        );
+
+        // Drive es lo único apagado; el resto tiene dirección.
+        assert_eq!(
+            microsoft.unavailable_capabilities(),
+            vec![CapabilityType::Drive]
+        );
+
+        // Pedir todo lo que la pantalla ofrece ya **no** es NoneAvailable: se
+        // conecta con calendario, contactos y correo, y se descarta Drive.
+        let filtrado = microsoft
+            .filter_available(&[
+                CapabilityType::Email,
+                CapabilityType::Calendar,
+                CapabilityType::Contacts,
+                CapabilityType::Drive,
+            ])
+            .expect("una cuenta de Microsoft tiene que poder conectarse");
+        assert_eq!(
+            filtrado.available,
+            vec![
+                CapabilityType::Email,
+                CapabilityType::Calendar,
+                CapabilityType::Contacts,
+            ]
+        );
+        assert_eq!(filtrado.discarded, vec![CapabilityType::Drive]);
+    }
+
+    /// El correo de Microsoft va por **IMAP+XOAUTH2**, no por Graph.
+    ///
+    /// Los alcances tienen que ser los de `outlook.office.com`
+    /// (`IMAP.AccessAsUser.All` + `SMTP.Send`), que son los que sirven para IMAP,
+    /// y **no** los de Graph mail (`Mail.ReadWrite` / `Mail.Send`), que no sirven.
+    /// Y la capacidad queda disponible por el camino IMAP de siempre: el endpoint
+    /// guarda los servidores de Outlook, igual que el de Google, no una dirección
+    /// de Graph.
+    #[test]
+    fn el_correo_de_microsoft_va_por_imap() {
+        let directorio =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/providers.d");
+        let microsoft = &cargar(&directorio)["microsoft"];
+
+        let alcances = &microsoft.scopes[&CapabilityType::Email];
+        assert!(
+            alcances
+                .iter()
+                .any(|a| a == "https://outlook.office.com/IMAP.AccessAsUser.All"),
+            "el correo no pide el alcance de IMAP: {alcances:?}"
+        );
+        assert!(
+            alcances
+                .iter()
+                .any(|a| a == "https://outlook.office.com/SMTP.Send"),
+            "el correo no pide el alcance de SMTP: {alcances:?}"
+        );
+        // Y nada de Graph mail: esos no autentican contra IMAP.
+        assert!(
+            !alcances
+                .iter()
+                .any(|a| a.contains("graph.microsoft.com/Mail")),
+            "el correo todavía pide alcances de Graph mail: {alcances:?}"
+        );
+
+        // La capacidad vive en IMAP, no en Graph: el endpoint son los servidores.
+        let correo = &microsoft.endpoints[&CapabilityType::Email];
+        assert_eq!(
+            correo.get("imap_server"),
+            Some(&EndpointValue::Text("outlook.office365.com".into()))
+        );
+        assert_eq!(correo.get("imap_port"), Some(&EndpointValue::Number(993)));
+        assert_eq!(
+            correo.get("smtp_server"),
+            Some(&EndpointValue::Text("smtp.office365.com".into()))
+        );
+        assert_eq!(correo.get("smtp_port"), Some(&EndpointValue::Number(587)));
+        // Sin `url` de Graph: el correo no se habla por Graph.
+        assert!(
+            correo.get("url").is_none(),
+            "el correo tiene una dirección de Graph y tendría que ir por IMAP: {correo:?}"
+        );
+    }
+
+    /// Calendario y contactos de Microsoft viven en Graph (lectura disponible),
+    /// y Drive queda apagado por no tener dirección.
+    #[test]
+    fn el_calendario_y_los_contactos_de_microsoft_viven_en_graph() {
+        let directorio =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/providers.d");
+        let microsoft = &cargar(&directorio)["microsoft"];
+
+        for capacidad in [CapabilityType::Calendar, CapabilityType::Contacts] {
+            let Some(EndpointValue::Text(url)) = microsoft.endpoints[&capacidad].get("url") else {
+                panic!("{} no dice dónde vive en Graph", capacidad.as_id());
+            };
+            assert!(
+                url.starts_with("https://graph.microsoft.com/"),
+                "{} no apunta a Graph: {url}",
+                capacidad.as_id()
+            );
+        }
+
+        // Drive no tiene dirección: OneDrive por Graph queda fuera de M4.
+        assert!(
+            !microsoft.endpoints.contains_key(&CapabilityType::Drive),
+            "Drive tiene dirección y debería estar apagado en M4"
+        );
+    }
+
+    /// Contactos pide `People.Read`, que es lo que el backend de Graph usa contra
+    /// la People API (`/me/people`). Con `Contacts.ReadWrite` la sincronización
+    /// recibiría 403.
+    #[test]
+    fn los_contactos_de_microsoft_piden_la_people_api() {
+        let directorio =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/providers.d");
+        let microsoft = &cargar(&directorio)["microsoft"];
+
+        let alcances = &microsoft.scopes[&CapabilityType::Contacts];
+        assert!(
+            alcances
+                .iter()
+                .any(|a| a == "https://graph.microsoft.com/People.Read"),
+            "contactos no pide People.Read, que es lo que usa el backend: {alcances:?}"
+        );
+    }
+
+    /// El correo y el calendario/contactos de Microsoft son **recursos OAuth
+    /// distintos**, y esto tiene que quedar escrito.
+    ///
+    /// Microsoft emite un access_token **por recurso**: uno vale para
+    /// `outlook.office.com` (IMAP) o para `graph.microsoft.com`, nunca para los
+    /// dos a la vez. Como el correo pide alcances de `outlook.office.com` y el
+    /// calendario/contactos de `graph.microsoft.com`, **un único token por cuenta
+    /// no alcanza para ambos**: P3/P4 va a tener que adquirir un token por recurso
+    /// usando el refresh_token de `offline_access`. Esta guarda falla si alguien
+    /// mueve el correo a Graph (o el calendario a Outlook) y hace que los hosts se
+    /// pisen, borrando sin querer esa invariante.
+    #[test]
+    fn el_correo_y_el_calendario_de_microsoft_son_recursos_oauth_distintos() {
+        let directorio =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/providers.d");
+        let microsoft = &cargar(&directorio)["microsoft"];
+
+        // Los hosts de recurso de una capacidad: el host de cada alcance que sea
+        // una URL. `offline_access` no es URL y se descarta sin romper.
+        let hosts = |capacidad: &CapabilityType| -> std::collections::BTreeSet<String> {
+            microsoft.scopes[capacidad]
+                .iter()
+                .filter_map(|alcance| url::Url::parse(alcance).ok())
+                .filter_map(|u| u.host_str().map(str::to_string))
+                .collect()
+        };
+
+        let correo = hosts(&CapabilityType::Email);
+        let calendario = hosts(&CapabilityType::Calendar);
+        let contactos = hosts(&CapabilityType::Contacts);
+
+        assert!(
+            correo.contains("outlook.office.com"),
+            "el correo no pide alcances de outlook.office.com: {correo:?}"
+        );
+        assert!(
+            calendario.contains("graph.microsoft.com"),
+            "el calendario no pide alcances de graph.microsoft.com: {calendario:?}"
+        );
+        assert!(
+            contactos.contains("graph.microsoft.com"),
+            "los contactos no piden alcances de graph.microsoft.com: {contactos:?}"
+        );
+
+        // Y no comparten ningún host de recurso: el token de uno no sirve para el
+        // otro, así que un solo token por cuenta no puede cubrir a los dos.
+        let graph: std::collections::BTreeSet<String> =
+            calendario.union(&contactos).cloned().collect();
+        assert!(
+            correo.is_disjoint(&graph),
+            "el correo y el calendario/contactos comparten host de recurso \
+             ({correo:?} vs {graph:?}); un token por cuenta no puede cubrir ambos \
+             recursos, y P3/P4 depende de que sean distintos"
+        );
     }
 
     #[test]
