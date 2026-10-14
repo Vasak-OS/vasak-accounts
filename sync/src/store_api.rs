@@ -3564,6 +3564,782 @@ mod tests {
         assert_eq!(source.next_after(horizon).await, None);
     }
 
+    // ── La superficie de escritura que encola (M2, vasak-accounts#88) ─────────
+    //
+    // Las cuatro escrituras —`PutEvent`, `DeleteEvent`, `PutContact`,
+    // `DeleteContact`— por el bus, con el `vasak-permissions` falso y la base de
+    // verdad: autorizan antes de actuar, validan antes de tocar nada, no cruzan
+    // de colección, escapan lo que les mandan, encolan la op correcta, respetan
+    // el cupo por llamante y no filtran el cuerpo en el error.
+
+    use crate::store::calendar::CalendarRoom;
+    use crate::store::queue::{PendingKind, PendingOp};
+
+    /// Una cuenta con calendario **y** contactos, para ejercer las cuatro
+    /// escrituras sobre la misma cuenta.
+    fn with_both(id: &str) -> broker::Account {
+        let mut account = with_calendar(id, "Trabajo");
+        account.capabilities.push("contacts".into());
+        account
+    }
+
+    /// El texto del error de D-Bus, para comprobar que es el fijo y que **no**
+    /// lleva un pedazo del cuerpo que se mandó.
+    fn error_message<T>(result: &zbus::Result<T>) -> String {
+        match result {
+            Err(zbus::Error::MethodError(_, message, _)) => message.clone().unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
+    /// Las ops pendientes de un área, tal como están en la base.
+    async fn pending_ops_of(api: &Api, account: &str, area: &'static str) -> Vec<PendingOp> {
+        api.manager
+            .read_store(account, move |store| store.pending_ops(area))
+            .await
+            .unwrap()
+    }
+
+    /// Cuántas ops pendientes tiene un área.
+    async fn pending_count_of(api: &Api, account: &str, area: &'static str) -> i64 {
+        api.manager
+            .read_store(account, move |store| store.pending_count(area))
+            .await
+            .unwrap()
+    }
+
+    /// Un espectador de la señal `Changed` del objeto.
+    async fn changed_stream(client: &zbus::Connection) -> zbus::MessageStream {
+        let rule = zbus::MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .interface(IFACE)
+            .unwrap()
+            .member("Changed")
+            .unwrap()
+            .build();
+        zbus::MessageStream::for_match_rule(rule, client, None)
+            .await
+            .unwrap()
+    }
+
+    /// **Con el permiso en «no», ninguna de las cuatro escrituras actúa**:
+    /// contestan `AccessDenied`, no encolan nada, no avisan por `Changed` y no
+    /// encienden el área. La autorización va antes de encolar.
+    #[tokio::test]
+    async fn ninguna_escritura_actua_sin_permiso() {
+        let mut api = Api::new("api-write-deny", vec![with_both("cuenta")], Answer::Deny).await;
+        // La base ya tiene un calendario y una libreta: si una escritura
+        // actuara pese al «no», la cola dejaría de estar vacía.
+        let (cal_id, book_id) = api
+            .manager
+            .with_store("cuenta", |store| {
+                let cal = calendar(store, "https://x/a/");
+                let book = store
+                    .upsert_address_books(&[("https://x/b/".into(), "Personal".into())])?
+                    .remove(0);
+                Ok((cal.id, book.id))
+            })
+            .await
+            .unwrap();
+        let (client, service) = api.client(":1.7").await;
+        service.forward_changes(None);
+        let mut signals = changed_stream(&client).await;
+
+        let denied = [
+            (
+                "PutEvent",
+                call(
+                    &client,
+                    "PutEvent",
+                    &("cuenta", cal_id.to_string(), "{\"summary\":\"x\"}", ""),
+                )
+                .await,
+            ),
+            (
+                "DeleteEvent",
+                call(&client, "DeleteEvent", &("cuenta", "1", "")).await,
+            ),
+            (
+                "PutContact",
+                call(
+                    &client,
+                    "PutContact",
+                    &("cuenta", book_id.to_string(), "{\"full_name\":\"x\"}", ""),
+                )
+                .await,
+            ),
+            (
+                "DeleteContact",
+                call(&client, "DeleteContact", &("cuenta", "1", "")).await,
+            ),
+        ];
+        for (method, result) in &denied {
+            assert_eq!(error_name(result), ACCESS_DENIED, "{method} sin permiso");
+        }
+
+        assert_eq!(pending_count_of(&api, "cuenta", CALENDAR_AREA).await, 0);
+        assert_eq!(pending_count_of(&api, "cuenta", CONTACTS_AREA).await, 0);
+        assert!(!api.settings().is_active("cuenta", CALENDAR_AREA));
+        assert!(!api.settings().is_active("cuenta", CONTACTS_AREA));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), signals.next())
+                .await
+                .is_err(),
+            "una escritura negada no avisa por Changed"
+        );
+    }
+
+    /// **La validación de los identificadores va antes del permiso y de la
+    /// base**: con un `account_id` con barra y con uno bien formado pero
+    /// inexistente, `PutEvent` contesta `InvalidArgs` sin preguntar por el
+    /// permiso y sin abrir ninguna base nueva.
+    #[tokio::test]
+    async fn la_validacion_va_antes_del_permiso_y_de_la_base() {
+        let mut api = Api::new(
+            "api-write-validate",
+            vec![with_both("cuenta")],
+            Answer::Allow,
+        )
+        .await;
+        let (client, _service) = api.client(":1.7").await;
+        let opened_before = api.keys.state().stored.len();
+
+        for account in ["../x", "desconocida"] {
+            let result = call(
+                &client,
+                "PutEvent",
+                &(account, "1", "{\"summary\":\"x\"}", ""),
+            )
+            .await;
+            assert_eq!(error_name(&result), INVALID_ARGS, "cuenta {account:?}");
+        }
+
+        assert_eq!(
+            api.access.permissions.calls(),
+            0,
+            "no se preguntó por ningún permiso"
+        );
+        assert_eq!(
+            api.keys.state().stored.len(),
+            opened_before,
+            "no se abrió ninguna base para esos identificadores"
+        );
+    }
+
+    /// **Una escritura no cruza de colección.** Editar un evento de un
+    /// calendario diciendo que es de otro, o borrar «un evento» que en realidad
+    /// es un contacto, se rechaza; y lo mismo del lado de los contactos. Nada de
+    /// esto encola una op.
+    #[tokio::test]
+    async fn una_escritura_no_cruza_de_coleccion() {
+        let mut api = Api::new(
+            "api-write-iso",
+            vec![with_both("ev"), with_both("con")],
+            Answer::Allow,
+        )
+        .await;
+
+        // Cuenta «ev»: dos calendarios con un evento en el A, y dos contactos
+        // —así hay un id de contacto (el segundo) que no es de ningún evento—.
+        let (cal_b, event_id, a_contact_id) = api
+            .manager
+            .with_store("ev", |store| {
+                let a = calendar(store, "https://x/ea/");
+                let b = calendar(store, "https://x/eb/");
+                let w = window();
+                let raw = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:ev1\r\n\
+                           SUMMARY:Uno\r\nDTSTART:20260915T120000Z\r\n\
+                           END:VEVENT\r\nEND:VCALENDAR\r\n";
+                store.apply_calendar_objects(
+                    &a,
+                    &[ObjectOp::Upsert(object("https://x/ea/1.ics", raw, w))],
+                    w,
+                    None,
+                    CalendarRoom::UNLIMITED,
+                )?;
+                let event_id = store
+                    .object_id_by_href(a.id, "https://x/ea/1.ics")?
+                    .unwrap();
+                let book = store
+                    .upsert_address_books(&[("https://x/ebk/".into(), "Personal".into())])?
+                    .remove(0);
+                store.apply_contacts(
+                    &book,
+                    &[
+                        ContactOp::Upsert(row("https://x/ebk/1.vcf", "Ana", "a@x.com")),
+                        ContactOp::Upsert(row("https://x/ebk/2.vcf", "Beto", "b@x.com")),
+                    ],
+                    None,
+                    u64::MAX,
+                )?;
+                let a_contact_id = store
+                    .contact_id_by_href(book.id, "https://x/ebk/2.vcf")?
+                    .unwrap();
+                Ok((b.id, event_id, a_contact_id))
+            })
+            .await
+            .unwrap();
+
+        // Cuenta «con»: dos libretas con un contacto en la A, y dos eventos
+        // —así hay un id de evento (el segundo) que no es de ningún contacto—.
+        let (book_b, contact_id, an_event_id) = api
+            .manager
+            .with_store("con", |store| {
+                let a = store
+                    .upsert_address_books(&[("https://x/ca/".into(), "A".into())])?
+                    .remove(0);
+                let b = store
+                    .upsert_address_books(&[("https://x/cb/".into(), "B".into())])?
+                    .remove(0);
+                store.apply_contacts(
+                    &a,
+                    &[ContactOp::Upsert(row(
+                        "https://x/ca/1.vcf",
+                        "Cora",
+                        "c@x.com",
+                    ))],
+                    None,
+                    u64::MAX,
+                )?;
+                let contact_id = store
+                    .contact_id_by_href(a.id, "https://x/ca/1.vcf")?
+                    .unwrap();
+                let cal = calendar(store, "https://x/cc/");
+                let w = window();
+                let event = |uid: &str| {
+                    format!(
+                        "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:{uid}\r\n\
+                         SUMMARY:{uid}\r\nDTSTART:20260915T120000Z\r\n\
+                         END:VEVENT\r\nEND:VCALENDAR\r\n"
+                    )
+                };
+                store.apply_calendar_objects(
+                    &cal,
+                    &[
+                        ObjectOp::Upsert(object("https://x/cc/1.ics", &event("c1"), w)),
+                        ObjectOp::Upsert(object("https://x/cc/2.ics", &event("c2"), w)),
+                    ],
+                    w,
+                    None,
+                    CalendarRoom::UNLIMITED,
+                )?;
+                let an_event_id = store
+                    .object_id_by_href(cal.id, "https://x/cc/2.ics")?
+                    .unwrap();
+                Ok((b.id, contact_id, an_event_id))
+            })
+            .await
+            .unwrap();
+
+        let (client, _service) = api.client(":1.7").await;
+
+        // Editar el evento del calendario A diciendo que es del B: rechazado.
+        let payload = format!("{{\"id\":{event_id},\"summary\":\"x\"}}");
+        let result = call(
+            &client,
+            "PutEvent",
+            &("ev", cal_b.to_string(), payload.as_str(), "\"1\""),
+        )
+        .await;
+        assert_eq!(error_name(&result), INVALID_ARGS);
+        assert!(
+            error_message(&result).contains("no es de ese calendario"),
+            "{}",
+            error_message(&result)
+        );
+
+        // Borrar «un evento» cuyo id es el de un contacto: no existe.
+        let result = call(
+            &client,
+            "DeleteEvent",
+            &("ev", a_contact_id.to_string(), ""),
+        )
+        .await;
+        assert_eq!(error_name(&result), INVALID_ARGS);
+        assert!(
+            error_message(&result).contains("el evento no existe"),
+            "{}",
+            error_message(&result)
+        );
+
+        // Lo mismo del lado de los contactos.
+        let payload = format!("{{\"id\":{contact_id},\"full_name\":\"x\"}}");
+        let result = call(
+            &client,
+            "PutContact",
+            &("con", book_b.to_string(), payload.as_str(), "\"1\""),
+        )
+        .await;
+        assert_eq!(error_name(&result), INVALID_ARGS);
+        assert!(
+            error_message(&result).contains("no es de esa libreta"),
+            "{}",
+            error_message(&result)
+        );
+
+        let result = call(
+            &client,
+            "DeleteContact",
+            &("con", an_event_id.to_string(), ""),
+        )
+        .await;
+        assert_eq!(error_name(&result), INVALID_ARGS);
+        assert!(
+            error_message(&result).contains("el contacto no existe"),
+            "{}",
+            error_message(&result)
+        );
+
+        assert_eq!(pending_count_of(&api, "ev", CALENDAR_AREA).await, 0);
+        assert_eq!(pending_count_of(&api, "con", CONTACTS_AREA).await, 0);
+    }
+
+    /// **Lo que se escribe no inyecta una línea nueva.** Un `SUMMARY` con un
+    /// salto de línea y un `DTSTART` pegado queda escapado dentro del valor, sin
+    /// una propiedad `DTSTART` nueva; y en la vCard el `NOTE` y el valor de una
+    /// relación quedan escapados, y la etiqueta se sanea sin meter un parámetro
+    /// ni una línea.
+    #[tokio::test]
+    async fn una_escritura_no_inyecta_lineas() {
+        let mut api = Api::new("api-write-inject", vec![with_both("cuenta")], Answer::Allow).await;
+        let (cal_id, book_id) = api
+            .manager
+            .with_store("cuenta", |store| {
+                let cal = calendar(store, "https://x/a/");
+                let book = store
+                    .upsert_address_books(&[("https://x/b/".into(), "Personal".into())])?
+                    .remove(0);
+                Ok((cal.id, book.id))
+            })
+            .await
+            .unwrap();
+        let (client, _service) = api.client(":1.7").await;
+
+        // iCal: un SUMMARY que intenta abrir un DTSTART con un salto de línea.
+        let payload = serde_json::json!({ "summary": "X\r\nDTSTART:19990101T000000Z" }).to_string();
+        call(
+            &client,
+            "PutEvent",
+            &("cuenta", cal_id.to_string(), payload.as_str(), ""),
+        )
+        .await
+        .unwrap();
+        let ops = pending_ops_of(&api, "cuenta", CALENDAR_AREA).await;
+        let ical = String::from_utf8(ops[0].payload.clone().unwrap()).unwrap();
+        assert!(
+            ical.contains(r"SUMMARY:X\nDTSTART:19990101T000000Z"),
+            "el salto no quedó escapado dentro del SUMMARY:\n{ical}"
+        );
+        assert!(
+            !ical.contains("\r\nDTSTART:19990101"),
+            "se inyectó una propiedad DTSTART:\n{ical}"
+        );
+
+        // vCard: NOTE y el valor de la relación con saltos, y una etiqueta con
+        // «;TYPE=x:» que intentaría meter un parámetro.
+        let payload = serde_json::json!({
+            "full_name": "Zeta",
+            "note": "linea1\nlinea2",
+            "related": [{ "label": ";TYPE=x:", "value": "otro\npegado" }]
+        })
+        .to_string();
+        call(
+            &client,
+            "PutContact",
+            &("cuenta", book_id.to_string(), payload.as_str(), ""),
+        )
+        .await
+        .unwrap();
+        let ops = pending_ops_of(&api, "cuenta", CONTACTS_AREA).await;
+        let vcard = String::from_utf8(ops[0].payload.clone().unwrap()).unwrap();
+        assert!(
+            vcard.contains(r"NOTE:linea1\nlinea2"),
+            "la nota no quedó escapada:\n{vcard}"
+        );
+        assert!(
+            vcard.contains(r"otro\npegado"),
+            "el valor de la relación no quedó escapado:\n{vcard}"
+        );
+        assert!(
+            !vcard.contains(";TYPE=x:"),
+            "la etiqueta cruda sobrevivió, con «;», «=» y «:»:\n{vcard}"
+        );
+        assert!(
+            !vcard.contains("\r\npegado"),
+            "el valor inyectó una línea nueva:\n{vcard}"
+        );
+    }
+
+    /// **La cola guarda la op correcta.** `put` al crear encola un `Put` sin
+    /// precondición (`base_etag = None`); `put` al editar, un `Put` con el
+    /// `if_match` de precondición; `delete` marca la fila guardada y suma un
+    /// `Delete`. Cada lote avisa por `Changed(area, cuenta, generación)`.
+    #[tokio::test]
+    async fn la_cola_guarda_crear_editar_y_borrar() {
+        let mut api = Api::new(
+            "api-write-queue",
+            vec![with_calendar("cuenta", "Trabajo")],
+            Answer::Allow,
+        )
+        .await;
+        let (cal_id, e1_href, e1_id, e2_href, e2_id) = api
+            .manager
+            .with_store("cuenta", |store| {
+                let cal = calendar(store, "https://x/a/");
+                let w = window();
+                let event = |uid: &str| {
+                    format!(
+                        "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:{uid}\r\n\
+                         SUMMARY:{uid}\r\nDTSTART:20260915T120000Z\r\n\
+                         END:VEVENT\r\nEND:VCALENDAR\r\n"
+                    )
+                };
+                store.apply_calendar_objects(
+                    &cal,
+                    &[
+                        ObjectOp::Upsert(object("https://x/a/e1.ics", &event("e1"), w)),
+                        ObjectOp::Upsert(object("https://x/a/e2.ics", &event("e2"), w)),
+                    ],
+                    w,
+                    None,
+                    CalendarRoom::UNLIMITED,
+                )?;
+                let e1 = store
+                    .object_id_by_href(cal.id, "https://x/a/e1.ics")?
+                    .unwrap();
+                let e2 = store
+                    .object_id_by_href(cal.id, "https://x/a/e2.ics")?
+                    .unwrap();
+                Ok((
+                    cal.id,
+                    "https://x/a/e1.ics".to_string(),
+                    e1,
+                    "https://x/a/e2.ics".to_string(),
+                    e2,
+                ))
+            })
+            .await
+            .unwrap();
+
+        let (client, service) = api.client(":1.7").await;
+        service.forward_changes(None);
+        let mut signals = changed_stream(&client).await;
+
+        // Crear: un `Put` sin precondición, para un href que no es ni e1 ni e2.
+        call(
+            &client,
+            "PutEvent",
+            &("cuenta", cal_id.to_string(), "{\"summary\":\"Nuevo\"}", ""),
+        )
+        .await
+        .unwrap();
+        let (area, account_id, _) = next_changed(&mut signals).await;
+        assert_eq!((area.as_str(), account_id.as_str()), ("calendar", "cuenta"));
+        let ops = pending_ops_of(&api, "cuenta", CALENDAR_AREA).await;
+        let created = ops
+            .iter()
+            .find(|op| op.object_href != e1_href && op.object_href != e2_href)
+            .expect("la creación encoló una op");
+        assert_eq!(created.kind, PendingKind::Put);
+        assert_eq!(created.base_etag, None, "crear va sin precondición");
+
+        // Editar e1: un `Put` con el `if_match` de precondición. El parche toca
+        // `summary`, saca `description` con `null` y fija una fecha con
+        // parámetros —así se ejercen las tres formas del parche de texto y de
+        // fecha—.
+        let payload = format!(
+            "{{\"id\":{e1_id},\"summary\":\"Editado\",\"description\":null,\
+               \"start\":{{\"value\":\"20270101T120000\",\"params\":[\"TZID=Europe/Madrid\"]}}}}"
+        );
+        call(
+            &client,
+            "PutEvent",
+            &(
+                "cuenta",
+                cal_id.to_string(),
+                payload.as_str(),
+                "\"etag-e1\"",
+            ),
+        )
+        .await
+        .unwrap();
+        next_changed(&mut signals).await;
+        let ops = pending_ops_of(&api, "cuenta", CALENDAR_AREA).await;
+        let edited = ops
+            .iter()
+            .find(|op| op.object_href == e1_href)
+            .expect("la edición encoló una op");
+        assert_eq!(edited.kind, PendingKind::Put);
+        assert_eq!(edited.base_etag.as_deref(), Some("\"etag-e1\""));
+        let ical = String::from_utf8(edited.payload.clone().unwrap()).unwrap();
+        assert!(
+            ical.contains("DTSTART;TZID=Europe/Madrid:20270101T120000"),
+            "la fecha con parámetros no se escribió:\n{ical}"
+        );
+
+        // Borrar e2: un `Delete`, y la fila guardada marcada «delete».
+        call(
+            &client,
+            "DeleteEvent",
+            &("cuenta", e2_id.to_string(), "\"etag-e2\""),
+        )
+        .await
+        .unwrap();
+        next_changed(&mut signals).await;
+        let ops = pending_ops_of(&api, "cuenta", CALENDAR_AREA).await;
+        let deleted = ops
+            .iter()
+            .find(|op| op.object_href == e2_href)
+            .expect("el borrado encoló una op");
+        assert_eq!(deleted.kind, PendingKind::Delete);
+        let marked: Option<String> = api
+            .manager
+            .read_store("cuenta", move |store| {
+                Ok(store
+                    .connection()
+                    .query_row(
+                        "SELECT pending_op FROM calendar_objects WHERE id = ?1",
+                        rusqlite::params![e2_id],
+                        |r| r.get::<_, Option<String>>(0),
+                    )
+                    .unwrap())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            marked.as_deref(),
+            Some("delete"),
+            "la fila del borrado tiene que quedar marcada hasta confirmar"
+        );
+    }
+
+    /// Lo mismo del lado de los contactos: `PutContact` crea (un `Put` sin
+    /// precondición) y edita (un `Put` con precondición, sacando un campo con
+    /// `null` y fijando una relación), y `DeleteContact` marca la fila y suma un
+    /// `Delete`. Cubre las dos ramas de `put_contact_in_store` y el camino feliz
+    /// de `delete_contact`.
+    #[tokio::test]
+    async fn la_cola_de_contactos_guarda_crear_editar_y_borrar() {
+        let mut api = Api::new(
+            "api-write-queue-contacts",
+            vec![with_contacts("cuenta")],
+            Answer::Allow,
+        )
+        .await;
+        let (book_id, c1_href, c1_id, c2_href, c2_id) = api
+            .manager
+            .with_store("cuenta", |store| {
+                let book = store
+                    .upsert_address_books(&[("https://x/a/".into(), "Personal".into())])?
+                    .remove(0);
+                store.apply_contacts(
+                    &book,
+                    &[
+                        ContactOp::Upsert(row("https://x/a/c1.vcf", "Ana", "ana@x.com")),
+                        ContactOp::Upsert(row("https://x/a/c2.vcf", "Beto", "beto@x.com")),
+                    ],
+                    None,
+                    u64::MAX,
+                )?;
+                let c1 = store
+                    .contact_id_by_href(book.id, "https://x/a/c1.vcf")?
+                    .unwrap();
+                let c2 = store
+                    .contact_id_by_href(book.id, "https://x/a/c2.vcf")?
+                    .unwrap();
+                Ok((
+                    book.id,
+                    "https://x/a/c1.vcf".to_string(),
+                    c1,
+                    "https://x/a/c2.vcf".to_string(),
+                    c2,
+                ))
+            })
+            .await
+            .unwrap();
+
+        let (client, _service) = api.client(":1.7").await;
+
+        // Crear: un `Put` sin precondición, para un href nuevo.
+        call(
+            &client,
+            "PutContact",
+            &(
+                "cuenta",
+                book_id.to_string(),
+                "{\"full_name\":\"Nuevo\"}",
+                "",
+            ),
+        )
+        .await
+        .unwrap();
+        let ops = pending_ops_of(&api, "cuenta", CONTACTS_AREA).await;
+        let created = ops
+            .iter()
+            .find(|op| op.object_href != c1_href && op.object_href != c2_href)
+            .expect("la creación encoló una op");
+        assert_eq!(created.kind, PendingKind::Put);
+        assert_eq!(created.base_etag, None, "crear va sin precondición");
+
+        // Editar c1: `Put` con precondición; «note» en `null` se saca y
+        // «related» se fija.
+        let payload = format!(
+            "{{\"id\":{c1_id},\"full_name\":\"Ana María\",\"note\":null,\
+               \"related\":[{{\"label\":\"spouse\",\"value\":\"Juan\"}}]}}"
+        );
+        call(
+            &client,
+            "PutContact",
+            &(
+                "cuenta",
+                book_id.to_string(),
+                payload.as_str(),
+                "\"etag-c1\"",
+            ),
+        )
+        .await
+        .unwrap();
+        let ops = pending_ops_of(&api, "cuenta", CONTACTS_AREA).await;
+        let edited = ops
+            .iter()
+            .find(|op| op.object_href == c1_href)
+            .expect("la edición encoló una op");
+        assert_eq!(edited.kind, PendingKind::Put);
+        assert_eq!(edited.base_etag.as_deref(), Some("\"etag-c1\""));
+        let vcard = String::from_utf8(edited.payload.clone().unwrap()).unwrap();
+        assert!(
+            vcard.contains("RELATED;TYPE=spouse:Juan"),
+            "la relación no se escribió:\n{vcard}"
+        );
+
+        // Borrar c2: un `Delete`, y la fila guardada marcada «delete».
+        call(
+            &client,
+            "DeleteContact",
+            &("cuenta", c2_id.to_string(), "\"etag-c2\""),
+        )
+        .await
+        .unwrap();
+        let ops = pending_ops_of(&api, "cuenta", CONTACTS_AREA).await;
+        let deleted = ops
+            .iter()
+            .find(|op| op.object_href == c2_href)
+            .expect("el borrado encoló una op");
+        assert_eq!(deleted.kind, PendingKind::Delete);
+        let marked: Option<String> = api
+            .manager
+            .read_store("cuenta", move |store| {
+                Ok(store
+                    .connection()
+                    .query_row(
+                        "SELECT pending_op FROM contacts WHERE id = ?1",
+                        rusqlite::params![c2_id],
+                        |r| r.get::<_, Option<String>>(0),
+                    )
+                    .unwrap())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            marked.as_deref(),
+            Some("delete"),
+            "la fila del borrado tiene que quedar marcada hasta confirmar"
+        );
+    }
+
+    /// **El cupo de escritura por llamante corta la ráfaga.** `WRITE_BURST`
+    /// escrituras de un mismo nombre único sobre una cuenta pasan; la siguiente
+    /// contesta `LimitsExceeded`. Las que pasaron quedaron encoladas.
+    #[tokio::test]
+    async fn el_cupo_de_escritura_corta_la_rafaga_del_llamante() {
+        let mut api = Api::new(
+            "api-write-burst",
+            vec![with_calendar("cuenta", "Trabajo")],
+            Answer::Allow,
+        )
+        .await;
+        let cal_id = api
+            .manager
+            .with_store("cuenta", |store| Ok(calendar(store, "https://x/a/").id))
+            .await
+            .unwrap();
+        let (client, _service) = api.client(":1.7").await;
+
+        for n in 0..access::WRITE_BURST {
+            let payload = format!("{{\"summary\":\"n{n}\"}}");
+            call(
+                &client,
+                "PutEvent",
+                &("cuenta", cal_id.to_string(), payload.as_str(), ""),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("la escritura {n} tenía que pasar: {e}"));
+        }
+        let result = call(
+            &client,
+            "PutEvent",
+            &(
+                "cuenta",
+                cal_id.to_string(),
+                "{\"summary\":\"una de mas\"}",
+                "",
+            ),
+        )
+        .await;
+        assert_eq!(error_name(&result), LIMITS_EXCEEDED);
+        assert_eq!(
+            pending_count_of(&api, "cuenta", CALENDAR_AREA).await,
+            access::WRITE_BURST as i64,
+            "las que pasaron quedaron encoladas; la de más no"
+        );
+    }
+
+    /// **Un error de una escritura no filtra el cuerpo.** Un JSON roto, un JSON
+    /// que no es un objeto y una fecha mal formada contestan `InvalidArgs` con
+    /// un texto fijo que no lleva ningún pedazo del cuerpo, sin pánico, y sin
+    /// encolar nada.
+    #[tokio::test]
+    async fn un_error_de_escritura_no_filtra_el_cuerpo() {
+        let mut api = Api::new(
+            "api-write-error",
+            vec![with_calendar("cuenta", "Trabajo")],
+            Answer::Allow,
+        )
+        .await;
+        let cal_id = api
+            .manager
+            .with_store("cuenta", |store| Ok(calendar(store, "https://x/a/").id))
+            .await
+            .unwrap();
+        let (client, _service) = api.client(":1.7").await;
+
+        // Cada cuerpo lleva la marca «SECRETO», que no puede aparecer en el error.
+        let cases: [(&str, &str); 3] = [
+            ("{\"SECRETO", "el cuerpo no es JSON válido"),
+            ("[\"SECRETO\"]", "el cuerpo no es un objeto JSON"),
+            (
+                "{\"start\":{\"value\":\"SECRETO-19990101\"}}",
+                "la fecha no tiene el formato de iCalendar",
+            ),
+        ];
+        for (payload, expected) in cases {
+            let result = call(
+                &client,
+                "PutEvent",
+                &("cuenta", cal_id.to_string(), payload, ""),
+            )
+            .await;
+            assert_eq!(error_name(&result), INVALID_ARGS, "cuerpo {payload:?}");
+            let message = error_message(&result);
+            assert_eq!(message, expected, "el texto no es el fijo para {payload:?}");
+            assert!(
+                !message.contains("SECRETO"),
+                "el error filtró el cuerpo: {message}"
+            );
+        }
+        assert_eq!(pending_count_of(&api, "cuenta", CALENDAR_AREA).await, 0);
+    }
+
     /// El sincronizador con el llavero de verdad encima: el
     /// [`SecretServiceKeys`] de verdad, conectado por una conexión punto a
     /// punto al llavero falso de `key.rs` ([`fake_keyring`]), una base de
