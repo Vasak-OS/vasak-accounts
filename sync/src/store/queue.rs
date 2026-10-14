@@ -96,6 +96,14 @@ pub struct PendingOp {
     /// Testigo de versión: sube cada vez que una edición nueva reemplaza la op.
     /// El cierre de una op es condicional a este número (ver [`Store::complete_put`]).
     pub revision: i64,
+    /// El ETag de la versión del servidor del recurso en conflicto, si ya se
+    /// trajo. `None` mientras no se haya traído (el caso normal fuera de un
+    /// conflicto, y el de un conflicto cuya copia todavía no entró).
+    pub server_etag: Option<String>,
+    /// El crudo de la versión del servidor del recurso en conflicto —el iCal o la
+    /// vCard—, si ya se trajo. `None` mientras no se haya traído. Es dato privado:
+    /// vive cifrado como el resto de la fila, y no se escribe en el diario.
+    pub server_raw: Option<Vec<u8>>,
 }
 
 /// El nombre estático del área, para subir su generación.
@@ -215,7 +223,7 @@ impl Store {
             .connection
             .prepare(
                 "SELECT id, area, collection_href, object_href, op, base_etag, payload, state,
-                        attempts, last_error, revision
+                        attempts, last_error, revision, server_etag, server_raw
                    FROM pending_dav_ops
                   WHERE area = ?1
                   ORDER BY id",
@@ -237,6 +245,8 @@ impl Store {
                     attempts: row.get(8)?,
                     last_error: row.get(9)?,
                     revision: row.get(10)?,
+                    server_etag: row.get(11)?,
+                    server_raw: row.get(12)?,
                 })
             })
             .map_err(classify)?;
@@ -386,6 +396,41 @@ impl Store {
         Ok(())
     }
 
+    /// Guarda la copia del servidor —su ETag y su crudo— de un recurso en
+    /// conflicto, en las columnas cifradas `server_etag`/`server_raw` de la op.
+    /// Devuelve si la guardó.
+    ///
+    /// **Condicional al `id`, la `revision` y el estado `conflict`**, por las
+    /// mismas razones que [`Self::complete_put`]: el empuje saca la op, suelta el
+    /// almacén para traer la copia por la red, y recién con ella vuelve a tomar el
+    /// almacén para guardarla. Si en el medio una edición nueva reemplazó la op
+    /// (revisión nueva, y de paso vuelta a `ready`), la foto traída es de una op
+    /// que ya no existe: no se guarda, para no resucitar una copia vieja sobre la
+    /// edición de la persona (lost-update) ni pisar una op que ya no está en
+    /// conflicto (idempotencia). `false` quiere decir exactamente eso: la op
+    /// cambió o se fue entre la foto y ahora, y no hay que tocar nada.
+    ///
+    /// No sube la generación: el conflicto ya avisó al marcarse
+    /// ([`Self::mark_conflict`]); esto sólo le suma el detalle que M3 mostrará.
+    pub fn store_server_copy(
+        &mut self,
+        id: i64,
+        revision: i64,
+        server_etag: Option<&str>,
+        server_raw: &[u8],
+    ) -> Result<bool, StoreError> {
+        let affected = self
+            .connection
+            .execute(
+                "UPDATE pending_dav_ops
+                    SET server_etag = ?3, server_raw = ?4
+                  WHERE id = ?1 AND revision = ?2 AND state = 'conflict'",
+                rusqlite::params![id, revision, server_etag, server_raw],
+            )
+            .map_err(classify)?;
+        Ok(affected > 0)
+    }
+
     /// Deja una op para reintentar más tarde (red, `423`, `507`): suma un
     /// reintento y guarda el detalle, sin tocar la fila guardada ni la
     /// generación. La op sigue en `ready`.
@@ -486,6 +531,18 @@ mod tests {
                 |r| r.get::<_, String>(0),
             )
             .ok()
+    }
+
+    /// La copia del servidor guardada en la op de un objeto: su ETag y su crudo.
+    fn server_copy_of(store: &Store, href: &str) -> (Option<String>, Option<Vec<u8>>) {
+        store
+            .connection()
+            .query_row(
+                "SELECT server_etag, server_raw FROM pending_dav_ops WHERE object_href = ?1",
+                [href],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
     }
 
     /// Encolar un `put` escribe el crudo **ya mismo**, lo marca con
@@ -621,6 +678,98 @@ mod tests {
         assert_eq!(after.attempts, 1);
         assert_eq!(raw_of(&store, HREF), Some(local.raw_vcard));
         assert_eq!(pending_op_of(&store, HREF).as_deref(), Some("put"));
+    }
+
+    /// Guardar la copia del servidor de un conflicto escribe su ETag y su crudo
+    /// en la op, y los deja leer de vuelta.
+    #[test]
+    fn guardar_la_copia_del_servidor_de_un_conflicto() {
+        let temp = TempDir::new("cola-copia-servidor");
+        let mut store = open_store(&temp);
+        let book = one_book(&mut store);
+        store
+            .enqueue_contact_put(&book, &row(HREF, "Mía", "yo@x.com"))
+            .unwrap();
+        let op = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        store.mark_conflict(&op, "chocó").unwrap();
+        let op = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        // Antes de traerla, no hay copia.
+        assert_eq!(server_copy_of(&store, HREF), (None, None));
+
+        let saved = store
+            .store_server_copy(op.id, op.revision, Some("\"srv\""), b"BEGIN:VCARD servidor")
+            .unwrap();
+        assert!(saved, "se guardó");
+
+        assert_eq!(
+            server_copy_of(&store, HREF),
+            (
+                Some("\"srv\"".to_string()),
+                Some(b"BEGIN:VCARD servidor".to_vec())
+            )
+        );
+        // La vuelve a leer `pending_ops`.
+        let after = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        assert_eq!(after.server_etag.as_deref(), Some("\"srv\""));
+        assert_eq!(
+            after.server_raw.as_deref(),
+            Some(&b"BEGIN:VCARD servidor"[..])
+        );
+    }
+
+    /// **Lost-update / idempotencia**: guardar la copia del servidor con la **foto
+    /// vieja** después de que una edición nueva reemplazó la op (revisión nueva, y
+    /// de vuelta a `ready`) **no toca nada**. La foto es de una op que ya no está
+    /// en conflicto; guardarla resucitaría una versión vieja sobre la edición de
+    /// la persona.
+    #[test]
+    fn guardar_una_copia_con_foto_vieja_no_pisa_la_edicion_nueva() {
+        let temp = TempDir::new("cola-copia-stale");
+        let mut store = open_store(&temp);
+        let book = one_book(&mut store);
+        store
+            .enqueue_contact_put(&book, &row(HREF, "Mía", "yo@x.com"))
+            .unwrap();
+        let snapshot = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        store.mark_conflict(&snapshot, "chocó").unwrap();
+        let snapshot = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+
+        // Entre la foto y el guardado, la persona vuelve a editar: la op se
+        // reemplaza (revisión nueva, estado `ready`).
+        store
+            .enqueue_contact_put(&book, &row(HREF, "Ana María", "nuevo@x.com"))
+            .unwrap();
+
+        let saved = store
+            .store_server_copy(snapshot.id, snapshot.revision, Some("\"srv\""), b"ajeno")
+            .unwrap();
+        assert!(!saved, "la foto vieja no guarda nada");
+        // La edición nueva sigue limpia, sin copia del servidor encima.
+        let after = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        assert_eq!(after.state, PendingState::Ready);
+        assert_eq!(after.server_etag, None);
+        assert_eq!(after.server_raw, None);
+    }
+
+    /// Guardar la copia del servidor sobre una op que **ya no está en conflicto**
+    /// (volvió a `ready` con la misma revisión, caso teórico) tampoco escribe: la
+    /// condición pide `state = 'conflict'`.
+    #[test]
+    fn guardar_una_copia_pide_estado_conflicto() {
+        let temp = TempDir::new("cola-copia-ready");
+        let mut store = open_store(&temp);
+        let book = one_book(&mut store);
+        store
+            .enqueue_contact_put(&book, &row(HREF, "Mía", "yo@x.com"))
+            .unwrap();
+        // La op está en `ready`, no en conflicto.
+        let op = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+
+        let saved = store
+            .store_server_copy(op.id, op.revision, Some("\"srv\""), b"ajeno")
+            .unwrap();
+        assert!(!saved, "una op en `ready` no recibe copia del servidor");
+        assert_eq!(server_copy_of(&store, HREF), (None, None));
     }
 
     /// Encolar un borrado marca la fila `'delete'` —se queda— y suma la op;
