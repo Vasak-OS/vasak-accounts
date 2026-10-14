@@ -10,7 +10,10 @@
 //! Es **de sólo lectura**: no escribe nada contra Graph. La escritura por Graph
 //! (`Contacts.ReadWrite`) es fase 2 (Vasak-OS/vasak-accounts#97).
 
+use std::collections::HashSet;
 use std::time::Duration;
+
+use url::Url;
 
 use crate::broker::BrokerError;
 use crate::contacts_sync::backend::{SyncContext, SyncResult};
@@ -23,6 +26,23 @@ use crate::vcard;
 
 /// Cada cuánto se sincronizan los contactos de una cuenta encendida.
 const CONTACTS_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Plazo para que un pedido a Graph conecte, como el resto del servicio.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Plazo por pedido —conexión más respuesta— al paginar la carpeta. Corta un
+/// servidor que acepta la conexión y no responde. Igual que `dav_sync` acota
+/// cada pedido con [`tokio::time::timeout_at`].
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Tope de páginas de la paginación por `@odata.nextLink`. Con `$top=100` da de
+/// sobra para una agenda personal; un servidor que no corta es un bucle o un
+/// intento de agotar memoria.
+const MAX_PAGES: usize = 1_000;
+
+/// Tope de contactos acumulados. Cota de memoria independiente del tope de
+/// páginas, por si un servidor devuelve páginas enormes.
+const MAX_CONTACTS: usize = 100_000;
 
 /// Lo que se ve en el estado cuando el servicio de cuentas dice que no.
 const DENIED_DETAIL: &str = "el servicio de cuentas no le da al sincronizador permiso para los \
@@ -39,12 +59,33 @@ const GRAPH_BASE_URL: &str = "https://graph.microsoft.com/v1.0";
 ///
 /// Contiene el token de acceso OAuth2 y el ID de usuario para la carpeta de
 /// contactos.
-#[derive(Debug, Clone)]
+///
+/// No deriva `Debug`: su `Debug` manual redacta el token para que no termine en
+/// un log ni en un volcado. El token se guarda en [`zeroize::Zeroizing`], que lo
+/// pone en cero al soltarlo.
+#[derive(Clone)]
 pub struct GraphCredential {
     /// Token de acceso OAuth2.
-    pub access_token: String,
+    pub access_token: zeroize::Zeroizing<String>,
     /// URL base del usuario (para multi-tenant).
     pub user_id: String,
+    /// Raíz de la API de Graph (`https://graph.microsoft.com/v1.0` en
+    /// producción). Es un campo para que las pruebas puedan apuntar el
+    /// sincronizador a un endpoint falso en `127.0.0.1`; el servicio de cuentas
+    /// siempre la rellena con [`GRAPH_BASE_URL`]. El host (y el esquema) de esta
+    /// URL es el único al que el sincronizador adjunta el token: ver
+    /// [`GraphApiBackend::fetch_all_contacts`].
+    pub base_url: String,
+}
+
+impl std::fmt::Debug for GraphCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GraphCredential")
+            .field("access_token", &"<redactado>")
+            .field("user_id", &self.user_id)
+            .field("base_url", &self.base_url)
+            .finish()
+    }
 }
 
 /// Fuente de credenciales para Graph API.
@@ -83,9 +124,74 @@ impl GraphCredentialSource {
             .to_string();
 
         Ok(GraphCredential {
-            access_token: (*token).clone(),
+            access_token: token,
             user_id,
+            base_url: GRAPH_BASE_URL.to_string(),
         })
+    }
+}
+
+/// Lo que puede fallar al traer la carpeta de contactos de Graph.
+///
+/// Tipado a propósito: la validación del `@odata.nextLink` (ver
+/// [`GraphApiBackend::fetch_all_contacts`]) corta la sincronización con una
+/// variante propia, y las pruebas pueden distinguir «host no confiable» de un
+/// simple error de red. Ninguna variante vuelca el cuerpo crudo de la respuesta
+/// de Graph al estado que se muestra.
+#[derive(Debug)]
+enum GraphFetchError {
+    /// No se pudo contactar al servidor.
+    Network(String),
+    /// La respuesta no se pudo parsear como la carpeta de contactos.
+    Parse,
+    /// Graph respondió con un código de error. Sólo el código, nunca el cuerpo.
+    Http(reqwest::StatusCode),
+    /// La URL base o un `nextLink` no es una URL válida.
+    MalformedUrl,
+    /// El `nextLink` apunta a un host o esquema distinto del de la URL base: se
+    /// aborta para no mandarle el token a otro servidor.
+    UntrustedNextLink,
+    /// El servidor repitió un `nextLink` ya visto: paginación en bucle.
+    PaginationLoop,
+    /// Se superó el tope de páginas.
+    TooManyPages,
+    /// Se superó el tope de contactos acumulados.
+    TooManyContacts,
+    /// Se agotó el plazo de un pedido.
+    Timeout,
+}
+
+impl std::fmt::Display for GraphFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // El `e` de reqwest trae la URL y el motivo (DNS, TLS, conexión),
+            // nunca el token ni el cuerpo de la respuesta.
+            GraphFetchError::Network(e) => write!(f, "error de red con Graph: {e}"),
+            GraphFetchError::Parse => write!(f, "no se pudo parsear la respuesta de Graph"),
+            GraphFetchError::Http(status) => write!(f, "Graph respondió con error {status}"),
+            GraphFetchError::MalformedUrl => write!(f, "URL inválida al paginar los contactos"),
+            GraphFetchError::UntrustedNextLink => write!(
+                f,
+                "Graph devolvió un enlace de paginación a un host no confiable; se abortó la \
+                 sincronización"
+            ),
+            GraphFetchError::PaginationLoop => {
+                write!(
+                    f,
+                    "Graph repitió un enlace de paginación; se abortó la sincronización"
+                )
+            }
+            GraphFetchError::TooManyPages => {
+                write!(
+                    f,
+                    "demasiadas páginas de contactos; se abortó la sincronización"
+                )
+            }
+            GraphFetchError::TooManyContacts => {
+                write!(f, "demasiados contactos; se abortó la sincronización")
+            }
+            GraphFetchError::Timeout => write!(f, "se agotó el tiempo de espera de Graph"),
+        }
     }
 }
 
@@ -204,7 +310,16 @@ impl GraphApiBackend {
         }
         set_status(AreaState::Syncing, "").await;
 
-        let client = reqwest::Client::new();
+        let client = match reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                set_status(AreaState::Failed, "no se pudo preparar el cliente HTTP").await;
+                return SyncResult::Failed(e.to_string());
+            }
+        };
         let mut report = SyncReport::default();
 
         // Traer la carpeta de contactos completa (sin delta sync por ahora).
@@ -275,47 +390,108 @@ impl GraphApiBackend {
 
     /// Trae todos los contactos de la carpeta con paginación por
     /// `@odata.nextLink`.
+    ///
+    /// **El `nextLink` es dato de red y no se sigue a ciegas.** Antes de
+    /// adjuntarle el token de Graph, cada `nextLink` se parsea y se exige que
+    /// comparta *origen* con la URL base de la credencial —mismo esquema, mismo
+    /// host y mismo puerto—. En producción la base es [`GRAPH_BASE_URL`]
+    /// (`https://graph.microsoft.com/v1.0`), así que el token sólo viaja a ese
+    /// host por HTTPS; las pruebas apuntan `base_url` a un endpoint falso y la
+    /// validación compara contra *ese* host, no contra un literal. Un `nextLink`
+    /// a otro host —un servidor comprometido o un MITM— aborta la sincronización
+    /// sin haberle mandado el token.
+    ///
+    /// Además acota la paginación: tope de páginas, de contactos, dedup de
+    /// `nextLink` para cortar un bucle, y un plazo por pedido.
     async fn fetch_all_contacts(
         client: &reqwest::Client,
         credential: &GraphCredential,
-    ) -> Result<Vec<GraphContact>, String> {
-        let mut all_contacts = Vec::new();
-        let mut url = format!(
-            "{}/users/{}/contacts?$top=100&$select=id,displayName,givenName,surname,middleName,emailAddresses,businessPhones,homePhones,mobilePhone,homeAddress,businessAddress,otherAddress,companyName,jobTitle,birthday,personalNotes",
-            GRAPH_BASE_URL, credential.user_id
-        );
+    ) -> Result<Vec<GraphContact>, GraphFetchError> {
+        // El origen de confianza sale de la URL base de la credencial, no de un
+        // literal: así la validación sirve igual para producción, para una nube
+        // alternativa de Graph y para el endpoint falso de las pruebas.
+        let base = Url::parse(&credential.base_url).map_err(|_| GraphFetchError::MalformedUrl)?;
+        let same_origin = |candidate: &Url| -> bool {
+            candidate.scheme() == base.scheme()
+                && candidate.host_str() == base.host_str()
+                && candidate.port_or_known_default() == base.port_or_known_default()
+        };
 
-        loop {
+        // La primera URL se arma sobre la base. `user_id` entra como *segmento*
+        // de ruta: `path_segments_mut` lo percent-codifica, así que un `?`, un
+        // `#` o una `/` en el id no pueden alterar la query, el fragmento ni la
+        // ruta.
+        let mut url = base.clone();
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| GraphFetchError::MalformedUrl)?;
+            segments.pop_if_empty();
+            segments.push("users");
+            segments.push(&credential.user_id);
+            segments.push("contacts");
+        }
+        url.set_query(Some(
+            "$top=100&$select=id,displayName,givenName,surname,middleName,emailAddresses,\
+             businessPhones,homePhones,mobilePhone,homeAddress,businessAddress,otherAddress,\
+             companyName,jobTitle,birthday,personalNotes",
+        ));
+
+        let mut all_contacts = Vec::new();
+        // Los `nextLink` ya pedidos, para cortar un servidor que repite el mismo
+        // enlace en bucle. Incluye la URL inicial.
+        let mut seen: HashSet<String> = HashSet::new();
+        seen.insert(url.as_str().to_string());
+
+        for _page in 0..MAX_PAGES {
+            // Plazo por pedido: conexión más respuesta. El token sólo se adjunta
+            // acá, y `url` ya fue validada como del mismo origen que la base.
+            let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
             let request = client
-                .get(&url)
-                .bearer_auth(&credential.access_token)
+                .get(url.as_str())
+                .bearer_auth(credential.access_token.as_str())
                 .header("Accept", "application/json");
 
-            let response = request
-                .send()
-                .await
-                .map_err(|e| format!("error de red: {e}"))?;
+            let fetch_page = async {
+                let response = request
+                    .send()
+                    .await
+                    .map_err(|e| GraphFetchError::Network(e.to_string()))?;
+                if !response.status().is_success() {
+                    // Sólo el código: el cuerpo crudo del error de Graph no se
+                    // vuelca al estado que ve quien usa el sistema.
+                    return Err(GraphFetchError::Http(response.status()));
+                }
+                response
+                    .json::<GraphContactsResponse>()
+                    .await
+                    .map_err(|_| GraphFetchError::Parse)
+            };
 
-            if !response.status().is_success() {
-                let status = response.status();
-                let text = response.text().await.unwrap_or_default();
-                return Err(format!("Graph API error {status}: {text}"));
-            }
-
-            let data: GraphContactsResponse = response
-                .json()
-                .await
-                .map_err(|e| format!("error parseando respuesta: {e}"))?;
+            let data = match tokio::time::timeout_at(deadline, fetch_page).await {
+                Ok(result) => result?,
+                Err(_) => return Err(GraphFetchError::Timeout),
+            };
 
             all_contacts.extend(data.value);
-
-            match data.next_link {
-                Some(next) => url = next,
-                None => break,
+            if all_contacts.len() > MAX_CONTACTS {
+                return Err(GraphFetchError::TooManyContacts);
             }
+
+            let Some(next) = data.next_link else {
+                return Ok(all_contacts);
+            };
+            let next_url = Url::parse(&next).map_err(|_| GraphFetchError::MalformedUrl)?;
+            if !same_origin(&next_url) {
+                return Err(GraphFetchError::UntrustedNextLink);
+            }
+            if !seen.insert(next_url.as_str().to_string()) {
+                return Err(GraphFetchError::PaginationLoop);
+            }
+            url = next_url;
         }
 
-        Ok(all_contacts)
+        Err(GraphFetchError::TooManyPages)
     }
 
     /// Convierte un `GraphContact` a `ContactRow`.
@@ -326,7 +502,10 @@ impl GraphApiBackend {
         if contact.id.is_empty() {
             return None;
         }
-        let href = contact.id.clone();
+        // El `id` es dato de red: se escapa igual que cualquier otro campo antes
+        // de usarlo como `href`. Así un `id` con `\r\n` no puede fabricar nada
+        // allí donde el `href` se vuelque a un formato por líneas.
+        let href = vcard::escape_vcard_public(&contact.id);
         let vcard = Self::contact_to_vcard(&contact);
         let parsed = vcard::contact_from(&vcard, &href).unwrap_or_default();
         Some(ContactRow {
@@ -344,11 +523,19 @@ impl GraphApiBackend {
         let mut vcard = String::new();
         vcard.push_str("BEGIN:VCARD\r\n");
         vcard.push_str("VERSION:3.0\r\n");
-        vcard.push_str(&format!("UID:{}\r\n", contact.id));
+        // El `id` también se escapa: era el único campo que iba crudo, y un `id`
+        // con `\r\n` fabricaría propiedades o registros nuevos (inyección vCard).
+        vcard.push_str(&format!(
+            "UID:{}\r\n",
+            vcard::escape_vcard_public(&contact.id)
+        ));
 
         let display_name = contact.display_name.as_deref().unwrap_or("");
         if !display_name.is_empty() {
-            vcard.push_str(&format!("FN:{}\r\n", Self::escape_vcard(display_name)));
+            vcard.push_str(&format!(
+                "FN:{}\r\n",
+                vcard::escape_vcard_public(display_name)
+            ));
         }
 
         // N: apellido;nombre;segundo nombre;prefijo;sufijo
@@ -358,9 +545,9 @@ impl GraphApiBackend {
         if !surname.is_empty() || !given.is_empty() || !middle.is_empty() {
             vcard.push_str(&format!(
                 "N:{};{};{};;\r\n",
-                Self::escape_vcard(surname),
-                Self::escape_vcard(given),
-                Self::escape_vcard(middle)
+                vcard::escape_vcard_public(surname),
+                vcard::escape_vcard_public(given),
+                vcard::escape_vcard_public(middle)
             ));
         }
 
@@ -368,7 +555,10 @@ impl GraphApiBackend {
         for email in &contact.email_addresses {
             if let Some(address) = email.address.as_deref() {
                 if !address.is_empty() {
-                    vcard.push_str(&format!("EMAIL:{}\r\n", Self::escape_vcard(address)));
+                    vcard.push_str(&format!(
+                        "EMAIL:{}\r\n",
+                        vcard::escape_vcard_public(address)
+                    ));
                 }
             }
         }
@@ -376,17 +566,26 @@ impl GraphApiBackend {
         // Teléfonos: cada lista con su tipo de vCard.
         for phone in &contact.business_phones {
             if !phone.is_empty() {
-                vcard.push_str(&format!("TEL;TYPE=WORK:{}\r\n", Self::escape_vcard(phone)));
+                vcard.push_str(&format!(
+                    "TEL;TYPE=WORK:{}\r\n",
+                    vcard::escape_vcard_public(phone)
+                ));
             }
         }
         for phone in &contact.home_phones {
             if !phone.is_empty() {
-                vcard.push_str(&format!("TEL;TYPE=HOME:{}\r\n", Self::escape_vcard(phone)));
+                vcard.push_str(&format!(
+                    "TEL;TYPE=HOME:{}\r\n",
+                    vcard::escape_vcard_public(phone)
+                ));
             }
         }
         if let Some(mobile) = contact.mobile_phone.as_deref() {
             if !mobile.is_empty() {
-                vcard.push_str(&format!("TEL;TYPE=CELL:{}\r\n", Self::escape_vcard(mobile)));
+                vcard.push_str(&format!(
+                    "TEL;TYPE=CELL:{}\r\n",
+                    vcard::escape_vcard_public(mobile)
+                ));
             }
         }
 
@@ -398,12 +597,12 @@ impl GraphApiBackend {
         // Organización y puesto
         if let Some(company) = contact.company_name.as_deref() {
             if !company.is_empty() {
-                vcard.push_str(&format!("ORG:{}\r\n", Self::escape_vcard(company)));
+                vcard.push_str(&format!("ORG:{}\r\n", vcard::escape_vcard_public(company)));
             }
         }
         if let Some(title) = contact.job_title.as_deref() {
             if !title.is_empty() {
-                vcard.push_str(&format!("TITLE:{}\r\n", Self::escape_vcard(title)));
+                vcard.push_str(&format!("TITLE:{}\r\n", vcard::escape_vcard_public(title)));
             }
         }
 
@@ -411,14 +610,14 @@ impl GraphApiBackend {
         if let Some(birthday) = contact.birthday.as_deref() {
             let date = birthday.split('T').next().unwrap_or(birthday);
             if !date.is_empty() {
-                vcard.push_str(&format!("BDAY:{}\r\n", Self::escape_vcard(date)));
+                vcard.push_str(&format!("BDAY:{}\r\n", vcard::escape_vcard_public(date)));
             }
         }
 
         // Notas
         if let Some(notes) = contact.personal_notes.as_deref() {
             if !notes.is_empty() {
-                vcard.push_str(&format!("NOTE:{}\r\n", Self::escape_vcard(notes)));
+                vcard.push_str(&format!("NOTE:{}\r\n", vcard::escape_vcard_public(notes)));
             }
         }
 
@@ -437,21 +636,15 @@ impl GraphApiBackend {
         if address.is_empty() {
             return;
         }
-        let street = Self::escape_vcard(address.street.as_deref().unwrap_or(""));
-        let city = Self::escape_vcard(address.city.as_deref().unwrap_or(""));
-        let state = Self::escape_vcard(address.state.as_deref().unwrap_or(""));
-        let postal = Self::escape_vcard(address.postal_code.as_deref().unwrap_or(""));
-        let country = Self::escape_vcard(address.country_or_region.as_deref().unwrap_or(""));
+        let street = vcard::escape_vcard_public(address.street.as_deref().unwrap_or(""));
+        let city = vcard::escape_vcard_public(address.city.as_deref().unwrap_or(""));
+        let state = vcard::escape_vcard_public(address.state.as_deref().unwrap_or(""));
+        let postal = vcard::escape_vcard_public(address.postal_code.as_deref().unwrap_or(""));
+        let country =
+            vcard::escape_vcard_public(address.country_or_region.as_deref().unwrap_or(""));
         vcard.push_str(&format!(
             "ADR;TYPE={kind}:;;{street};{city};{state};{postal};{country}\r\n"
         ));
-    }
-
-    fn escape_vcard(s: &str) -> String {
-        s.replace(',', "\\,")
-            .replace(';', "\\;")
-            .replace('\n', "\\n")
-            .replace('\r', "")
     }
 }
 
