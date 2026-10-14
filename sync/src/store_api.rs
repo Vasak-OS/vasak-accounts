@@ -1909,9 +1909,120 @@ fn contact_patch_from(
     })
 }
 
-/// Crea o edita un evento en la base y lo encola: todo en la misma transacción
-/// del almacén (ver `store/queue.rs`). Devuelve el `id` local del objeto y su
-/// `href`. Corre en el hilo de bloqueo, dentro de `with_store`.
+/// El parche de un objeto de calendario ya parseado, del tipo que sea. Agrupa lo
+/// propio de un evento y de una tarea para el camino de escritura común
+/// ([`put_calendar_object_in_store`]): cómo serializar uno nuevo o editado, y los
+/// textos de `InvalidArgs` para que cada tipo hable de «el evento» o «la tarea».
+enum CalendarPatch {
+    Event(EventPatch),
+    Task(TaskPatch),
+}
+
+impl CalendarPatch {
+    /// Arma el crudo de un objeto nuevo.
+    fn new_raw(&self, uid: &str, dtstamp: &str) -> Result<String, SerializeError> {
+        match self {
+            CalendarPatch::Event(patch) => ical_write::new_event(uid, dtstamp, patch),
+            CalendarPatch::Task(patch) => ical_write::new_todo(uid, dtstamp, patch),
+        }
+    }
+
+    /// Aplica el parche sobre el crudo guardado.
+    fn apply(&self, raw: &str) -> Result<String, SerializeError> {
+        match self {
+            CalendarPatch::Event(patch) => ical_write::apply_changes(raw, patch),
+            CalendarPatch::Task(patch) => ical_write::apply_todo_changes(raw, patch),
+        }
+    }
+
+    /// El texto de `InvalidArgs` cuando el objeto a editar no existe.
+    fn missing(&self) -> &'static str {
+        match self {
+            CalendarPatch::Event(_) => "el evento no existe",
+            CalendarPatch::Task(_) => "la tarea no existe",
+        }
+    }
+
+    /// El texto de `InvalidArgs` cuando el objeto no es del calendario indicado.
+    fn wrong_calendar(&self) -> &'static str {
+        match self {
+            CalendarPatch::Event(_) => "el evento no es de ese calendario",
+            CalendarPatch::Task(_) => "la tarea no es de ese calendario",
+        }
+    }
+}
+
+/// Crea o edita un objeto de calendario —un evento o una tarea— en la base y lo
+/// encola: todo en la misma transacción del almacén (ver `store/queue.rs`).
+/// Devuelve el `id` local del objeto y su `href`. Corre en el hilo de bloqueo,
+/// dentro de `with_store`.
+///
+/// Es lo común entre eventos y tareas, que viven en la misma colección: el
+/// encolado, la derivación de lo que se lista y el `href` son los mismos. Lo
+/// único propio de cada tipo —cómo se serializa el crudo y los textos de error—
+/// lo decide [`CalendarPatch`]. `derive_with_occurrences` reconoce el componente
+/// del crudo (un `VTODO` se deriva sin ocurrencias).
+fn put_calendar_object_in_store(
+    store: &mut Store,
+    calendar_id: i64,
+    obj: &serde_json::Map<String, serde_json::Value>,
+    if_match: &str,
+    uid: Option<String>,
+    patch: CalendarPatch,
+) -> Result<(i64, String), StoreError> {
+    // La ventana con la que se derivan las ocurrencias es la de la base; si no
+    // tiene todavía, la del día, que es con la que la encolará `enqueue`.
+    let window = store
+        .calendar_window()?
+        .unwrap_or_else(|| Window::around(chrono::Utc::now()));
+    if if_match.is_empty() {
+        forbid_id_on_create(obj)?;
+        let calendar = store
+            .calendar_by_id(calendar_id)?
+            .ok_or_else(|| StoreError::InvalidArgument("el calendario no existe".into()))?;
+        let uid =
+            uid.ok_or_else(|| StoreError::InvalidArgument("falta el identificador nuevo".into()))?;
+        let href = child_href(&calendar.href, &uid, ".ics");
+        let dtstamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let raw = patch.new_raw(&uid, &dtstamp).map_err(serialize_error)?;
+        let (index, occurrences) = derive_with_occurrences(&raw, window, &ExpansionLimits::DEFAULT);
+        let row = ObjectRow {
+            href: href.clone(),
+            etag: None,
+            raw_ical: raw,
+            index,
+            occurrences,
+        };
+        store.enqueue_calendar_put(&calendar, &row, window)?;
+        let id = store
+            .object_id_by_href(calendar.id, &href)?
+            .ok_or(StoreError::Missing)?;
+        Ok((id, href))
+    } else {
+        let object_id = require_edit_id(obj)?;
+        let (calendar, href, raw) = store
+            .event_target(object_id)?
+            .ok_or_else(|| StoreError::InvalidArgument(patch.missing().into()))?;
+        if calendar.id != calendar_id {
+            return Err(StoreError::InvalidArgument(patch.wrong_calendar().into()));
+        }
+        let edited = patch.apply(&raw).map_err(serialize_error)?;
+        let (index, occurrences) =
+            derive_with_occurrences(&edited, window, &ExpansionLimits::DEFAULT);
+        let row = ObjectRow {
+            href: href.clone(),
+            etag: Some(if_match.to_string()),
+            raw_ical: edited,
+            index,
+            occurrences,
+        };
+        store.enqueue_calendar_put(&calendar, &row, window)?;
+        Ok((object_id, href))
+    }
+}
+
+/// Crea o edita un evento: parsea el parche y serializa un `VEVENT` sobre el
+/// camino común ([`put_calendar_object_in_store`]).
 fn put_event_in_store(
     store: &mut Store,
     calendar_id: i64,
@@ -1920,67 +2031,12 @@ fn put_event_in_store(
     uid: Option<String>,
 ) -> Result<(i64, String), StoreError> {
     let obj = json_object(payload)?;
-    let patch = event_patch_from(&obj)?;
-    // La ventana con la que se derivan las ocurrencias es la de la base; si no
-    // tiene todavía, la del día, que es con la que la encolará `enqueue`.
-    let window = store
-        .calendar_window()?
-        .unwrap_or_else(|| Window::around(chrono::Utc::now()));
-    if if_match.is_empty() {
-        forbid_id_on_create(&obj)?;
-        let calendar = store
-            .calendar_by_id(calendar_id)?
-            .ok_or_else(|| StoreError::InvalidArgument("el calendario no existe".into()))?;
-        let uid =
-            uid.ok_or_else(|| StoreError::InvalidArgument("falta el identificador nuevo".into()))?;
-        let href = child_href(&calendar.href, &uid, ".ics");
-        let dtstamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-        let raw = ical_write::new_event(&uid, &dtstamp, &patch).map_err(serialize_error)?;
-        let (index, occurrences) = derive_with_occurrences(&raw, window, &ExpansionLimits::DEFAULT);
-        let row = ObjectRow {
-            href: href.clone(),
-            etag: None,
-            raw_ical: raw,
-            index,
-            occurrences,
-        };
-        store.enqueue_calendar_put(&calendar, &row, window)?;
-        let id = store
-            .object_id_by_href(calendar.id, &href)?
-            .ok_or(StoreError::Missing)?;
-        Ok((id, href))
-    } else {
-        let event_id = require_edit_id(&obj)?;
-        let (calendar, href, raw) = store
-            .event_target(event_id)?
-            .ok_or_else(|| StoreError::InvalidArgument("el evento no existe".into()))?;
-        if calendar.id != calendar_id {
-            return Err(StoreError::InvalidArgument(
-                "el evento no es de ese calendario".into(),
-            ));
-        }
-        let edited = ical_write::apply_changes(&raw, &patch).map_err(serialize_error)?;
-        let (index, occurrences) =
-            derive_with_occurrences(&edited, window, &ExpansionLimits::DEFAULT);
-        let row = ObjectRow {
-            href: href.clone(),
-            etag: Some(if_match.to_string()),
-            raw_ical: edited,
-            index,
-            occurrences,
-        };
-        store.enqueue_calendar_put(&calendar, &row, window)?;
-        Ok((event_id, href))
-    }
+    let patch = CalendarPatch::Event(event_patch_from(&obj)?);
+    put_calendar_object_in_store(store, calendar_id, &obj, if_match, uid, patch)
 }
 
-/// Crea o edita una tarea (`VTODO`) en la base y la encola: espejo de
-/// [`put_event_in_store`]. Las tareas viven en la colección de calendario, así
-/// que el encolado, la derivación de lo que se lista y el `href` son los mismos;
-/// lo único que cambia es que se serializa un `VTODO` (ver
-/// [`crate::serialize::ical::new_todo`] y `apply_todo_changes`) con el parche de
-/// tarea. `derive_with_occurrences` reconoce el `VTODO` del crudo y lo deriva sin
-/// ocurrencias.
+/// Crea o edita una tarea (`VTODO`): parsea el parche y serializa un `VTODO`
+/// sobre el mismo camino común que un evento.
 fn put_task_in_store(
     store: &mut Store,
     calendar_id: i64,
@@ -1989,56 +2045,8 @@ fn put_task_in_store(
     uid: Option<String>,
 ) -> Result<(i64, String), StoreError> {
     let obj = json_object(payload)?;
-    let patch = task_patch_from(&obj)?;
-    let window = store
-        .calendar_window()?
-        .unwrap_or_else(|| Window::around(chrono::Utc::now()));
-    if if_match.is_empty() {
-        forbid_id_on_create(&obj)?;
-        let calendar = store
-            .calendar_by_id(calendar_id)?
-            .ok_or_else(|| StoreError::InvalidArgument("el calendario no existe".into()))?;
-        let uid =
-            uid.ok_or_else(|| StoreError::InvalidArgument("falta el identificador nuevo".into()))?;
-        let href = child_href(&calendar.href, &uid, ".ics");
-        let dtstamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-        let raw = ical_write::new_todo(&uid, &dtstamp, &patch).map_err(serialize_error)?;
-        let (index, occurrences) = derive_with_occurrences(&raw, window, &ExpansionLimits::DEFAULT);
-        let row = ObjectRow {
-            href: href.clone(),
-            etag: None,
-            raw_ical: raw,
-            index,
-            occurrences,
-        };
-        store.enqueue_calendar_put(&calendar, &row, window)?;
-        let id = store
-            .object_id_by_href(calendar.id, &href)?
-            .ok_or(StoreError::Missing)?;
-        Ok((id, href))
-    } else {
-        let task_id = require_edit_id(&obj)?;
-        let (calendar, href, raw) = store
-            .event_target(task_id)?
-            .ok_or_else(|| StoreError::InvalidArgument("la tarea no existe".into()))?;
-        if calendar.id != calendar_id {
-            return Err(StoreError::InvalidArgument(
-                "la tarea no es de ese calendario".into(),
-            ));
-        }
-        let edited = ical_write::apply_todo_changes(&raw, &patch).map_err(serialize_error)?;
-        let (index, occurrences) =
-            derive_with_occurrences(&edited, window, &ExpansionLimits::DEFAULT);
-        let row = ObjectRow {
-            href: href.clone(),
-            etag: Some(if_match.to_string()),
-            raw_ical: edited,
-            index,
-            occurrences,
-        };
-        store.enqueue_calendar_put(&calendar, &row, window)?;
-        Ok((task_id, href))
-    }
+    let patch = CalendarPatch::Task(task_patch_from(&obj)?);
+    put_calendar_object_in_store(store, calendar_id, &obj, if_match, uid, patch)
 }
 
 /// Crea o edita un contacto en la base y lo encola. Como

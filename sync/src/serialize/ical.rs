@@ -88,11 +88,21 @@ fn has_control(text: &str) -> bool {
 /// Validar el valor con el **mismo** lector que usa la lectura
 /// ([`DateValue::parse`]) cierra la inyección por el valor: un `20260101T000000Z`
 /// con un `\r\n` y una propiedad pegada detrás no es una fecha, así que no pasa.
+///
+/// **Pero `DateValue::parse` recorta antes de validar**, así que un CR o un LF
+/// al principio o al final del valor —`20260101T000000Z\r\n`— pasaría el parseo
+/// y después la escritura, que usa `spec.value` **sin recortar**, metería el
+/// salto crudo en la línea. Por eso el valor se rechaza por `has_control`
+/// primero, igual que el `UID` y los parámetros: el control no es parte de una
+/// fecha, venga en el medio o en el borde.
 fn validate_date(spec: &DateSpec) -> Result<(), SerializeError> {
     for param in &spec.params {
         if has_control(param) || param.contains(':') {
             return Err(SerializeError::InjectableParam);
         }
+    }
+    if has_control(&spec.value) {
+        return Err(SerializeError::MalformedDate);
     }
     if DateValue::parse(&spec.value, &spec.params).is_none() {
         return Err(SerializeError::MalformedDate);
@@ -248,8 +258,13 @@ trait ComponentPatch {
     /// recorrido genérico.
     fn flush_missing(&self, out: &mut Vec<String>, done: &Self::Done);
 
-    /// Al crear: escribe lo que el parche fija.
-    fn push_set(&self, out: &mut Vec<String>);
+    /// Al crear: escribe lo que el parche fija. Es [`Self::flush_missing`] con
+    /// nada hecho todavía —un objeto nuevo no trae ninguna propiedad, así que
+    /// todas las que el parche fija se escriben—, así que las dos salen del mismo
+    /// código y en el mismo orden.
+    fn push_set(&self, out: &mut Vec<String>) {
+        self.flush_missing(out, &Self::Done::default());
+    }
 }
 
 /// El nombre y el valor de una línea lógica, en mayúsculas el nombre. El valor
@@ -592,6 +607,55 @@ fn put_number(
     }
 }
 
+// ── Agregar lo que falta al cerrar (o al crear) ──────────────────────────────
+//
+// Las de arriba (`put_*`) editan una propiedad **en el lugar** mientras se
+// recorre el objetivo: dejan lo que no cambia, sacan lo que se limpia. Las de
+// abajo (`append_*`) son lo contrario: al cerrar el componente agregan lo que el
+// parche fija y todavía **no** se escribió (`done` en `false`), y al crear uno
+// nuevo —con `done` en `false` para todo— escriben lo que el parche fija. Son
+// comunes al evento y a la tarea, así que `flush_missing` de cada uno es una
+// lista de llamadas y no dos bloques casi iguales. Un valor nuevo nunca lleva
+// los parámetros del crudo: no hay crudo.
+
+/// Agrega una propiedad de texto si el parche la fija y no se escribió ya.
+fn append_text(out: &mut Vec<String>, change: &Change<String>, done: bool, name: &str) {
+    if let Change::Set(text) = change {
+        if !done {
+            out.extend(fold(&render(name, &[], &escape_text(text))));
+        }
+    }
+}
+
+/// Agrega una fecha si el parche la fija y no se escribió ya. Lleva sus
+/// parámetros, que son parte del valor nuevo ([`DateSpec`]).
+fn append_date(out: &mut Vec<String>, change: &Change<DateSpec>, done: bool, name: &str) {
+    if let Change::Set(spec) = change {
+        if !done {
+            out.extend(fold(&render(name, &spec.params, &spec.value)));
+        }
+    }
+}
+
+/// Agrega el `STATUS` de una tarea si el parche lo fija y no se escribió ya.
+fn append_status(out: &mut Vec<String>, change: &Change<TodoStatus>, done: bool, name: &str) {
+    if let Change::Set(status) = change {
+        if !done {
+            out.extend(fold(&render(name, &[], status.as_ical())));
+        }
+    }
+}
+
+/// Agrega un entero (`PERCENT-COMPLETE`, `PRIORITY`) si el parche lo fija y no se
+/// escribió ya.
+fn append_number(out: &mut Vec<String>, change: &Change<u8>, done: bool, name: &str) {
+    if let Change::Set(number) = change {
+        if !done {
+            out.extend(fold(&render(name, &[], &number.to_string())));
+        }
+    }
+}
+
 /// Qué propiedades de un evento ya se reescribieron, para no duplicarlas ni
 /// volver a agregarlas al cerrar.
 #[derive(Default)]
@@ -655,49 +719,11 @@ impl ComponentPatch for EventPatch {
     }
 
     fn flush_missing(&self, out: &mut Vec<String>, done: &Self::Done) {
-        if let Change::Set(text) = &self.summary {
-            if !done.summary {
-                out.extend(fold(&render("SUMMARY", &[], &escape_text(text))));
-            }
-        }
-        if let Change::Set(text) = &self.description {
-            if !done.description {
-                out.extend(fold(&render("DESCRIPTION", &[], &escape_text(text))));
-            }
-        }
-        if let Change::Set(text) = &self.location {
-            if !done.location {
-                out.extend(fold(&render("LOCATION", &[], &escape_text(text))));
-            }
-        }
-        if let Change::Set(spec) = &self.start {
-            if !done.start {
-                out.extend(fold(&render("DTSTART", &spec.params, &spec.value)));
-            }
-        }
-        if let Change::Set(spec) = &self.end {
-            if !done.end {
-                out.extend(fold(&render("DTEND", &spec.params, &spec.value)));
-            }
-        }
-    }
-
-    fn push_set(&self, out: &mut Vec<String>) {
-        if let Change::Set(text) = &self.summary {
-            out.extend(fold(&render("SUMMARY", &[], &escape_text(text))));
-        }
-        if let Change::Set(text) = &self.description {
-            out.extend(fold(&render("DESCRIPTION", &[], &escape_text(text))));
-        }
-        if let Change::Set(text) = &self.location {
-            out.extend(fold(&render("LOCATION", &[], &escape_text(text))));
-        }
-        if let Change::Set(spec) = &self.start {
-            out.extend(fold(&render("DTSTART", &spec.params, &spec.value)));
-        }
-        if let Change::Set(spec) = &self.end {
-            out.extend(fold(&render("DTEND", &spec.params, &spec.value)));
-        }
+        append_text(out, &self.summary, done.summary, "SUMMARY");
+        append_text(out, &self.description, done.description, "DESCRIPTION");
+        append_text(out, &self.location, done.location, "LOCATION");
+        append_date(out, &self.start, done.start, "DTSTART");
+        append_date(out, &self.end, done.end, "DTEND");
     }
 }
 
@@ -779,57 +805,17 @@ impl ComponentPatch for TaskPatch {
     }
 
     fn flush_missing(&self, out: &mut Vec<String>, done: &Self::Done) {
-        if let Change::Set(text) = &self.summary {
-            if !done.summary {
-                out.extend(fold(&render("SUMMARY", &[], &escape_text(text))));
-            }
-        }
-        if let Change::Set(text) = &self.description {
-            if !done.description {
-                out.extend(fold(&render("DESCRIPTION", &[], &escape_text(text))));
-            }
-        }
-        if let Change::Set(spec) = &self.due {
-            if !done.due {
-                out.extend(fold(&render("DUE", &spec.params, &spec.value)));
-            }
-        }
-        if let Change::Set(status) = &self.status {
-            if !done.status {
-                out.extend(fold(&render("STATUS", &[], status.as_ical())));
-            }
-        }
-        if let Change::Set(percent) = &self.percent_complete {
-            if !done.percent {
-                out.extend(fold(&render("PERCENT-COMPLETE", &[], &percent.to_string())));
-            }
-        }
-        if let Change::Set(priority) = &self.priority {
-            if !done.priority {
-                out.extend(fold(&render("PRIORITY", &[], &priority.to_string())));
-            }
-        }
-    }
-
-    fn push_set(&self, out: &mut Vec<String>) {
-        if let Change::Set(text) = &self.summary {
-            out.extend(fold(&render("SUMMARY", &[], &escape_text(text))));
-        }
-        if let Change::Set(text) = &self.description {
-            out.extend(fold(&render("DESCRIPTION", &[], &escape_text(text))));
-        }
-        if let Change::Set(spec) = &self.due {
-            out.extend(fold(&render("DUE", &spec.params, &spec.value)));
-        }
-        if let Change::Set(status) = &self.status {
-            out.extend(fold(&render("STATUS", &[], status.as_ical())));
-        }
-        if let Change::Set(percent) = &self.percent_complete {
-            out.extend(fold(&render("PERCENT-COMPLETE", &[], &percent.to_string())));
-        }
-        if let Change::Set(priority) = &self.priority {
-            out.extend(fold(&render("PRIORITY", &[], &priority.to_string())));
-        }
+        append_text(out, &self.summary, done.summary, "SUMMARY");
+        append_text(out, &self.description, done.description, "DESCRIPTION");
+        append_date(out, &self.due, done.due, "DUE");
+        append_status(out, &self.status, done.status, "STATUS");
+        append_number(
+            out,
+            &self.percent_complete,
+            done.percent,
+            "PERCENT-COMPLETE",
+        );
+        append_number(out, &self.priority, done.priority, "PRIORITY");
     }
 }
 
@@ -1088,6 +1074,31 @@ mod tests {
         );
 
         // Y por `new_event` tampoco pasa: no se arma un evento con la inyección.
+        assert_eq!(
+            new_event("a", "20260101T000000Z", &patch),
+            Err(SerializeError::MalformedDate)
+        );
+    }
+
+    /// **El borde que el incrustado no cubría: un CR/LF al principio o al final
+    /// del valor.** `DateValue::parse` recorta antes de validar, así que
+    /// `" 20260101T000000Z\r\n"` **parsearía** como una fecha; pero la escritura
+    /// usa el valor sin recortar y metería el salto crudo en la línea. Se rechaza
+    /// por `has_control`, no por el formato. Es código compartido: vale para el
+    /// evento y para la tarea.
+    #[test]
+    fn una_fecha_de_evento_con_crlf_al_final_se_rechaza() {
+        let patch = EventPatch {
+            start: Change::Set(DateSpec {
+                value: " 20260101T000000Z\r\n".into(),
+                params: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            apply_changes(EVENT, &patch),
+            Err(SerializeError::MalformedDate)
+        );
         assert_eq!(
             new_event("a", "20260101T000000Z", &patch),
             Err(SerializeError::MalformedDate)
@@ -1387,6 +1398,28 @@ mod tests {
         let patch = TaskPatch {
             due: Change::Set(DateSpec {
                 value: "20260101T000000Z\r\nATTENDEE:mailto:x\r\nX-:".into(),
+                params: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            apply_todo_changes(TASK, &patch),
+            Err(SerializeError::MalformedDate)
+        );
+        assert_eq!(
+            new_todo("t", "20260101T000000Z", &patch),
+            Err(SerializeError::MalformedDate)
+        );
+    }
+
+    /// **El borde de la tarea: un `due` con un CR/LF al final.** Igual que en el
+    /// evento, `DateValue::parse` lo recortaría y lo daría por válido, pero la
+    /// escritura usa el valor crudo; `has_control` lo rechaza antes.
+    #[test]
+    fn un_due_con_crlf_al_final_se_rechaza() {
+        let patch = TaskPatch {
+            due: Change::Set(DateSpec {
+                value: "20261001T100000Z\r\n".into(),
                 params: Vec::new(),
             }),
             ..Default::default()
