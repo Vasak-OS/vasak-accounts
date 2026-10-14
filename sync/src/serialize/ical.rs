@@ -1053,56 +1053,39 @@ mod tests {
         assert_eq!(events_from(&out)[0].title, largo.trim());
     }
 
-    /// **H1 (seguridad): una fecha con `\r\n` incrustado no inyecta líneas.**
+    /// **H1 (seguridad): un `\r\n` en el valor de una fecha no inyecta líneas.**
     /// El valor viene de afuera —de la ventana por D-Bus en el PR de la cola— y
-    /// lo que se escribe se sube al servidor con la credencial de la persona. Un
-    /// `20260101T000000Z\r\nATTENDEE:mailto:x\r\nX-:` escrito crudo partiría la
-    /// línea y metería un `ATTENDEE` y una propiedad en el `VEVENT`. Se rechaza,
-    /// no se filtra: filtrar fabricaría una fecha distinta de la que se pidió.
+    /// lo que se escribe se sube al servidor con la credencial de la persona. Dos
+    /// bordes del mismo ataque: **incrustado** en el medio
+    /// (`...Z\r\nATTENDEE:mailto:x\r\nX-:`, que partiría la línea y metería un
+    /// `ATTENDEE` y una propiedad) y **al final** (`" ...Z\r\n"`, que
+    /// `DateValue::parse` recortaría y daría por válido, pero la escritura usa el
+    /// valor sin recortar). Los dos se rechazan —no se filtran, que fabricaría una
+    /// fecha distinta—, por `apply_changes` y por `new_event`.
     #[test]
-    fn una_fecha_con_crlf_incrustado_se_rechaza() {
-        let patch = EventPatch {
-            start: Change::Set(DateSpec {
-                value: "20260101T000000Z\r\nATTENDEE:mailto:x\r\nX-:".into(),
-                params: Vec::new(),
-            }),
-            ..Default::default()
-        };
-        assert_eq!(
-            apply_changes(EVENT, &patch),
-            Err(SerializeError::MalformedDate)
-        );
-
-        // Y por `new_event` tampoco pasa: no se arma un evento con la inyección.
-        assert_eq!(
-            new_event("a", "20260101T000000Z", &patch),
-            Err(SerializeError::MalformedDate)
-        );
-    }
-
-    /// **El borde que el incrustado no cubría: un CR/LF al principio o al final
-    /// del valor.** `DateValue::parse` recorta antes de validar, así que
-    /// `" 20260101T000000Z\r\n"` **parsearía** como una fecha; pero la escritura
-    /// usa el valor sin recortar y metería el salto crudo en la línea. Se rechaza
-    /// por `has_control`, no por el formato. Es código compartido: vale para el
-    /// evento y para la tarea.
-    #[test]
-    fn una_fecha_de_evento_con_crlf_al_final_se_rechaza() {
-        let patch = EventPatch {
-            start: Change::Set(DateSpec {
-                value: " 20260101T000000Z\r\n".into(),
-                params: Vec::new(),
-            }),
-            ..Default::default()
-        };
-        assert_eq!(
-            apply_changes(EVENT, &patch),
-            Err(SerializeError::MalformedDate)
-        );
-        assert_eq!(
-            new_event("a", "20260101T000000Z", &patch),
-            Err(SerializeError::MalformedDate)
-        );
+    fn una_fecha_de_evento_con_control_se_rechaza() {
+        for value in [
+            "20260101T000000Z\r\nATTENDEE:mailto:x\r\nX-:",
+            " 20260101T000000Z\r\n",
+        ] {
+            let patch = EventPatch {
+                start: Change::Set(DateSpec {
+                    value: value.into(),
+                    params: Vec::new(),
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                apply_changes(EVENT, &patch),
+                Err(SerializeError::MalformedDate),
+                "{value:?}"
+            );
+            assert_eq!(
+                new_event("a", "20260101T000000Z", &patch),
+                Err(SerializeError::MalformedDate),
+                "{value:?}"
+            );
+        }
     }
 
     /// Y un parámetro de fecha con `\r\n` o con dos puntos tampoco: partiría la
@@ -1391,47 +1374,33 @@ mod tests {
         assert_eq!(todo.text("SUMMARY", 256).unwrap(), "Pagar la luz");
     }
 
-    /// **H1 en la tarea: un `due` con `\r\n` incrustado no inyecta líneas.** Es
-    /// la misma validación de fecha que un evento, por la misma pieza.
+    /// **H1 en la tarea: un `\r\n` en el `due` no inyecta líneas.** Los mismos dos
+    /// bordes que en el evento —incrustado en el medio y al final—, por la misma
+    /// pieza de validación, rechazados por `apply_todo_changes` y por `new_todo`.
     #[test]
-    fn un_due_con_crlf_incrustado_se_rechaza() {
-        let patch = TaskPatch {
-            due: Change::Set(DateSpec {
-                value: "20260101T000000Z\r\nATTENDEE:mailto:x\r\nX-:".into(),
-                params: Vec::new(),
-            }),
-            ..Default::default()
-        };
-        assert_eq!(
-            apply_todo_changes(TASK, &patch),
-            Err(SerializeError::MalformedDate)
-        );
-        assert_eq!(
-            new_todo("t", "20260101T000000Z", &patch),
-            Err(SerializeError::MalformedDate)
-        );
-    }
-
-    /// **El borde de la tarea: un `due` con un CR/LF al final.** Igual que en el
-    /// evento, `DateValue::parse` lo recortaría y lo daría por válido, pero la
-    /// escritura usa el valor crudo; `has_control` lo rechaza antes.
-    #[test]
-    fn un_due_con_crlf_al_final_se_rechaza() {
-        let patch = TaskPatch {
-            due: Change::Set(DateSpec {
-                value: "20261001T100000Z\r\n".into(),
-                params: Vec::new(),
-            }),
-            ..Default::default()
-        };
-        assert_eq!(
-            apply_todo_changes(TASK, &patch),
-            Err(SerializeError::MalformedDate)
-        );
-        assert_eq!(
-            new_todo("t", "20260101T000000Z", &patch),
-            Err(SerializeError::MalformedDate)
-        );
+    fn un_due_con_control_se_rechaza() {
+        for value in [
+            "20260101T000000Z\r\nATTENDEE:mailto:x\r\nX-:",
+            "20261001T100000Z\r\n",
+        ] {
+            let patch = TaskPatch {
+                due: Change::Set(DateSpec {
+                    value: value.into(),
+                    params: Vec::new(),
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                apply_todo_changes(TASK, &patch),
+                Err(SerializeError::MalformedDate),
+                "{value:?}"
+            );
+            assert_eq!(
+                new_todo("t", "20260101T000000Z", &patch),
+                Err(SerializeError::MalformedDate),
+                "{value:?}"
+            );
+        }
     }
 
     /// **El dominio del porcentaje y de la prioridad se respeta:** fuera de
