@@ -1772,4 +1772,337 @@ mod tests {
             "Graph se refrescó dos veces para capacidades del mismo recurso"
         );
     }
+
+    /// Un endpoint de token que **rota el refresh_token en cada uso** y rechaza el
+    /// reuso del viejo, como hace Microsoft AAD (el refresh es de un solo uso).
+    ///
+    /// Arranca con `rt-0` como único refresh válido. Cada canje exitoso emite un
+    /// access nuevo (`tok-{n}`) y rota el refresh válido a `rt-{n}`; el refresh
+    /// anterior deja de servir. Un canje que llega con un refresh que ya no es el
+    /// vigente recibe `invalid_grant`, que es con lo que un proveedor dice que la
+    /// autorización ya no vale. Registra, en orden, el `refresh_token` que recibió
+    /// cada canje: así la prueba ve si el segundo refresco usó el token ya rotado
+    /// (serializado) o el viejo (carrera).
+    struct FakeRotatingToken {
+        port: u16,
+        refreshes: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        _handle: tokio::task::JoinHandle<()>,
+    }
+
+    async fn fake_rotating_token() -> FakeRotatingToken {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let escucha = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = escucha.local_addr().unwrap().port();
+        let refreshes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let registro = refreshes.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut valido = "rt-0".to_string();
+            let mut n = 0u32;
+            while let Ok((mut flujo, _)) = escucha.accept().await {
+                let mut datos = Vec::new();
+                let mut buf = [0u8; 1024];
+                let mut total: Option<usize> = None;
+                loop {
+                    match flujo.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(k) => datos.extend_from_slice(&buf[..k]),
+                    }
+                    if total.is_none() {
+                        if let Some(pos) = headers_end(&datos) {
+                            total = Some(pos + 4 + content_length(&datos[..pos]));
+                        }
+                    }
+                    if total.is_some_and(|t| datos.len() >= t) {
+                        break;
+                    }
+                }
+
+                let cuerpo = headers_end(&datos)
+                    .map(|pos| datos[pos + 4..].to_vec())
+                    .unwrap_or_default();
+                let recibido = url::form_urlencoded::parse(&cuerpo)
+                    .find(|(clave, _)| clave == "refresh_token")
+                    .map(|(_, valor)| valor.into_owned())
+                    .unwrap_or_default();
+                registro.lock().unwrap().push(recibido.clone());
+
+                let respuesta = if recibido == valido {
+                    n += 1;
+                    valido = format!("rt-{n}");
+                    let cuerpo = format!(
+                        "{{\"access_token\":\"tok-{n}\",\"token_type\":\"bearer\",\
+                         \"expires_in\":3600,\"refresh_token\":\"rt-{n}\"}}"
+                    );
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{cuerpo}",
+                        cuerpo.len()
+                    )
+                } else {
+                    // Reuso de un refresh ya rotado: es la carrera que el candado
+                    // por cuenta evita.
+                    let cuerpo =
+                        r#"{"error":"invalid_grant","error_description":"refresh ya usado"}"#;
+                    format!(
+                        "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{cuerpo}",
+                        cuerpo.len()
+                    )
+                };
+                let _ = flujo.write_all(respuesta.as_bytes()).await;
+                let _ = flujo.flush().await;
+            }
+        });
+
+        FakeRotatingToken {
+            port,
+            refreshes,
+            _handle: handle,
+        }
+    }
+
+    /// **El corazón de H1.** Dos recursos de la **misma** cuenta piden su token a
+    /// la vez contra un proveedor que rota el refresh en cada uso (uso único) y
+    /// rechaza el reuso. Es lo que pasa al abrir sesión: el cliente de correo
+    /// (`outlook.office.com`) y el de calendario (`graph.microsoft.com`) de una
+    /// cuenta de Microsoft arrancan juntos, los dos leen el `refresh` compartido y
+    /// los dos lo quieren canjear.
+    ///
+    /// Con el candado por cuenta, los dos refrescos se serializan: el primero rota
+    /// `rt-0` → `rt-1` y lo persiste, y el segundo lee ya `rt-1`. Los dos resuelven,
+    /// cada recurso queda con su token, y la cuenta **no** queda revocada.
+    ///
+    /// Sin el candado (revertido), los dos leen `rt-0` antes de que ninguno
+    /// persista, el primero lo rota y el segundo llega con el viejo → `invalid_grant`
+    /// → `Revoked`: una cuenta sana mandada a reautenticar, la denegación de
+    /// servicio que H1 cierra. Verificado en rojo quitando el candado de
+    /// `get_valid_access_token`: el calendario vuelve `Err(Revoked)` y los refresh
+    /// registrados son `["rt-0", "rt-0"]` (los dos reusaron el viejo).
+    #[tokio::test]
+    async fn dos_recursos_concurrentes_no_revocan_la_cuenta_con_refresh_rotatorio() {
+        let _guard = TOKEN_TEST_LOCK.lock().await;
+        let _root = set_test_root();
+        let server = fake_rotating_token().await;
+        let uid = 900_005;
+
+        let pasado = Utc::now() - chrono::Duration::hours(1);
+        let mut caps = HashMap::new();
+        caps.insert(
+            CapabilityType::Email,
+            cap_config(
+                server.port,
+                &[
+                    "offline_access",
+                    "https://outlook.office.com/IMAP.AccessAsUser.All",
+                ],
+                Some(pasado),
+            ),
+        );
+        caps.insert(
+            CapabilityType::Calendar,
+            cap_config(
+                server.port,
+                &[
+                    "offline_access",
+                    "https://graph.microsoft.com/Calendars.Read",
+                ],
+                Some(pasado),
+            ),
+        );
+        let id = seed(uid, Account::new("Trabajo", "microsoft", caps), "rt-0");
+
+        // Los dos recursos a la vez, como al abrir la sesión.
+        let (correo, calendario) = tokio::join!(
+            get_valid_access_token(uid, &id, &CapabilityType::Email),
+            get_valid_access_token(uid, &id, &CapabilityType::Calendar),
+        );
+
+        // Ninguno quedó revocado: los dos resolvieron.
+        let correo = correo.expect("el correo no debe quedar revocado por la carrera");
+        let calendario = calendario.expect("el calendario no debe quedar revocado por la carrera");
+
+        // Cada recurso con su propio token, bajo su clave.
+        assert_ne!(correo, calendario);
+        assert_eq!(
+            SecretStore::get_secret(uid, &id, "access:outlook.office.com").unwrap(),
+            correo
+        );
+        assert_eq!(
+            SecretStore::get_secret(uid, &id, "access:graph.microsoft.com").unwrap(),
+            calendario
+        );
+
+        // La prueba de que se serializó: el segundo canje llegó con el refresh ya
+        // rotado por el primero, no con el viejo. Sin candado serían `["rt-0","rt-0"]`.
+        let refreshes = server.refreshes.lock().unwrap().clone();
+        assert_eq!(
+            refreshes,
+            vec!["rt-0".to_string(), "rt-1".to_string()],
+            "los refrescos no se serializaron: {refreshes:?}"
+        );
+
+        // Y el refresh rotado final quedó persistido para la próxima vez.
+        assert_eq!(
+            SecretStore::get_secret(uid, &id, "refresh").unwrap(),
+            "rt-2"
+        );
+    }
+
+    /// El split de Google **funciona de verdad**: una cuenta con correo por
+    /// `mail.google.com` y calendario por `www.googleapis.com` se parte en **dos**
+    /// tokens por recurso, los dos válidos, cada uno cacheado bajo su `access:HOST`
+    /// y pidiendo sólo los alcances de su host. Google emite tokens de alcance
+    /// completo y no rota el refresh, así que los dos recursos conviven sin 401 ni
+    /// re-consentimiento.
+    ///
+    /// La prueba vieja de recurso usaba hosts de un solo dominio y daba confianza
+    /// falsa sobre Google. Verificado en rojo volviendo `resource_plan` a una sola
+    /// clave `access`: entonces nunca se escribe `access:mail.google.com` ni
+    /// `access:www.googleapis.com` —los dos recursos se pisan bajo `access`— y los
+    /// `get_secret` de esas claves hacen fallar la prueba.
+    #[tokio::test]
+    async fn una_cuenta_de_google_se_parte_en_dos_tokens_por_recurso() {
+        let _guard = TOKEN_TEST_LOCK.lock().await;
+        let _root = set_test_root();
+        // Google no rota el refresh: el endpoint común, que emite un token nuevo por
+        // canje sin rechazar nada, lo modela bien.
+        let server = fake_token(false).await;
+        let uid = 900_006;
+
+        let pasado = Utc::now() - chrono::Duration::hours(1);
+        let mut caps = HashMap::new();
+        caps.insert(
+            CapabilityType::Email,
+            cap_config(server.port, &["https://mail.google.com/"], Some(pasado)),
+        );
+        caps.insert(
+            CapabilityType::Calendar,
+            cap_config(
+                server.port,
+                &["https://www.googleapis.com/auth/calendar"],
+                Some(pasado),
+            ),
+        );
+        let id = seed(uid, Account::new("Personal", "google", caps), "rt-0");
+        // El token del canje, como lo tiene una cuenta ya conectada: vale para un
+        // solo recurso, así que ni el correo ni el calendario pueden reusarlo.
+        SecretStore::store_secret(uid, &id, "access", "token-del-canje").unwrap();
+
+        let correo = get_valid_access_token(uid, &id, &CapabilityType::Email)
+            .await
+            .unwrap();
+        let calendario = get_valid_access_token(uid, &id, &CapabilityType::Calendar)
+            .await
+            .unwrap();
+
+        // Dos tokens distintos, ninguno el del canje.
+        assert_ne!(correo, "token-del-canje");
+        assert_ne!(calendario, "token-del-canje");
+        assert_ne!(correo, calendario);
+
+        // Cada uno bajo la clave de su recurso: el split se escribió de verdad.
+        assert_eq!(
+            SecretStore::get_secret(uid, &id, "access:mail.google.com").unwrap(),
+            correo
+        );
+        assert_eq!(
+            SecretStore::get_secret(uid, &id, "access:www.googleapis.com").unwrap(),
+            calendario
+        );
+
+        // Mínimo privilegio: cada recurso pidió sólo los alcances de su host.
+        let pedidos = server.pedidos.lock().unwrap().clone();
+        assert_eq!(pedidos.len(), 2, "un canje por recurso: {pedidos:?}");
+        assert!(
+            pedidos[0].contains("mail.google.com") && !pedidos[0].contains("googleapis.com/auth"),
+            "el correo pidió alcances que no son suyos: {pedidos:?}"
+        );
+        assert!(
+            pedidos[1].contains("www.googleapis.com") && !pedidos[1].contains("mail.google.com"),
+            "el calendario pidió alcances que no son suyos: {pedidos:?}"
+        );
+    }
+
+    /// Doble chequeo, mismo recurso, concurrente: dos llamadores de capacidades que
+    /// comparten recurso (calendario y contactos de Microsoft, los dos por Graph)
+    /// piden a la vez con la caché vencida. El primero toma el candado y refresca;
+    /// el segundo espera, y al tomar el candado **recarga de disco y re-mira la
+    /// caché** —que el primero acaba de dejar vigente— y entrega ese token sin un
+    /// segundo canje.
+    ///
+    /// Es el borde que cubre el doble chequeo (la recarga tras tomar el candado).
+    /// Verificado en rojo quitando ese segundo `token_cacheado_vigente` de
+    /// `get_valid_access_token`: el segundo llamador refresca igual —dos canjes— y
+    /// los dos tokens dejan de coincidir.
+    #[tokio::test]
+    async fn el_segundo_llamador_del_mismo_recurso_reusa_lo_que_persistio_el_primero() {
+        let _guard = TOKEN_TEST_LOCK.lock().await;
+        let _root = set_test_root();
+        let server = fake_token(false).await;
+        let uid = 900_007;
+
+        let pasado = Utc::now() - chrono::Duration::hours(1);
+        let mut caps = HashMap::new();
+        // El correo por otro recurso, para que la cuenta sea multi-recurso y el
+        // token se parta por host; calendario y contactos comparten Graph.
+        caps.insert(
+            CapabilityType::Email,
+            cap_config(
+                server.port,
+                &[
+                    "offline_access",
+                    "https://outlook.office.com/IMAP.AccessAsUser.All",
+                ],
+                Some(pasado),
+            ),
+        );
+        caps.insert(
+            CapabilityType::Calendar,
+            cap_config(
+                server.port,
+                &[
+                    "offline_access",
+                    "https://graph.microsoft.com/Calendars.Read",
+                ],
+                Some(pasado),
+            ),
+        );
+        caps.insert(
+            CapabilityType::Contacts,
+            cap_config(
+                server.port,
+                &[
+                    "offline_access",
+                    "https://graph.microsoft.com/Contacts.Read",
+                ],
+                Some(pasado),
+            ),
+        );
+        let id = seed(uid, Account::new("Trabajo", "microsoft", caps), "rt-0");
+        SecretStore::store_secret(uid, &id, "access", "token-del-canje").unwrap();
+
+        // Calendario y contactos, los dos Graph, a la vez.
+        let (calendario, contactos) = tokio::join!(
+            get_valid_access_token(uid, &id, &CapabilityType::Calendar),
+            get_valid_access_token(uid, &id, &CapabilityType::Contacts),
+        );
+        let calendario = calendario.unwrap();
+        let contactos = contactos.unwrap();
+
+        // El segundo salió de la caché que dejó el primero: mismo token.
+        assert_eq!(calendario, contactos);
+        assert_eq!(
+            SecretStore::get_secret(uid, &id, "access:graph.microsoft.com").unwrap(),
+            calendario
+        );
+        // Un solo canje contra Graph: el doble chequeo le ahorró el segundo.
+        assert_eq!(
+            server.pedidos.lock().unwrap().len(),
+            1,
+            "el doble chequeo no evitó el segundo canje de Graph: {:?}",
+            server.pedidos.lock().unwrap()
+        );
+    }
 }
