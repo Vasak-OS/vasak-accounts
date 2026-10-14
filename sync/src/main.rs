@@ -77,6 +77,12 @@ mod outbox;
 mod preferences;
 mod query;
 mod reminders;
+// El lado de la escritura conservadora de iCalendar y vCard. Todavía no lo
+// consume nadie: la cola de cambios y la superficie D-Bus que lo van a usar son
+// los PRs siguientes de este hito (`vasak-accounts#23`), así que por ahora sólo
+// lo ejercitan sus pruebas.
+#[allow(dead_code)]
+mod serialize;
 mod smtp;
 mod store;
 mod store_api;
