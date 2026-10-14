@@ -284,6 +284,24 @@ pub fn unescape_text(value: &str) -> String {
     out
 }
 
+/// Escapa un valor para una propiedad de vCard (RFC 2426 / 6350).
+///
+/// Es el ayudante compartido: los backends que arman vCard a mano
+/// (`contacts_sync::graph`, `contacts_sync::ldap`) lo reusan en vez de tener su
+/// propia copia. La **barra invertida va primero**, antes que la coma y el punto
+/// y coma: si se escapara después, se re-escaparían las barras que agregan esos
+/// pasos. El retorno de carro se descarta y el salto de línea se codifica como
+/// `\n`; así un valor con `\r\n` no puede fabricar propiedades ni registros
+/// nuevos. [`unescape_text`] / [`split_fields`] revierten exactamente este
+/// escape.
+pub fn escape_vcard_public(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace(',', "\\,")
+        .replace(';', "\\;")
+        .replace('\n', "\\n")
+        .replace('\r', "")
+}
+
 /// Los campos de un valor con varias partes, como `N` o `ADR`.
 ///
 /// El separador es el punto y coma **sin escapar**: un apellido compuesto que
@@ -908,6 +926,29 @@ mod tests {
         assert_eq!(unescape_text(r"Pérez\, Ana"), "Pérez, Ana");
         assert_eq!(unescape_text(r"uno\ndos"), "uno\ndos");
         assert_eq!(unescape_text(r"punto\; y coma"), "punto; y coma");
+    }
+
+    #[test]
+    fn escape_vcard_escapa_caracteres_especiales() {
+        assert_eq!(escape_vcard_public("a,b"), "a\\,b");
+        assert_eq!(escape_vcard_public("a;b"), "a\\;b");
+        assert_eq!(escape_vcard_public("a\nb"), "a\\nb");
+        assert_eq!(escape_vcard_public("a\rb"), "ab");
+        // La barra invertida va primero: no debe re-escapar las barras que
+        // agregan los pasos siguientes.
+        assert_eq!(escape_vcard_public("a\\b"), "a\\\\b");
+        assert_eq!(escape_vcard_public("a\\,b"), "a\\\\\\,b");
+    }
+
+    /// Lo que escapa [`escape_vcard_public`] lo revierte el parser propio: un
+    /// valor con barra, coma y punto y coma round-trips a través de `FN`.
+    #[test]
+    fn el_escape_de_vcard_round_trips_por_el_parser() {
+        let raw = "C:\\ruta, con coma; y punto y coma";
+        let line = format!("FN:{}\r\n", escape_vcard_public(raw));
+        let vcard = format!("BEGIN:VCARD\r\n{line}END:VCARD\r\n");
+        let contact = contact_from(&vcard, "").unwrap();
+        assert_eq!(contact.display_name, raw);
     }
 
     /// Un apellido compuesto con un punto y coma escapado no puede partir el

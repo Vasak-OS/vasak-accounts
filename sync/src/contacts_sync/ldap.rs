@@ -297,7 +297,7 @@ impl LdapBackend {
         let mut vcard = String::new();
         vcard.push_str("BEGIN:VCARD\r\n");
         vcard.push_str("VERSION:3.0\r\n");
-        vcard.push_str(&format!("UID:{}\r\n", Self::escape_vcard(&dn)));
+        vcard.push_str(&format!("UID:{}\r\n", vcard::escape_vcard_public(&dn)));
 
         // CN o displayName
         let cn = attrs
@@ -306,7 +306,7 @@ impl LdapBackend {
             .or_else(|| attrs.get("displayName").and_then(|v| v.first()))
             .cloned();
         if let Some(cn) = cn {
-            vcard.push_str(&format!("FN:{}\r\n", Self::escape_vcard(&cn)));
+            vcard.push_str(&format!("FN:{}\r\n", vcard::escape_vcard_public(&cn)));
         }
 
         // Nombre estructurado
@@ -318,77 +318,83 @@ impl LdapBackend {
         if given.is_some() || sn.is_some() {
             vcard.push_str(&format!(
                 "N:{};{};;;\r\n",
-                sn.map(Self::escape_vcard).unwrap_or_default(),
-                given.map(Self::escape_vcard).unwrap_or_default()
+                sn.map(vcard::escape_vcard_public).unwrap_or_default(),
+                given.map(vcard::escape_vcard_public).unwrap_or_default()
             ));
         }
 
         // Emails
         if let Some(mails) = attrs.get("mail") {
             for mail in mails {
-                vcard.push_str(&format!("EMAIL:{}\r\n", Self::escape_vcard(mail)));
+                vcard.push_str(&format!("EMAIL:{}\r\n", vcard::escape_vcard_public(mail)));
             }
         }
 
         // Teléfonos
         if let Some(phones) = attrs.get("telephoneNumber") {
             for phone in phones {
-                vcard.push_str(&format!("TEL;TYPE=WORK:{}\r\n", Self::escape_vcard(phone)));
+                vcard.push_str(&format!(
+                    "TEL;TYPE=WORK:{}\r\n",
+                    vcard::escape_vcard_public(phone)
+                ));
             }
         }
         if let Some(mobiles) = attrs.get("mobile") {
             for mobile in mobiles {
-                vcard.push_str(&format!("TEL;TYPE=CELL:{}\r\n", Self::escape_vcard(mobile)));
+                vcard.push_str(&format!(
+                    "TEL;TYPE=CELL:{}\r\n",
+                    vcard::escape_vcard_public(mobile)
+                ));
             }
         }
 
         // Título
         if let Some(title) = attrs.get("title").and_then(|v| v.first()) {
-            vcard.push_str(&format!("TITLE:{}\r\n", Self::escape_vcard(title)));
+            vcard.push_str(&format!("TITLE:{}\r\n", vcard::escape_vcard_public(title)));
         }
 
         // Departamento
         if let Some(dept) = attrs.get("department").and_then(|v| v.first()) {
             vcard.push_str(&format!(
                 "ORG;TYPE=DEPARTMENT:{}\r\n",
-                Self::escape_vcard(dept)
+                vcard::escape_vcard_public(dept)
             ));
         }
 
         // Empresa
         if let Some(company) = attrs.get("company").and_then(|v| v.first()) {
-            vcard.push_str(&format!("ORG:{}\r\n", Self::escape_vcard(company)));
+            vcard.push_str(&format!("ORG:{}\r\n", vcard::escape_vcard_public(company)));
         }
 
         // Dirección
         if let Some(street) = attrs.get("streetAddress").and_then(|v| v.first()) {
             vcard.push_str(&format!(
                 "ADR;TYPE=WORK:;;{}\r\n",
-                Self::escape_vcard(street)
+                vcard::escape_vcard_public(street)
             ));
         }
         if let Some(locality) = attrs.get("l").and_then(|v| v.first()) {
             vcard.push_str(&format!(
                 "ADR;TYPE=WORK:;;;{}\r\n",
-                Self::escape_vcard(locality)
+                vcard::escape_vcard_public(locality)
             ));
         }
         if let Some(state) = attrs.get("st").and_then(|v| v.first()) {
             vcard.push_str(&format!(
                 "ADR;TYPE=WORK:;;;;{}\r\n",
-                Self::escape_vcard(state)
+                vcard::escape_vcard_public(state)
             ));
         }
         if let Some(postal) = attrs.get("postalCode").and_then(|v| v.first()) {
             vcard.push_str(&format!(
                 "ADR;TYPE=WORK:;;;;;{}\r\n",
-                Self::escape_vcard(postal)
+                vcard::escape_vcard_public(postal)
             ));
         }
         if let Some(country) = attrs.get("co").and_then(|v| v.first()) {
             vcard.push_str(&format!(
                 "ADR;TYPE=WORK:;;;;;;{}\r\n",
-                Self::escape_vcard(country)
+                vcard::escape_vcard_public(country)
             ));
         }
 
@@ -402,32 +408,5 @@ impl LdapBackend {
             raw_vcard: vcard,
             contact,
         })
-    }
-
-    fn escape_vcard(s: &str) -> String {
-        s.replace(',', "\\,")
-            .replace(';', "\\;")
-            .replace('\n', "\\n")
-            .replace('\r', "")
-    }
-}
-
-pub fn escape_vcard_public(s: &str) -> String {
-    s.replace(',', "\\,")
-        .replace(';', "\\;")
-        .replace('\n', "\\n")
-        .replace('\r', "")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn escape_vcard_escapa_caracteres_especiales() {
-        assert_eq!(escape_vcard_public("a,b"), "a\\,b");
-        assert_eq!(escape_vcard_public("a;b"), "a\\;b");
-        assert_eq!(escape_vcard_public("a\nb"), "a\\nb");
-        assert_eq!(escape_vcard_public("a\rb"), "ab");
     }
 }
