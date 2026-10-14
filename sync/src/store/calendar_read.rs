@@ -288,6 +288,14 @@ pub struct TaskItem {
     pub completed: Option<String>,
     pub done: bool,
     pub color: Option<String>,
+    /// El ETag del objeto guardado, para pasarlo como `if_match` al editar o
+    /// completar la tarea. **Vacío** en un objeto recién creado local que
+    /// todavía no confirmó el servidor: así la aplicación sabe que todavía no
+    /// se puede editar.
+    pub etag: String,
+    /// El estado de sincronización del objeto: `synced`, `pending` o `conflict`.
+    /// Para el ícono «sin sincronizar» y la superficie de conflicto.
+    pub sync_state: SyncState,
 }
 
 /// Lo que dio una cuenta para una página: las filas con su posición, y si
@@ -888,9 +896,12 @@ pub fn account_tasks(
         .unwrap_or_default();
     let sql = format!(
         "SELECT c.id, c.calendar_id, c.summary, c.ends_at, c.all_day, c.status, c.priority,
-                c.completed_at, c.done, c.sort_key, k.color
+                c.completed_at, c.done, c.sort_key, k.color, c.etag, c.pending_op, pdo.state
            FROM calendar_objects c
            JOIN calendars k ON k.id = c.calendar_id
+           LEFT JOIN pending_dav_ops pdo
+                  ON pdo.area = 'calendar' AND pdo.object_href = c.href
+                 AND pdo.collection_href = k.href
           WHERE c.component = 'VTODO'
             AND (c.pending_op IS NULL OR c.pending_op != 'delete'){}{}{}
           ORDER BY c.sort_key, c.id
@@ -912,6 +923,9 @@ pub fn account_tasks(
         let sort_key: i64 = row.get(9).map_err(classify)?;
         let due: Option<i64> = row.get(3).map_err(classify)?;
         let completed: Option<i64> = row.get(7).map_err(classify)?;
+        let etag: Option<String> = row.get(11).map_err(classify)?;
+        let pending_op: Option<String> = row.get(12).map_err(classify)?;
+        let op_state: Option<String> = row.get(13).map_err(classify)?;
         result.rows.push((
             ListCursor {
                 key: sort_key,
@@ -938,6 +952,8 @@ pub fn account_tasks(
                 completed: completed.map(ical::rfc3339),
                 done: row.get(8).map_err(classify)?,
                 color: row.get(10).map_err(classify)?,
+                etag: etag.unwrap_or_default(),
+                sync_state: SyncState::derive(pending_op.as_deref(), op_state.as_deref()),
             },
         ));
     }
@@ -1561,6 +1577,101 @@ mod tests {
         let op = store.pending_ops(CALENDAR_AREA).unwrap().remove(0);
         store.mark_conflict(&op, "chocó").unwrap();
         assert_eq!(read(&store).1, SyncState::Conflict);
+    }
+
+    /// Un VTODO para las pruebas del DTO de tareas.
+    fn todo_task(uid: &str, due: &str) -> String {
+        format!(
+            "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:{uid}\r\nSUMMARY:{uid}\r\n\
+             DUE:{due}\r\nEND:VTODO\r\nEND:VCALENDAR\r\n"
+        )
+    }
+
+    /// **DTO**: las tareas guardadas traen el `etag` del objeto y su
+    /// `sync_state`, que pasa de `synced` a `pending` al editar/completar local
+    /// sin confirmar y a `conflict` cuando la op choca con el servidor. Es lo
+    /// que enciende el badge «sin sincronizar» y lo que habilita editar (el
+    /// `etag` como `if_match` en `PutTask`).
+    #[test]
+    fn las_tareas_traen_etag_y_sync_state() {
+        use super::super::lifecycle::CALENDAR_AREA;
+        let temp = TempDir::new("task-sync-state");
+        let mut store = open_store(&temp);
+        let cal = calendar(&mut store, "https://x/c/");
+        let w = window();
+        let href = "https://x/c/t.ics";
+        store
+            .apply_calendar_objects(
+                &cal,
+                &[ObjectOp::Upsert(object(
+                    href,
+                    &todo_task("t", "20261001T100000Z"),
+                    w,
+                ))],
+                w,
+                None,
+                CalendarRoom::UNLIMITED,
+            )
+            .unwrap();
+        // Devuelve sólo los campos escalares que la prueba mira (ETag y estado):
+        // el valor entero —con datos de la cuenta— no sale del cierre ni fluye a
+        // un `.unwrap()`/panic, para no disparar `rust/cleartext-logging`.
+        let read = |store: &Store| -> (String, SyncState) {
+            let Ok(mut page) = account_tasks(store.connection(), "cuenta", None, true, None, 10)
+            else {
+                panic!("no se pudo leer la tarea");
+            };
+            let item = page.rows.remove(0).1;
+            (item.etag, item.sync_state)
+        };
+
+        // Al día con el servidor: trae su ETag y `synced`.
+        let (etag, state) = read(&store);
+        assert_eq!(etag, "\"1\"");
+        assert_eq!(state, SyncState::Synced);
+
+        // Editar/completar local sin confirmar: `pending`.
+        store
+            .enqueue_calendar_put(
+                &cal,
+                &object(href, &todo_task("t", "20261002T100000Z"), w),
+                w,
+            )
+            .unwrap();
+        assert_eq!(read(&store).1, SyncState::Pending);
+
+        // La op choca con el servidor: `conflict`.
+        let op = store.pending_ops(CALENDAR_AREA).unwrap().remove(0);
+        store.mark_conflict(&op, "cambió en el servidor").unwrap();
+        assert_eq!(read(&store).1, SyncState::Conflict);
+    }
+
+    /// **DTO**: una tarea recién creada local sin confirmar (`enqueue` con etag
+    /// nulo) trae el `etag` **vacío** —no se puede editar todavía— y
+    /// `sync_state = pending`.
+    #[test]
+    fn una_tarea_recien_creada_no_trae_etag() {
+        let temp = TempDir::new("task-sin-etag");
+        let mut store = open_store(&temp);
+        let cal = calendar(&mut store, "https://x/c/");
+        let w = window();
+        let mut row = object(
+            "https://x/c/nueva.ics",
+            &todo_task("nueva", "20261001T100000Z"),
+            w,
+        );
+        row.etag = None;
+        store.enqueue_calendar_put(&cal, &row, w).unwrap();
+        let Ok(mut page) = account_tasks(store.connection(), "cuenta", None, true, None, 10) else {
+            panic!("no se pudo leer la tarea");
+        };
+        // Sólo los campos escalares salen de la lectura (ver nota de arriba).
+        let (etag, state) = {
+            let item = page.rows.remove(0).1;
+            (item.etag, item.sync_state)
+        };
+        assert_eq!(etag, "");
+        assert_eq!(state, SyncState::Pending);
     }
 
     fn single(uid: &str, start: &str) -> String {
