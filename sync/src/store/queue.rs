@@ -167,6 +167,13 @@ fn now_text() -> String {
 /// Suma una fila a `pending_dav_ops`, reemplazando la que hubiera del mismo
 /// objeto: una edición nueva pisa a la anterior sin confirmar (misma `UNIQUE`),
 /// y arranca de cero los reintentos y el estado.
+///
+/// Al re-encolar se **limpia la copia del servidor** (`server_etag`/`server_raw`
+/// a `NULL`): era de la revisión anterior y la edición nueva es otro recurso que
+/// todavía no chocó. Dejarla heredada rompería el invariante «la copia es de su
+/// revisión» —si la edición nueva diera 412 y el fetch inline fallara, la guarda
+/// de `replay` la vería no-nula y no volvería a traerla, y M3 mostraría la copia
+/// de una revisión vieja como la actual—.
 fn insert_pending_op(
     transaction: &rusqlite::Transaction<'_>,
     area: &str,
@@ -186,7 +193,8 @@ fn insert_pending_op(
                collection_href = excluded.collection_href, op = excluded.op,
                base_etag = excluded.base_etag, payload = excluded.payload,
                state = 'ready', created_at = excluded.created_at, attempts = 0,
-               last_error = NULL, revision = revision + 1",
+               last_error = NULL, revision = revision + 1,
+               server_etag = NULL, server_raw = NULL",
             rusqlite::params![
                 area,
                 collection_href,
@@ -829,6 +837,41 @@ mod tests {
             .unwrap();
         assert!(!saved, "una op en `ready` no recibe copia del servidor");
         assert_eq!(server_copy_of(&store, HREF), (None, None));
+    }
+
+    /// **Integridad**: re-encolar una edición nueva **limpia la copia del
+    /// servidor** de la revisión anterior. Sin esto, una edición nueva heredaría
+    /// `server_etag`/`server_raw` viejos, y si volviera a chocar sin poder traer
+    /// su copia, M3 mostraría la del servidor de una revisión vieja como la actual.
+    #[test]
+    fn re_encolar_una_edicion_limpia_la_copia_del_servidor() {
+        let temp = TempDir::new("cola-reencolar-limpia-copia");
+        let mut store = open_store(&temp);
+        let book = one_book(&mut store);
+        store
+            .enqueue_contact_put(&book, &row(HREF, "Mía", "yo@x.com"))
+            .unwrap();
+        let op = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        store.mark_conflict(&op, "chocó").unwrap();
+        let op = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        store
+            .store_server_copy(op.id, op.revision, Some("\"srv\""), b"CRUDO-VIEJO")
+            .unwrap();
+        // La copia vieja está guardada.
+        assert_ne!(server_copy_of(&store, HREF), (None, None));
+
+        // Edición nueva del mismo recurso: re-encola por `insert_pending_op`.
+        store
+            .enqueue_contact_put(&book, &row(HREF, "Ana María", "nuevo@x.com"))
+            .unwrap();
+
+        // La copia heredada se limpió, y la op arrancó limpia.
+        assert_eq!(server_copy_of(&store, HREF), (None, None));
+        let after = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        assert_eq!(after.state, PendingState::Ready);
+        assert_eq!(after.server_etag, None);
+        assert_eq!(after.server_raw, None);
+        assert!(after.revision > op.revision, "la revisión subió");
     }
 
     /// **Seguridad**: el `Debug` de una op **tacha** los cuerpos privados —el
