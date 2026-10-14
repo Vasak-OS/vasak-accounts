@@ -3704,14 +3704,15 @@ mod tests {
         let (client, _service) = api.client(":1.7").await;
         let opened_before = api.keys.state().stored.len();
 
-        for account in ["../x", "desconocida"] {
+        // El primero con barra, el segundo bien formado pero inexistente.
+        for (i, account) in ["../x", "desconocida"].into_iter().enumerate() {
             let result = call(
                 &client,
                 "PutEvent",
                 &(account, "1", "{\"summary\":\"x\"}", ""),
             )
             .await;
-            assert_eq!(error_name(&result), INVALID_ARGS, "cuenta {account:?}");
+            assert_eq!(error_name(&result), INVALID_ARGS, "caso {i}");
         }
 
         assert_eq!(
@@ -4322,16 +4323,16 @@ mod tests {
                 "la fecha no tiene el formato de iCalendar",
             ),
         ];
-        for (payload, expected) in cases {
+        for (i, (payload, expected)) in cases.into_iter().enumerate() {
             let result = call(
                 &client,
                 "PutEvent",
                 &("cuenta", cal_id.to_string(), payload, ""),
             )
             .await;
-            assert_eq!(error_name(&result), INVALID_ARGS, "cuerpo {payload:?}");
+            assert_eq!(error_name(&result), INVALID_ARGS, "caso {i}");
             let message = error_message(&result);
-            assert_eq!(message, expected, "el texto no es el fijo para {payload:?}");
+            assert_eq!(message, expected, "el texto no es el fijo para el caso {i}");
             assert!(
                 !message.contains("SECRETO"),
                 "el error filtró el cuerpo: {message}"
