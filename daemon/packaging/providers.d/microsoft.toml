@@ -57,8 +57,12 @@ userinfo_url = "https://graph.microsoft.com/oidc/userinfo"
 # El correo va por **IMAP+XOAUTH2**, no por Graph: el sincronizador ya habla IMAP
 # (Vasak-OS/vasak-accounts#24), y para eso Outlook.com/Exchange Online piden los
 # alcances de `outlook.office.com`, **no** los de Graph mail (`Mail.ReadWrite` /
-# `Mail.Send` no sirven para IMAP). `IMAP.AccessAsUser.All` para leer y
+# `Mail.Send` no sirven para IMAP). `IMAP.AccessAsUser.All` para IMAP y
 # `SMTP.Send` para enviar.
+#
+# Ojo: `IMAP.AccessAsUser.All` **no es sólo lectura** —concede IMAP completo:
+# leer, marcar, borrar y mover—. No existe un alcance IMAP delegado de sólo
+# lectura en Microsoft, así que éste es el mínimo disponible para hablar IMAP.
 email = [
     "offline_access",
     "https://outlook.office.com/IMAP.AccessAsUser.All",

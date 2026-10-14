@@ -1865,6 +1865,62 @@ mod tests {
         );
     }
 
+    /// El correo y el calendario/contactos de Microsoft son **recursos OAuth
+    /// distintos**, y esto tiene que quedar escrito.
+    ///
+    /// Microsoft emite un access_token **por recurso**: uno vale para
+    /// `outlook.office.com` (IMAP) o para `graph.microsoft.com`, nunca para los
+    /// dos a la vez. Como el correo pide alcances de `outlook.office.com` y el
+    /// calendario/contactos de `graph.microsoft.com`, **un único token por cuenta
+    /// no alcanza para ambos**: P3/P4 va a tener que adquirir un token por recurso
+    /// usando el refresh_token de `offline_access`. Esta guarda falla si alguien
+    /// mueve el correo a Graph (o el calendario a Outlook) y hace que los hosts se
+    /// pisen, borrando sin querer esa invariante.
+    #[test]
+    fn el_correo_y_el_calendario_de_microsoft_son_recursos_oauth_distintos() {
+        let directorio =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/providers.d");
+        let microsoft = &cargar(&directorio)["microsoft"];
+
+        // Los hosts de recurso de una capacidad: el host de cada alcance que sea
+        // una URL. `offline_access` no es URL y se descarta sin romper.
+        let hosts = |capacidad: &CapabilityType| -> std::collections::BTreeSet<String> {
+            microsoft.scopes[capacidad]
+                .iter()
+                .filter_map(|alcance| url::Url::parse(alcance).ok())
+                .filter_map(|u| u.host_str().map(str::to_string))
+                .collect()
+        };
+
+        let correo = hosts(&CapabilityType::Email);
+        let calendario = hosts(&CapabilityType::Calendar);
+        let contactos = hosts(&CapabilityType::Contacts);
+
+        assert!(
+            correo.contains("outlook.office.com"),
+            "el correo no pide alcances de outlook.office.com: {correo:?}"
+        );
+        assert!(
+            calendario.contains("graph.microsoft.com"),
+            "el calendario no pide alcances de graph.microsoft.com: {calendario:?}"
+        );
+        assert!(
+            contactos.contains("graph.microsoft.com"),
+            "los contactos no piden alcances de graph.microsoft.com: {contactos:?}"
+        );
+
+        // Y no comparten ningún host de recurso: el token de uno no sirve para el
+        // otro, así que un solo token por cuenta no puede cubrir a los dos.
+        let graph: std::collections::BTreeSet<String> =
+            calendario.union(&contactos).cloned().collect();
+        assert!(
+            correo.is_disjoint(&graph),
+            "el correo y el calendario/contactos comparten host de recurso \
+             ({correo:?} vs {graph:?}); un token por cuenta no puede cubrir ambos \
+             recursos, y P3/P4 depende de que sean distintos"
+        );
+    }
+
     #[test]
     fn el_error_de_proveedor_desconocido_dice_donde_se_buscan() {
         let mensaje = CatalogError::Unknown("inventado".into()).to_string();
