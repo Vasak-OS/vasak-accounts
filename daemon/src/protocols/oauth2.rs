@@ -357,12 +357,20 @@ fn resource_plan(account: &Account, capability: &CapabilityType) -> ResourcePlan
 /// [`SecretStore::store_secret_in`] es leer → modificar → escribir, dos
 /// `persistir` a la vez se pisan y pierden el `refresh` rotado.
 ///
-/// Serializar por cuenta resuelve las dos cosas: los recursos de una misma cuenta
-/// refrescan de a uno —el segundo lee el `refresh` ya rotado y persistido— y las
-/// escrituras al almacén quedan ordenadas. **No** por uid, que serializaría los
-/// refrescos de cuentas ajenas detrás de una sola llamada de red (lo que `F4`
-/// quiso evitar); **no** por recurso, que dejaría competir a los recursos de la
-/// misma cuenta por el `refresh` compartido, que es justamente la carrera.
+/// Serializar por cuenta cierra la carrera **intra-cuenta**: los recursos de una
+/// misma cuenta refrescan de a uno —el segundo lee el `refresh` ya rotado y
+/// persistido— y sus escrituras al almacén quedan ordenadas **entre sí**. **No**
+/// por uid, que serializaría los refrescos de cuentas ajenas detrás de una sola
+/// llamada de red (lo que `F4` quiso evitar); **no** por recurso, que dejaría
+/// competir a los recursos de la misma cuenta por el `refresh` compartido, que es
+/// justamente la carrera.
+///
+/// Esto **no** ordena las escrituras de cuentas **distintas** del mismo uid: siguen
+/// haciendo leer → modificar → escribir sobre el `secrets.json` compartido (un
+/// archivo por uid) y pueden pisarse, perdiendo un `refresh` rotado —misma clase de
+/// DoS, preexistente y fuera del alcance de este candado por cuenta—. Rastreado en
+/// vasak-accounts#107 (se arregla serializando sólo el read-modify-write del almacén
+/// por uid, sin serializar la red).
 ///
 /// Vive como estático del módulo y no en el estado del demonio porque
 /// [`get_valid_access_token`] es una función libre —la usan las pruebas sin un
