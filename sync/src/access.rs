@@ -129,7 +129,15 @@ pub const EMAIL_RESOURCE: &str = "store.email";
 /// nombre único en cada ventana.
 pub const CONTROL_BURST: usize = 3;
 
-/// La ventana de [`CONTROL_BURST`].
+/// Cuántas escrituras ([`ControlAction::Write`]) deja pasar [`CallerLimits`] por
+/// cuenta y nombre único en cada [`CONTROL_WINDOW`]. Más alto que
+/// [`CONTROL_BURST`] porque una escritura es lo normal de una aplicación de
+/// calendario o de contactos —crear, editar y borrar seguido—, no un comando que
+/// rehace la base; frena igual a una con un bucle por error, y el tope global de
+/// [`MAX_TRACKED_CALLS`] acota la memoria venga de donde venga.
+pub const WRITE_BURST: usize = 60;
+
+/// La ventana de [`CONTROL_BURST`] y [`WRITE_BURST`].
 pub const CONTROL_WINDOW: Duration = Duration::from_secs(60);
 
 /// El piso por cuenta de lo que borra o rehace una base: un `ClearStore`, un
@@ -152,7 +160,7 @@ const _: () = assert!(SYNC_FLOOR.as_nanos() <= LONGEST_FLOOR.as_nanos());
 /// entra: la tabla no crece con los nombres nuevos que se abran.
 pub const MAX_TRACKED_CALLS: usize = 4096;
 
-/// Qué comando de control es: el piso por cuenta va por cada uno.
+/// Qué comando es: el piso y el cupo por cuenta van por cada uno.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ControlAction {
     /// `ClearStore`.
@@ -163,14 +171,36 @@ pub enum ControlAction {
     Disable,
     /// `RequestSync`.
     Sync,
+    /// Una escritura que encola (`PutEvent`, `DeleteEvent`, `PutContact`,
+    /// `DeleteContact`): cambia lo guardado y suma una op a la cola, pero es lo
+    /// normal de una aplicación de CRUD, no un comando que rehace la base.
+    Write,
 }
 
 impl ControlAction {
-    /// El piso por cuenta de este comando.
+    /// El piso por cuenta de este comando: cuánto espera la misma cuenta antes
+    /// de aceptar otro igual, venga de quien venga.
+    ///
+    /// La escritura **no tiene piso** (`ZERO`): el piso va por `(cuenta,
+    /// comando)`, así que un piso serializaría dos escrituras a objetos distintos
+    /// de la misma cuenta, que es justo lo que una aplicación de CRUD hace.
+    /// La concurrencia real la cuida la cola, con su testigo de revisión y su
+    /// alcance de colección (ver `store/queue.rs`); acá sólo acota el costo, y
+    /// eso lo hace el cupo por llamante ([`Self::burst`]).
     pub fn floor(self) -> Duration {
         match self {
             ControlAction::Sync => SYNC_FLOOR,
             ControlAction::Clear | ControlAction::Enable | ControlAction::Disable => ACCOUNT_FLOOR,
+            ControlAction::Write => Duration::ZERO,
+        }
+    }
+
+    /// Cuántos de este comando deja pasar un mismo llamante por cuenta en la
+    /// ventana.
+    pub fn burst(self) -> usize {
+        match self {
+            ControlAction::Write => WRITE_BURST,
+            _ => CONTROL_BURST,
         }
     }
 }
@@ -593,17 +623,21 @@ impl CallerLimits {
             .calls
             .get(name)
             .and_then(|accounts| accounts.get(account_id))
-            .is_some_and(|t| t.count >= CONTROL_BURST)
+            .is_some_and(|t| t.count >= action.burst())
         {
             return Err(Refusal::Caller);
         }
-        let floor = (account_id.to_string(), action);
-        if state
-            .floors
-            .get(&floor)
-            .is_some_and(|at| now.saturating_duration_since(*at) < action.floor())
-        {
-            return Err(Refusal::Account);
+        // Un comando sin piso (la escritura) ni se mira ni se anota en `floors`:
+        // no bloquea nunca, y anotarlo sólo haría crecer la fila sin razón.
+        let floor = (action.floor() > Duration::ZERO).then(|| (account_id.to_string(), action));
+        if let Some(floor) = &floor {
+            if state
+                .floors
+                .get(floor)
+                .is_some_and(|at| now.saturating_duration_since(*at) < action.floor())
+            {
+                return Err(Refusal::Account);
+            }
         }
         // Lo vencido ya salió: si igual no hay lugar, no se anota nada.
         if state.log.len() >= MAX_TRACKED_CALLS {
@@ -627,8 +661,10 @@ impl CallerLimits {
             account: account_id.to_string(),
             generation,
         });
-        state.floors.insert(floor.clone(), now);
-        state.floor_log.push_back((now, floor));
+        if let Some(floor) = floor {
+            state.floors.insert(floor.clone(), now);
+            state.floor_log.push_back((now, floor));
+        }
         Ok(())
     }
 

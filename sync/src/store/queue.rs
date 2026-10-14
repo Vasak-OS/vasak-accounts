@@ -168,9 +168,8 @@ impl Store {
     /// queda hasta confirmar, para que la bajada no la vuelva a traer— y suma la
     /// op. Si no había fila guardada, igual encola el borrado (el recurso existe
     /// en el servidor aunque no esté en la caché).
-    // Lo que encola es la superficie D-Bus del PR siguiente de este hito
-    // (`vasak-accounts#23`); por ahora lo ejercitan las pruebas.
-    #[cfg_attr(not(test), allow(dead_code))]
+    // Lo encola la superficie D-Bus de escritura (`DeleteEvent`, `DeleteContact`
+    // en `store_api.rs`), y lo ejercitan también las pruebas.
     pub fn enqueue_delete(
         &mut self,
         area: &str,

@@ -923,9 +923,8 @@ impl Store {
     ///
     /// El calendario tiene que estar en esta base (mismo `id` y dirección), como
     /// en [`Self::apply_calendar_objects`]; si no, `Err(Missing)`.
-    // Lo que encola es la superficie D-Bus del PR siguiente (`vasak-accounts#23`);
-    // por ahora lo ejercitan las pruebas.
-    #[cfg_attr(not(test), allow(dead_code))]
+    // Lo encola la superficie D-Bus de escritura (`PutEvent` en `store_api.rs`),
+    // y lo ejercitan también las pruebas.
     pub fn enqueue_calendar_put(
         &mut self,
         calendar: &StoredCalendar,
@@ -968,6 +967,74 @@ impl Store {
         transaction.commit().map_err(classify)?;
         self.note_change(CALENDAR_AREA, generation);
         Ok(())
+    }
+
+    /// Un calendario por su `id`, para encolar una escritura en él. `None` si no
+    /// está en esta base. Lo usa la superficie D-Bus de escritura
+    /// (`store_api.rs`): la ventana nombra el calendario por el número de su `id`
+    /// global, y de acá sale su `href`, que es con lo que la cola habla con el
+    /// servidor.
+    pub fn calendar_by_id(&self, id: i64) -> Result<Option<StoredCalendar>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id, href, ctag FROM calendars WHERE id = ?1",
+                [id],
+                |row| {
+                    Ok(StoredCalendar {
+                        id: row.get(0)?,
+                        href: row.get(1)?,
+                        ctag: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(classify)
+    }
+
+    /// El calendario, el `href` y el iCalendar crudo de un objeto por su `id`,
+    /// para editarlo o borrarlo. `None` si no está. El crudo es la fuente sobre
+    /// la que la escritura conservadora aplica el parche (decisión 3); el `href`
+    /// y el del calendario son el alcance con el que la cola lo identifica en el
+    /// servidor.
+    pub fn event_target(
+        &self,
+        id: i64,
+    ) -> Result<Option<(StoredCalendar, String, String)>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT c.id, c.href, c.ctag, o.href, o.raw_ical
+                   FROM calendar_objects o JOIN calendars c ON c.id = o.calendar_id
+                  WHERE o.id = ?1",
+                [id],
+                |row| {
+                    let calendar = StoredCalendar {
+                        id: row.get(0)?,
+                        href: row.get(1)?,
+                        ctag: row.get(2)?,
+                    };
+                    Ok((calendar, row.get(3)?, row.get(4)?))
+                },
+            )
+            .optional()
+            .map_err(classify)
+    }
+
+    /// El `id` de un objeto por su calendario y su `href`, recién encolado un
+    /// `put` que lo creó: es lo que la respuesta de D-Bus le devuelve a la
+    /// ventana para que lo vuelva a pedir.
+    pub fn object_id_by_href(
+        &self,
+        calendar_id: i64,
+        href: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id FROM calendar_objects WHERE calendar_id = ?1 AND href = ?2",
+                rusqlite::params![calendar_id, href],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(classify)
     }
 
     /// Las series cuyas ocurrencias guardadas no cubren `target`: las que hay

@@ -397,9 +397,8 @@ impl Store {
     ///
     /// La libreta tiene que estar en esta base (mismo `id` y dirección), como en
     /// [`Self::apply_contacts`]; si no, `Err(Missing)`.
-    // Lo que encola es la superficie D-Bus del PR siguiente (`vasak-accounts#23`);
-    // por ahora lo ejercitan las pruebas.
-    #[cfg_attr(not(test), allow(dead_code))]
+    // Lo encola la superficie D-Bus de escritura (`PutContact` en
+    // `store_api.rs`), y lo ejercitan también las pruebas.
     pub fn enqueue_contact_put(
         &mut self,
         book: &StoredAddressBook,
@@ -437,6 +436,68 @@ impl Store {
         transaction.commit().map_err(classify)?;
         self.note_change(CONTACTS_AREA, generation);
         Ok(())
+    }
+
+    /// Una libreta por su `id`, para encolar una escritura en ella. `None` si no
+    /// está en esta base. Lo usa la superficie D-Bus de escritura
+    /// (`store_api.rs`): la ventana nombra la libreta por su `id`, y de acá sale
+    /// su `href`, que es con lo que la cola habla con el servidor.
+    pub fn address_book_by_id(&self, id: i64) -> Result<Option<StoredAddressBook>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id, href, ctag FROM address_books WHERE id = ?1",
+                [id],
+                |row| {
+                    Ok(StoredAddressBook {
+                        id: row.get(0)?,
+                        href: row.get(1)?,
+                        ctag: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(classify)
+    }
+
+    /// La libreta, el `href` y la vCard cruda de un contacto por su `id`, para
+    /// editarlo o borrarlo. `None` si no está. El crudo es la fuente sobre la que
+    /// la escritura conservadora aplica el parche (decisión 3); el `href` y el de
+    /// la libreta son el alcance con el que la cola lo identifica en el servidor.
+    pub fn contact_target(
+        &self,
+        id: i64,
+    ) -> Result<Option<(StoredAddressBook, String, String)>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT b.id, b.href, b.ctag, c.href, c.raw_vcard
+                   FROM contacts c JOIN address_books b ON b.id = c.address_book_id
+                  WHERE c.id = ?1",
+                [id],
+                |row| {
+                    let book = StoredAddressBook {
+                        id: row.get(0)?,
+                        href: row.get(1)?,
+                        ctag: row.get(2)?,
+                    };
+                    Ok((book, row.get(3)?, row.get(4)?))
+                },
+            )
+            .optional()
+            .map_err(classify)
+    }
+
+    /// El `id` de un contacto por su libreta y su `href`, recién encolado un
+    /// `put` que lo creó: es lo que la respuesta de D-Bus le devuelve a la
+    /// ventana para que lo vuelva a pedir.
+    pub fn contact_id_by_href(&self, book_id: i64, href: &str) -> Result<Option<i64>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id FROM contacts WHERE address_book_id = ?1 AND href = ?2",
+                rusqlite::params![book_id, href],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(classify)
     }
 }
 
