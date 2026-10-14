@@ -78,6 +78,41 @@ impl PendingState {
     }
 }
 
+/// El estado de sincronización de un objeto guardado, como lo ve una aplicación
+/// que lo lee: para el ícono «sin sincronizar» y para saber si se puede editar.
+///
+/// Sale de la marca `pending_op` de la fila guardada y, si la hay, del estado de
+/// su op en `pending_dav_ops` (ver [`SyncState::derive`]). No es lo mismo que
+/// [`PendingState`], que es el estado interno de la op en la cola: `SyncState`
+/// agrega el caso `synced` —ninguna op— que la cola no tiene por qué nombrar.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SyncState {
+    /// Al día con el servidor: sin cambio local pendiente.
+    #[default]
+    Synced,
+    /// Hay un cambio local sin confirmar, a la espera de subir (op en `ready`).
+    Pending,
+    /// El cambio local chocó con el servidor (op en `conflict`): lo resuelve la
+    /// superficie de conflicto (`ListConflicts`/`GetConflict`).
+    Conflict,
+}
+
+impl SyncState {
+    /// Deriva el estado de la marca `pending_op` de la fila y del estado
+    /// (`state`) de su op en `pending_dav_ops`. Sin marca, `synced`; con marca y
+    /// op en `conflict`, `conflict`; con marca en cualquier otro caso, `pending`.
+    pub fn derive(pending_op: Option<&str>, op_state: Option<&str>) -> Self {
+        match pending_op {
+            None => SyncState::Synced,
+            Some(_) => match op_state {
+                Some("conflict") => SyncState::Conflict,
+                _ => SyncState::Pending,
+            },
+        }
+    }
+}
+
 /// Una escritura pendiente, tal como está en la base.
 ///
 /// **Sin `Debug` derivado** (como `DavCredential` en `dav::webdav`): `payload` y
@@ -152,7 +187,7 @@ fn area_static(area: &str) -> Option<&'static str> {
 /// (`UNIQUE (calendar_id, href)` / `UNIQUE (address_book_id, href)`), así que
 /// tocar «el objeto con este href» sin decir **de qué colección** podría borrar
 /// o pisar el de otra. La op guarda su `collection_href`; de ahí sale el `id`.
-fn area_tables(area: &str) -> Option<(&'static str, &'static str, &'static str)> {
+pub(super) fn area_tables(area: &str) -> Option<(&'static str, &'static str, &'static str)> {
     match area {
         CALENDAR_AREA => Some(("calendar_objects", "calendars", "calendar_id")),
         CONTACTS_AREA => Some(("contacts", "address_books", "address_book_id")),

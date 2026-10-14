@@ -43,6 +43,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
 use super::contacts_read::{InvalidArgument, MAX_CURSOR_BYTES};
+use super::queue::SyncState;
 use super::readers::Reader;
 use super::{classify, paths, StoreError};
 use crate::ical::recurrence::{EventSeries, ExpansionLimits, Trigger};
@@ -263,6 +264,13 @@ pub struct OccurrenceItem {
     /// Si es una serie cuya regla no se entendió y se muestra sólo el día que
     /// empieza: antes que inventar fechas se muestra una vez, y se dice.
     pub shown_once: bool,
+    /// El ETag del objeto guardado, para pasarlo como `if_match` al editar.
+    /// **Vacío** en un objeto recién creado local que todavía no confirmó el
+    /// servidor: así la aplicación sabe que todavía no se puede editar.
+    pub etag: String,
+    /// El estado de sincronización del objeto: `synced`, `pending` o `conflict`.
+    /// Para el ícono «sin sincronizar» y la superficie de conflicto.
+    pub sync_state: SyncState,
 }
 
 /// Una tarea, para `ListTasks`.
@@ -400,11 +408,14 @@ pub fn occurrences_sql(
     format!(
         "SELECT o.starts_at, o.object_id, o.recurrence_id, o.ends_at, o.all_day,
                 coalesce(t.summary, c.summary), o.calendar_id, k.color, c.zone,
-                c.recurring, c.expansion
+                c.recurring, c.expansion, c.etag, c.pending_op, pdo.state
            FROM occurrences o INDEXED BY {index}
            JOIN calendar_objects c ON c.id = o.object_id
            JOIN calendars k ON k.id = o.calendar_id
            LEFT JOIN object_titles t ON t.object_id = o.object_id AND t.position = o.title
+           LEFT JOIN pending_dav_ops pdo
+                  ON pdo.area = 'calendar' AND pdo.object_href = c.href
+                 AND pdo.collection_href = k.href
           WHERE {starts}
             AND (o.ends_at > ? OR (o.ends_at <= o.starts_at AND o.starts_at >= ?))
             AND (c.pending_op IS NULL OR c.pending_op != 'delete'){}{}
@@ -531,6 +542,8 @@ fn occurrence_item(
     zone: &str,
     recurring: bool,
     shown_once: bool,
+    etag: String,
+    sync_state: SyncState,
 ) -> OccurrenceItem {
     OccurrenceItem {
         event_id: GlobalId {
@@ -552,6 +565,8 @@ fn occurrence_item(
         color,
         recurring,
         shown_once,
+        etag,
+        sync_state,
     }
 }
 
@@ -587,6 +602,9 @@ fn stored_occurrences(
                 continue;
             }
             let zone: String = row.get(8).map_err(classify)?;
+            let etag: Option<String> = row.get(11).map_err(classify)?;
+            let pending_op: Option<String> = row.get(12).map_err(classify)?;
+            let op_state: Option<String> = row.get(13).map_err(classify)?;
             let item = occurrence_item(
                 account_id,
                 start,
@@ -600,6 +618,8 @@ fn stored_occurrences(
                 &zone,
                 row.get(9).map_err(classify)?,
                 row.get::<_, String>(10).map_err(classify)? == "invalid",
+                etag.unwrap_or_default(),
+                SyncState::derive(pending_op.as_deref(), op_state.as_deref()),
             );
             top.insert(at, item);
         }
@@ -617,6 +637,11 @@ struct SeriesSource {
     summary: String,
     zone: String,
     color: Option<String>,
+    /// El ETag guardado de la serie; vacío si todavía no confirmó.
+    etag: String,
+    /// La marca de la fila y el estado de su op, para derivar el `sync_state`.
+    pending_op: Option<String>,
+    op_state: Option<String>,
 }
 
 /// Una tanda de las series cuya ventana no cubre el rango, por número,
@@ -631,9 +656,12 @@ fn series_batch(
     let mut statement = connection
         .prepare_cached(&format!(
             "SELECT c.id, c.calendar_id, c.raw_ical, c.expanded_from, c.expanded_to,
-                    c.summary, c.zone, k.color
+                    c.summary, c.zone, k.color, c.etag, c.pending_op, pdo.state
                FROM calendar_objects c
                JOIN calendars k ON k.id = c.calendar_id
+               LEFT JOIN pending_dav_ops pdo
+                      ON pdo.area = 'calendar' AND pdo.object_href = c.href
+                     AND pdo.collection_href = k.href
               WHERE c.recurring = 1 AND c.component = 'VEVENT'
                 AND (c.starts_at IS NULL OR c.starts_at < ?1)
                 AND NOT (c.expanded_from IS NOT NULL AND c.expanded_from <= ?2 - c.span
@@ -672,6 +700,12 @@ fn series_batch(
             summary: row.get(5).map_err(classify)?,
             zone: row.get(6).map_err(classify)?,
             color: row.get(7).map_err(classify)?,
+            etag: row
+                .get::<_, Option<String>>(8)
+                .map_err(classify)?
+                .unwrap_or_default(),
+            pending_op: row.get(9).map_err(classify)?,
+            op_state: row.get(10).map_err(classify)?,
         });
     }
     Ok((batch, false))
@@ -731,6 +765,8 @@ fn expand_into(
             // que se pudo expandir no es «sólo una vez».
             true,
             false,
+            source.etag.clone(),
+            SyncState::derive(source.pending_op.as_deref(), source.op_state.as_deref()),
         );
         top.insert(at, item);
     }
@@ -1082,6 +1118,12 @@ pub struct EventDetail {
     pub alarms: Vec<AlarmItem>,
     pub organizer: Option<Person>,
     pub attendees: Vec<Person>,
+    /// El ETag del objeto guardado, para pasarlo como `if_match` al editar.
+    /// **Vacío** en un objeto recién creado local sin confirmar: así la
+    /// aplicación sabe que todavía no se puede editar.
+    pub etag: String,
+    /// El estado de sincronización del objeto: `synced`, `pending` o `conflict`.
+    pub sync_state: SyncState,
     /// Si no entraba en [`MAX_EVENT_BYTES`] y se le sacaron asistentes o se
     /// recortó la descripción.
     pub truncated: bool,
@@ -1191,19 +1233,41 @@ pub fn get_event(
     occurrence: Option<i64>,
     limits: &ExpansionLimits,
 ) -> Result<Option<EventDetail>, StoreError> {
-    let row: Option<(i64, String, String)> = reader.read(|connection| {
+    type EventHead = (
+        i64,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let row: Option<EventHead> = reader.read(|connection| {
         connection
             .query_row(
-                "SELECT calendar_id, raw_ical, zone FROM calendar_objects
-                  WHERE id = ?1 AND component = 'VEVENT'
-                    AND (pending_op IS NULL OR pending_op != 'delete')",
+                "SELECT c.calendar_id, c.raw_ical, c.zone, c.etag, c.pending_op, pdo.state
+                   FROM calendar_objects c
+                   JOIN calendars k ON k.id = c.calendar_id
+                   LEFT JOIN pending_dav_ops pdo
+                          ON pdo.area = 'calendar' AND pdo.object_href = c.href
+                         AND pdo.collection_href = k.href
+                  WHERE c.id = ?1 AND c.component = 'VEVENT'
+                    AND (c.pending_op IS NULL OR c.pending_op != 'delete')",
                 [id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .optional()
             .map_err(classify)
     })?;
-    let Some((calendar, raw, zone)) = row else {
+    let Some((calendar, raw, zone, etag, pending_op, op_state)) = row else {
         return Ok(None);
     };
     let document = ical::parse_document(&raw);
@@ -1296,6 +1360,8 @@ pub fn get_event(
             .take(MAX_ATTENDEES)
             .map(person)
             .collect(),
+        etag: etag.unwrap_or_default(),
+        sync_state: SyncState::derive(pending_op.as_deref(), op_state.as_deref()),
         truncated: false,
     };
     Ok(Some(fit_event(detail, MAX_EVENT_BYTES)))
@@ -1346,6 +1412,155 @@ mod tests {
 
     fn range(from: &str, to: &str) -> Range {
         Range::parse(from, to).unwrap()
+    }
+
+    /// **DTO**: las ocurrencias guardadas traen el `etag` del objeto y su
+    /// `sync_state`, que pasa de `synced` a `pending` al editar local sin
+    /// confirmar y a `conflict` cuando la op choca con el servidor. Es lo que
+    /// enciende el badge «sin sincronizar» y lo que habilita editar (el `etag`
+    /// como `if_match`).
+    #[test]
+    fn las_ocurrencias_traen_etag_y_sync_state() {
+        use super::super::lifecycle::CALENDAR_AREA;
+        let temp = TempDir::new("occ-sync-state");
+        let mut store = open_store(&temp);
+        let cal = calendar(&mut store, "https://x/c/");
+        let w = window();
+        let href = "https://x/c/a.ics";
+        store
+            .apply_calendar_objects(
+                &cal,
+                &[ObjectOp::Upsert(object(
+                    href,
+                    &single("a", "20260926T120000Z"),
+                    w,
+                ))],
+                w,
+                None,
+                CalendarRoom::UNLIMITED,
+            )
+            .unwrap();
+        // Devuelve sólo los campos escalares que la prueba mira (ETag y estado):
+        // el valor entero —con datos de la cuenta— no sale del cierre ni fluye a
+        // un `.unwrap()`/panic, para no disparar `rust/cleartext-logging`.
+        let read = |store: &Store| -> (String, SyncState) {
+            let Ok(mut page) = account_occurrences(
+                store.connection(),
+                "cuenta",
+                range("2026-09-25T00:00:00Z", "2026-09-27T00:00:00Z"),
+                None,
+                None,
+                100,
+                &ExpansionLimits::DEFAULT,
+            ) else {
+                panic!("no se pudo leer la ocurrencia");
+            };
+            let item = page.rows.remove(0).1;
+            (item.etag, item.sync_state)
+        };
+
+        // Al día con el servidor: trae su ETag y `synced`.
+        let (etag, state) = read(&store);
+        assert_eq!(etag, "\"1\"");
+        assert_eq!(state, SyncState::Synced);
+
+        // Editar local sin confirmar: `pending`.
+        store
+            .enqueue_calendar_put(&cal, &object(href, &single("a", "20260926T130000Z"), w), w)
+            .unwrap();
+        assert_eq!(read(&store).1, SyncState::Pending);
+
+        // La op choca con el servidor: `conflict`.
+        let op = store.pending_ops(CALENDAR_AREA).unwrap().remove(0);
+        store.mark_conflict(&op, "cambió en el servidor").unwrap();
+        assert_eq!(read(&store).1, SyncState::Conflict);
+    }
+
+    /// **DTO**: un objeto recién creado local sin confirmar (`enqueue` con etag
+    /// nulo) trae el `etag` **vacío** —no se puede editar todavía— y
+    /// `sync_state = pending`.
+    #[test]
+    fn una_ocurrencia_recien_creada_no_trae_etag() {
+        let temp = TempDir::new("occ-sin-etag");
+        let mut store = open_store(&temp);
+        let cal = calendar(&mut store, "https://x/c/");
+        let w = window();
+        let mut row = object(
+            "https://x/c/nuevo.ics",
+            &single("nuevo", "20260926T120000Z"),
+            w,
+        );
+        row.etag = None;
+        store.enqueue_calendar_put(&cal, &row, w).unwrap();
+        let Ok(mut page) = account_occurrences(
+            store.connection(),
+            "cuenta",
+            range("2026-09-25T00:00:00Z", "2026-09-27T00:00:00Z"),
+            None,
+            None,
+            100,
+            &ExpansionLimits::DEFAULT,
+        ) else {
+            panic!("no se pudo leer la ocurrencia");
+        };
+        // Sólo los campos escalares salen de la lectura (ver nota de arriba).
+        let (etag, state) = {
+            let item = page.rows.remove(0).1;
+            (item.etag, item.sync_state)
+        };
+        assert_eq!(etag, "");
+        assert_eq!(state, SyncState::Pending);
+    }
+
+    /// **DTO**: `GetEvent` trae el `etag` y el `sync_state` del objeto, que
+    /// cambia con el estado de su op.
+    #[test]
+    fn un_evento_trae_etag_y_sync_state() {
+        use super::super::lifecycle::CALENDAR_AREA;
+        let temp = TempDir::new("evento-sync-state");
+        let mut store = open_store(&temp);
+        let cal = calendar(&mut store, "https://x/c/");
+        let w = window();
+        let href = "https://x/c/g.ics";
+        store
+            .apply_calendar_objects(
+                &cal,
+                &[ObjectOp::Upsert(object(
+                    href,
+                    &single("g", "20260926T120000Z"),
+                    w,
+                ))],
+                w,
+                None,
+                CalendarRoom::UNLIMITED,
+            )
+            .unwrap();
+        // Sólo ETag y estado salen de la lectura (ver la nota de
+        // `las_ocurrencias_traen_etag_y_sync_state` sobre `cleartext-logging`).
+        let read = |store: &Store| -> (String, SyncState) {
+            let Ok(Some(event)) = get_event(
+                store.connection(),
+                "cuenta",
+                1,
+                None,
+                &ExpansionLimits::DEFAULT,
+            ) else {
+                panic!("no se pudo leer el evento");
+            };
+            (event.etag, event.sync_state)
+        };
+
+        let (etag, state) = read(&store);
+        assert_eq!(etag, "\"1\"");
+        assert_eq!(state, SyncState::Synced);
+
+        store
+            .enqueue_calendar_put(&cal, &object(href, &single("g", "20260926T130000Z"), w), w)
+            .unwrap();
+        assert_eq!(read(&store).1, SyncState::Pending);
+        let op = store.pending_ops(CALENDAR_AREA).unwrap().remove(0);
+        store.mark_conflict(&op, "chocó").unwrap();
+        assert_eq!(read(&store).1, SyncState::Conflict);
     }
 
     fn single(uid: &str, start: &str) -> String {

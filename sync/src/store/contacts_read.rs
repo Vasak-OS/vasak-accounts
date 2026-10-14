@@ -47,6 +47,7 @@ use base64::Engine;
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
+use super::queue::SyncState;
 use super::{classify, StoreError};
 use crate::vcard::{self, Field};
 
@@ -244,6 +245,11 @@ pub struct ContactDetail {
     pub organization: String,
     pub notes: String,
     pub related: Vec<Field>,
+    /// El ETag de la tarjeta guardada, para pasarlo como `if_match` al editar.
+    /// **Vacío** en una tarjeta recién creada local sin confirmar.
+    pub etag: String,
+    /// El estado de sincronización: `synced`, `pending` o `conflict`.
+    pub sync_state: SyncState,
     /// Si no entraba en [`MAX_CONTACT_BYTES`] y se le sacaron datos del
     /// final: relaciones, después teléfonos, después correos.
     pub truncated: bool,
@@ -296,6 +302,12 @@ pub struct ContactCard {
     /// Dónde vive en el servidor: lo que identifica a la tarjeta entre vueltas.
     pub href: String,
     pub vcard: String,
+    /// El ETag de la tarjeta guardada, para pasarlo como `if_match` al editar.
+    /// **Vacío** en una tarjeta recién creada local sin confirmar: así la
+    /// aplicación sabe que todavía no se puede editar.
+    pub etag: String,
+    /// El estado de sincronización: `synced`, `pending` o `conflict`.
+    pub sync_state: SyncState,
 }
 
 /// Una página de tarjetas crudas, en el mismo orden y con el mismo cursor que
@@ -318,8 +330,13 @@ fn cards_page(
     byte_cap: usize,
 ) -> Result<Page<ContactCard>, StoreError> {
     let mut sql = String::from(
-        "SELECT c.id, c.address_book_id, c.sort_key, c.href, c.raw_vcard
+        "SELECT c.id, c.address_book_id, c.sort_key, c.href, c.raw_vcard,
+                c.etag, c.pending_op, pdo.state
            FROM contacts c
+           JOIN address_books ab ON ab.id = c.address_book_id
+           LEFT JOIN pending_dav_ops pdo
+                  ON pdo.area = 'contacts' AND pdo.object_href = c.href
+                 AND pdo.collection_href = ab.href
           WHERE c.display_name != ''
             AND (c.pending_op IS NULL OR c.pending_op != 'delete')",
     );
@@ -343,11 +360,18 @@ fn cards_page(
         seen += 1;
         let id: i64 = row.get(0).map_err(classify)?;
         let sort_key: String = row.get(2).map_err(classify)?;
+        let pending_op: Option<String> = row.get(6).map_err(classify)?;
+        let op_state: Option<String> = row.get(7).map_err(classify)?;
         let card = ContactCard {
             id: id.to_string(),
             address_book_id: row.get::<_, i64>(1).map_err(classify)?.to_string(),
             href: row.get(3).map_err(classify)?,
             vcard: row.get(4).map_err(classify)?,
+            etag: row
+                .get::<_, Option<String>>(5)
+                .map_err(classify)?
+                .unwrap_or_default(),
+            sync_state: SyncState::derive(pending_op.as_deref(), op_state.as_deref()),
         };
         let size = json_len(&card) + 1;
         if size > byte_cap {
@@ -514,17 +538,31 @@ fn page(
 
 /// Un contacto entero, o `None` si no está o no tiene nada que mostrar.
 pub fn get_contact(connection: &Connection, id: i64) -> Result<Option<ContactDetail>, StoreError> {
-    let row: Option<(i64, String)> = connection
+    type ContactHead = (i64, String, Option<String>, Option<String>, Option<String>);
+    let row: Option<ContactHead> = connection
         .query_row(
-            "SELECT address_book_id, raw_vcard FROM contacts
-              WHERE id = ?1 AND display_name != ''
-                AND (pending_op IS NULL OR pending_op != 'delete')",
+            "SELECT c.address_book_id, c.raw_vcard, c.etag, c.pending_op, pdo.state
+               FROM contacts c
+               JOIN address_books ab ON ab.id = c.address_book_id
+               LEFT JOIN pending_dav_ops pdo
+                      ON pdo.area = 'contacts' AND pdo.object_href = c.href
+                     AND pdo.collection_href = ab.href
+              WHERE c.id = ?1 AND c.display_name != ''
+                AND (c.pending_op IS NULL OR c.pending_op != 'delete')",
             [id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()
         .map_err(classify)?;
-    let Some((address_book_id, raw)) = row else {
+    let Some((address_book_id, raw, etag, pending_op, op_state)) = row else {
         return Ok(None);
     };
     // Lo guardado es la tarjeta cruda (la decisión 3 del taller): se lee ahora.
@@ -542,6 +580,8 @@ pub fn get_contact(connection: &Connection, id: i64) -> Result<Option<ContactDet
             organization: contact.organization,
             notes: contact.notes,
             related: contact.related,
+            etag: etag.unwrap_or_default(),
+            sync_state: SyncState::derive(pending_op.as_deref(), op_state.as_deref()),
             truncated: false,
         },
         MAX_CONTACT_BYTES,
@@ -624,6 +664,109 @@ mod tests {
             name,
             &format!("c{n}@x.com"),
         )
+    }
+
+    /// **DTO**: las tarjetas y el detalle traen el `etag` y el `sync_state`, que
+    /// pasa de `synced` a `pending` al editar local y a `conflict` cuando la op
+    /// choca. Es lo que enciende el badge «sin sincronizar» y habilita editar.
+    #[test]
+    fn las_tarjetas_traen_etag_y_sync_state() {
+        use super::super::lifecycle::CONTACTS_AREA;
+        let temp = TempDir::new("tarjetas-sync-state");
+        let mut store = open_store(&temp);
+        let b = book(&mut store, "https://x/a/", "A");
+        add(
+            &mut store,
+            &b,
+            vec![row("https://x/a/1.vcf", "Ana", "a@x.com")],
+        );
+        // Devuelven sólo los campos escalares que la prueba mira: el valor entero
+        // —con datos de la cuenta— no fluye a un `.unwrap()`/panic, para no
+        // disparar `rust/cleartext-logging`.
+        let card = |store: &Store| -> (String, SyncState) {
+            let Ok(mut page) = list_cards(store.connection(), None, None, 10) else {
+                panic!("no se pudo leer la tarjeta");
+            };
+            let c = page.items.remove(0);
+            (c.etag, c.sync_state)
+        };
+        let detail = |store: &Store| -> (String, SyncState) {
+            let Ok(Some(d)) = get_contact(store.connection(), 1) else {
+                panic!("no se pudo leer el detalle");
+            };
+            (d.etag, d.sync_state)
+        };
+
+        // Al día: trae su ETag y `synced`, en la tarjeta y en el detalle.
+        assert_eq!(card(&store), ("\"1\"".to_string(), SyncState::Synced));
+        assert_eq!(detail(&store), ("\"1\"".to_string(), SyncState::Synced));
+
+        // Editar local sin confirmar: `pending`.
+        store
+            .enqueue_contact_put(&b, &row("https://x/a/1.vcf", "Ana María", "a@x.com"))
+            .unwrap();
+        assert_eq!(card(&store).1, SyncState::Pending);
+        assert_eq!(detail(&store).1, SyncState::Pending);
+
+        // La op choca: `conflict`.
+        let op = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        store.mark_conflict(&op, "chocó").unwrap();
+        assert_eq!(card(&store).1, SyncState::Conflict);
+        assert_eq!(detail(&store).1, SyncState::Conflict);
+    }
+
+    /// **F1 — el `sync_state` se acota por colección.** El esquema deja el mismo
+    /// `href` en dos libretas de una cuenta (`UNIQUE(address_book_id, href)`), y
+    /// `pending_dav_ops` guarda una sola op por `href` (`UNIQUE(area,
+    /// object_href)`). Si el join de `sync_state` uniera sólo por `href`, el
+    /// estado de la op de **una** libreta se pegaría al objeto de la **otra**.
+    ///
+    /// Las dos libretas editan el mismo `href`; la segunda edición pisa la op (su
+    /// `collection_href` queda en la libreta B) y choca. La tarjeta de la libreta
+    /// A, cuya op ya no existe, tiene que verse `pending` —su marca sigue, pero el
+    /// conflicto es de B—, no `conflict`. Sin el `AND pdo.collection_href` se ve
+    /// `conflict` (el estado de la op ajena). Y nunca hay fila de más por objeto.
+    #[test]
+    fn el_sync_state_no_cruza_de_coleccion() {
+        use super::super::lifecycle::CONTACTS_AREA;
+        let temp = TempDir::new("sync-state-scope");
+        let mut store = open_store(&temp);
+        let a = book(&mut store, "https://x/a/", "A");
+        let b = book(&mut store, "https://x/b/", "B");
+        const HREF: &str = "https://x/shared.vcf";
+        // El MISMO href, al día, en las dos libretas.
+        add(&mut store, &a, vec![row(HREF, "En A", "a@x.com")]);
+        add(&mut store, &b, vec![row(HREF, "En B", "b@x.com")]);
+        // Las dos editan; la de B pisa la única op (ON CONFLICT por área+href) y
+        // choca. La marca de A queda, pero su op ya no es la viva.
+        store
+            .enqueue_contact_put(&a, &row(HREF, "En A editada", "a@x.com"))
+            .unwrap();
+        store
+            .enqueue_contact_put(&b, &row(HREF, "En B editada", "b@x.com"))
+            .unwrap();
+        let op = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        store.mark_conflict(&op, "chocó B").unwrap();
+
+        let Ok(page) = list_cards(store.connection(), None, None, 10) else {
+            panic!("no se pudieron leer las tarjetas");
+        };
+        let cards = page.items;
+        // Una fila por objeto: la de A y la de B, sin duplicar.
+        assert_eq!(cards.len(), 2, "una tarjeta por libreta, sin duplicados");
+        // Se extrae el `sync_state` (escalar) antes del `.unwrap()`, así el valor
+        // con datos de la cuenta no fluye al sink (ver `cleartext-logging`).
+        let of = |book_id: i64| {
+            cards
+                .iter()
+                .find(|c| c.address_book_id == book_id.to_string())
+                .map(|c| c.sync_state)
+                .unwrap()
+        };
+        // La de A: su conflicto es ajeno, se ve `pending`, no `conflict`.
+        assert_eq!(of(a.id), SyncState::Pending);
+        // La de B: la op viva es la suya, y chocó.
+        assert_eq!(of(b.id), SyncState::Conflict);
     }
 
     /// Todas las páginas de una lista, desde el principio.
@@ -1625,8 +1768,8 @@ mod tests {
         let keys: Vec<&String> = back["items"][0].as_object().unwrap().keys().collect();
         assert_eq!(
             keys.len(),
-            4,
-            "sólo id, address_book_id, href y vcard: {keys:?}"
+            6,
+            "sólo id, address_book_id, href, vcard, etag y sync_state: {keys:?}"
         );
     }
 
