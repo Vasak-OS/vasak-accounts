@@ -170,17 +170,30 @@ impl Store {
     /// contactos sería una sola transacción de diez mil filas.
     pub fn remove_address_book_chunk(&mut self, book_id: i64) -> Result<usize, StoreError> {
         let transaction = self.connection.transaction().map_err(classify)?;
+        // No se lleva un cambio local sin confirmar: una fila marcada
+        // (`pending_op`) se deja, igual que el guard de `apply_contacts` en la
+        // bajada. El empuje la resuelve y un re-sync posterior la limpia.
         let removed = transaction
             .execute(
                 "DELETE FROM contacts WHERE id IN
-                   (SELECT id FROM contacts WHERE address_book_id = ?1 LIMIT ?2)",
+                   (SELECT id FROM contacts
+                     WHERE address_book_id = ?1 AND pending_op IS NULL LIMIT ?2)",
                 rusqlite::params![book_id, WRITE_BATCH_ROWS as i64],
             )
             .map_err(classify)?;
         let mut changed = removed > 0;
         if removed == 0 {
+            // La libreta se borra sólo cuando no le queda ningún contacto: si
+            // sobreviven filas marcadas, borrarla las arrastraría por la cascada
+            // (`ON DELETE CASCADE`) y perdería el cambio local que el guard de
+            // arriba acaba de proteger.
             changed |= transaction
-                .execute("DELETE FROM address_books WHERE id = ?1", [book_id])
+                .execute(
+                    "DELETE FROM address_books WHERE id = ?1
+                      AND NOT EXISTS
+                        (SELECT 1 FROM contacts WHERE address_book_id = ?1)",
+                    [book_id],
+                )
                 .map_err(classify)?
                 > 0;
         }
@@ -1064,5 +1077,53 @@ pub(crate) mod tests {
             0
         );
         assert_eq!(store.contacts_sync_token(&book.href).unwrap(), None);
+    }
+
+    /// El borrado masivo de una libreta que se fue del servidor no se lleva un
+    /// contacto con cambio local sin confirmar: los sin marca se borran, el
+    /// marcado (`pending_op`) queda, y la libreta no se borra mientras le quede
+    /// uno —la cascada se lo llevaría—.
+    #[test]
+    fn el_borrado_masivo_respeta_un_contacto_con_pending_op() {
+        let temp = TempDir::new("contactos-remove-pending");
+        let mut store = open_store(&temp);
+        let book = store
+            .upsert_address_books(&[("https://x/a/".into(), "A".into())])
+            .unwrap()
+            .remove(0);
+        store
+            .apply_contacts(
+                &book,
+                &[
+                    ContactOp::Upsert(row("https://x/a/a.vcf", "Ana", "a@x.com")),
+                    ContactOp::Upsert(row("https://x/a/b.vcf", "Beto", "b@x.com")),
+                ],
+                None,
+                u64::MAX,
+            )
+            .unwrap();
+        // «b» tiene un borrado local todavía sin subir.
+        store
+            .enqueue_delete(
+                CONTACTS_AREA,
+                &book.href,
+                "https://x/a/b.vcf",
+                Some("\"1\""),
+            )
+            .unwrap();
+
+        while store.remove_address_book_chunk(book.id).unwrap() > 0 {}
+
+        // «a» (sin marca) se fue; «b» (marcada) quedó.
+        assert_eq!(count(&store, "SELECT count(*) FROM contacts"), 1);
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM contacts WHERE href = 'https://x/a/b.vcf'"
+            ),
+            1
+        );
+        // La libreta no se borró: borrarla se habría llevado «b» por la cascada.
+        assert_eq!(store.address_books().unwrap().len(), 1);
     }
 }

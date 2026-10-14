@@ -255,7 +255,8 @@ pub fn list_address_books(connection: &Connection) -> Result<Vec<AddressBookItem
         .prepare(
             "SELECT b.id, b.display_name,
                     (SELECT count(*) FROM contacts c
-                      WHERE c.address_book_id = b.id AND c.display_name != '')
+                      WHERE c.address_book_id = b.id AND c.display_name != ''
+                        AND (c.pending_op IS NULL OR c.pending_op != 'delete'))
                FROM address_books b
               ORDER BY b.display_name, b.id",
         )
@@ -319,7 +320,8 @@ fn cards_page(
     let mut sql = String::from(
         "SELECT c.id, c.address_book_id, c.sort_key, c.href, c.raw_vcard
            FROM contacts c
-          WHERE c.display_name != ''",
+          WHERE c.display_name != ''
+            AND (c.pending_op IS NULL OR c.pending_op != 'delete')",
     );
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
     page_filters(&mut sql, &mut params, address_book, after, limit);
@@ -418,6 +420,9 @@ fn page_filters(
 
 /// La consulta de las dos, armada según lo que se pidió, para que cada forma
 /// use su índice.
+///
+/// Un contacto borrado local que todavía no subió (`pending_op = 'delete'`) no
+/// se lista; uno creado o editado local (`pending_op = 'put'`) sí.
 fn page(
     connection: &Connection,
     address_book: Option<i64>,
@@ -433,7 +438,8 @@ fn page(
                 (SELECT p.value FROM contact_phones p
                   WHERE p.contact_id = c.id ORDER BY p.position LIMIT 1)
            FROM contacts c
-          WHERE c.display_name != ''",
+          WHERE c.display_name != ''
+            AND (c.pending_op IS NULL OR c.pending_op != 'delete')",
     );
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
     if let Some(fts) = fts {
@@ -511,7 +517,8 @@ pub fn get_contact(connection: &Connection, id: i64) -> Result<Option<ContactDet
     let row: Option<(i64, String)> = connection
         .query_row(
             "SELECT address_book_id, raw_vcard FROM contacts
-              WHERE id = ?1 AND display_name != ''",
+              WHERE id = ?1 AND display_name != ''
+                AND (pending_op IS NULL OR pending_op != 'delete')",
             [id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -1621,5 +1628,74 @@ mod tests {
             4,
             "sólo id, address_book_id, href y vcard: {keys:?}"
         );
+    }
+
+    /// Un contacto borrado local sin confirmar (`pending_op = 'delete'`) no se
+    /// lista, ni como tarjeta, ni en la búsqueda, ni en el detalle, y no cuenta
+    /// en la libreta; uno creado local (`pending_op = 'put'`) sí se ve.
+    #[test]
+    fn la_lectura_oculta_un_contacto_borrado_local_y_muestra_uno_creado() {
+        use super::super::lifecycle::CONTACTS_AREA;
+        let temp = TempDir::new("contactos-pending");
+        let mut store = open_store(&temp);
+        let b = book(&mut store, "https://x/a/", "A");
+        add(
+            &mut store,
+            &b,
+            vec![
+                row("https://x/a/vive.vcf", "Vive", "vive@x.com"),
+                row("https://x/a/muere.vcf", "Muere", "muere@x.com"),
+            ],
+        );
+        // «muere» (id 2) se borra local; «nueva» (id 3) se crea local.
+        store
+            .enqueue_delete(
+                CONTACTS_AREA,
+                &b.href,
+                "https://x/a/muere.vcf",
+                Some("\"1\""),
+            )
+            .unwrap();
+        store
+            .enqueue_contact_put(&b, &row("https://x/a/nueva.vcf", "Nueva", "nueva@x.com"))
+            .unwrap();
+
+        // La lista: «Nueva» y «Vive», nunca «Muere».
+        assert_eq!(
+            names(list_contacts(store.connection(), None, None, 100).unwrap()),
+            vec!["Nueva", "Vive"]
+        );
+
+        // La lista de tarjetas crudas: la borrada local (id 2) no está.
+        let cards: Vec<String> = list_cards(store.connection(), None, None, 100)
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert!(
+            !cards.contains(&"2".to_string()),
+            "la tarjeta borrada local se listó: {cards:?}"
+        );
+        assert_eq!(cards.len(), 2);
+
+        // La búsqueda tampoco la trae.
+        assert!(
+            search(&store, "muere").is_empty(),
+            "la búsqueda trajo un contacto borrado local"
+        );
+        assert_eq!(search(&store, "vive"), vec!["Vive"]);
+
+        // El detalle: «muere» (id 2) no; «vive» (id 1) sí.
+        assert!(
+            get_contact(store.connection(), 2).unwrap().is_none(),
+            "el detalle devolvió un contacto borrado local"
+        );
+        assert!(get_contact(store.connection(), 1).unwrap().is_some());
+
+        // El conteo de la libreta no cuenta la borrada (vive + nueva = 2).
+        let books = list_address_books(store.connection()).unwrap();
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].contacts, 2);
     }
 }
