@@ -1,0 +1,40 @@
+# iCloud — calendario y contactos por CalDAV/CardDAV.
+#
+# ── Qué hace falta ──────────────────────────────────────────────────────────
+#
+# El correo de la Apple ID y una **contraseña específica de aplicación**. No se
+# usa la contraseña principal de la cuenta: Apple exige una contraseña aparte
+# para los clientes que no son suyos, y es la que se pega acá. Se genera en
+# https://appleid.apple.com/ → «Iniciar sesión y seguridad» → «Contraseñas
+# específicas para apps». La cuenta tiene que tener la verificación en dos pasos
+# activada, o esa opción no aparece.
+#
+# ── Por qué no lleva `dav_url` ───────────────────────────────────────────────
+#
+# iCloud reparte los calendarios y las libretas en una ruta propia de cada
+# persona, con un identificador numérico que sólo se conoce después de
+# autenticarse (el «principal» de RFC 6764). Una dirección fija no serviría: hay
+# que preguntarle al servidor dónde viven las colecciones. Ese recorrido lo hace
+# la pantalla de Configuración al conectar (`.well-known/caldav` → principal →
+# calendar-home-set), y guarda la dirección ya resuelta en la cuenta. Por eso
+# acá no hay `dav_url`: no se sabe hasta ese momento, igual que con Nextcloud.
+#
+# Las direcciones de autodescubrimiento, para referencia:
+#   CalDAV:  https://caldav.icloud.com/
+#   CardDAV: https://contacts.icloud.com/
+#
+# ── Qué se guarda ────────────────────────────────────────────────────────────
+#
+# La dirección resuelta de cada capacidad, el usuario (el correo de la Apple ID)
+# y la contraseña de aplicación. La contraseña va cifrada en el almacén de
+# secretos del usuario (`vasak-keyring`), no en este archivo ni en la
+# configuración de la cuenta. La autenticación es HTTP Basic sobre TLS.
+
+id = "icloud"
+display_name = "iCloud"
+kind = "carddav"
+
+# Apple no ofrece correo por un protocolo que VasakOS hable hoy sin OAuth, así
+# que la cuenta declara calendario y contactos: lo que CalDAV/CardDAV dan de
+# verdad con una contraseña de aplicación.
+capabilities = ["calendar", "contacts"]

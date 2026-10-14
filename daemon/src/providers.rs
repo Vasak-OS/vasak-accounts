@@ -1270,6 +1270,47 @@ mod tests {
         }
     }
 
+    /// Los proveedores DAV con la URL conocida —iCloud, Yahoo, Fastmail— tienen
+    /// que estar en el catálogo, ser `carddav` y ofrecer calendario y contactos.
+    ///
+    /// Sin la entrada, una cuenta de iCloud se conecta igual (la pantalla arma
+    /// las capacidades a mano), pero el servicio no la reconoce: el resumen de
+    /// cuentas no sabe qué ofrece ni qué le falta, y la tarjeta queda sin el
+    /// nombre del proveedor. La entrada es lo que la vuelve una cuenta conocida.
+    #[test]
+    fn los_proveedores_dav_conocidos_declaran_calendario_y_contactos() {
+        let directorio =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/providers.d");
+        let catalogo = cargar(&directorio);
+
+        for id in ["icloud", "yahoo", "fastmail"] {
+            let proveedor = catalogo
+                .get(id)
+                .unwrap_or_else(|| panic!("falta el proveedor '{id}' en el catálogo"));
+
+            assert_eq!(
+                proveedor.kind,
+                ProviderKind::CardDav,
+                "{id} tiene que ser carddav: la dirección la resuelve la pantalla al conectar"
+            );
+            // Sin `dav_url`: la dirección de cada colección se resuelve al
+            // conectar, no se sabe antes. La prueba general ya lo exige para
+            // todo carddav; se repite acá para que el motivo quede junto al
+            // proveedor.
+            assert!(
+                !proveedor.is_configured(),
+                "{id} no debería estar configurado sin dav_url"
+            );
+            for esperada in [CapabilityType::Calendar, CapabilityType::Contacts] {
+                assert!(
+                    proveedor.capabilities().contains(&esperada),
+                    "{id} no ofrece '{}': ninguna app le podría pedir esa capacidad",
+                    esperada.as_id(),
+                );
+            }
+        }
+    }
+
     /// Cada capacidad que un proveedor OAuth2 ofrece tiene que decir **dónde
     /// vive**, o la cuenta se conecta bien y después ninguna aplicación sabe a
     /// qué servidor hablarle: es exactamente el fallo que se arregló acá, y no
