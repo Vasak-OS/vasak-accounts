@@ -59,7 +59,12 @@ use crate::dav_sync::BrokerCredentials;
 use crate::email_sync::{EmailScheduler, EmailSync, EMAIL_TICK};
 use crate::ical::recurrence::ExpansionLimits;
 use crate::reminders;
+use crate::serialize::ical::{DateSpec, EventPatch, SerializeError};
+use crate::serialize::vcard::{ContactPatch, Relation};
+use crate::serialize::{ical as ical_write, vcard as vcard_write, Change};
+use crate::store::calendar::{derive_with_occurrences, ObjectRow, Window};
 use crate::store::calendar_read::{self, GlobalId, ListCursor, Range};
+use crate::store::contacts::ContactRow;
 use crate::store::contacts_read::{self, Cursor, InvalidArgument};
 use crate::store::email_read::{self, Cursor as EmailCursor};
 use crate::store::key::{self, KeyError, KeySource, SecretServiceKeys};
@@ -67,7 +72,7 @@ use crate::store::lifecycle::{
     AccountListing, AreaAccount, Consent, ListedAccount, Locations, Status, StoreManager,
     CALENDAR_AREA, CONTACTS_AREA, EMAIL_AREA, SYNCED_AREAS,
 };
-use crate::store::{paths, StoreError};
+use crate::store::{paths, Store, StoreError};
 
 /// Dónde se publica la interfaz.
 pub const PATH: &str = "/ar/net/vasak/os/AccountsStore";
@@ -821,6 +826,194 @@ impl<K: KeySource> StoreApi<K> {
             .map_err(read_error)
     }
 
+    /// Crea o edita un evento o una tarea de un calendario, **encolándolo** hacia
+    /// el servidor (no espera a la red): escribe el crudo optimista, lo marca y
+    /// suma la op (ver `store/queue.rs`). La señal `Changed` del área sale sola.
+    ///
+    /// - `calendar_id`: el número del calendario (el de su `id` global de
+    ///   `ListCalendars`), dentro de `account_id`.
+    /// - `if_match` vacío: **crear**. El `payload` no lleva `id`; se genera un
+    ///   `UID` y un `href` nuevos, y la op va sin precondición de ETag
+    ///   (`Precondition::Create`).
+    /// - `if_match` con un ETag: **editar** el evento cuyo `id` (número local) va
+    ///   en el `payload`, con ese ETag de precondición. La edición es
+    ///   conservadora: se parte del crudo guardado y se toca sólo lo que el
+    ///   parche nombra (decisión 3).
+    /// - `payload`: un objeto JSON. Cada campo ausente **no se toca**, `null` lo
+    ///   **saca**, y un valor lo **fija**: `summary`, `description`, `location`
+    ///   de texto; `start`, `end` como `{"value": "...", "params": ["..."]}`. Al
+    ///   editar, `id` identifica el evento.
+    ///
+    /// Devuelve `{"event_id": "<cuenta>/<id>", "href": "..."}`. Un `payload` mal
+    /// formado —una fecha que no es iCalendar, un parámetro que inyectaría una
+    /// línea— da `InvalidArgs` sin tocar nada, nunca un pánico.
+    ///
+    /// Autoriza con `store.calendar` **antes** de actuar, y respeta el límite por
+    /// llamante.
+    async fn put_event(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        account_id: String,
+        calendar_id: String,
+        payload: String,
+        if_match: String,
+    ) -> zbus::fdo::Result<String> {
+        let calendar_id = contacts_read::parse_id(&calendar_id).map_err(invalid)?;
+        let account = self
+            .manager
+            .area_account(CALENDAR_AREA, &account_id)
+            .await
+            .map_err(to_fdo)?;
+        self.authorize(&header, CALENDAR_RESOURCE, &account.display_name)
+            .await?;
+        self.caller_limit(&header, &account_id)?;
+        self.activate_after_read(CALENDAR_AREA, &account_id, &account)
+            .await;
+        let uid = if if_match.is_empty() {
+            Some(new_uid()?)
+        } else {
+            None
+        };
+        let (id, href) = self
+            .manager
+            .with_store(&account_id, move |store| {
+                put_event_in_store(store, calendar_id, &payload, &if_match, uid)
+            })
+            .await
+            .map_err(read_error)?;
+        self.ask_for_sync(CALENDAR_AREA, &account_id);
+        let body = GlobalId {
+            account_id: account_id.clone(),
+            id,
+        };
+        serde_json::to_string(&serde_json::json!({ "event_id": body.encode(), "href": href }))
+            .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
+    }
+
+    /// Borra un evento o una tarea, **encolando** el borrado hacia el servidor:
+    /// marca la fila guardada —se queda hasta confirmar— y suma la op. La señal
+    /// `Changed` del área sale sola.
+    ///
+    /// `event_id` es el número local del objeto. `if_match` vacío borra sin
+    /// precondición; con un ETag, sólo si el recurso no cambió desde él.
+    ///
+    /// Autoriza con `store.calendar` antes de actuar, y respeta el límite por
+    /// llamante. Devuelve `{}`.
+    async fn delete_event(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        account_id: String,
+        event_id: String,
+        if_match: String,
+    ) -> zbus::fdo::Result<String> {
+        let event_id = contacts_read::parse_id(&event_id).map_err(invalid)?;
+        let account = self
+            .manager
+            .area_account(CALENDAR_AREA, &account_id)
+            .await
+            .map_err(to_fdo)?;
+        self.authorize(&header, CALENDAR_RESOURCE, &account.display_name)
+            .await?;
+        self.caller_limit(&header, &account_id)?;
+        self.activate_after_read(CALENDAR_AREA, &account_id, &account)
+            .await;
+        let base_etag = (!if_match.is_empty()).then_some(if_match);
+        self.manager
+            .with_store(&account_id, move |store| {
+                let (calendar, href, _raw) = store
+                    .event_target(event_id)?
+                    .ok_or_else(|| StoreError::InvalidArgument("el evento no existe".into()))?;
+                store.enqueue_delete(CALENDAR_AREA, &calendar.href, &href, base_etag.as_deref())
+            })
+            .await
+            .map_err(read_error)?;
+        self.ask_for_sync(CALENDAR_AREA, &account_id);
+        Ok("{}".to_string())
+    }
+
+    /// Crea o edita un contacto de una libreta, **encolándolo** hacia el
+    /// servidor. Como [`Self::put_event`], pero con vCard: `if_match` vacío crea
+    /// (sin `id` en el `payload`), con ETag edita el contacto cuyo `id` va en el
+    /// `payload`.
+    ///
+    /// `payload`: un objeto JSON con `full_name`, `organization`, `note` de
+    /// texto (ausente no toca, `null` saca, valor fija) y `related` como lista de
+    /// `{"label": "...", "value": "..."}`. Al editar, `id` identifica el
+    /// contacto. Devuelve `{"contact_id": <id>, "href": "..."}`.
+    ///
+    /// Autoriza con `store.contacts` antes de actuar, y respeta el límite por
+    /// llamante.
+    async fn put_contact(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        account_id: String,
+        address_book_id: String,
+        payload: String,
+        if_match: String,
+    ) -> zbus::fdo::Result<String> {
+        let address_book_id = contacts_read::parse_id(&address_book_id).map_err(invalid)?;
+        let account = self
+            .manager
+            .area_account(CONTACTS_AREA, &account_id)
+            .await
+            .map_err(to_fdo)?;
+        self.authorize(&header, CONTACTS_RESOURCE, &account.display_name)
+            .await?;
+        self.caller_limit(&header, &account_id)?;
+        self.activate_after_read(CONTACTS_AREA, &account_id, &account)
+            .await;
+        let uid = if if_match.is_empty() {
+            Some(new_uid()?)
+        } else {
+            None
+        };
+        let (id, href) = self
+            .manager
+            .with_store(&account_id, move |store| {
+                put_contact_in_store(store, address_book_id, &payload, &if_match, uid)
+            })
+            .await
+            .map_err(read_error)?;
+        self.ask_for_sync(CONTACTS_AREA, &account_id);
+        serde_json::to_string(&serde_json::json!({ "contact_id": id, "href": href }))
+            .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
+    }
+
+    /// Borra un contacto, **encolando** el borrado hacia el servidor. Como
+    /// [`Self::delete_event`], pero con `store.contacts` y una libreta. Devuelve
+    /// `{}`.
+    async fn delete_contact(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        account_id: String,
+        contact_id: String,
+        if_match: String,
+    ) -> zbus::fdo::Result<String> {
+        let contact_id = contacts_read::parse_id(&contact_id).map_err(invalid)?;
+        let account = self
+            .manager
+            .area_account(CONTACTS_AREA, &account_id)
+            .await
+            .map_err(to_fdo)?;
+        self.authorize(&header, CONTACTS_RESOURCE, &account.display_name)
+            .await?;
+        self.caller_limit(&header, &account_id)?;
+        self.activate_after_read(CONTACTS_AREA, &account_id, &account)
+            .await;
+        let base_etag = (!if_match.is_empty()).then_some(if_match);
+        self.manager
+            .with_store(&account_id, move |store| {
+                let (book, href, _raw) = store
+                    .contact_target(contact_id)?
+                    .ok_or_else(|| StoreError::InvalidArgument("el contacto no existe".into()))?;
+                store.enqueue_delete(CONTACTS_AREA, &book.href, &href, base_etag.as_deref())
+            })
+            .await
+            .map_err(read_error)?;
+        self.ask_for_sync(CONTACTS_AREA, &account_id);
+        Ok("{}".to_string())
+    }
+
     /// Señal `StatusChanged` — cambió el estado de alguna base.
     ///
     /// Sin detalle: quien la recibe vuelve a leer `GetStatus`.
@@ -853,6 +1046,25 @@ impl<K: KeySource> StoreApi<K> {
         if !self.manager.is_known(account_id).await {
             return Err(to_fdo(StoreError::UnknownAccount(account_id.to_string())));
         }
+        self.limit(header, account_id, action)
+    }
+
+    /// El límite por llamante de una escritura (`PutEvent`, `DeleteEvent`,
+    /// `PutContact`, `DeleteContact`): [`access::WRITE_BURST`] por cuenta y
+    /// llamante en la ventana, sin piso por cuenta —dos escrituras a objetos
+    /// distintos no se serializan—. La cuenta ya se validó al autorizar
+    /// (`area_account`); acá sólo acota el costo.
+    fn caller_limit(&self, header: &Header<'_>, account_id: &str) -> zbus::fdo::Result<()> {
+        self.limit(header, account_id, ControlAction::Write)
+    }
+
+    /// El límite por llamante de un comando, con el texto fijo de cada rechazo.
+    fn limit(
+        &self,
+        header: &Header<'_>,
+        account_id: &str,
+        action: ControlAction,
+    ) -> zbus::fdo::Result<()> {
         let sender = sender_of(header);
         match self
             .access
@@ -862,7 +1074,7 @@ impl<K: KeySource> StoreApi<K> {
             Ok(()) => Ok(()),
             Err(Refusal::Caller) => Err(zbus::fdo::Error::LimitsExceeded(format!(
                 "demasiados pedidos seguidos sobre esta cuenta: como mucho {} cada {} s",
-                access::CONTROL_BURST,
+                action.burst(),
                 access::CONTROL_WINDOW.as_secs()
             ))),
             Err(Refusal::Account) => Err(zbus::fdo::Error::LimitsExceeded(format!(
@@ -1107,6 +1319,322 @@ fn denied(resource: &str) -> zbus::fdo::Error {
 
 fn invalid(error: InvalidArgument) -> zbus::fdo::Error {
     zbus::fdo::Error::InvalidArgs(error.to_string())
+}
+
+/// Un `SerializeError` de iCalendar como error del almacén: un argumento
+/// inválido, con su texto fijo (una fecha mal formada, un parámetro que
+/// inyectaría una línea). `read_error` lo pasa a `InvalidArgs`; nunca un pánico.
+fn serialize_error(error: SerializeError) -> StoreError {
+    StoreError::InvalidArgument(error.to_string())
+}
+
+/// El `href` de un hijo de una colección: su dirección más el nombre y la
+/// extensión. Con una barra en el medio si la colección no termina en una.
+fn child_href(collection: &str, name: &str, ext: &str) -> String {
+    if collection.ends_with('/') {
+        format!("{collection}{name}{ext}")
+    } else {
+        format!("{collection}/{name}{ext}")
+    }
+}
+
+/// Un identificador nuevo para un recurso que se crea: 16 bytes del azar del
+/// sistema, en hexadecimal. Es el `UID` del objeto y el nombre de su `href`.
+fn new_uid() -> zbus::fdo::Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes)
+        .map_err(|e| zbus::fdo::Error::Failed(format!("no hay azar del sistema: {e}")))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// El cuerpo de una escritura: un objeto JSON. Con un texto fijo si no es JSON o
+/// no es un objeto —nada de lo que dijo el parser, que podría llevar parte del
+/// cuerpo—.
+fn json_object(payload: &str) -> Result<serde_json::Map<String, serde_json::Value>, StoreError> {
+    match serde_json::from_str::<serde_json::Value>(payload) {
+        Ok(serde_json::Value::Object(map)) => Ok(map),
+        Ok(_) => Err(StoreError::InvalidArgument(
+            "el cuerpo no es un objeto JSON".into(),
+        )),
+        Err(_) => Err(StoreError::InvalidArgument(
+            "el cuerpo no es JSON válido".into(),
+        )),
+    }
+}
+
+/// Cómo cambia un campo de texto: ausente no se toca, `null` lo saca, un texto
+/// lo fija. Cualquier otra forma es un argumento inválido.
+fn text_change(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<Change<String>, StoreError> {
+    match obj.get(key) {
+        None => Ok(Change::Leave),
+        Some(serde_json::Value::Null) => Ok(Change::Clear),
+        Some(serde_json::Value::String(text)) => Ok(Change::Set(text.clone())),
+        Some(_) => Err(StoreError::InvalidArgument(format!(
+            "«{key}» es texto o null"
+        ))),
+    }
+}
+
+/// Cómo cambia una fecha: ausente no se toca, `null` la saca, un objeto
+/// `{value, params}` la fija. El valor y los parámetros van tal cual a la
+/// serialización, que es la que valida que sean una fecha de iCalendar de
+/// verdad (ver [`serialize_error`]).
+fn date_change(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<Change<DateSpec>, StoreError> {
+    match obj.get(key) {
+        None => Ok(Change::Leave),
+        Some(serde_json::Value::Null) => Ok(Change::Clear),
+        Some(serde_json::Value::Object(map)) => {
+            let value = map
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    StoreError::InvalidArgument(format!("«{key}» necesita «value» de texto"))
+                })?
+                .to_string();
+            let params = match map.get("params") {
+                None | Some(serde_json::Value::Null) => Vec::new(),
+                Some(serde_json::Value::Array(items)) => items
+                    .iter()
+                    .map(|param| {
+                        param.as_str().map(str::to_string).ok_or_else(|| {
+                            StoreError::InvalidArgument(format!("cada «param» de «{key}» es texto"))
+                        })
+                    })
+                    .collect::<Result<_, _>>()?,
+                Some(_) => {
+                    return Err(StoreError::InvalidArgument(format!(
+                        "«params» de «{key}» es una lista"
+                    )))
+                }
+            };
+            Ok(Change::Set(DateSpec { value, params }))
+        }
+        Some(_) => Err(StoreError::InvalidArgument(format!(
+            "«{key}» es un objeto {{value, params}} o null"
+        ))),
+    }
+}
+
+/// Cómo cambian las relaciones de un contacto: ausente no se toca, `null` las
+/// saca, una lista de `{label, value}` las fija enteras.
+fn related_change(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<Change<Vec<Relation>>, StoreError> {
+    match obj.get(key) {
+        None => Ok(Change::Leave),
+        Some(serde_json::Value::Null) => Ok(Change::Clear),
+        Some(serde_json::Value::Array(items)) => {
+            let relations = items
+                .iter()
+                .map(|item| {
+                    let map = item.as_object().ok_or_else(|| {
+                        StoreError::InvalidArgument(
+                            "cada relación es un objeto {label, value}".into(),
+                        )
+                    })?;
+                    let field = |name: &str| {
+                        map.get(name)
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                            .ok_or_else(|| {
+                                StoreError::InvalidArgument(format!(
+                                    "una relación necesita «{name}» de texto"
+                                ))
+                            })
+                    };
+                    Ok(Relation {
+                        label: field("label")?,
+                        value: field("value")?,
+                    })
+                })
+                .collect::<Result<Vec<_>, StoreError>>()?;
+            Ok(Change::Set(relations))
+        }
+        Some(_) => Err(StoreError::InvalidArgument(
+            "«related» es una lista de {label, value} o null".into(),
+        )),
+    }
+}
+
+/// El `id` del objeto que se edita, del cuerpo: un número local positivo.
+fn require_edit_id(obj: &serde_json::Map<String, serde_json::Value>) -> Result<i64, StoreError> {
+    let value = obj
+        .get("id")
+        .ok_or_else(|| StoreError::InvalidArgument("para editar, el cuerpo lleva «id»".into()))?;
+    let id = match value {
+        serde_json::Value::Number(number) => number.as_i64(),
+        serde_json::Value::String(text) => text.parse::<i64>().ok(),
+        _ => None,
+    };
+    id.filter(|id| *id > 0)
+        .ok_or_else(|| StoreError::InvalidArgument("«id» no es un identificador válido".into()))
+}
+
+/// Al crear, el cuerpo **no** lleva `id`: así no hay duda entre crear y editar.
+fn forbid_id_on_create(obj: &serde_json::Map<String, serde_json::Value>) -> Result<(), StoreError> {
+    if obj.contains_key("id") {
+        return Err(StoreError::InvalidArgument(
+            "para crear no se manda «id»; para editar va if_match con el etag".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// El parche de un evento, del cuerpo JSON.
+fn event_patch_from(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<EventPatch, StoreError> {
+    Ok(EventPatch {
+        summary: text_change(obj, "summary")?,
+        description: text_change(obj, "description")?,
+        location: text_change(obj, "location")?,
+        start: date_change(obj, "start")?,
+        end: date_change(obj, "end")?,
+    })
+}
+
+/// El parche de un contacto, del cuerpo JSON.
+fn contact_patch_from(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<ContactPatch, StoreError> {
+    Ok(ContactPatch {
+        full_name: text_change(obj, "full_name")?,
+        organization: text_change(obj, "organization")?,
+        note: text_change(obj, "note")?,
+        related: related_change(obj, "related")?,
+    })
+}
+
+/// Crea o edita un evento en la base y lo encola: todo en la misma transacción
+/// del almacén (ver `store/queue.rs`). Devuelve el `id` local del objeto y su
+/// `href`. Corre en el hilo de bloqueo, dentro de `with_store`.
+fn put_event_in_store(
+    store: &mut Store,
+    calendar_id: i64,
+    payload: &str,
+    if_match: &str,
+    uid: Option<String>,
+) -> Result<(i64, String), StoreError> {
+    let obj = json_object(payload)?;
+    let patch = event_patch_from(&obj)?;
+    // La ventana con la que se derivan las ocurrencias es la de la base; si no
+    // tiene todavía, la del día, que es con la que la encolará `enqueue`.
+    let window = store
+        .calendar_window()?
+        .unwrap_or_else(|| Window::around(chrono::Utc::now()));
+    if if_match.is_empty() {
+        forbid_id_on_create(&obj)?;
+        let calendar = store
+            .calendar_by_id(calendar_id)?
+            .ok_or_else(|| StoreError::InvalidArgument("el calendario no existe".into()))?;
+        let uid =
+            uid.ok_or_else(|| StoreError::InvalidArgument("falta el identificador nuevo".into()))?;
+        let href = child_href(&calendar.href, &uid, ".ics");
+        let dtstamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let raw = ical_write::new_event(&uid, &dtstamp, &patch).map_err(serialize_error)?;
+        let (index, occurrences) = derive_with_occurrences(&raw, window, &ExpansionLimits::DEFAULT);
+        let row = ObjectRow {
+            href: href.clone(),
+            etag: None,
+            raw_ical: raw,
+            index,
+            occurrences,
+        };
+        store.enqueue_calendar_put(&calendar, &row, window)?;
+        let id = store
+            .object_id_by_href(calendar.id, &href)?
+            .ok_or(StoreError::Missing)?;
+        Ok((id, href))
+    } else {
+        let event_id = require_edit_id(&obj)?;
+        let (calendar, href, raw) = store
+            .event_target(event_id)?
+            .ok_or_else(|| StoreError::InvalidArgument("el evento no existe".into()))?;
+        if calendar.id != calendar_id {
+            return Err(StoreError::InvalidArgument(
+                "el evento no es de ese calendario".into(),
+            ));
+        }
+        let edited = ical_write::apply_changes(&raw, &patch).map_err(serialize_error)?;
+        let (index, occurrences) =
+            derive_with_occurrences(&edited, window, &ExpansionLimits::DEFAULT);
+        let row = ObjectRow {
+            href: href.clone(),
+            etag: Some(if_match.to_string()),
+            raw_ical: edited,
+            index,
+            occurrences,
+        };
+        store.enqueue_calendar_put(&calendar, &row, window)?;
+        Ok((event_id, href))
+    }
+}
+
+/// Crea o edita un contacto en la base y lo encola. Como
+/// [`put_event_in_store`], pero con vCard —que no tiene camino de error de
+/// serialización— y una libreta.
+fn put_contact_in_store(
+    store: &mut Store,
+    book_id: i64,
+    payload: &str,
+    if_match: &str,
+    uid: Option<String>,
+) -> Result<(i64, String), StoreError> {
+    let obj = json_object(payload)?;
+    let patch = contact_patch_from(&obj)?;
+    if if_match.is_empty() {
+        forbid_id_on_create(&obj)?;
+        let book = store
+            .address_book_by_id(book_id)?
+            .ok_or_else(|| StoreError::InvalidArgument("la libreta no existe".into()))?;
+        let uid =
+            uid.ok_or_else(|| StoreError::InvalidArgument("falta el identificador nuevo".into()))?;
+        let href = child_href(&book.href, &uid, ".vcf");
+        let raw = vcard_write::new_contact(&uid, &patch);
+        let contact = crate::vcard::contact_from(&raw, &href).ok_or_else(|| {
+            StoreError::InvalidArgument("la vCard nueva no se pudo interpretar".into())
+        })?;
+        let row = ContactRow {
+            href: href.clone(),
+            etag: None,
+            raw_vcard: raw,
+            contact,
+        };
+        store.enqueue_contact_put(&book, &row)?;
+        let id = store
+            .contact_id_by_href(book.id, &href)?
+            .ok_or(StoreError::Missing)?;
+        Ok((id, href))
+    } else {
+        let contact_id = require_edit_id(&obj)?;
+        let (book, href, raw) = store
+            .contact_target(contact_id)?
+            .ok_or_else(|| StoreError::InvalidArgument("el contacto no existe".into()))?;
+        if book.id != book_id {
+            return Err(StoreError::InvalidArgument(
+                "el contacto no es de esa libreta".into(),
+            ));
+        }
+        let edited = vcard_write::apply_changes(&raw, &patch);
+        let contact = crate::vcard::contact_from(&edited, &href).ok_or_else(|| {
+            StoreError::InvalidArgument("la vCard editada no se pudo interpretar".into())
+        })?;
+        let row = ContactRow {
+            href: href.clone(),
+            etag: Some(if_match.to_string()),
+            raw_vcard: edited,
+            contact,
+        };
+        store.enqueue_contact_put(&book, &row)?;
+        Ok((contact_id, href))
+    }
 }
 
 /// El error de una lectura, con texto fijo: nada de rutas ni de lo que dijo
@@ -1796,6 +2324,8 @@ mod tests {
             vec![
                 "Changed",
                 "ClearStore",
+                "DeleteContact",
+                "DeleteEvent",
                 "GetContact",
                 "GetEvent",
                 "GetMessage",
@@ -1809,6 +2339,8 @@ mod tests {
                 "ListMessages",
                 "ListOccurrences",
                 "ListTasks",
+                "PutContact",
+                "PutEvent",
                 "RequestSync",
                 "SearchContacts",
                 "SearchMessages",
