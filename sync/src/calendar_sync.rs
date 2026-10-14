@@ -58,7 +58,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use crate::broker::Broker;
+use crate::broker::{Account, Broker, Provider};
 use crate::calendar_sync::backend::CalendarBackendKind;
 use crate::dav::caldav::{self, CalendarCollection, CalendarResource};
 use crate::dav::webdav::{self, href_key, DavClient, DavCredential, DavError, HttpPolicy, Limits};
@@ -301,36 +301,27 @@ impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
     /// proveedores y mapea el `kind` de la cuenta. Hoy todo cae en CalDAV; las
     /// APIs propietarias (Graph) suman su variante en un hito posterior. Ante
     /// cualquier falla del broker, CalDAV por omisión.
+    ///
+    /// La decisión vive en la parte pura y probada
+    /// ([`backend::calendar_backend_for_account`]); acá queda sólo el I/O de
+    /// bus, que no se prueba sin un servicio de cuentas.
     async fn calendar_backend_kind_for_account(&self, account_id: &str) -> CalendarBackendKind {
-        let broker = match Broker::connect().await {
-            Ok(b) => b,
-            Err(_) => return CalendarBackendKind::CalDav,
-        };
-
-        let providers = match broker.list_providers().await {
-            Ok(p) => p,
-            Err(_) => return CalendarBackendKind::CalDav,
-        };
-
-        let accounts = match broker.accounts().await {
-            Ok(a) => a,
-            Err(_) => return CalendarBackendKind::CalDav,
-        };
-
-        let account = accounts.iter().find(|a| a.id == account_id);
-        let provider_type = account.map(|a| a.provider_type.as_str()).unwrap_or("");
-
-        // Buscar el proveedor en el catálogo.
-        for provider in providers {
-            if provider.id == provider_type {
-                return match provider.kind.as_str() {
-                    "caldav" => CalendarBackendKind::CalDav,
-                    _ => CalendarBackendKind::CalDav,
-                };
+        match self.query_provider_catalog().await {
+            Some((providers, accounts)) => {
+                backend::calendar_backend_for_account(&providers, &accounts, account_id)
             }
+            None => CalendarBackendKind::CalDav,
         }
+    }
 
-        CalendarBackendKind::CalDav
+    /// El catálogo de proveedores y la lista de cuentas, del broker. `None` si
+    /// el broker no está o falló: la selección cae entonces en CalDAV. Es I/O
+    /// de bus sin decisión; la decisión está en `backend`.
+    async fn query_provider_catalog(&self) -> Option<(Vec<Provider>, Vec<Account>)> {
+        let broker = Broker::connect().await.ok()?;
+        let providers = broker.list_providers().await.ok()?;
+        let accounts = broker.accounts().await.ok()?;
+        Some((providers, accounts))
     }
 
     /// Una vuelta de una cuenta, de punta a punta, con su estado.

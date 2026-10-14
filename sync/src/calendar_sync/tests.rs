@@ -255,6 +255,23 @@ async fn el_calendario_solo_pide_la_capacidad_de_calendario() {
     assert_eq!(f.credentials.0.lock().unwrap().asked, vec!["calendar"]);
 }
 
+/// El despacho: con el backend fijado en CalDAV (como toda cuenta hoy),
+/// `sync_account` elige la rama CalDAV del match y entra a `sync_account_caldav`
+/// —el único camino que pide la credencial de `calendar` y sincroniza—.
+#[tokio::test]
+async fn el_despacho_con_backend_caldav_toma_el_camino_caldav() {
+    let f = Fixture::new("calendario-despacho").await;
+    f.server
+        .put(0, "reunion.ics", &event("r", "Reunión", "20260928T140000Z"));
+
+    let report = f.synced().await;
+
+    // El camino CalDAV es el único que pide la credencial de `calendar`.
+    let asked = f.credentials.0.lock().unwrap().asked.clone();
+    assert_eq!(asked, vec!["calendar"]);
+    assert_eq!(report.fetched, 1);
+}
+
 // ── La carga inicial ────────────────────────────────────────────────────────
 
 /// La primera vez no hay token: `sync-collection` vacío trae todo —eventos y
