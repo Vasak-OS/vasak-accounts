@@ -145,7 +145,8 @@ impl Fixture {
         .with_clock(Arc::new(move || {
             Utc.timestamp_opt(clock.load(Ordering::SeqCst), 0).unwrap()
         }))
-        .with_expansion(expansion);
+        .with_expansion(expansion)
+        .with_backend_kind(CalendarBackendKind::CalDav);
         Self {
             _temp: temp,
             keys,
@@ -1504,7 +1505,8 @@ async fn una_cuenta_lenta_no_frena_a_las_otras_en_el_calendario() {
             HttpPolicy::plain_loopback(),
             Arc::new(|| {}),
         )
-        .with_clock(Arc::new(move || Utc.timestamp_opt(now, 0).unwrap())),
+        .with_clock(Arc::new(move || Utc.timestamp_opt(now, 0).unwrap()))
+        .with_backend_kind(CalendarBackendKind::CalDav),
     );
 
     tokio::time::timeout(Duration::from_secs(10), scheduler.run_due(Instant::now()))
