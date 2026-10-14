@@ -1,0 +1,38 @@
+# Fastmail — calendario y contactos por CalDAV/CardDAV.
+#
+# ── Qué hace falta ──────────────────────────────────────────────────────────
+#
+# El correo de Fastmail y una **contraseña de aplicación**. Fastmail no acepta
+# la contraseña principal en los clientes externos: hay que crear una en
+# https://www.fastmail.com/settings/security/apppasswords con acceso a
+# «CalDAV/CardDAV» (o «IMAP/SMTP/… y DAV»). Es la que se pega acá.
+#
+# ── Por qué no lleva `dav_url` ───────────────────────────────────────────────
+#
+# Como todos los `carddav`, la dirección de cada colección se resuelve al
+# conectar, a partir del servidor y del usuario, y recién ahí se sabe. La
+# pantalla de Configuración hace el recorrido de RFC 6764 y guarda la dirección
+# ya armada. Por eso acá no hay `dav_url`.
+#
+# Las direcciones de autodescubrimiento, para referencia:
+#   CalDAV:  https://caldav.fastmail.com/
+#   CardDAV: https://carddav.fastmail.com/
+#
+# Fastmail redirige su dominio a secas (`fastmail.com`) a su página web, que no
+# habla DAV: por eso el autodescubrimiento se hace contra los subdominios
+# `caldav.fastmail.com` y `carddav.fastmail.com`, no contra `fastmail.com`.
+#
+# ── Qué se guarda ────────────────────────────────────────────────────────────
+#
+# La dirección resuelta de cada capacidad, el usuario (el correo) y la
+# contraseña de aplicación. La contraseña va cifrada en `vasak-keyring`, no en
+# este archivo. La autenticación es HTTP Basic sobre TLS.
+
+id = "fastmail"
+display_name = "Fastmail"
+kind = "carddav"
+
+# Fastmail también da correo, pero por IMAP/SMTP (o JMAP), que es otro camino de
+# conexión. Acá se declara lo que reutiliza el DAV que ya anda: calendario y
+# contactos.
+capabilities = ["calendar", "contacts"]
