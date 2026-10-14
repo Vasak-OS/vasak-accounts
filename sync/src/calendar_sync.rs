@@ -49,6 +49,8 @@
 //! de la cuenta —por el cambio neto de cada lote, medido en su transacción— y
 //! el plazo de la vuelta. Pasar uno de la cuenta corta la vuelta sin guardar el token.
 
+pub mod backend;
+
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::sync::Arc;
@@ -56,6 +58,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
+use crate::broker::{Account, Broker, Provider};
+use crate::calendar_sync::backend::CalendarBackendKind;
 use crate::dav::caldav::{self, CalendarCollection, CalendarResource};
 use crate::dav::webdav::{self, href_key, DavClient, DavCredential, DavError, HttpPolicy, Limits};
 use crate::dav_sync::{
@@ -225,6 +229,10 @@ pub struct CalendarSync<K: KeySource, C: CredentialSource> {
     clock: Clock,
     /// Cuántas vueltas seguidas le faltó algo pedido a cada calendario.
     missing: MissingStreaks,
+    /// En las pruebas, el backend ya fijado: así la vuelta no consulta el
+    /// broker (no hay bus) y despacha directo. En producción es `None` y el
+    /// backend sale de [`CalendarSync::calendar_backend_kind_for_account`].
+    forced_backend_kind: Option<CalendarBackendKind>,
 }
 
 impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
@@ -244,6 +252,7 @@ impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
             notify,
             clock: Arc::new(Utc::now),
             missing: MissingStreaks::default(),
+            forced_backend_kind: None,
         }
     }
 
@@ -251,6 +260,14 @@ impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
     #[cfg(test)]
     pub fn with_clock(mut self, clock: Clock) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// Con el backend ya fijado: la vuelta despacha a ése sin consultar el
+    /// broker. Para las pruebas, que corren sin bus.
+    #[cfg(test)]
+    pub fn with_backend_kind(mut self, kind: CalendarBackendKind) -> Self {
+        self.forced_backend_kind = Some(kind);
         self
     }
 
@@ -279,6 +296,34 @@ impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
         Ok(self.manager.with_store(account_id, work).await?)
     }
 
+    /// Obtiene el tipo de backend para una cuenta, espejo de
+    /// `ContactsSync::backend_kind_for_account`: consulta el catálogo de
+    /// proveedores y mapea el `kind` de la cuenta. Hoy todo cae en CalDAV; las
+    /// APIs propietarias (Graph) suman su variante en un hito posterior. Ante
+    /// cualquier falla del broker, CalDAV por omisión.
+    ///
+    /// La decisión vive en la parte pura y probada
+    /// ([`backend::calendar_backend_for_account`]); acá queda sólo el I/O de
+    /// bus, que no se prueba sin un servicio de cuentas.
+    async fn calendar_backend_kind_for_account(&self, account_id: &str) -> CalendarBackendKind {
+        match self.query_provider_catalog().await {
+            Some((providers, accounts)) => {
+                backend::calendar_backend_for_account(&providers, &accounts, account_id)
+            }
+            None => CalendarBackendKind::CalDav,
+        }
+    }
+
+    /// El catálogo de proveedores y la lista de cuentas, del broker. `None` si
+    /// el broker no está o falló: la selección cae entonces en CalDAV. Es I/O
+    /// de bus sin decisión; la decisión está en `backend`.
+    async fn query_provider_catalog(&self) -> Option<(Vec<Provider>, Vec<Account>)> {
+        let broker = Broker::connect().await.ok()?;
+        let providers = broker.list_providers().await.ok()?;
+        let accounts = broker.accounts().await.ok()?;
+        Some((providers, accounts))
+    }
+
     /// Una vuelta de una cuenta, de punta a punta, con su estado.
     pub async fn sync_account(&self, account_id: &str) -> CalendarOutcome {
         // Antes de nada, y releyendo el llavero: con la base cerrada no se le
@@ -294,6 +339,20 @@ impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
         }
         self.set_status(account_id, AreaState::Syncing, "").await;
 
+        // Elegir el backend. La capa sólo despacha: hoy todo es CalDAV.
+        let backend_kind = match self.forced_backend_kind {
+            Some(kind) => kind,
+            None => self.calendar_backend_kind_for_account(account_id).await,
+        };
+
+        match backend_kind {
+            CalendarBackendKind::CalDav => self.sync_account_caldav(account_id).await,
+        }
+    }
+
+    /// El camino CalDAV de una vuelta: la credencial con la capacidad
+    /// `calendar`, y la bajada/subida de `run`, con su estado.
+    async fn sync_account_caldav(&self, account_id: &str) -> CalendarOutcome {
         let credential = match self.credentials.credential(account_id, CALENDAR_AREA).await {
             Ok(credential) => credential,
             Err(CredentialError::Denied) => {
