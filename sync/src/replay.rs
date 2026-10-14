@@ -105,8 +105,19 @@ pub async fn replay_area<K: KeySource>(
         // falló o no entró en el plazo), se vuelve a intentar traerla ahora: es
         // lo único que se reintenta de una op en conflicto, y no toca el crudo
         // local ni reintenta la escritura.
+        //
+        // **Acotada con el mismo tope que las escrituras** ([`MAX_REPLAY_ATTEMPTS`]):
+        // una op en conflicto cuya copia no llega —el recurso se borró en el
+        // servidor y el `multiget` da `Ok(None)` para siempre, o la red falla
+        // vuelta tras vuelta— no puede re-traerse indefinidamente consumiendo el
+        // plazo de cada vuelta y postergando el empuje de las escrituras que la
+        // persona quiere subir. Pasado el tope se deja de intentar la copia; M3
+        // (A2) muestra el conflicto igual, con «copia del servidor no disponible».
         if op.state == PendingState::Conflict {
-            if op.server_etag.is_none() && op.server_raw.is_none() {
+            if op.server_etag.is_none()
+                && op.server_raw.is_none()
+                && op.attempts < MAX_REPLAY_ATTEMPTS
+            {
                 if let Ok(object) = url::Url::parse(&op.object_href) {
                     capture_server_copy(
                         manager,
@@ -370,10 +381,15 @@ async fn fetch_server_copy(
 /// la op, **condicionada al `id` y la `revision`** (ver `Store::store_server_copy`).
 ///
 /// Respeta el plazo de la vuelta: si la traída no entra, si falla, o si el
-/// recurso no volvió, **se deja el conflicto sin copia** y se reintenta la
-/// próxima vuelta —nunca se bloquea ni se pierde el conflicto—. El detalle del
-/// error no se registra: el crudo del servidor es dato privado y no tiene por qué
-/// terminar en el diario.
+/// recurso no volvió, **se deja el conflicto sin copia**. El detalle del error no
+/// se registra: el crudo del servidor es dato privado y no tiene por qué terminar
+/// en el diario.
+///
+/// Cuando no se guarda la copia, **se le suma un intento a la op**
+/// (`Store::count_conflict_fetch_attempt`), condicionado a su
+/// `id`/`revision`: así la re-traída queda acotada por [`MAX_REPLAY_ATTEMPTS`] —el
+/// bucle deja de intentarla al llegar al tope— y un recurso borrado en el servidor
+/// (`Ok(None)` permanente) no se re-trae para siempre.
 #[allow(clippy::too_many_arguments)]
 async fn capture_server_copy<K: KeySource>(
     manager: &StoreManager<K>,
@@ -386,43 +402,56 @@ async fn capture_server_copy<K: KeySource>(
     collection_href: &str,
     object: &url::Url,
 ) -> Result<(), StoreError> {
-    let Ok(collection) = url::Url::parse(collection_href) else {
+    let stored = match url::Url::parse(collection_href) {
         // La dirección de la colección no se puede parsear: sin ella no hay a
         // quién pedirle la copia. Raro, porque se guardó desde una URL válida.
-        return Ok(());
-    };
-    let copy = match run(
-        deadline,
-        fetch_server_copy(area, client, &collection, object),
-    )
-    .await
-    {
-        Timed::Elapsed => {
-            tracing::info!(
-                "'{account_id}': la copia del servidor del conflicto no entró en el plazo; \
-                 se trae la próxima vuelta"
-            );
-            return Ok(());
-        }
-        Timed::Done(Ok(Some(copy))) => copy,
-        Timed::Done(Ok(None)) => return Ok(()),
-        Timed::Done(Err(_)) => {
-            // Sin el detalle: puede venir del servidor y el crudo es privado.
-            tracing::info!(
-                "'{account_id}': no se pudo traer la copia del servidor del conflicto; \
-                 se reintenta la próxima vuelta"
-            );
-            return Ok(());
-        }
+        Err(_) => false,
+        Ok(collection) => match run(
+            deadline,
+            fetch_server_copy(area, client, &collection, object),
+        )
+        .await
+        {
+            Timed::Elapsed => {
+                tracing::info!(
+                    "'{account_id}': la copia del servidor del conflicto no entró en el plazo; \
+                     se trae la próxima vuelta"
+                );
+                false
+            }
+            // El recurso no volvió (se borró en el servidor, o un error por
+            // recurso): no hay copia que guardar.
+            Timed::Done(Ok(None)) => false,
+            Timed::Done(Err(_)) => {
+                // Sin el detalle: puede venir del servidor y el crudo es privado.
+                tracing::info!(
+                    "'{account_id}': no se pudo traer la copia del servidor del conflicto; \
+                     se reintenta la próxima vuelta"
+                );
+                false
+            }
+            Timed::Done(Ok(Some((server_etag, server_raw)))) => {
+                manager
+                    .with_store(account_id, move |store| {
+                        store.store_server_copy(id, revision, server_etag.as_deref(), &server_raw)
+                    })
+                    .await?
+            }
+        },
     };
 
-    let (server_etag, server_raw) = copy;
-    manager
-        .with_store(account_id, move |store| {
-            store.store_server_copy(id, revision, server_etag.as_deref(), &server_raw)?;
-            Ok(())
-        })
-        .await
+    if !stored {
+        // Acota la re-traída: la próxima vuelta deja de intentarla al llegar al
+        // tope. Condicional a `id`/`revision` y al estado `conflict`, así una
+        // edición nueva que reemplazó la op (vuelta a `ready`, revisión nueva) no
+        // arrastra los intentos de la vieja.
+        manager
+            .with_store(account_id, move |store| {
+                store.count_conflict_fetch_attempt(id, revision)
+            })
+            .await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

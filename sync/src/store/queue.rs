@@ -79,7 +79,13 @@ impl PendingState {
 }
 
 /// Una escritura pendiente, tal como está en la base.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// **Sin `Debug` derivado** (como `DavCredential` en `dav::webdav`): `payload` y
+/// `server_raw` son cuerpos privados de la persona —el evento o la tarjeta local,
+/// y la copia del servidor del recurso en conflicto—, y un `Debug` derivado los
+/// escribiría enteros en cualquier registro, `dbg!` de paso o mensaje de pánico
+/// que lleve la op adentro. El `Debug` manual los tacha, mostrando sólo su largo.
+#[derive(Clone, PartialEq, Eq)]
 pub struct PendingOp {
     pub id: i64,
     pub area: String,
@@ -104,6 +110,30 @@ pub struct PendingOp {
     /// vCard—, si ya se trajo. `None` mientras no se haya traído. Es dato privado:
     /// vive cifrado como el resto de la fila, y no se escribe en el diario.
     pub server_raw: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for PendingOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Los cuerpos privados —`payload` y `server_raw`— se tachan mostrando sólo
+        // su largo; el resto va tal cual.
+        let redacted =
+            |body: &Option<Vec<u8>>| body.as_ref().map(|b| format!("<{} bytes>", b.len()));
+        f.debug_struct("PendingOp")
+            .field("id", &self.id)
+            .field("area", &self.area)
+            .field("collection_href", &self.collection_href)
+            .field("object_href", &self.object_href)
+            .field("kind", &self.kind)
+            .field("base_etag", &self.base_etag)
+            .field("payload", &redacted(&self.payload))
+            .field("state", &self.state)
+            .field("attempts", &self.attempts)
+            .field("last_error", &self.last_error)
+            .field("revision", &self.revision)
+            .field("server_etag", &self.server_etag)
+            .field("server_raw", &redacted(&self.server_raw))
+            .finish()
+    }
 }
 
 /// El nombre estático del área, para subir su generación.
@@ -429,6 +459,35 @@ impl Store {
             )
             .map_err(classify)?;
         Ok(affected > 0)
+    }
+
+    /// Le suma un intento a una op en conflicto a la que **no se le pudo traer la
+    /// copia del servidor** (la red falló, no entró en el plazo, o el recurso ya
+    /// no está en el servidor). Acota la re-traída con el mismo tope que las
+    /// escrituras (`MAX_REPLAY_ATTEMPTS`, en `replay`): un recurso borrado en el
+    /// servidor —`multiget` con `Ok(None)` permanente— o una traída que falla
+    /// vuelta tras vuelta no pueden re-traerse para siempre consumiendo el plazo de
+    /// cada vuelta. Pasado el tope, el empuje deja de intentar la copia y M3
+    /// muestra el conflicto con «copia del servidor no disponible».
+    ///
+    /// **Condicional al `id`, la `revision` y el estado `conflict`**, como
+    /// [`Self::store_server_copy`]: una edición nueva que reemplazó la op (vuelta a
+    /// `ready`, revisión nueva) no arrastra los intentos de la vieja. No toca la
+    /// fila guardada ni la generación.
+    pub fn count_conflict_fetch_attempt(
+        &mut self,
+        id: i64,
+        revision: i64,
+    ) -> Result<(), StoreError> {
+        self.connection
+            .execute(
+                "UPDATE pending_dav_ops
+                    SET attempts = attempts + 1
+                  WHERE id = ?1 AND revision = ?2 AND state = 'conflict'",
+                rusqlite::params![id, revision],
+            )
+            .map(|_| ())
+            .map_err(classify)
     }
 
     /// Deja una op para reintentar más tarde (red, `423`, `507`): suma un
@@ -770,6 +829,43 @@ mod tests {
             .unwrap();
         assert!(!saved, "una op en `ready` no recibe copia del servidor");
         assert_eq!(server_copy_of(&store, HREF), (None, None));
+    }
+
+    /// **Seguridad**: el `Debug` de una op **tacha** los cuerpos privados —el
+    /// `payload` local y la copia del servidor—, mostrando sólo su largo: un `{:?}`
+    /// no los filtra al diario.
+    #[test]
+    fn el_debug_de_una_op_tacha_los_cuerpos_privados() {
+        let temp = TempDir::new("cola-debug-tacha");
+        let mut store = open_store(&temp);
+        let book = one_book(&mut store);
+        store
+            .enqueue_contact_put(&book, &row(HREF, "Ana", "a@x.com"))
+            .unwrap();
+        let op = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        store.mark_conflict(&op, "chocó").unwrap();
+        let op = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        store
+            .store_server_copy(op.id, op.revision, Some("\"srv\""), b"CRUDO-DEL-SERVIDOR")
+            .unwrap();
+        let op = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+
+        let text = format!("{op:?}");
+        assert!(
+            !text.contains("CRUDO-DEL-SERVIDOR"),
+            "el crudo del servidor no sale: {text}"
+        );
+        assert!(
+            !text.contains("BEGIN:VCARD"),
+            "el payload local no sale: {text}"
+        );
+        // Se tacha mostrando el largo, no el contenido.
+        assert!(text.contains("bytes"), "se muestra el largo: {text}");
+        // El ETag del servidor sí sale (no es privado), y el estado también.
+        assert!(
+            text.contains("\\\"srv\\\""),
+            "el ETag del servidor sale: {text}"
+        );
     }
 
     /// Encolar un borrado marca la fila `'delete'` —se queda— y suma la op;

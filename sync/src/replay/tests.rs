@@ -401,6 +401,54 @@ async fn clear_store_borra_la_copia_del_servidor() {
     assert_eq!(f.server_copy("a.ics").await, (None, None));
 }
 
+/// **M3 / disponibilidad**: la re-traída de la copia del servidor está **acotada**
+/// por `MAX_REPLAY_ATTEMPTS`. Un recurso en conflicto que se **borra en el
+/// servidor** —el `multiget` devuelve `Ok(None)` para siempre— no se re-trae en
+/// cada vuelta consumiendo el plazo y postergando el empuje: pasado el tope, deja
+/// de intentarse. Sin el fix, el `multiget` corre una vez por vuelta sin fin.
+#[tokio::test]
+async fn la_re_traida_de_la_copia_esta_acotada() {
+    let f = Fixture::new("replay-copia-acotada").await;
+    f.server
+        .put(0, "a.ics", &event("a", "Del servidor", "20260928T150000Z"));
+    // La traída inline del 412 falla: el conflicto queda SIN copia.
+    f.server.state().fail_multiget_from = Some(1);
+    f.enqueue_put(
+        "a.ics",
+        &event("a", "Mía", "20260928T140000Z"),
+        Some("\"viejo\""),
+    )
+    .await;
+    f.replay().await;
+    assert_eq!(f.op_state("a.ics").await.as_deref(), Some("conflict"));
+    assert_eq!(f.server_copy("a.ics").await, (None, None));
+
+    // El recurso se borra en el servidor: el `multiget` dará `Ok(None)` siempre.
+    f.server.remove(0, "a.ics");
+    {
+        let mut state = f.server.state();
+        state.fail_multiget_from = None;
+        state.multigets = 0;
+    }
+
+    // Muchas más vueltas que el tope: la re-traída no corre en cada una.
+    let rounds = (MAX_REPLAY_ATTEMPTS as usize) + 5;
+    for _ in 0..rounds {
+        f.replay().await;
+    }
+    let multigets = f.server.state().multigets as i64;
+    assert!(
+        multigets < rounds as i64,
+        "la re-traída se acota, no corre cada vuelta ({multigets} de {rounds})"
+    );
+    assert!(
+        multigets <= MAX_REPLAY_ATTEMPTS,
+        "la re-traída no pasa del tope ({multigets})"
+    );
+    // Sigue sin copia: M3 lo mostrará como «copia del servidor no disponible».
+    assert_eq!(f.server_copy("a.ics").await, (None, None));
+}
+
 /// **H2**: un `Create` que choca con un `412` **no** se da por hecho: no se puede
 /// distinguir «mi creación ya llegó» de «hay OTRO recurso en ese href». Va a
 /// conflicto, y la creación local se conserva —no se pisa con lo ajeno en la
