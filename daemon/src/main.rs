@@ -378,7 +378,14 @@ impl AccountManager {
                 FdoError::InvalidArgs(format!("no hay ningún proveedor '{provider_id}'"))
             })?;
 
-        if proveedor.kind != providers::ProviderKind::Oauth2 {
+        // Los dos tipos que se registran con un client_id propio: OAuth2 y Graph
+        // (Microsoft). Nextcloud, CardDAV y LDAP no usan client_id —sus
+        // credenciales las da el servidor de la persona—, así que dejarlo sería
+        // guardar algo que nada lee.
+        if !matches!(
+            proveedor.kind,
+            providers::ProviderKind::Oauth2 | providers::ProviderKind::GraphApi
+        ) {
             return Err(FdoError::InvalidArgs(format!(
                 "'{provider_id}' no usa client_id: las credenciales las emite el \
                  servidor de la propia persona"
@@ -476,7 +483,12 @@ impl AccountManager {
         let proveedor = providers::resolve(
             uid,
             &provider_id,
-            providers::ProviderKind::Oauth2,
+            // El flujo de navegador conecta tanto `oauth2` como `graph`: Graph es
+            // OAuth2 de Microsoft, mismo intercambio de código con PKCE.
+            &[
+                providers::ProviderKind::Oauth2,
+                providers::ProviderKind::GraphApi,
+            ],
             &capacidades,
         )
         .map_err(|e| FdoError::Failed(e.to_string()))?;
@@ -563,7 +575,11 @@ impl AccountManager {
         let proveedor = providers::resolve(
             uid,
             &pendiente.provider_id,
-            providers::ProviderKind::Oauth2,
+            // Igual que en `BeginAuth`: el canje sirve para `oauth2` y para `graph`.
+            &[
+                providers::ProviderKind::Oauth2,
+                providers::ProviderKind::GraphApi,
+            ],
             &pendiente.capabilities,
         )
         .map_err(|e| FdoError::Failed(e.to_string()))?;
@@ -664,7 +680,7 @@ impl AccountManager {
         // capacidades que una cuenta de Nextcloud va a tener, y así se pueden
         // recortar sin recompilar.
         let proveedor =
-            providers::resolve(uid, "nextcloud", providers::ProviderKind::Nextcloud, &[])
+            providers::resolve(uid, "nextcloud", &[providers::ProviderKind::Nextcloud], &[])
                 .map_err(|e| FdoError::Failed(e.to_string()))?;
 
         let inicio = protocols::nextcloud::start_login(&servidor)

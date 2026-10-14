@@ -16,8 +16,24 @@
 
 id = "microsoft"
 display_name = "Microsoft"
+
+# `kind = "graph"` y no el oauth2 por omisión: calendario y contactos de
+# Microsoft **no** se hablan por CalDAV/CardDAV —Microsoft no los expone—, sino
+# por Microsoft Graph. Con esto el sincronizador enruta los contactos al backend
+# de Graph (`/me/people`) en vez de a CardDAV, y el día que exista el backend de
+# calendario pasa lo mismo con el calendario. El **flujo de conexión sigue
+# siendo OAuth2**: Graph es OAuth2 de Microsoft —mismo intercambio de código con
+# PKCE contra login.microsoftonline.com—, por eso `auth_url` y `token_url` están
+# acá igual que en un proveedor oauth2.
+kind = "graph"
+
 auth_url = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
 token_url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+
+# La base de Microsoft Graph, para los backends de Graph (contactos y, más
+# adelante, calendario). Las direcciones de cada capacidad la repiten abajo con
+# su ruta; se deja también acá porque la estructura del proveedor la declara.
+graph_url = "https://graph.microsoft.com/v1.0"
 
 # client_id = "00000000-0000-0000-0000-000000000000"
 
@@ -26,11 +42,75 @@ token_url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 # «Aplicaciones y servicios con acceso». Al borrar una cuenta acá se dice que eso
 # quedó pendiente, en vez de fingir que se revocó.
 
+# Lo que se pide siempre, además de lo de cada capacidad: sin esto el servicio no
+# se entera de **qué cuenta** se acaba de conectar, y el correo por IMAP+XOAUTH2
+# necesita el usuario —va en la misma línea que el token— para autenticarse. Son
+# los alcances de OpenID Connect; `userinfo_url` es dónde preguntarlos.
+identity_scopes = ["openid", "email", "profile"]
+userinfo_url = "https://graph.microsoft.com/oidc/userinfo"
+
 [scopes]
 # `offline_access` es lo que hace que Microsoft devuelva refresh_token. Va en
 # cada capacidad porque los alcances se piden juntos y esta es la lista de la
 # que salen.
-email = ["offline_access", "https://graph.microsoft.com/Mail.ReadWrite", "https://graph.microsoft.com/Mail.Send"]
-calendar = ["offline_access", "https://graph.microsoft.com/Calendars.ReadWrite"]
-contacts = ["offline_access", "https://graph.microsoft.com/Contacts.ReadWrite"]
-drive = ["offline_access", "https://graph.microsoft.com/Files.ReadWrite"]
+#
+# El correo va por **IMAP+XOAUTH2**, no por Graph: el sincronizador ya habla IMAP
+# (Vasak-OS/vasak-accounts#24), y para eso Outlook.com/Exchange Online piden los
+# alcances de `outlook.office.com`, **no** los de Graph mail (`Mail.ReadWrite` /
+# `Mail.Send` no sirven para IMAP). `IMAP.AccessAsUser.All` para IMAP y
+# `SMTP.Send` para enviar.
+#
+# Ojo: `IMAP.AccessAsUser.All` **no es sólo lectura** —concede IMAP completo:
+# leer, marcar, borrar y mover—. No existe un alcance IMAP delegado de sólo
+# lectura en Microsoft, así que éste es el mínimo disponible para hablar IMAP.
+email = [
+    "offline_access",
+    "https://outlook.office.com/IMAP.AccessAsUser.All",
+    "https://outlook.office.com/SMTP.Send",
+]
+# Calendario y contactos **de lectura**: la escritura por Graph todavía no
+# existe (fase 2), así que se pide sólo lo que hoy se usa —menos superficie de
+# permiso concedida de la que no se aprovecha—. Cuando entre la escritura, acá
+# se suben a `.ReadWrite` y las cuentas ya conectadas vuelven a consentir.
+#
+# Contactos usa la **People API** (`/me/people`), que es lo que consume el
+# backend de Graph; por eso `People.Read` y no `Contacts.Read`.
+calendar = ["offline_access", "https://graph.microsoft.com/Calendars.Read"]
+contacts = ["offline_access", "https://graph.microsoft.com/People.Read"]
+# Drive se declara para que la capacidad exista y se muestre —apagada— en la
+# pantalla, pero no tiene dirección abajo: montar OneDrive por Graph queda fuera
+# de M4. `Files.Read` por el mismo criterio de mínimo privilegio.
+drive = ["offline_access", "https://graph.microsoft.com/Files.Read"]
+
+# ── Dónde vive cada servicio ────────────────────────────────────────────────
+#
+# Lo que las aplicaciones (y el sincronizador) leen para saber a qué servidor
+# hablarle. Una capacidad **con** dirección acá se muestra disponible; una sin
+# dirección se muestra apagada y no se pide al conectar.
+
+[endpoints.email]
+# Outlook.com y Exchange Online por IMAP. Mismos servidores para la cuenta
+# personal y la de organización. El usuario (de la identidad) viaja en la misma
+# línea que el token en XOAUTH2, por eso hace falta `userinfo_url` arriba.
+imap_server = "outlook.office365.com"
+imap_port = 993
+# 587 con STARTTLS para enviar.
+smtp_server = "smtp.office365.com"
+smtp_port = 587
+
+[endpoints.calendar]
+# Microsoft Graph Calendar: la colección de calendarios de la cuenta. El backend
+# de lectura de calendario Graph todavía no existe (fase 2); se guarda la
+# dirección para que la capacidad quede disponible y para documentar dónde vive.
+url = "https://graph.microsoft.com/v1.0/me/calendars"
+
+[endpoints.contacts]
+# Microsoft Graph People API, que es lo que consume el backend de contactos de
+# Graph. El backend arma la ruta a partir del `user_id` (por omisión «me»); se
+# guarda la colección base para que la capacidad quede disponible.
+url = "https://graph.microsoft.com/v1.0/me/people"
+
+# Drive **no** tiene dirección acá a propósito: montar OneDrive por Graph queda
+# fuera de M4, así que la capacidad se ofrece —el alcance es real— pero se
+# muestra apagada hasta que reciba su dirección. El día que la tenga, se enciende
+# sola, igual que Drive de Google (Vasak-OS/vasak-file-manager#95).
