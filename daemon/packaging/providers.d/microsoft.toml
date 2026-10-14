@@ -20,11 +20,12 @@ display_name = "Microsoft"
 # `kind = "graph"` y no el oauth2 por omisión: calendario y contactos de
 # Microsoft **no** se hablan por CalDAV/CardDAV —Microsoft no los expone—, sino
 # por Microsoft Graph. Con esto el sincronizador enruta los contactos al backend
-# de Graph (`/me/people`) en vez de a CardDAV, y el día que exista el backend de
-# calendario pasa lo mismo con el calendario. El **flujo de conexión sigue
-# siendo OAuth2**: Graph es OAuth2 de Microsoft —mismo intercambio de código con
-# PKCE contra login.microsoftonline.com—, por eso `auth_url` y `token_url` están
-# acá igual que en un proveedor oauth2.
+# de Graph (`/me/contacts`, la carpeta de contactos del usuario) en vez de a
+# CardDAV, y el día que exista el backend de calendario pasa lo mismo con el
+# calendario. El **flujo de conexión sigue siendo OAuth2**: Graph es OAuth2 de
+# Microsoft —mismo intercambio de código con PKCE contra
+# login.microsoftonline.com—, por eso `auth_url` y `token_url` están acá igual
+# que en un proveedor oauth2.
 kind = "graph"
 
 auth_url = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
@@ -73,10 +74,13 @@ email = [
 # permiso concedida de la que no se aprovecha—. Cuando entre la escritura, acá
 # se suben a `.ReadWrite` y las cuentas ya conectadas vuelven a consentir.
 #
-# Contactos usa la **People API** (`/me/people`), que es lo que consume el
-# backend de Graph; por eso `People.Read` y no `Contacts.Read`.
+# Contactos lee la **carpeta de contactos** del usuario (`/me/contacts`), que es
+# la agenda que la persona guardó a mano; por eso `Contacts.Read`. La People API
+# (`/me/people`) devuelve «personas relevantes» por ranking —incluye a quien se
+# le escribió sin guardar, no la agenda— y queda reservada para enriquecimiento
+# a futuro, no para sincronizar contactos.
 calendar = ["offline_access", "https://graph.microsoft.com/Calendars.Read"]
-contacts = ["offline_access", "https://graph.microsoft.com/People.Read"]
+contacts = ["offline_access", "https://graph.microsoft.com/Contacts.Read"]
 # Drive se declara para que la capacidad exista y se muestre —apagada— en la
 # pantalla, pero no tiene dirección abajo: montar OneDrive por Graph queda fuera
 # de M4. `Files.Read` por el mismo criterio de mínimo privilegio.
@@ -105,10 +109,12 @@ smtp_port = 587
 url = "https://graph.microsoft.com/v1.0/me/calendars"
 
 [endpoints.contacts]
-# Microsoft Graph People API, que es lo que consume el backend de contactos de
-# Graph. El backend arma la ruta a partir del `user_id` (por omisión «me»); se
-# guarda la colección base para que la capacidad quede disponible.
-url = "https://graph.microsoft.com/v1.0/me/people"
+# La carpeta de contactos del usuario en Microsoft Graph, que es lo que lee el
+# backend de contactos de Graph. El backend arma la ruta a partir del `user_id`
+# (por omisión «me»); se guarda la colección base para que la capacidad quede
+# disponible. La People API (`/me/people`) queda para enriquecimiento futuro, no
+# para sincronizar la agenda.
+url = "https://graph.microsoft.com/v1.0/me/contacts"
 
 # Drive **no** tiene dirección acá a propósito: montar OneDrive por Graph queda
 # fuera de M4, así que la capacidad se ofrece —el alcance es real— pero se

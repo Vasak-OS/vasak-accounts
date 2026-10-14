@@ -1967,11 +1967,13 @@ mod tests {
         );
     }
 
-    /// Contactos pide `People.Read`, que es lo que el backend de Graph usa contra
-    /// la People API (`/me/people`). Con `Contacts.ReadWrite` la sincronización
-    /// recibiría 403.
+    /// Contactos pide `Contacts.Read`, que es lo que el backend de Graph usa
+    /// contra la carpeta de contactos (`/me/contacts`). La People API
+    /// (`/me/people`) queda para enriquecimiento futuro, no para sincronizar la
+    /// agenda; por eso `Contacts.Read` y no `People.Read`. De sólo lectura: la
+    /// escritura (`Contacts.ReadWrite`) es fase 2.
     #[test]
-    fn los_contactos_de_microsoft_piden_la_people_api() {
+    fn los_contactos_de_microsoft_leen_la_carpeta_de_contactos() {
         let directorio =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/providers.d");
         let microsoft = &cargar(&directorio)["microsoft"];
@@ -1980,8 +1982,20 @@ mod tests {
         assert!(
             alcances
                 .iter()
+                .any(|a| a == "https://graph.microsoft.com/Contacts.Read"),
+            "contactos no pide Contacts.Read, que es lo que usa el backend: {alcances:?}"
+        );
+        // Y nada de People.Read: la People API no es la agenda.
+        assert!(
+            !alcances
+                .iter()
                 .any(|a| a == "https://graph.microsoft.com/People.Read"),
-            "contactos no pide People.Read, que es lo que usa el backend: {alcances:?}"
+            "contactos todavía pide People.Read, que no es la carpeta de contactos: {alcances:?}"
+        );
+        // De sólo lectura: la escritura por Graph es fase 2 (#97).
+        assert!(
+            !alcances.iter().any(|a| a.contains("Contacts.ReadWrite")),
+            "contactos pide escritura y la escritura por Graph es fase 2: {alcances:?}"
         );
     }
 
