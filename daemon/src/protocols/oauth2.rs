@@ -7,6 +7,8 @@ use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge,
     PkceCodeVerifier, RedirectUrl, RefreshToken, RequestTokenError, Scope, TokenUrl,
 };
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
 
 /// Cuánta vida le tiene que quedar a un token para darlo sin refrescarlo.
 ///
@@ -268,10 +270,18 @@ fn resource_of(scopes: &[String]) -> Option<String> {
 struct ResourcePlan {
     /// La clave con la que vive el access_token en el almacén de secretos.
     ///
-    /// `access` —la de siempre— cuando la cuenta tiene un solo recurso (o
-    /// ninguno): así Nextcloud y los proveedores de un recurso no cambian, un
-    /// token por cuenta. `access:HOST` cuando la cuenta mezcla recursos, como
-    /// Microsoft, para que el del correo y el de Graph no se pisen.
+    /// `access` —la de siempre, un token por cuenta— sólo cuando todas las
+    /// capacidades de la cuenta caen en el **mismo recurso o en ninguno**: una
+    /// contraseña de aplicación de Nextcloud no tiene alcances, y un proveedor de
+    /// un solo host no se parte. `access:HOST` cuando la cuenta **mezcla
+    /// recursos**, para que el token de uno no se pise con el del otro y cada uno
+    /// quede acotado a su recurso. Microsoft los mezcla —correo por
+    /// `outlook.office.com`, calendario y contactos por `graph.microsoft.com`— y
+    /// **Google también**: el correo va por `mail.google.com` y el resto por
+    /// `www.googleapis.com`, así que su token se divide por host. No es una
+    /// regresión sino mejor separación de privilegios —el token de calendario
+    /// deja de llevar el alcance IMAP de Gmail— y funciona porque Google emite
+    /// tokens de alcance completo y no rota el refresh_token.
     access_key: String,
     /// Las capacidades que comparten este recurso. Usan el mismo token, así que
     /// su `expires_at` se actualiza junto y ninguna lo refresca de más.
@@ -334,27 +344,64 @@ fn resource_plan(account: &Account, capability: &CapabilityType) -> ResourcePlan
     }
 }
 
-/// Un access_token **válido** para la cuenta y capacidad indicadas.
+/// Un candado por cuenta que serializa el refresco y la persistencia del token.
 ///
-/// El token es **por recurso**: Microsoft emite uno distinto para el correo
-/// (`outlook.office.com`) y para calendario/contactos (`graph.microsoft.com`), y
-/// el de uno responde 401 contra el otro. Esta función entrega el del recurso de
-/// la capacidad pedida: si está cacheado y le queda más de cinco minutos de
-/// vida, tal cual; si falta o está por vencer, lo adquiere con el refresh_token
-/// pidiendo sólo los alcances de ese recurso, y lo persiste bajo su clave.
+/// **Por qué por cuenta y no por recurso ni por uid.** Con el token por recurso,
+/// al abrir la sesión el cliente de correo (recurso `outlook.office.com`) y el de
+/// calendario (recurso `graph.microsoft.com`) piden cada uno su token de la
+/// **misma** cuenta a la vez. Los dos refrescos leen el `refresh` compartido, y
+/// Microsoft AAD lo **rota en cada uso** (es de un solo uso): el primero lo rota,
+/// el segundo llega con el viejo y recibe `invalid_grant`, que
+/// [`clasificar_error`] vuelve `Revoked` y manda a reautenticar una cuenta sana
+/// —una denegación de servicio del servicio de credenciales—. Y como
+/// [`SecretStore::store_secret_in`] es leer → modificar → escribir, dos
+/// `persistir` a la vez se pisan y pierden el `refresh` rotado.
 ///
-/// Una cuenta de un solo recurso —Google, Nextcloud— sigue con **un token por
-/// cuenta**, sin cambio.
+/// Serializar por cuenta resuelve las dos cosas: los recursos de una misma cuenta
+/// refrescan de a uno —el segundo lee el `refresh` ya rotado y persistido— y las
+/// escrituras al almacén quedan ordenadas. **No** por uid, que serializaría los
+/// refrescos de cuentas ajenas detrás de una sola llamada de red (lo que `F4`
+/// quiso evitar); **no** por recurso, que dejaría competir a los recursos de la
+/// misma cuenta por el `refresh` compartido, que es justamente la carrera.
 ///
-/// Un `TokenError::Revoked` acá significa que la cuenta hay que reconectarla, y
-/// quien llama la marca. Lo que **no** hace esta función es marcarla: el
-/// almacén lo escribe el que atiende la petición, que es el que también tiene
-/// que avisar por la señal.
-pub async fn get_valid_access_token(
+/// Vive como estático del módulo y no en el estado del demonio porque
+/// [`get_valid_access_token`] es una función libre —la usan las pruebas sin un
+/// `AccountManager`— y no hay un objeto compartido del que colgarlo. El candado
+/// por cuenta y el candado por uid de `main` nunca se sostienen a la vez (el
+/// token se obtiene antes de tomar `con_candado`), así que no hay orden de
+/// candados que pueda trabarse.
+static CANDADOS_POR_CUENTA: LazyLock<CandadosPorCuenta> =
+    LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
+
+/// El candado de una sola cuenta. `tokio::sync::Mutex` porque se sostiene a través
+/// de la llamada de red del refresco.
+type CandadoDeCuenta = Arc<tokio::sync::Mutex<()>>;
+
+/// El registro de candados, uno por `(uid, cuenta)`.
+type CandadosPorCuenta = tokio::sync::Mutex<HashMap<(u32, String), CandadoDeCuenta>>;
+
+/// El candado de esta cuenta, creándolo si todavía no existe.
+///
+/// El `Mutex` del mapa se toma sólo para clonar el `Arc` y se suelta en el acto:
+/// nunca se sostiene a través de la llamada de red, que corre bajo el candado de
+/// la cuenta devuelto.
+async fn candado_de_cuenta(uid: u32, account_id: &str) -> CandadoDeCuenta {
+    CANDADOS_POR_CUENTA
+        .lock()
+        .await
+        .entry((uid, account_id.to_string()))
+        .or_default()
+        .clone()
+}
+
+/// Lo que hace falta para decidir el token: la cuenta, la config de la capacidad
+/// y el plan de recurso. Se recarga de disco en cada paso para que el doble
+/// chequeo tras tomar el candado vea lo que otro llamador acabe de persistir.
+fn cargar_plan(
     uid: u32,
     account_id: &str,
     capability: &CapabilityType,
-) -> Result<String, TokenError> {
+) -> Result<(Account, serde_json::Value, ResourcePlan), TokenError> {
     let mut db = AccountDatabase::for_user(uid)
         .map_err(|e| TokenError::Failed(format!("no se pudo abrir la base: {e}")))?;
     db.load()
@@ -377,11 +424,22 @@ pub async fn get_valid_access_token(
         .clone();
 
     let plan = resource_plan(&cuenta, capability);
+    Ok((cuenta, config, plan))
+}
 
-    // El token cacheado de este recurso. Puede no existir todavía: una cuenta
-    // recién conectada sólo tiene el token del canje —que vale para un recurso—,
-    // y el del otro recurso se adquiere la primera vez que se lo pide.
-    let cacheado = SecretStore::get_secret(uid, account_id, &plan.access_key).ok();
+/// El token cacheado de este recurso **si sirve para entregarlo tal cual**: sin
+/// vencimiento (contraseña de aplicación) o con más de [`MARGEN`] de vida.
+///
+/// `None` cuando falta —una cuenta recién conectada sólo tiene el token del
+/// canje, que vale para un recurso, y el del otro se adquiere la primera vez que
+/// se pide— o cuando está por vencer: en los dos casos hay que refrescar.
+fn token_cacheado_vigente(
+    uid: u32,
+    account_id: &str,
+    plan: &ResourcePlan,
+    config: &serde_json::Value,
+) -> Option<String> {
+    let cacheado = SecretStore::get_secret(uid, account_id, &plan.access_key).ok()?;
 
     let expires_at = config
         .get("expires_at")
@@ -389,20 +447,72 @@ pub async fn get_valid_access_token(
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&Utc));
 
-    match (&cacheado, expires_at) {
+    match expires_at {
         // Sin vencimiento no hay nada que refrescar: es una contraseña de
         // aplicación de IMAP, que vale hasta que se revoque.
-        (Some(token), None) => {
+        None => {
             tracing::debug!("'{account_id}' no tiene vencimiento; se entrega tal cual");
-            return Ok(token.clone());
+            Some(cacheado)
         }
-        (Some(token), Some(expira)) if Utc::now() + MARGEN < expira => {
+        Some(expira) if Utc::now() + MARGEN < expira => {
             tracing::debug!("'{account_id}' sigue válido hasta {expira}");
-            return Ok(token.clone());
+            Some(cacheado)
         }
-        // Falta el token de este recurso, o está por vencer: se adquiere uno
-        // nuevo con el refresh_token, pidiendo sólo los alcances del recurso.
-        _ => {}
+        // Por vencer: hay que refrescar.
+        Some(_) => None,
+    }
+}
+
+/// Un access_token **válido** para la cuenta y capacidad indicadas.
+///
+/// El token es **por recurso**: Microsoft emite uno distinto para el correo
+/// (`outlook.office.com`) y para calendario/contactos (`graph.microsoft.com`), y
+/// el de uno responde 401 contra el otro. Esta función entrega el del recurso de
+/// la capacidad pedida: si está cacheado y le queda más de cinco minutos de
+/// vida, tal cual; si falta o está por vencer, lo adquiere con el refresh_token
+/// pidiendo sólo los alcances de ese recurso, y lo persiste bajo su clave.
+///
+/// Una cuenta de **un solo recurso o sin alcances** —Nextcloud con contraseña de
+/// aplicación, o un proveedor de un solo host— sigue con **un token por cuenta**,
+/// sin cambio. Google **no** es uno de esos casos: sus alcances se reparten entre
+/// `mail.google.com` (correo) y `www.googleapis.com` (el resto), así que su token
+/// también se divide por recurso —cada uno acotado al suyo—.
+///
+/// **Refresco serializado por cuenta.** El caso común —token cacheado y vigente—
+/// se resuelve sin candado. Cuando hay que refrescar se toma el candado de la
+/// cuenta (ver [`CANDADOS_POR_CUENTA`]) y se **vuelve a mirar la caché** (doble
+/// chequeo): si otro llamador ya refrescó este recurso mientras esperábamos, se
+/// entrega lo que dejó, sin tocar la red; si lo que estaba refrescando era otro
+/// recurso de la misma cuenta, ahora es el turno de éste y lee el `refresh` ya
+/// rotado. Así cada recurso conserva su token pero los refrescos de una misma
+/// cuenta no compiten por el `refresh` compartido.
+///
+/// Un `TokenError::Revoked` acá significa que la cuenta hay que reconectarla, y
+/// quien llama la marca. Lo que **no** hace esta función es marcarla: el
+/// almacén lo escribe el que atiende la petición, que es el que también tiene
+/// que avisar por la señal.
+pub async fn get_valid_access_token(
+    uid: u32,
+    account_id: &str,
+    capability: &CapabilityType,
+) -> Result<String, TokenError> {
+    // Camino rápido, sin candado: lo habitual es un token cacheado y con vida de
+    // sobra, y serializar eso por cuenta sólo agregaría contención.
+    let (_, config, plan) = cargar_plan(uid, account_id, capability)?;
+    if let Some(token) = token_cacheado_vigente(uid, account_id, &plan, &config) {
+        return Ok(token);
+    }
+
+    // Hay que refrescar: desde acá, de a uno por cuenta.
+    let candado = candado_de_cuenta(uid, account_id).await;
+    let _guard = candado.lock().await;
+
+    // Doble chequeo: mientras esperábamos el candado, otro llamador pudo refrescar
+    // **este** recurso. Se recarga de disco —ve lo que el otro persistió— y si ya
+    // hay un token vigente se entrega sin tocar la red.
+    let (cuenta, config, plan) = cargar_plan(uid, account_id, capability)?;
+    if let Some(token) = token_cacheado_vigente(uid, account_id, &plan, &config) {
+        return Ok(token);
     }
 
     tracing::info!(
@@ -1210,7 +1320,10 @@ mod tests {
     // un candado; cada una usa su propio directorio y su propio uid.
     // -----------------------------------------------------------------------
 
-    /// El recurso OAuth se saca del host de los alcances que son URL.
+    /// El recurso OAuth se saca del host de los alcances que son URL. Los
+    /// alcances que no son URL —`offline_access`, `openid`— no aportan host y se
+    /// descartan: están para pedir el refresh_token y la identidad, no apuntan a
+    /// ningún servicio.
     #[test]
     fn el_recurso_sale_del_host_de_los_alcances() {
         let correo = vec![
@@ -1222,14 +1335,50 @@ mod tests {
 
         let graph = vec![
             "offline_access".to_string(),
+            "openid".to_string(),
             "https://graph.microsoft.com/Calendars.Read".to_string(),
         ];
         assert_eq!(resource_of(&graph).as_deref(), Some("graph.microsoft.com"));
+    }
 
+    /// Casos borde del parseo de alcances.
+    #[test]
+    fn el_parseo_de_alcances_descarta_lo_que_no_es_url() {
         // Una contraseña de aplicación no tiene alcances: sin recurso.
         assert_eq!(resource_of(&[]), None);
-        // Y `offline_access`/`openid` por sí solos tampoco lo son.
+
+        // Los alcances que no son URL —solos o mezclados— no aportan host:
+        // `offline_access` pide el refresh_token y `openid` la identidad, pero
+        // ninguno apunta a un servicio.
         assert_eq!(resource_of(&["offline_access".to_string()]), None);
+        assert_eq!(resource_of(&["openid".to_string()]), None);
+        assert_eq!(
+            resource_of(&["offline_access".to_string(), "openid".to_string()]),
+            None
+        );
+
+        // Mezclados con una URL, sólo cuenta el host de la URL.
+        assert_eq!(
+            resource_of(&[
+                "openid".to_string(),
+                "offline_access".to_string(),
+                "https://graph.microsoft.com/Calendars.Read".to_string(),
+            ])
+            .as_deref(),
+            Some("graph.microsoft.com")
+        );
+
+        // Varios hosts distintos: ordenados y sin repetir, para que la clave de
+        // caché sea la misma vengan como vengan los alcances.
+        assert_eq!(
+            resource_of(&[
+                "https://outlook.office.com/IMAP.AccessAsUser.All".to_string(),
+                "https://graph.microsoft.com/Calendars.Read".to_string(),
+                "https://graph.microsoft.com/Contacts.Read".to_string(),
+            ])
+            .as_deref(),
+            Some("graph.microsoft.com,outlook.office.com")
+        );
     }
 
     static TOKEN_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -1448,34 +1597,33 @@ mod tests {
         );
     }
 
-    /// Un proveedor de un solo recurso sigue con **un token por cuenta**, bajo la
-    /// clave de siempre y compartido entre sus capacidades: sin regresión.
+    /// El caso de no-regresión **real**: un proveedor **sin alcances** —una
+    /// contraseña de aplicación estilo Nextcloud— sigue con **un token por
+    /// cuenta**, bajo la clave de siempre `access` y compartido entre sus
+    /// capacidades. Sin alcances no hay host, así que no hay recurso que partir:
+    /// la clave nunca se vuelve `access:HOST`.
+    ///
+    /// Antes esta prueba usaba dos URL del mismo dominio (`api.example.test/...`),
+    /// que caen igual en «un solo recurso» pero no demuestran el caso que de
+    /// verdad no cambia —el que no tiene alcances ni vencimiento—, y daba
+    /// confianza falsa.
     #[tokio::test]
-    async fn un_proveedor_de_un_recurso_sigue_con_un_token_por_cuenta() {
+    async fn un_proveedor_sin_alcances_sigue_con_un_token_por_cuenta() {
         let _guard = TOKEN_TEST_LOCK.lock().await;
         let _root = set_test_root();
+        // Un servidor de token igual: lo que esta prueba exige es que **nunca** se
+        // le pida nada, porque una contraseña de aplicación no se refresca.
         let server = fake_token(false).await;
         let uid = 900_002;
 
-        let pasado = Utc::now() - chrono::Duration::hours(1);
+        // Sin alcances y sin vencimiento: así se guarda una contraseña de
+        // aplicación de Nextcloud, que vale hasta que se revoque.
         let mut caps = HashMap::new();
-        caps.insert(
-            CapabilityType::Calendar,
-            cap_config(
-                server.port,
-                &["https://api.example.test/calendar"],
-                Some(pasado),
-            ),
-        );
-        caps.insert(
-            CapabilityType::Contacts,
-            cap_config(
-                server.port,
-                &["https://api.example.test/contacts"],
-                Some(pasado),
-            ),
-        );
+        caps.insert(CapabilityType::Calendar, cap_config(server.port, &[], None));
+        caps.insert(CapabilityType::Contacts, cap_config(server.port, &[], None));
         let id = seed(uid, Account::new("Nube", "custom", caps), "rt-0");
+        // La contraseña de aplicación, bajo la clave por cuenta de siempre.
+        SecretStore::store_secret(uid, &id, "access", "clave-de-app").unwrap();
 
         let calendario = get_valid_access_token(uid, &id, &CapabilityType::Calendar)
             .await
@@ -1484,19 +1632,20 @@ mod tests {
             .await
             .unwrap();
 
-        // Las dos capacidades comparten el token de la cuenta.
+        // Las dos capacidades comparten el único token de la cuenta, tal cual.
+        assert_eq!(calendario, "clave-de-app");
         assert_eq!(calendario, contactos);
         assert_eq!(
             SecretStore::get_secret(uid, &id, "access").unwrap(),
             calendario
         );
-        // Y no se partió en claves por recurso.
-        assert!(
-            SecretStore::get_secret(uid, &id, "access:api.example.test").is_err(),
-            "un recurso único no debe guardarse por recurso"
+        // No se refrescó ni una vez: una contraseña de aplicación no tiene
+        // vencimiento, así que el token se entrega sin tocar la red.
+        assert_eq!(
+            server.pedidos.lock().unwrap().len(),
+            0,
+            "una contraseña de aplicación no debe refrescarse"
         );
-        // Un solo canje: el segundo pedido salió de la caché.
-        assert_eq!(server.pedidos.lock().unwrap().len(), 1);
     }
 
     /// Un refresco fallido devuelve error y **no** entrega el token viejo cacheado
@@ -1546,6 +1695,81 @@ mod tests {
         assert_eq!(
             SecretStore::get_secret(uid, &id, "access:graph.microsoft.com").unwrap(),
             "token-viejo"
+        );
+    }
+
+    /// Dos capacidades del **mismo** recurso comparten un solo token: en una
+    /// cuenta de Microsoft, calendario y contactos van los dos por Graph, así que
+    /// el token del primero sirve para el segundo y éste no vuelve a refrescar. Es
+    /// la otra cara del token por recurso: se parte por recurso, no por
+    /// capacidad, o Graph refrescaría dos veces para lo mismo.
+    #[tokio::test]
+    async fn calendario_y_contactos_de_microsoft_comparten_el_token_de_graph() {
+        let _guard = TOKEN_TEST_LOCK.lock().await;
+        let _root = set_test_root();
+        let server = fake_token(false).await;
+        let uid = 900_004;
+
+        let pasado = Utc::now() - chrono::Duration::hours(1);
+        let mut caps = HashMap::new();
+        // El correo, por otro recurso, para que la cuenta sea de varios recursos
+        // y el token se parta por recurso.
+        caps.insert(
+            CapabilityType::Email,
+            cap_config(
+                server.port,
+                &[
+                    "offline_access",
+                    "https://outlook.office.com/IMAP.AccessAsUser.All",
+                ],
+                Some(pasado),
+            ),
+        );
+        caps.insert(
+            CapabilityType::Calendar,
+            cap_config(
+                server.port,
+                &[
+                    "offline_access",
+                    "https://graph.microsoft.com/Calendars.Read",
+                ],
+                Some(pasado),
+            ),
+        );
+        caps.insert(
+            CapabilityType::Contacts,
+            cap_config(
+                server.port,
+                &[
+                    "offline_access",
+                    "https://graph.microsoft.com/Contacts.Read",
+                ],
+                Some(pasado),
+            ),
+        );
+        let id = seed(uid, Account::new("Trabajo", "microsoft", caps), "rt-0");
+        // El token del canje, como lo tiene una cuenta ya conectada. Vale para un
+        // solo recurso: Graph lo adquiere aparte y calendario/contactos lo
+        // comparten, sin refrescar dos veces lo mismo.
+        SecretStore::store_secret(uid, &id, "access", "token-del-canje").unwrap();
+
+        let calendario = get_valid_access_token(uid, &id, &CapabilityType::Calendar)
+            .await
+            .unwrap();
+        let contactos = get_valid_access_token(uid, &id, &CapabilityType::Contacts)
+            .await
+            .unwrap();
+
+        // El segundo salió de la caché del recurso: mismo token, un solo canje.
+        assert_eq!(calendario, contactos);
+        assert_eq!(
+            SecretStore::get_secret(uid, &id, "access:graph.microsoft.com").unwrap(),
+            calendario
+        );
+        assert_eq!(
+            server.pedidos.lock().unwrap().len(),
+            1,
+            "Graph se refrescó dos veces para capacidades del mismo recurso"
         );
     }
 }
