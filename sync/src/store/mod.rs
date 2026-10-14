@@ -36,6 +36,7 @@
 
 pub mod calendar;
 pub mod calendar_read;
+pub mod conflict_read;
 pub mod contacts;
 pub mod contacts_read;
 pub mod email;

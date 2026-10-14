@@ -64,6 +64,7 @@ use crate::serialize::vcard::{ContactPatch, LabeledValue, Relation};
 use crate::serialize::{ical as ical_write, vcard as vcard_write, Change};
 use crate::store::calendar::{derive_with_occurrences, ObjectRow, Window};
 use crate::store::calendar_read::{self, GlobalId, ListCursor, Range};
+use crate::store::conflict_read;
 use crate::store::contacts::ContactRow;
 use crate::store::contacts_read::{self, Cursor, InvalidArgument};
 use crate::store::email_read::{self, Cursor as EmailCursor};
@@ -1029,6 +1030,92 @@ impl<K: KeySource> StoreApi<K> {
         Ok("{}".to_string())
     }
 
+    /// Los objetos de un área (`calendar`, `contacts`) de una cuenta que están
+    /// en conflicto: un cambio local chocó con el servidor y espera que la
+    /// persona lo resuelva. `{items: [{id, op, summary, has_server_copy}]}`, con
+    /// `id` el número local del objeto (el de `GetEvent`/`GetContact`), `op`
+    /// `put` o `delete`, y `has_server_copy` si ya se trajo la copia del servidor
+    /// para comparar. Sólo los del área y la cuenta pedidas; nada si no hay.
+    /// Nunca el `href` ni los crudos: para la comparación, `GetConflict`.
+    ///
+    /// `area` que no sea `calendar` o `contacts`: `InvalidArgs`, antes de
+    /// preguntar nada. Autoriza con el permiso de **lectura** del área
+    /// (`store.calendar` / `store.contacts`) antes de actuar, y respeta el límite
+    /// por llamante.
+    async fn list_conflicts(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        account_id: String,
+        area: String,
+    ) -> zbus::fdo::Result<String> {
+        let (area_static, resource) = conflict_area(&area)?;
+        let account = self
+            .manager
+            .area_account(area_static, &account_id)
+            .await
+            .map_err(to_fdo)?;
+        self.authorize(&header, resource, &account.display_name)
+            .await?;
+        self.caller_limit(&header, &account_id)?;
+        self.activate_after_read(area_static, &account_id, &account)
+            .await;
+        let items = self
+            .manager
+            .read(&account_id, move |c| {
+                conflict_read::list_conflicts(c, area_static)
+            })
+            .await
+            .map_err(read_error)?;
+        contacts_read::to_capped_json(
+            &serde_json::json!({ "items": items }),
+            contacts_read::MAX_PAGE_REPLY_BYTES,
+        )
+        .map_err(read_error)
+    }
+
+    /// La comparación «la mía / la del servidor» de un objeto en conflicto, por
+    /// su número local: `{id, op, local, server, server_etag, server_unavailable}`.
+    /// `local` es el crudo local sin confirmar (ausente si el cambio local es un
+    /// borrado); `server` y `server_etag`, la copia del servidor que trajo A3.
+    /// Si esa copia todavía no entró, `server` es `null` y `server_unavailable`
+    /// es `true` —«copia del servidor no disponible»— en vez de fallar. `null`
+    /// si ese id no está en conflicto en esa área.
+    ///
+    /// `area` que no sea `calendar` o `contacts`, o un `id` que no sea un número
+    /// local válido: `InvalidArgs`, antes de preguntar nada. Expone datos
+    /// privados —el crudo local y el del servidor—, así que autoriza con el
+    /// permiso de **lectura** del área antes de actuar, y respeta el límite por
+    /// llamante.
+    async fn get_conflict(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        account_id: String,
+        area: String,
+        id: String,
+    ) -> zbus::fdo::Result<String> {
+        let (area_static, resource) = conflict_area(&area)?;
+        let id = contacts_read::parse_id(&id).map_err(invalid)?;
+        let account = self
+            .manager
+            .area_account(area_static, &account_id)
+            .await
+            .map_err(to_fdo)?;
+        self.authorize(&header, resource, &account.display_name)
+            .await?;
+        self.caller_limit(&header, &account_id)?;
+        self.activate_after_read(area_static, &account_id, &account)
+            .await;
+        let conflict = self
+            .manager
+            .read(&account_id, move |c| {
+                conflict_read::get_conflict(c, area_static, id)
+            })
+            .await
+            .map_err(read_error)?;
+        contacts_read::to_capped_json(&conflict, contacts_read::MAX_CONTACT_BYTES)
+            .map_err(read_error)
+    }
+
     /// Señal `StatusChanged` — cambió el estado de alguna base.
     ///
     /// Sin detalle: quien la recibe vuelve a leer `GetStatus`.
@@ -1334,6 +1421,20 @@ fn denied(resource: &str) -> zbus::fdo::Error {
 
 fn invalid(error: InvalidArgument) -> zbus::fdo::Error {
     zbus::fdo::Error::InvalidArgs(error.to_string())
+}
+
+/// El área de un conflicto y el recurso de **lectura** con que se autoriza, o
+/// `InvalidArgs` si el área no tiene cola de escritura (sólo `calendar` y
+/// `contacts` la tienen; el correo no). Se valida **antes** de preguntar nada,
+/// como el resto de los argumentos.
+fn conflict_area(area: &str) -> zbus::fdo::Result<(&'static str, &'static str)> {
+    match area {
+        CALENDAR_AREA => Ok((CALENDAR_AREA, CALENDAR_RESOURCE)),
+        CONTACTS_AREA => Ok((CONTACTS_AREA, CONTACTS_RESOURCE)),
+        _ => Err(zbus::fdo::Error::InvalidArgs(
+            "el área de un conflicto es «calendar» o «contacts»".into(),
+        )),
+    }
 }
 
 /// Un `SerializeError` de iCalendar como error del almacén: un argumento
@@ -2399,6 +2500,7 @@ mod tests {
                 "ClearStore",
                 "DeleteContact",
                 "DeleteEvent",
+                "GetConflict",
                 "GetContact",
                 "GetEvent",
                 "GetMessage",
@@ -2406,6 +2508,7 @@ mod tests {
                 "ListAddressBooks",
                 "ListAttachments",
                 "ListCalendars",
+                "ListConflicts",
                 "ListContactCards",
                 "ListContacts",
                 "ListMailboxes",
@@ -2729,7 +2832,19 @@ mod tests {
             .map(String::as_str)
             .collect();
         keys.sort();
-        assert_eq!(keys, vec!["address_book_id", "href", "id", "vcard"]);
+        assert_eq!(
+            keys,
+            vec![
+                "address_book_id",
+                "etag",
+                "href",
+                "id",
+                "sync_state",
+                "vcard"
+            ]
+        );
+        // Una tarjeta recién bajada del servidor está al día y con su ETag.
+        assert_eq!(first["items"][0]["sync_state"], "synced");
 
         // El mismo cursor que la lista.
         let listed: serde_json::Value = serde_json::from_str(
@@ -2828,6 +2943,112 @@ mod tests {
             assert_eq!(error_name(result), INVALID_ARGS);
         }
         assert_eq!(api.access.permissions.calls(), 0);
+    }
+
+    /// Monta un conflicto de contactos en la cuenta, con la copia del servidor
+    /// ya traída, como lo dejaría el empuje contra un `412`.
+    async fn with_a_conflict(api: &Api) {
+        api.manager
+            .with_store("cuenta", |store| {
+                let book = store
+                    .upsert_address_books(&[("https://x/a/".into(), "A".into())])?
+                    .remove(0);
+                store.enqueue_contact_put(&book, &row("https://x/a/c.vcf", "Mía", "yo@x.com"))?;
+                let op = store.pending_ops(CONTACTS_AREA)?.remove(0);
+                store.mark_conflict(&op, "cambió en el servidor")?;
+                let op = store.pending_ops(CONTACTS_AREA)?.remove(0);
+                store.store_server_copy(
+                    op.id,
+                    op.revision,
+                    Some("\"srv\""),
+                    b"BEGIN:VCARD servidor",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    /// `ListConflicts`/`GetConflict` piden el permiso de lectura del área y
+    /// **antes** validan los argumentos: un área o un id mal formados son
+    /// `InvalidArgs` sin abrir ningún diálogo. Con permiso, listan el conflicto y
+    /// devuelven la comparación local/servidor.
+    #[tokio::test]
+    async fn los_conflictos_se_listan_y_se_detallan_con_permiso() {
+        let mut api = Api::new(
+            "api-conflictos",
+            vec![with_contacts("cuenta")],
+            Answer::Allow,
+        )
+        .await;
+        with_a_conflict(&api).await;
+        let (client, _service) = api.client(":1.7").await;
+
+        // Un área sin cola, o un id que no es un número: InvalidArgs, sin preguntar.
+        assert_eq!(
+            error_name(&call(&client, "ListConflicts", &("cuenta", "email")).await),
+            INVALID_ARGS
+        );
+        assert_eq!(
+            error_name(&call(&client, "GetConflict", &("cuenta", "email", "1")).await),
+            INVALID_ARGS
+        );
+        assert_eq!(
+            error_name(&call(&client, "GetConflict", &("cuenta", "contacts", "abc")).await),
+            INVALID_ARGS
+        );
+        assert_eq!(
+            api.access.permissions.calls(),
+            0,
+            "un argumento malo no abre diálogo"
+        );
+
+        // Con permiso: el conflicto se lista con su resumen y su copia del servidor.
+        let listed: serde_json::Value = serde_json::from_str(
+            &call(&client, "ListConflicts", &("cuenta", "contacts"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let items = listed["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["op"], "put");
+        assert_eq!(items[0]["summary"], "Mía");
+        assert_eq!(items[0]["has_server_copy"], true);
+        let id = items[0]["id"].as_str().unwrap().to_string();
+
+        // Y la comparación trae la mía y la del servidor.
+        let detail: serde_json::Value = serde_json::from_str(
+            &call(&client, "GetConflict", &("cuenta", "contacts", id.as_str()))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(detail["local"].as_str().unwrap().contains("Mía"));
+        assert_eq!(detail["server"], "BEGIN:VCARD servidor");
+        assert_eq!(detail["server_etag"], "\"srv\"");
+        assert_eq!(detail["server_unavailable"], false);
+    }
+
+    /// Sin el permiso de lectura del área, la superficie de conflicto —que
+    /// expone datos privados— contesta `AccessDenied` y ningún dato.
+    #[tokio::test]
+    async fn los_conflictos_sin_permiso_dan_access_denied() {
+        let mut api = Api::new(
+            "api-conflictos-neg",
+            vec![with_contacts("cuenta")],
+            Answer::Deny,
+        )
+        .await;
+        let (client, _service) = api.client(":1.7").await;
+        assert_eq!(
+            error_name(&call(&client, "ListConflicts", &("cuenta", "contacts")).await),
+            ACCESS_DENIED
+        );
+        assert_eq!(
+            error_name(&call(&client, "GetConflict", &("cuenta", "contacts", "1")).await),
+            ACCESS_DENIED
+        );
     }
 
     /// Con el llavero bloqueado, leer da un error que lo dice, y ningún dato.
