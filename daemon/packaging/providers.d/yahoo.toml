@@ -1,0 +1,33 @@
+# Yahoo — calendario y contactos por CalDAV/CardDAV.
+#
+# ── Qué hace falta ──────────────────────────────────────────────────────────
+#
+# El correo de Yahoo y una **contraseña de aplicación**. Yahoo no acepta la
+# contraseña principal en clientes externos: hay que generar una en
+# https://login.yahoo.com/account/security → «Generar contraseña de aplicación».
+# Es la que se pega acá.
+#
+# ── Por qué no lleva `dav_url` ───────────────────────────────────────────────
+#
+# Como todos los `carddav`, la dirección de cada colección se resuelve al
+# conectar (RFC 6764: `.well-known` → principal → home-set) y recién ahí se
+# sabe. La pantalla de Configuración hace el recorrido y guarda la dirección ya
+# armada. Por eso acá no hay `dav_url`.
+#
+# Las direcciones de autodescubrimiento, para referencia:
+#   CalDAV:  https://caldav.calendar.yahoo.com/
+#   CardDAV: https://carddav.address.yahoo.com/
+#
+# ── Qué se guarda ────────────────────────────────────────────────────────────
+#
+# La dirección resuelta de cada capacidad, el usuario (el correo) y la
+# contraseña de aplicación. La contraseña va cifrada en `vasak-keyring`, no en
+# este archivo. La autenticación es HTTP Basic sobre TLS.
+
+id = "yahoo"
+display_name = "Yahoo"
+kind = "carddav"
+
+# Yahoo da correo por IMAP/SMTP, que es otro camino. Acá se declara lo que
+# reutiliza el DAV que ya anda: calendario y contactos.
+capabilities = ["calendar", "contacts"]
