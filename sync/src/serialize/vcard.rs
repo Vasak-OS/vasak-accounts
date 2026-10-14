@@ -4,6 +4,13 @@
 //! desde cero. Lo que el parche no nombra —una `PHOTO` en base64, una `X-` de un
 //! exportador, el `VERSION`— sale byte por byte como entró.
 //!
+//! El parche cubre los textos (`FN`, `ORG`, `NOTE`) y las listas de correos
+//! (`EMAIL`), teléfonos (`TEL`) y relaciones (`RELATED` / la forma de Apple).
+//! Cada lista se fija **entera**: al editarla se sacan todas sus líneas del crudo
+//! y la lista nueva se vuelve a escribir, con la etiqueta en `TYPE` saneada y el
+//! valor escapado (nada de inyección de línea ni de parámetro, hereda los
+//! hallazgos de `#86`).
+//!
 //! ── `RELATED`: nunca las dos formas a la vez ────────────────────────────────
 //!
 //! Hay dos maneras de escribir «la esposa de Ana es Marta», y la decisión 3 del
@@ -26,11 +33,22 @@ pub struct Relation {
     pub value: String,
 }
 
+/// Un dato con etiqueta para escribir: un teléfono o un correo. La etiqueta
+/// («casa», «trabajo», «celular») va como `TYPE`, y el valor es la dirección o
+/// el número. Una sin etiqueta —cadena vacía— va sin `TYPE`, como la lee la
+/// lectura cuando no hay ninguno.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabeledValue {
+    pub label: String,
+    pub value: String,
+}
+
 /// Lo que cambia de una tarjeta.
 ///
-/// Cada campo es un [`Change`]: por omisión no se toca. Las relaciones se fijan
-/// enteras —la lista nueva reemplaza la vieja—, en la forma que la tarjeta ya
-/// usaba.
+/// Cada campo es un [`Change`]: por omisión no se toca. Las listas —correos,
+/// teléfonos, relaciones— se fijan **enteras**: la lista nueva reemplaza la
+/// vieja; `Clear` las saca todas. Las relaciones se escriben en la forma que la
+/// tarjeta ya usaba.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContactPatch {
     /// `FN`, el nombre que se muestra.
@@ -39,6 +57,10 @@ pub struct ContactPatch {
     pub organization: Change<String>,
     /// `NOTE`.
     pub note: Change<String>,
+    /// Los `EMAIL`, con su etiqueta en `TYPE`.
+    pub emails: Change<Vec<LabeledValue>>,
+    /// Los `TEL`, con su etiqueta en `TYPE`.
+    pub phones: Change<Vec<LabeledValue>>,
     /// `RELATED` o el par de Apple, según lo que la tarjeta ya traía.
     pub related: Change<Vec<Relation>>,
 }
@@ -49,6 +71,8 @@ impl ContactPatch {
         self.full_name == Change::Leave
             && self.organization == Change::Leave
             && self.note == Change::Leave
+            && self.emails == Change::Leave
+            && self.phones == Change::Leave
             && self.related == Change::Leave
     }
 }
@@ -86,6 +110,16 @@ fn property_of(logical: &Logical) -> Option<Property> {
     split_property(&logical.unfolded())
 }
 
+/// Los grupos `itemN` de las propiedades que se llaman `name`: los `X-ABLabel`
+/// de esos grupos se sacan junto con su propiedad principal.
+fn groups_of(properties: &[Property], name: &str) -> Vec<String> {
+    properties
+        .iter()
+        .filter(|p| p.name == name)
+        .filter_map(|p| p.group.clone())
+        .collect()
+}
+
 /// El número de grupo `itemN` más alto que ya usa la tarjeta, para que los
 /// grupos nuevos de una relación de Apple no pisen los de un correo.
 fn max_item_group(properties: &[Property]) -> u32 {
@@ -109,22 +143,32 @@ pub fn apply_changes(raw_vcard: &str, patch: &ContactPatch) -> String {
     let logicals = logical_lines(raw_vcard);
     let properties: Vec<Property> = logicals.iter().filter_map(property_of).collect();
 
+    let editing_emails = !matches!(patch.emails, Change::Leave);
+    let editing_phones = !matches!(patch.phones, Change::Leave);
     let editing_related = !matches!(patch.related, Change::Leave);
-    // Al reescribir las relaciones se sacan **las dos formas**, no sólo la que se
-    // vuelve a escribir. Si el crudo trajera `RELATED` y la forma de Apple a la
-    // vez —malformado—, dejar la de Apple como «desconocida» haría que el nombre
-    // viejo sobreviviera en la copia del servidor; sacarla cierra la decisión 3.
-    // Los grupos de Apple cuyas líneas (`X-ABRELATEDNAMES` y su `X-ABLabel`) se
-    // sacan.
-    let apple_groups: Vec<String> = if editing_related {
-        properties
-            .iter()
-            .filter(|p| p.name == "X-ABRELATEDNAMES")
-            .filter_map(|p| p.group.clone())
-            .collect()
-    } else {
-        Vec::new()
-    };
+    // Una lista se fija entera: se sacan **todas** sus líneas del crudo y la lista
+    // nueva se escribe en `flush`. Al reescribir las relaciones se sacan **las dos
+    // formas**, no sólo la que se vuelve a escribir: si el crudo trajera `RELATED`
+    // y la forma de Apple a la vez —malformado—, dejar la de Apple como
+    // «desconocida» haría que el nombre viejo sobreviviera en la copia del
+    // servidor; sacarla cierra la decisión 3.
+    //
+    // Los correos y los teléfonos de Apple vienen como `itemN.EMAIL` con su
+    // `itemN.X-ABLabel`; al sacar la propiedad hay que sacar también esa etiqueta
+    // suelta, o queda un `X-ABLabel` huérfano. `stripped_groups` junta los grupos
+    // `itemN` cuya propiedad principal se saca, para sacar sus `X-ABLabel` con
+    // ella. La lectura de correos y teléfonos ignora el `X-ABLabel` (sólo mira
+    // `TYPE`), así que no se pierde ninguna etiqueta que se estuviera mostrando.
+    let mut stripped_groups: Vec<String> = Vec::new();
+    if editing_related {
+        stripped_groups.extend(groups_of(&properties, "X-ABRELATEDNAMES"));
+    }
+    if editing_emails {
+        stripped_groups.extend(groups_of(&properties, "EMAIL"));
+    }
+    if editing_phones {
+        stripped_groups.extend(groups_of(&properties, "TEL"));
+    }
 
     let mut out: Vec<String> = Vec::new();
     let mut done = Done::default();
@@ -166,16 +210,20 @@ pub fn apply_changes(raw_vcard: &str, patch: &ContactPatch) -> String {
                 logical,
             ),
             "NOTE" => put_text(&mut out, &patch.note, &mut done.note, &property, logical),
-            // Al editar relaciones se sacan las dos formas; la elegida se vuelve a
-            // escribir en `flush`, la otra no.
+            // Las listas que se editan se sacan enteras acá y se vuelven a escribir
+            // en `flush`. Para las relaciones se sacan las dos formas; la elegida se
+            // reescribe, la otra no.
+            "EMAIL" if editing_emails => {}
+            "TEL" if editing_phones => {}
             "RELATED" if editing_related => {}
             "X-ABRELATEDNAMES" if editing_related => {}
+            // El `X-ABLabel` de un grupo cuya propiedad principal se sacó —un
+            // correo, un teléfono o una relación de Apple— se va con ella.
             "X-ABLABEL"
-                if editing_related
-                    && property
-                        .group
-                        .as_ref()
-                        .is_some_and(|g| apple_groups.contains(g)) => {}
+                if property
+                    .group
+                    .as_ref()
+                    .is_some_and(|g| stripped_groups.contains(g)) => {}
             _ => out.extend_from_slice(&logical.physical),
         }
     }
@@ -207,6 +255,12 @@ pub fn new_contact(uid: &str, patch: &ContactPatch) -> String {
     }
     if let Change::Set(text) = &patch.note {
         out.extend(fold(&render("NOTE", &[], &escape_text(text))));
+    }
+    if let Change::Set(emails) = &patch.emails {
+        push_labeled(&mut out, "EMAIL", emails);
+    }
+    if let Change::Set(phones) = &patch.phones {
+        push_labeled(&mut out, "TEL", phones);
     }
     if let Change::Set(relations) = &patch.related {
         push_related(&mut out, relations);
@@ -271,31 +325,61 @@ fn flush(out: &mut Vec<String>, patch: &ContactPatch, done: &Done, properties: &
             out.extend(fold(&render("NOTE", &[], &escape_text(text))));
         }
     }
+    if let Change::Set(emails) = &patch.emails {
+        push_labeled(out, "EMAIL", emails);
+    }
+    if let Change::Set(phones) = &patch.phones {
+        push_labeled(out, "TEL", phones);
+    }
     if let Change::Set(relations) = &patch.related {
         match related_form(properties) {
             RelatedForm::Related => push_related(out, relations),
             RelatedForm::Apple => push_apple(out, relations, max_item_group(properties)),
         }
     }
-    // `Change::Clear` de las relaciones no agrega nada: las líneas viejas ya se
-    // sacaron al recorrer.
+    // `Change::Clear` de una lista no agrega nada: las líneas viejas ya se sacaron
+    // al recorrer.
 }
 
-/// Escribe las relaciones como `RELATED` (4.0). La etiqueta va como `TYPE`, y
-/// una relación sin etiqueta va sin él.
-fn push_related(out: &mut Vec<String>, relations: &[Relation]) {
-    for relation in relations {
-        let params = if relation.label.trim().is_empty() {
+/// Escribe una lista de valores con etiqueta como una propiedad simple
+/// (`RELATED`, `EMAIL`, `TEL`): la etiqueta va como `TYPE` **saneado**
+/// ([`sanitize_label`], que corta la inyección de parámetro), una sin etiqueta
+/// va sin él, y el valor se **escapa** ([`escape_text`], que corta la inyección
+/// de línea).
+fn push_type_values<'a>(
+    out: &mut Vec<String>,
+    name: &str,
+    items: impl Iterator<Item = (&'a str, &'a str)>,
+) {
+    for (label, value) in items {
+        let params = if label.trim().is_empty() {
             Vec::new()
         } else {
-            vec![format!("TYPE={}", sanitize_label(&relation.label))]
+            vec![format!("TYPE={}", sanitize_label(label))]
         };
-        out.extend(fold(&render(
-            "RELATED",
-            &params,
-            &escape_text(&relation.value),
-        )));
+        out.extend(fold(&render(name, &params, &escape_text(value))));
     }
+}
+
+/// Escribe las relaciones como `RELATED` (4.0).
+fn push_related(out: &mut Vec<String>, relations: &[Relation]) {
+    push_type_values(
+        out,
+        "RELATED",
+        relations
+            .iter()
+            .map(|r| (r.label.as_str(), r.value.as_str())),
+    );
+}
+
+/// Escribe una lista de correos o teléfonos (`EMAIL`, `TEL`), cada uno con su
+/// etiqueta en `TYPE`.
+fn push_labeled(out: &mut Vec<String>, name: &str, values: &[LabeledValue]) {
+    push_type_values(
+        out,
+        name,
+        values.iter().map(|v| (v.label.as_str(), v.value.as_str())),
+    );
 }
 
 /// Escribe las relaciones en la forma de Apple, con grupos `itemN` nuevos que no
@@ -348,6 +432,21 @@ mod tests {
 
     fn relation(label: &str, value: &str) -> Relation {
         Relation {
+            label: label.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    fn labeled(label: &str, value: &str) -> LabeledValue {
+        LabeledValue {
+            label: label.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    /// Un campo tal como lo devuelve la lectura, para comparar.
+    fn field(label: &str, value: &str) -> crate::vcard::Field {
+        crate::vcard::Field {
             label: label.to_string(),
             value: value.to_string(),
         }
@@ -652,5 +751,161 @@ mod tests {
             assert!(line.len() <= 75, "línea sin plegar: {line:?}");
         }
         assert_eq!(contact_from(&out, "").unwrap().notes, largo);
+    }
+
+    // ── Correos y teléfonos ──────────────────────────────────────────────────
+
+    /// Fijar los correos y los teléfonos reemplaza el conjunto entero y deja el
+    /// resto de la tarjeta intacto, y al releerla vuelven con su etiqueta.
+    #[test]
+    fn fijar_correos_y_telefonos_reemplaza_el_conjunto() {
+        let out = apply_changes(
+            CARD,
+            &ContactPatch {
+                emails: Change::Set(vec![labeled("home", "ana@casa.com")]),
+                phones: Change::Set(vec![labeled("work", "+54 11 4444-4444")]),
+                ..Default::default()
+            },
+        );
+        let before = contact_from(CARD, "").unwrap();
+        let after = contact_from(&out, "").unwrap();
+        assert_eq!(after.emails, vec![field("home", "ana@casa.com")]);
+        assert_eq!(after.phones, vec![field("work", "+54 11 4444-4444")]);
+        // El correo y el teléfono viejos de la tarjeta no sobreviven.
+        assert!(!out.contains("ana@ejemplo.com"), "{out}");
+        assert!(!out.contains("5555-5555"), "{out}");
+        // Lo no tocado vuelve igual.
+        assert_eq!(after.display_name, before.display_name);
+        assert_eq!(after.uid, before.uid);
+        assert_eq!(after.sort_name, before.sort_name);
+    }
+
+    /// Sacar los correos (`null`) los quita todos sin tocar los teléfonos.
+    #[test]
+    fn sacar_los_correos_los_quita_todos() {
+        let out = apply_changes(
+            CARD,
+            &ContactPatch {
+                emails: Change::Clear,
+                ..Default::default()
+            },
+        );
+        assert!(!out.contains("EMAIL"), "{out}");
+        let c = contact_from(&out, "").unwrap();
+        assert!(c.emails.is_empty());
+        // El teléfono sigue, intacto.
+        assert_eq!(c.phones.len(), 1);
+    }
+
+    /// Fijar un correo sin etiqueta lo escribe sin `TYPE`, como lo lee la lectura
+    /// cuando no hay ninguno.
+    #[test]
+    fn un_correo_sin_etiqueta_va_sin_type() {
+        let out = apply_changes(
+            CARD,
+            &ContactPatch {
+                emails: Change::Set(vec![labeled("", "ana@x.com")]),
+                ..Default::default()
+            },
+        );
+        assert!(out.contains("EMAIL:ana@x.com"), "{out}");
+        assert!(!out.contains("EMAIL;TYPE=:"), "{out}");
+        let c = contact_from(&out, "").unwrap();
+        assert_eq!(c.emails, vec![field("", "ana@x.com")]);
+    }
+
+    /// **Seguridad (hereda #86): un correo adversario no inyecta líneas ni
+    /// parámetros.** Un valor con un salto de línea y unos dos puntos, y una
+    /// etiqueta con un salto y un punto y coma, no pueden partir la línea `EMAIL`
+    /// ni meter una propiedad o un parámetro que la persona no puso.
+    #[test]
+    fn un_correo_adversario_no_inyecta_lineas_ni_parametros() {
+        let out = apply_changes(
+            CARD,
+            &ContactPatch {
+                emails: Change::Set(vec![labeled("home\r\nX-EVIL:1", "ana@x.com\r\nFN:Falsa")]),
+                ..Default::default()
+            },
+        );
+        let lines: Vec<&str> = out.split("\r\n").collect();
+        // Ninguna propiedad inyectada: sólo el `FN` original, ningún `X-EVIL`.
+        assert_eq!(
+            lines.iter().filter(|l| l.starts_with("FN:")).count(),
+            1,
+            "{out}"
+        );
+        assert!(!lines.iter().any(|l| l.starts_with("X-EVIL")), "{out}");
+        assert!(!lines.iter().any(|l| l.starts_with("FN:Falsa")), "{out}");
+        // Un solo parámetro `TYPE`, saneado (sin `:` ni control).
+        let email = lines
+            .iter()
+            .find(|l| l.starts_with("EMAIL"))
+            .expect("el correo se escribió");
+        assert_eq!(email.matches(";TYPE=").count(), 1, "{out}");
+        // Y la tarjeta se relee con un solo correo.
+        assert_eq!(contact_from(&out, "").unwrap().emails.len(), 1);
+    }
+
+    /// Editar los correos saca la etiqueta de Apple del mismo grupo, que si no
+    /// quedaría huérfana en la copia del servidor.
+    #[test]
+    fn editar_correos_saca_la_etiqueta_de_apple_huerfana() {
+        let apple = "BEGIN:VCARD\r\nFN:Ana\r\n\
+            item1.EMAIL:vieja@x.com\r\nitem1.X-ABLabel:_$!<Home>!$_\r\nEND:VCARD\r\n";
+        let out = apply_changes(
+            apple,
+            &ContactPatch {
+                emails: Change::Set(vec![labeled("work", "nueva@x.com")]),
+                ..Default::default()
+            },
+        );
+        assert!(!out.contains("vieja@x.com"), "{out}");
+        assert!(
+            !out.to_uppercase().contains("X-ABLABEL"),
+            "quedó una etiqueta huérfana: {out}"
+        );
+        assert!(out.contains("EMAIL;TYPE=work:nueva@x.com"), "{out}");
+        let c = contact_from(&out, "").unwrap();
+        assert_eq!(c.emails, vec![field("work", "nueva@x.com")]);
+    }
+
+    /// **Seguridad: editar correos sobre un crudo adversario no entra en pánico**
+    /// (un `itemN` enorme, una línea sin dos puntos, sin `END`), y lo desconocido
+    /// —una `PHOTO`— se conserva.
+    #[test]
+    fn editar_correos_en_un_crudo_adversario_no_panica() {
+        let raw = "BEGIN:VCARD\r\nFN:Ana\r\nbasura sin dos puntos\r\n\
+            item4294967295.EMAIL:x@x\r\nitem4294967295.X-ABLabel:_$!<Home>!$_\r\n\
+            PHOTO;ENCODING=b:iVBORw0=";
+        let out = apply_changes(
+            raw,
+            &ContactPatch {
+                emails: Change::Set(vec![labeled("", "ana@x.com")]),
+                phones: Change::Clear,
+                ..Default::default()
+            },
+        );
+        // No entra en pánico (correr esto ya lo prueba) y preserva lo ajeno.
+        assert!(out.contains("PHOTO;ENCODING=b:iVBORw0="), "{out}");
+        assert!(out.contains("basura sin dos puntos"), "{out}");
+        assert!(out.contains("EMAIL:ana@x.com"), "{out}");
+        assert!(!out.contains("x@x"), "{out}");
+    }
+
+    /// Una tarjeta nueva escribe sus correos y teléfonos, y se relee.
+    #[test]
+    fn una_tarjeta_nueva_con_correos_y_telefonos_se_lee() {
+        let out = new_contact(
+            "nuevo-2",
+            &ContactPatch {
+                full_name: set("Juan"),
+                emails: Change::Set(vec![labeled("home", "juan@x.com")]),
+                phones: Change::Set(vec![labeled("cell", "+5491100000000")]),
+                ..Default::default()
+            },
+        );
+        let c = contact_from(&out, "").unwrap();
+        assert_eq!(c.emails, vec![field("home", "juan@x.com")]);
+        assert_eq!(c.phones, vec![field("cell", "+5491100000000")]);
     }
 }
