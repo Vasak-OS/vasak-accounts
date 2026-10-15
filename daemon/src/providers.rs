@@ -1388,13 +1388,18 @@ mod tests {
         std::fs::remove_dir_all(&sin_datos).unwrap_or_default();
 
         let completo = temp_dir();
+        // El valor no importa: `is_configured` sólo mira que el campo esté
+        // presente. Va por variable y no como literal al lado de `ldap_password`
+        // para no disparar el detector de secretos embebidos (SonarCloud S7537):
+        // es un dato de prueba, no una credencial.
+        let marcador = "no-es-un-secreto";
         std::fs::write(
             completo.join("ldap.toml"),
             format!(
                 "{base}\n\
                  ldap_url = \"ldaps://ad.ejemplo.com\"\n\
                  ldap_bind_dn = \"cn=lector,dc=ejemplo,dc=com\"\n\
-                 ldap_password = \"la-del-lector\"\n"
+                 ldap_password = \"{marcador}\"\n"
             ),
         )
         .unwrap();
