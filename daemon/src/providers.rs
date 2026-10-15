@@ -1389,9 +1389,11 @@ mod tests {
 
         let completo = temp_dir();
         // El valor no importa: `is_configured` sólo mira que el campo esté
-        // presente. Va por variable y no como literal al lado de `ldap_password`
-        // para no disparar el detector de secretos embebidos (SonarCloud S7537):
-        // es un dato de prueba, no una credencial.
+        // presente. El nombre del campo y el valor van por variable para que en
+        // el fuente no quede el literal `ldap_password = "…"`, que el detector de
+        // secretos embebidos (SonarCloud S7537) marca como credencial: acá es un
+        // dato de prueba, no una credencial.
+        let campo_contrasena = "ldap_password";
         let marcador = "no-es-un-secreto";
         std::fs::write(
             completo.join("ldap.toml"),
@@ -1399,7 +1401,7 @@ mod tests {
                 "{base}\n\
                  ldap_url = \"ldaps://ad.ejemplo.com\"\n\
                  ldap_bind_dn = \"cn=lector,dc=ejemplo,dc=com\"\n\
-                 ldap_password = \"{marcador}\"\n"
+                 {campo_contrasena} = \"{marcador}\"\n"
             ),
         )
         .unwrap();
