@@ -10,202 +10,31 @@
 //! Es **de sólo lectura**: no escribe nada contra Graph. La escritura por Graph
 //! (`Contacts.ReadWrite`) es fase 2 (Vasak-OS/vasak-accounts#97).
 
-use std::collections::HashSet;
-use std::time::Duration;
-
-use url::Url;
-
-use crate::broker::BrokerError;
 use crate::contacts_sync::backend::{SyncContext, SyncResult};
 use crate::contacts_sync::SyncReport;
-use crate::dav_sync::CredentialError;
+use crate::graph::{self, GraphCredential, GraphFetchError};
 use crate::store::contacts::{ContactOp, ContactRow};
 use crate::store::key::KeySource;
 use crate::store::lifecycle::{AreaState, CONTACTS_AREA};
 use crate::vcard;
 
-/// Cada cuánto se sincronizan los contactos de una cuenta encendida.
-const CONTACTS_INTERVAL: Duration = Duration::from_secs(60 * 60);
-
-/// Plazo para que un pedido a Graph conecte, como el resto del servicio.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Plazo por pedido —conexión más respuesta— al paginar la carpeta. Corta un
-/// servidor que acepta la conexión y no responde. Igual que `dav_sync` acota
-/// cada pedido con [`tokio::time::timeout_at`].
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Tope de páginas de la paginación por `@odata.nextLink`. Con `$top=100` da de
-/// sobra para una agenda personal; un servidor que no corta es un bucle o un
-/// intento de agotar memoria.
-const MAX_PAGES: usize = 1_000;
+// La credencial, su fuente, los errores de red y la paginación por
+// `@odata.nextLink` con validación de mismo-origen son comunes a todos los
+// backends de Graph y viven en [`crate::graph`]; `GraphCredentialSource` se
+// instancia en el despacho de `contacts_sync::sync_account`.
 
 /// Tope de contactos acumulados. Cota de memoria independiente del tope de
 /// páginas, por si un servidor devuelve páginas enormes.
 const MAX_CONTACTS: usize = 100_000;
 
-/// Lo que se ve en el estado cuando el servicio de cuentas dice que no.
-const DENIED_DETAIL: &str = "el servicio de cuentas no le da al sincronizador permiso para los \
-     contactos de esta cuenta";
-
 /// Lo que se ve cuando la base no está abierta.
 const CLOSED_DETAIL: &str =
     "la base no está abierta: se sincroniza cuando se desbloquee el llavero";
 
-/// URL base de Microsoft Graph.
-const GRAPH_BASE_URL: &str = "https://graph.microsoft.com/v1.0";
-
-/// Credencial para Microsoft Graph API.
-///
-/// Contiene el token de acceso OAuth2 y el ID de usuario para la carpeta de
-/// contactos.
-///
-/// No deriva `Debug`: su `Debug` manual redacta el token para que no termine en
-/// un log ni en un volcado. El token se guarda en [`zeroize::Zeroizing`], que lo
-/// pone en cero al soltarlo.
-#[derive(Clone)]
-pub struct GraphCredential {
-    /// Token de acceso OAuth2.
-    pub access_token: zeroize::Zeroizing<String>,
-    /// URL base del usuario (para multi-tenant).
-    pub user_id: String,
-    /// Raíz de la API de Graph (`https://graph.microsoft.com/v1.0` en
-    /// producción). Es un campo para que las pruebas puedan apuntar el
-    /// sincronizador a un endpoint falso en `127.0.0.1`; el servicio de cuentas
-    /// siempre la rellena con [`GRAPH_BASE_URL`]. El host (y el esquema) de esta
-    /// URL es el único al que el sincronizador adjunta el token: ver
-    /// [`GraphApiBackend::fetch_all_contacts`].
-    pub base_url: String,
-}
-
-impl std::fmt::Debug for GraphCredential {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GraphCredential")
-            .field("access_token", &"<redactado>")
-            .field("user_id", &self.user_id)
-            .field("base_url", &self.base_url)
-            .finish()
-    }
-}
-
-/// Fuente de credenciales para Graph API.
-///
-/// Obtiene el token de acceso y el ID de usuario del servicio de cuentas.
-pub struct GraphCredentialSource;
-
-impl GraphCredentialSource {
-    /// Obtiene la credencial de Graph API para una cuenta.
-    pub async fn credential(
-        &self,
-        account_id: &str,
-        capability: &'static str,
-    ) -> Result<GraphCredential, CredentialError> {
-        let classify = |e: BrokerError| match e {
-            BrokerError::Denied(_) => CredentialError::Denied,
-            other => CredentialError::Failed(other.to_string()),
-        };
-        let broker = crate::broker::Broker::connect().await.map_err(classify)?;
-        let token = zeroize::Zeroizing::new(
-            broker
-                .access_token(account_id, capability)
-                .await
-                .map_err(classify)?,
-        );
-        let data = broker
-            .account_data(account_id, capability)
-            .await
-            .map_err(classify)?;
-        let config = data.get("config").unwrap_or(&data);
-        // Extraer el user_id de la configuración (viene del proveedor)
-        let user_id = config
-            .get("user_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("me")
-            .to_string();
-
-        Ok(GraphCredential {
-            access_token: token,
-            user_id,
-            base_url: GRAPH_BASE_URL.to_string(),
-        })
-    }
-}
-
-/// Lo que puede fallar al traer la carpeta de contactos de Graph.
-///
-/// Tipado a propósito: la validación del `@odata.nextLink` (ver
-/// [`GraphApiBackend::fetch_all_contacts`]) corta la sincronización con una
-/// variante propia, y las pruebas pueden distinguir «host no confiable» de un
-/// simple error de red. Ninguna variante vuelca el cuerpo crudo de la respuesta
-/// de Graph al estado que se muestra.
-#[derive(Debug)]
-enum GraphFetchError {
-    /// No se pudo contactar al servidor.
-    Network(String),
-    /// La respuesta no se pudo parsear como la carpeta de contactos.
-    Parse,
-    /// Graph respondió con un código de error. Sólo el código, nunca el cuerpo.
-    Http(reqwest::StatusCode),
-    /// La URL base o un `nextLink` no es una URL válida.
-    MalformedUrl,
-    /// El `nextLink` apunta a un host o esquema distinto del de la URL base: se
-    /// aborta para no mandarle el token a otro servidor.
-    UntrustedNextLink,
-    /// El servidor repitió un `nextLink` ya visto: paginación en bucle.
-    PaginationLoop,
-    /// Se superó el tope de páginas.
-    TooManyPages,
-    /// Se superó el tope de contactos acumulados.
-    TooManyContacts,
-    /// Se agotó el plazo de un pedido.
-    Timeout,
-}
-
-impl std::fmt::Display for GraphFetchError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            // El `e` de reqwest trae la URL y el motivo (DNS, TLS, conexión),
-            // nunca el token ni el cuerpo de la respuesta.
-            GraphFetchError::Network(e) => write!(f, "error de red con Graph: {e}"),
-            GraphFetchError::Parse => write!(f, "no se pudo parsear la respuesta de Graph"),
-            GraphFetchError::Http(status) => write!(f, "Graph respondió con error {status}"),
-            GraphFetchError::MalformedUrl => write!(f, "URL inválida al paginar los contactos"),
-            GraphFetchError::UntrustedNextLink => write!(
-                f,
-                "Graph devolvió un enlace de paginación a un host no confiable; se abortó la \
-                 sincronización"
-            ),
-            GraphFetchError::PaginationLoop => {
-                write!(
-                    f,
-                    "Graph repitió un enlace de paginación; se abortó la sincronización"
-                )
-            }
-            GraphFetchError::TooManyPages => {
-                write!(
-                    f,
-                    "demasiadas páginas de contactos; se abortó la sincronización"
-                )
-            }
-            GraphFetchError::TooManyContacts => {
-                write!(f, "demasiados contactos; se abortó la sincronización")
-            }
-            GraphFetchError::Timeout => write!(f, "se agotó el tiempo de espera de Graph"),
-        }
-    }
-}
-
-/// Respuesta de la carpeta de contactos (`/me/contacts`) de Microsoft Graph.
-///
-/// Sólo se mira `value` y el `@odata.nextLink` de la paginación; el resto de los
-/// anotadores de OData se ignora.
-#[derive(Debug, Default, serde::Deserialize)]
-struct GraphContactsResponse {
-    #[serde(default)]
-    value: Vec<GraphContact>,
-    #[serde(rename = "@odata.nextLink")]
-    next_link: Option<String>,
-}
+/// Los campos de la carpeta de contactos que se piden con `$select`.
+const CONTACTS_SELECT: &str = "$top=100&$select=id,displayName,givenName,surname,middleName,\
+     emailAddresses,businessPhones,homePhones,mobilePhone,homeAddress,businessAddress,otherAddress,\
+     companyName,jobTitle,birthday,personalNotes";
 
 /// Un contacto de la carpeta de contactos de Microsoft Graph.
 ///
@@ -310,10 +139,7 @@ impl GraphApiBackend {
         }
         set_status(AreaState::Syncing, "").await;
 
-        let client = match reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-        {
+        let client = match graph::http_client() {
             Ok(c) => c,
             Err(e) => {
                 set_status(AreaState::Failed, "no se pudo preparar el cliente HTTP").await;
@@ -391,107 +217,20 @@ impl GraphApiBackend {
     /// Trae todos los contactos de la carpeta con paginación por
     /// `@odata.nextLink`.
     ///
-    /// **El `nextLink` es dato de red y no se sigue a ciegas.** Antes de
-    /// adjuntarle el token de Graph, cada `nextLink` se parsea y se exige que
-    /// comparta *origen* con la URL base de la credencial —mismo esquema, mismo
-    /// host y mismo puerto—. En producción la base es [`GRAPH_BASE_URL`]
-    /// (`https://graph.microsoft.com/v1.0`), así que el token sólo viaja a ese
-    /// host por HTTPS; las pruebas apuntan `base_url` a un endpoint falso y la
-    /// validación compara contra *ese* host, no contra un literal. Un `nextLink`
-    /// a otro host —un servidor comprometido o un MITM— aborta la sincronización
-    /// sin haberle mandado el token.
-    ///
-    /// Además acota la paginación: tope de páginas, de contactos, dedup de
-    /// `nextLink` para cortar un bucle, y un plazo por pedido.
+    /// Arma la URL inicial de `/users/{user_id}/contacts` sobre la base de la
+    /// credencial y delega en [`crate::graph::fetch_all_pages`], que es donde
+    /// vive la defensa: el token sólo viaja al origen de la `base_url`, nunca al
+    /// host de un `nextLink` que no lo comparta, más las cotas de paginación.
     async fn fetch_all_contacts(
         client: &reqwest::Client,
         credential: &GraphCredential,
     ) -> Result<Vec<GraphContact>, GraphFetchError> {
-        // El origen de confianza sale de la URL base de la credencial, no de un
-        // literal: así la validación sirve igual para producción, para una nube
-        // alternativa de Graph y para el endpoint falso de las pruebas.
-        let base = Url::parse(&credential.base_url).map_err(|_| GraphFetchError::MalformedUrl)?;
-        let same_origin = |candidate: &Url| -> bool {
-            candidate.scheme() == base.scheme()
-                && candidate.host_str() == base.host_str()
-                && candidate.port_or_known_default() == base.port_or_known_default()
-        };
-
-        // La primera URL se arma sobre la base. `user_id` entra como *segmento*
-        // de ruta: `path_segments_mut` lo percent-codifica, así que un `?`, un
-        // `#` o una `/` en el id no pueden alterar la query, el fragmento ni la
-        // ruta.
-        let mut url = base.clone();
-        {
-            let mut segments = url
-                .path_segments_mut()
-                .map_err(|_| GraphFetchError::MalformedUrl)?;
-            segments.pop_if_empty();
-            segments.push("users");
-            segments.push(&credential.user_id);
-            segments.push("contacts");
-        }
-        url.set_query(Some(
-            "$top=100&$select=id,displayName,givenName,surname,middleName,emailAddresses,\
-             businessPhones,homePhones,mobilePhone,homeAddress,businessAddress,otherAddress,\
-             companyName,jobTitle,birthday,personalNotes",
-        ));
-
-        let mut all_contacts = Vec::new();
-        // Los `nextLink` ya pedidos, para cortar un servidor que repite el mismo
-        // enlace en bucle. Incluye la URL inicial.
-        let mut seen: HashSet<String> = HashSet::new();
-        seen.insert(url.as_str().to_string());
-
-        for _page in 0..MAX_PAGES {
-            // Plazo por pedido: conexión más respuesta. El token sólo se adjunta
-            // acá, y `url` ya fue validada como del mismo origen que la base.
-            let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
-            let request = client
-                .get(url.as_str())
-                .bearer_auth(credential.access_token.as_str())
-                .header("Accept", "application/json");
-
-            let fetch_page = async {
-                let response = request
-                    .send()
-                    .await
-                    .map_err(|e| GraphFetchError::Network(e.to_string()))?;
-                if !response.status().is_success() {
-                    // Sólo el código: el cuerpo crudo del error de Graph no se
-                    // vuelca al estado que ve quien usa el sistema.
-                    return Err(GraphFetchError::Http(response.status()));
-                }
-                response
-                    .json::<GraphContactsResponse>()
-                    .await
-                    .map_err(|_| GraphFetchError::Parse)
-            };
-
-            let data = match tokio::time::timeout_at(deadline, fetch_page).await {
-                Ok(result) => result?,
-                Err(_) => return Err(GraphFetchError::Timeout),
-            };
-
-            all_contacts.extend(data.value);
-            if all_contacts.len() > MAX_CONTACTS {
-                return Err(GraphFetchError::TooManyContacts);
-            }
-
-            let Some(next) = data.next_link else {
-                return Ok(all_contacts);
-            };
-            let next_url = Url::parse(&next).map_err(|_| GraphFetchError::MalformedUrl)?;
-            if !same_origin(&next_url) {
-                return Err(GraphFetchError::UntrustedNextLink);
-            }
-            if !seen.insert(next_url.as_str().to_string()) {
-                return Err(GraphFetchError::PaginationLoop);
-            }
-            url = next_url;
-        }
-
-        Err(GraphFetchError::TooManyPages)
+        let url = graph::build_url(
+            &credential.base_url,
+            &["users", &credential.user_id, "contacts"],
+            CONTACTS_SELECT,
+        )?;
+        graph::fetch_all_pages(client, credential, url, MAX_CONTACTS, &[]).await
     }
 
     /// Convierte un `GraphContact` a `ContactRow`.
@@ -729,7 +468,8 @@ mod tests {
             "value": [{ "id": "a" }, { "id": "b" }],
             "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/contacts?$skip=100"
         }"#;
-        let response: GraphContactsResponse = serde_json::from_str(json).expect("respuesta válida");
+        let response: graph::GraphPage<GraphContact> =
+            serde_json::from_str(json).expect("respuesta válida");
         assert_eq!(response.value.len(), 2);
         assert_eq!(
             response.next_link.as_deref(),
@@ -936,10 +676,7 @@ mod tests {
     }
 
     fn client() -> reqwest::Client {
-        reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .unwrap()
+        graph::http_client().unwrap()
     }
 
     fn credential_for(server: &FakeGraph) -> GraphCredential {
@@ -1294,7 +1031,7 @@ mod tests {
         );
         assert_eq!(
             server.requests().len(),
-            MAX_PAGES,
+            graph::MAX_PAGES,
             "se pidieron exactamente MAX_PAGES páginas antes de cortar"
         );
     }

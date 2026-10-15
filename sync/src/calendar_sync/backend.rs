@@ -3,21 +3,21 @@
 //! ([`crate::contacts_sync::backend`]).
 //!
 //! El sincronizador elige el backend basándose en el `ProviderKind` de la
-//! cuenta (`CalendarSync::calendar_backend_kind_for_account`). Por ahora el
-//! único protocolo es CalDAV; Microsoft Graph (u otro no-CalDAV) se agrega en
-//! un hito posterior sumando una variante y su rama de despacho, sin tocar el
-//! camino existente.
+//! cuenta (`CalendarSync::calendar_backend_kind_for_account`). Hay dos
+//! protocolos: CalDAV y Microsoft Graph; un `kind` sin backend propio cae en
+//! CalDAV.
 
 use crate::broker::{Account, Provider};
 
 /// El tipo de backend de calendario.
 ///
-/// Por ahora sólo CalDAV. Las APIs propietarias (Graph) entran después (ver la
-/// decisión 2 de `vasak-accounts#24`): cuando se agregue una variante, el
-/// despacho de `CalendarSync::sync_account` suma su rama.
+/// CalDAV para los proveedores estándar y Microsoft Graph para Microsoft (ver
+/// la decisión 2 de `vasak-accounts#24`: las APIs propietarias entran). Cada
+/// variante tiene su rama en el despacho de `CalendarSync::sync_account`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CalendarBackendKind {
     CalDav,
+    GraphApi,
 }
 
 /// Elige el backend para una cuenta a partir del catálogo de proveedores y la
@@ -40,7 +40,7 @@ pub fn calendar_backend_for_account(
 
 /// Elige el backend a partir del catálogo de proveedores y el `provider_type`
 /// de la cuenta. Un `provider_type` que no está en el catálogo cae en CalDAV,
-/// igual que un `kind` sin backend propio todavía.
+/// igual que un `kind` sin backend propio.
 pub fn calendar_backend_for_provider(
     providers: &[Provider],
     provider_type: &str,
@@ -53,10 +53,11 @@ pub fn calendar_backend_for_provider(
     CalendarBackendKind::CalDav
 }
 
-/// El mapa de `provider.kind` a backend. Hoy todo cae en CalDAV; cuando entre
-/// Graph, acá se suma su `"graph" => GraphApi` y el despacho su rama.
+/// El mapa de `provider.kind` a backend: `"graph"` —Microsoft— va por Graph, y
+/// cualquier otro (`"caldav"`, lo desconocido) por CalDAV.
 pub fn calendar_backend_for_kind(kind: &str) -> CalendarBackendKind {
     match kind {
+        "graph" => CalendarBackendKind::GraphApi,
         "caldav" => CalendarBackendKind::CalDav,
         _ => CalendarBackendKind::CalDav,
     }
@@ -95,12 +96,17 @@ mod tests {
 
     #[test]
     fn un_kind_desconocido_cae_en_caldav() {
-        // Hoy Graph no tiene variante: hasta que la tenga, cae en CalDAV como
-        // cualquier otro desconocido (nunca roto: decisión 2).
-        for kind in ["graph", "ews", "", "lo-que-sea"] {
+        // Lo que no tiene backend propio cae en CalDAV (nunca roto: decisión 2).
+        for kind in ["ews", "", "lo-que-sea"] {
             let got = calendar_backend_for_kind(kind);
             assert_eq!(got, CalendarBackendKind::CalDav, "kind={kind}");
         }
+    }
+
+    #[test]
+    fn un_kind_graph_elige_el_backend_graph() {
+        let got = calendar_backend_for_kind("graph");
+        assert_eq!(got, CalendarBackendKind::GraphApi);
     }
 
     #[test]
@@ -111,10 +117,10 @@ mod tests {
     }
 
     #[test]
-    fn un_proveedor_graph_cae_en_caldav_por_ahora() {
+    fn un_proveedor_graph_elige_el_backend_graph() {
         let catalog = [provider("microsoft", "graph")];
         let got = calendar_backend_for_provider(&catalog, "microsoft");
-        assert_eq!(got, CalendarBackendKind::CalDav);
+        assert_eq!(got, CalendarBackendKind::GraphApi);
     }
 
     #[test]
@@ -137,11 +143,12 @@ mod tests {
             provider("microsoft", "graph"),
         ];
         let accounts = [account("ana", "fastmail"), account("beto", "microsoft")];
-        // Cada cuenta resuelve por su proveedor; hoy ambas caen en CalDAV.
+        // Cada cuenta resuelve por su proveedor: fastmail → CalDAV, microsoft →
+        // Graph.
         let ana = calendar_backend_for_account(&providers, &accounts, "ana");
         assert_eq!(ana, CalendarBackendKind::CalDav);
         let beto = calendar_backend_for_account(&providers, &accounts, "beto");
-        assert_eq!(beto, CalendarBackendKind::CalDav);
+        assert_eq!(beto, CalendarBackendKind::GraphApi);
     }
 
     #[test]

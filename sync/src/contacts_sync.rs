@@ -41,10 +41,11 @@ use std::time::Duration;
 use crate::broker::{Account, Broker, Provider};
 use crate::contacts_sync::backend::{ContactBackendKind, SyncContext, SyncResult};
 use crate::contacts_sync::carddav::CardDavBackend;
-use crate::contacts_sync::graph::{GraphApiBackend, GraphCredentialSource};
+use crate::contacts_sync::graph::GraphApiBackend;
 use crate::contacts_sync::ldap::{LdapBackend, LdapCredentialSource};
 use crate::dav::webdav::HttpPolicy;
 use crate::dav_sync::{self, AreaSync, CredentialError, CredentialSource};
+use crate::graph::GraphCredentialSource;
 use crate::store::key::KeySource;
 use crate::store::lifecycle::{AreaState, StoreManager, CONTACTS_AREA};
 
