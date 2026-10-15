@@ -3,9 +3,7 @@
 //! Conecta a un servidor LDAP/AD y busca entradas con objectClass=person
 //! u organizationalPerson. No soporta escritura: es solo para consulta.
 
-use std::future::Future;
-use std::sync::Arc;
-use std::time::Duration;
+use zeroize::Zeroizing;
 
 use crate::broker::BrokerError;
 use crate::contacts_sync::backend::{SyncContext, SyncResult};
@@ -13,42 +11,79 @@ use crate::contacts_sync::SyncReport;
 use crate::dav_sync::CredentialError;
 use crate::store::contacts::{ContactOp, ContactRow};
 use crate::store::key::KeySource;
-use crate::store::lifecycle::{AreaState, StoreManager, CONTACTS_AREA};
-use crate::store::{LogLevel, Store, StoreError};
+use crate::store::lifecycle::{AreaState, CONTACTS_AREA};
 use crate::vcard;
-
-/// Cada cuánto se sincronizan los contactos de una cuenta encendida.
-const CONTACTS_INTERVAL: Duration = Duration::from_secs(60 * 60);
-
-/// Lo que se ve en el estado cuando el servicio de cuentas dice que no.
-const DENIED_DETAIL: &str = "el servicio de cuentas no le da al sincronizador permiso para los \
-     contactos de esta cuenta";
 
 /// Lo que se ve cuando la base no está abierta.
 const CLOSED_DETAIL: &str =
     "la base no está abierta: se sincroniza cuando se desbloquee el llavero";
 
+/// Los atributos que se piden si la cuenta no nombra ninguno.
+fn default_attributes() -> Vec<String> {
+    vec![
+        "cn".into(),
+        "sn".into(),
+        "givenName".into(),
+        "mail".into(),
+        "telephoneNumber".into(),
+        "mobile".into(),
+        "title".into(),
+        "department".into(),
+        "company".into(),
+        "streetAddress".into(),
+        "l".into(),
+        "st".into(),
+        "postalCode".into(),
+        "co".into(),
+    ]
+}
+
 /// Credencial para LDAP.
-#[derive(Debug, Clone)]
+///
+/// **Sin `Debug` derivado**: `password` es la contraseña del bind, y un `Debug`
+/// derivado la escribiría entera en cualquier registro o mensaje de pánico que
+/// la lleve adentro. Y en `Zeroizing`: al soltarla, la copia de este lado se
+/// borra. Mismo criterio que `DavCredential` (ver `dav/webdav.rs`).
+#[derive(Clone)]
 pub struct LdapCredential {
-    /// URL del servidor LDAP (ldap:// o ldaps://).
+    /// URL del servidor LDAP (`ldaps://`, `ldap://` o `ldapi://`).
     pub url: String,
     /// DN de enlace.
     pub bind_dn: String,
-    /// Contraseña.
-    pub password: String,
+    /// Contraseña. Sale del llavero, no del config. Ver [`LdapCredentialSource`].
+    pub password: Zeroizing<String>,
     /// Base DN para búsquedas.
     pub search_base: String,
-    /// Filtro de búsqueda (default: (objectClass=person)).
+    /// Filtro de búsqueda (default: `(objectClass=person)`).
     pub search_filter: String,
     /// Atributos a recuperar.
     pub attributes: Vec<String>,
+    /// Permitir `ldap://` en claro, sin StartTLS. Por omisión `false`: el bind
+    /// viaja cifrado o no viaja. Ver [`LdapBackend::connect_ldap`].
+    pub allow_insecure: bool,
+}
+
+impl std::fmt::Debug for LdapCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LdapCredential")
+            .field("url", &self.url)
+            .field("bind_dn", &self.bind_dn)
+            .field("password", &"<tachado>")
+            .field("search_base", &self.search_base)
+            .field("search_filter", &self.search_filter)
+            .field("attributes", &self.attributes)
+            .field("allow_insecure", &self.allow_insecure)
+            .finish()
+    }
 }
 
 /// Fuente de credenciales para LDAP.
 ///
-/// Obtiene la configuración LDAP (URL, bind DN, password, base DN, filtro, atributos)
-/// del servicio de cuentas.
+/// La **configuración** (URL, bind DN, base, filtro, atributos) sale de
+/// `GetAccountData`; la **contraseña** sale del llavero por `GetAccessToken`,
+/// nunca del config —el mismo patrón que `BrokerCredentials` para DAV (ver
+/// `dav_sync.rs`)—. Así la contraseña queda cifrada en `vasak-keyring` y no en
+/// `accounts.json`, donde la vería cualquiera que llame a `GetAccountData`.
 pub struct LdapCredentialSource;
 
 impl LdapCredentialSource {
@@ -63,10 +98,32 @@ impl LdapCredentialSource {
             other => CredentialError::Failed(other.to_string()),
         };
         let broker = crate::broker::Broker::connect().await.map_err(classify)?;
+
+        // El secreto primero, porque es lo que dispara el permiso: si el
+        // servicio dice que no, no tiene sentido pedir el resto. Una contraseña
+        // no vence, así que el servicio la entrega tal cual (ver el motor de
+        // tokens del daemon). Guardada bajo la clave `access`, como en DAV.
+        let password = Zeroizing::new(
+            broker
+                .access_token(account_id, capability)
+                .await
+                .map_err(classify)?,
+        );
+        if password.is_empty() {
+            // Un bind con contraseña vacía es un «unauthenticated bind»: varios
+            // servidores lo tratan como anónimo y contestan que sí. No es un
+            // enlace autenticado, así que no se intenta.
+            return Err(CredentialError::Failed(
+                "la contraseña guardada está vacía: la cuenta no está autenticada".into(),
+            ));
+        }
+
         let data = broker
             .account_data(account_id, capability)
             .await
             .map_err(classify)?;
+        // La configuración viene envuelta: el servicio devuelve la cuenta entera
+        // con la capacidad adentro.
         let config = data.get("config").unwrap_or(&data);
 
         let url = config
@@ -79,15 +136,10 @@ impl LdapCredentialSource {
             .and_then(|v| v.as_str())
             .ok_or_else(|| CredentialError::Failed("falta ldap_bind_dn".into()))?
             .to_string();
-        let password = config
-            .get("ldap_password")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| CredentialError::Failed("falta ldap_password".into()))?
-            .to_string();
         let search_base = config
             .get("ldap_search_base")
             .and_then(|v| v.as_str())
-            .unwrap_or("dc=example,dc=com")
+            .ok_or_else(|| CredentialError::Failed("falta ldap_search_base".into()))?
             .to_string();
         let search_filter = config
             .get("ldap_search_filter")
@@ -103,24 +155,11 @@ impl LdapCredentialSource {
                     .map(|s| s.to_string())
                     .collect()
             })
-            .unwrap_or_else(|| {
-                vec![
-                    "cn".into(),
-                    "sn".into(),
-                    "givenName".into(),
-                    "mail".into(),
-                    "telephoneNumber".into(),
-                    "mobile".into(),
-                    "title".into(),
-                    "department".into(),
-                    "company".into(),
-                    "streetAddress".into(),
-                    "l".into(),
-                    "st".into(),
-                    "postalCode".into(),
-                    "co".into(),
-                ]
-            });
+            .unwrap_or_else(default_attributes);
+        let allow_insecure = config
+            .get("ldap_allow_insecure")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         Ok(LdapCredential {
             url,
@@ -129,6 +168,7 @@ impl LdapCredentialSource {
             search_base,
             search_filter,
             attributes,
+            allow_insecure,
         })
     }
 }
@@ -240,8 +280,10 @@ impl LdapBackend {
 
         match applied {
             Ok(_) => {
-                let mut report = SyncReport::default();
-                report.fetched = fetched_count;
+                let report = SyncReport {
+                    fetched: fetched_count,
+                    ..Default::default()
+                };
                 set_status(AreaState::Synced, "").await;
                 SyncResult::Synced(report)
             }
@@ -252,17 +294,62 @@ impl LdapBackend {
         }
     }
 
-    /// Conecta al servidor LDAP.
+    /// Conecta al servidor LDAP y hace el bind, **cifrando el canal**.
+    ///
+    /// El bind simple manda la contraseña al servidor, así que el canal tiene que
+    /// ir cifrado o la contraseña viaja en claro:
+    ///
+    /// - `ldaps://`: TLS implícito, con validación de certificado contra el
+    ///   almacén de confianza del sistema (lo trae `ldap3` con `rustls`).
+    /// - `ldap://`: por omisión se sube a TLS con **StartTLS** antes del bind,
+    ///   con la misma validación. Sólo si la cuenta pone `ldap_allow_insecure`
+    ///   se manda el bind en claro, y se avisa.
+    /// - `ldapi://`: socket Unix local, sin red: no hace falta cifrar.
+    ///
+    /// La validación de certificado **nunca** se apaga: no se toca
+    /// `set_no_tls_verify`, así que un certificado que no valida corta la
+    /// conexión antes de mandar nada.
     async fn connect_ldap(credential: &LdapCredential) -> Result<ldap3::Ldap, String> {
-        let (conn, mut ldap) = ldap3::LdapConnAsync::new(&credential.url)
+        let parsed = url::Url::parse(&credential.url)
+            .map_err(|e| format!("ldap_url no es una dirección: {e}"))?;
+
+        let mut settings = ldap3::LdapConnSettings::new();
+        match parsed.scheme() {
+            // TLS implícito: `ldap3` lo aplica solo y valida el certificado.
+            "ldaps" => {}
+            // Socket Unix local: no sale a la red, no hay nada que cifrar.
+            "ldapi" => {}
+            "ldap" => {
+                if credential.allow_insecure {
+                    tracing::warn!(
+                        "'{}': conexión LDAP en claro por ldap_allow_insecure; el bind \
+                         viaja sin cifrar",
+                        credential.bind_dn
+                    );
+                } else {
+                    // Sube a TLS antes del bind. Si el servidor no sabe StartTLS,
+                    // el handshake falla y no se manda la contraseña en claro.
+                    settings = settings.set_starttls(true);
+                }
+            }
+            other => return Err(format!("esquema LDAP no soportado: {other}")),
+        }
+
+        let (conn, mut ldap) = ldap3::LdapConnAsync::with_settings(settings, &credential.url)
             .await
             .map_err(|e| format!("no se pudo conectar a LDAP: {e}"))?;
 
         ldap3::drive!(conn);
 
+        // `.success()` convierte un código de resultado distinto de cero —una
+        // contraseña incorrecta, por ejemplo— en error. Sin él, `simple_bind`
+        // devuelve `Ok` con un bind fallido adentro y la búsqueda seguiría como
+        // anónima.
         ldap.simple_bind(&credential.bind_dn, &credential.password)
             .await
-            .map_err(|e| format!("error en bind LDAP: {e}"))?;
+            .map_err(|e| format!("error en bind LDAP: {e}"))?
+            .success()
+            .map_err(|e| format!("el servidor LDAP rechazó el bind: {e}"))?;
 
         Ok(ldap)
     }
@@ -282,8 +369,13 @@ impl LdapBackend {
             .await
             .map_err(|e| format!("error en búsqueda LDAP: {e}"))?;
 
-        Ok(rs
-            .0
+        // Igual que en el bind: un código de resultado distinto de cero —base
+        // inexistente, filtro inválido— llega como `Ok` y hay que convertirlo.
+        let (entries, _result) = rs
+            .success()
+            .map_err(|e| format!("el servidor LDAP rechazó la búsqueda: {e}"))?;
+
+        Ok(entries
             .into_iter()
             .map(ldap3::SearchEntry::construct)
             .collect())

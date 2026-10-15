@@ -185,10 +185,15 @@ pub struct Provider {
     #[serde(default)]
     pub ldap_bind_dn: Option<String>,
 
-    /// La contraseña para autenticación LDAP.
+    /// La contraseña de bind para un proveedor LDAP **pre-provisionado**.
     ///
-    /// Sólo para proveedores `Ldap`. Se guarda cifrada en el almacén de secretos
-    /// (`vasak-keyring`), no en el archivo de configuración.
+    /// Sólo para proveedores `Ldap`, y normalmente **vacía**: igual que `dav_url`
+    /// en CardDAV, es el hueco que una organización rellena en el archivo del
+    /// catálogo (`/etc/vasak-accounts/providers.d`) para ofrecer su LDAP ya
+    /// armado. En el alta manual —la de «otro servidor», por `register_account`—
+    /// **la contraseña no pasa por acá**: viaja en `secrets_json` bajo la clave
+    /// `access` y queda cifrada en `vasak-keyring`, nunca en la configuración de
+    /// la cuenta ni visible por `GetAccountData`.
     #[serde(default)]
     pub ldap_password: Option<String>,
 }
@@ -294,10 +299,15 @@ impl Provider {
                 .into_iter()
                 .filter(|c| !self.endpoints.contains_key(c))
                 .collect(),
+            // LDAP es un directorio de **contactos** de sólo lectura y nada más.
+            // La dirección no está en el archivo: la escribe la persona al dar de
+            // alta la cuenta (`ldap_url`), igual que en CardDAV, así que contactos
+            // está disponible. Cualquier otra capacidad que un archivo le pusiera
+            // —calendario, drive— LDAP no la sabe dar, y se muestra apagada.
             ProviderKind::Ldap => self
                 .capabilities()
                 .into_iter()
-                .filter(|c| !self.endpoints.contains_key(c))
+                .filter(|c| !matches!(c, CapabilityType::Contacts))
                 .collect(),
         }
     }
