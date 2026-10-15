@@ -190,3 +190,144 @@ mod tests {
         assert!(account.1.active);
     }
 }
+
+/// La sincronización de contactos contra un servidor LDAP de mentira, de punta a
+/// punta hasta el almacén: conectar, bindear, buscar, convertir a vCard y
+/// guardar. Reusa el servidor falso de `ldap_fake`.
+#[cfg(test)]
+mod ldap_tests {
+    use super::*;
+    use crate::contacts_sync::ldap::{LdapBackend, LdapCredential};
+    use crate::contacts_sync::ldap_fake::{FakeEntry, FakeLdap, FakeLdapConfig};
+
+    /// Un almacén listo, con la cuenta dada de alta y el área de contactos
+    /// activa, igual que arma el `Fixture` de CardDAV pero sin su servidor HTTP.
+    async fn store(label: &str) -> (TempDir, Arc<StoreManager<FakeKeys>>) {
+        let temp = TempDir::new(label);
+        let keys = FakeKeys::default();
+        let manager = Arc::new(StoreManager::new(
+            keys,
+            Ok(Locations {
+                stores: temp.0.join("data/stores"),
+                settings: temp.0.join("config/stores.json"),
+            }),
+        ));
+        manager
+            .accounts_listed(
+                AccountListing::Listed(vec![ListedAccount {
+                    id: ACCOUNT.into(),
+                    display_name: "Trabajo".into(),
+                    capabilities: vec!["contacts".into()],
+                    needs_reauth: false,
+                }]),
+                Instant::now(),
+            )
+            .await;
+        assert!(manager
+            .activate_area(CONTACTS_AREA, ACCOUNT, Consent::Granted)
+            .await
+            .unwrap());
+        (temp, manager)
+    }
+
+    /// Una credencial `ldap://` en claro (`allow_insecure`) contra el servidor
+    /// falso: la única forma sin un servidor de TLS de verdad.
+    fn cleartext_credential(url: &str) -> LdapCredential {
+        LdapCredential {
+            url: url.into(),
+            bind_dn: "cn=lector,ou=servicios,dc=ejemplo,dc=com".into(),
+            password: Zeroizing::new("la-clave".into()),
+            search_base: "dc=ejemplo,dc=com".into(),
+            search_filter: "(objectClass=person)".into(),
+            attributes: vec!["cn".into(), "sn".into(), "givenName".into(), "mail".into()],
+            allow_insecure: true,
+        }
+    }
+
+    /// De punta a punta: dos personas en el directorio terminan como dos
+    /// contactos en el almacén, con sus nombres.
+    #[tokio::test]
+    async fn las_personas_del_directorio_entran_al_almacen() {
+        let server = FakeLdap::start(FakeLdapConfig {
+            bind_result: 0,
+            starttls_supported: false,
+            entries: vec![
+                FakeEntry::person(
+                    "cn=Ana Pérez,dc=ejemplo,dc=com",
+                    "Ana Pérez",
+                    "Pérez",
+                    "Ana",
+                    "ana@ejemplo.com",
+                ),
+                FakeEntry::person(
+                    "cn=Beto Ruiz,dc=ejemplo,dc=com",
+                    "Beto Ruiz",
+                    "Ruiz",
+                    "Beto",
+                    "beto@ejemplo.com",
+                ),
+            ],
+        })
+        .await;
+
+        let (_temp, manager) = store("ldap_e2e").await;
+        let credential = cleartext_credential(&server.url());
+        let ctx = SyncContext {
+            manager: &manager,
+            account_id: ACCOUNT,
+            notify: Arc::new(|| {}),
+        };
+
+        let outcome = LdapBackend.sync(ctx, &credential).await;
+        let report = match outcome {
+            SyncResult::Synced(report) => report,
+            other => panic!("la vuelta no terminó bien: {}", outcome_kind(&other)),
+        };
+        assert_eq!(report.fetched, 2);
+
+        let names: Vec<String> = manager
+            .with_store(ACCOUNT, move |store| {
+                Ok(store
+                    .connection()
+                    .prepare("SELECT display_name FROM contacts ORDER BY display_name")
+                    .unwrap()
+                    .query_map([], |row| row.get(0))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap())
+            })
+            .await
+            .expect("la base tenía que estar abierta");
+
+        assert_eq!(
+            names,
+            vec!["Ana Pérez".to_string(), "Beto Ruiz".to_string()]
+        );
+    }
+
+    /// Un bind rechazado deja la vuelta en `Failed`, no sincroniza anónimo ni
+    /// escribe contactos de nadie.
+    #[tokio::test]
+    async fn un_bind_rechazado_deja_la_vuelta_en_failed() {
+        let server = FakeLdap::start(FakeLdapConfig {
+            bind_result: 49,
+            ..Default::default()
+        })
+        .await;
+
+        let (_temp, manager) = store("ldap_bind_rechazado").await;
+        let credential = cleartext_credential(&server.url());
+        let ctx = SyncContext {
+            manager: &manager,
+            account_id: ACCOUNT,
+            notify: Arc::new(|| {}),
+        };
+
+        let outcome = LdapBackend.sync(ctx, &credential).await;
+        assert_eq!(
+            outcome_kind(&outcome),
+            "Failed",
+            "un bind rechazado no puede terminar sincronizando"
+        );
+    }
+}

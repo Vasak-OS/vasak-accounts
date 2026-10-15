@@ -1,0 +1,76 @@
+# LDAP / Active Directory genérico — un directorio corporativo contra el que
+# buscar contactos. Pensado para la libreta de la empresa: OpenLDAP, 389
+# Directory Server, Active Directory, Samba AD, y cualquier servidor que hable
+# LDAPv3.
+#
+# ── Qué hace ─────────────────────────────────────────────────────────────────
+#
+# **Sólo lectura.** Busca entradas de persona en el directorio y las copia al
+# almacén local como contactos. No escribe nunca en el servidor: una libreta de
+# empresa es de la empresa, y editarla no es cosa del cliente.
+#
+# ── Qué hace falta ───────────────────────────────────────────────────────────
+#
+# Es un alta **manual**, del mismo tipo que «otro servidor» de CardDAV: no hay
+# nada que registrar ni ningún flujo de navegador. La persona escribe los datos
+# de su directorio y la cuenta queda dada de alta por `RegisterAccount`:
+#
+#   - la URL del servidor (con esquema: `ldaps://`, `ldap://` o `ldapi://`);
+#   - el DN de enlace (`ldap_bind_dn`) y la contraseña de ese usuario;
+#   - la base de búsqueda (`ldap_search_base`);
+#   - opcionalmente, un filtro (`ldap_search_filter`) y la lista de atributos
+#     (`ldap_attributes`).
+#
+# ── Qué se guarda, y dónde ───────────────────────────────────────────────────
+#
+# La configuración (URL, DN de enlace, base, filtro, atributos) va en la
+# configuración de la cuenta. **La contraseña no**: viaja en `secrets_json` bajo
+# la clave `access` y queda cifrada en el almacén de secretos del usuario
+# (`vasak-keyring`), nunca en `accounts.json` ni visible por `GetAccountData`.
+# El sincronizador la pide por `GetAccessToken`, por la puerta de permisos, como
+# cualquier otra credencial de cuenta.
+#
+# ── Seguridad del canal ──────────────────────────────────────────────────────
+#
+# El bind simple manda la contraseña al servidor, así que el canal va cifrado:
+#
+#   - `ldaps://`: TLS implícito, con validación del certificado contra el
+#     almacén de confianza del sistema.
+#   - `ldap://`: se sube a TLS con **StartTLS** antes del bind, con la misma
+#     validación. Si el servidor no sabe StartTLS, la conexión falla en vez de
+#     mandar la contraseña en claro.
+#   - `ldapi://`: socket Unix local, sin red: no hay nada que cifrar.
+#
+# Para un servidor de laboratorio sin TLS se puede poner `ldap_allow_insecure`
+# en la configuración de la cuenta, y entonces `ldap://` va en claro (se avisa en
+# el registro). No es una opción del catálogo: es por cuenta y a propósito
+# incómoda.
+#
+# ── Campos pre-provisionados (opcionales) ────────────────────────────────────
+#
+# Una organización que quiera ofrecer su LDAP ya armado puede rellenar los
+# huecos de abajo en este archivo, en `/etc/vasak-accounts/providers.d/`. Es el
+# mismo criterio que `dav_url` en CardDAV. En el alta manual quedan vacíos.
+
+id = "ldap"
+display_name = "LDAP / Active Directory"
+kind = "ldap"
+
+capabilities = ["contacts"]
+
+# URL base del servidor LDAP, con esquema.
+# Ejemplos:
+#   OpenLDAP (TLS):      ldaps://ldap.ejemplo.com
+#   OpenLDAP (StartTLS): ldap://ldap.ejemplo.com:389
+#   Active Directory:    ldaps://ad.ejemplo.com:636
+# ldap_url = "ldaps://ldap.ejemplo.com"
+
+# DN de enlace del usuario que hace las búsquedas.
+# Ejemplos:
+#   OpenLDAP:          cn=lector,ou=servicios,dc=ejemplo,dc=com
+#   Active Directory:  lector@ejemplo.com
+# ldap_bind_dn = "cn=lector,ou=servicios,dc=ejemplo,dc=com"
+
+# Contraseña del DN de enlace.
+# En el alta manual NO va acá: va cifrada en vasak-keyring (ver arriba).
+# ldap_password = "la-contraseña-del-lector"
