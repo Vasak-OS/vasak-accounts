@@ -50,6 +50,7 @@
 //! el plazo de la vuelta. Pasar uno de la cuenta corta la vuelta sin guardar el token.
 
 pub mod backend;
+pub mod graph;
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -60,12 +61,14 @@ use chrono::{DateTime, Utc};
 
 use crate::broker::{Account, Broker, Provider};
 use crate::calendar_sync::backend::CalendarBackendKind;
+use crate::calendar_sync::graph::{GraphApiBackend, GraphSyncContext};
 use crate::dav::caldav::{self, CalendarCollection, CalendarResource};
 use crate::dav::webdav::{self, href_key, DavClient, DavCredential, DavError, HttpPolicy, Limits};
 use crate::dav_sync::{
     self, AreaSync, CollectionCap, CredentialError, CredentialSource, ListedCollection,
     MissingStreaks, Plan, RoundError, Settled, MISSING_ROUNDS,
 };
+use crate::graph::GraphCredentialSource;
 use crate::ical::recurrence::ExpansionLimits;
 use crate::store::calendar::{
     derive_with_occurrences, shift_series, CalendarApplied, CalendarListing, CalendarProgress,
@@ -339,7 +342,7 @@ impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
         }
         self.set_status(account_id, AreaState::Syncing, "").await;
 
-        // Elegir el backend. La capa sólo despacha: hoy todo es CalDAV.
+        // Elegir el backend y despachar: CalDAV o Microsoft Graph.
         let backend_kind = match self.forced_backend_kind {
             Some(kind) => kind,
             None => self.calendar_backend_kind_for_account(account_id).await,
@@ -347,6 +350,7 @@ impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
 
         match backend_kind {
             CalendarBackendKind::CalDav => self.sync_account_caldav(account_id).await,
+            CalendarBackendKind::GraphApi => self.sync_account_graph(account_id).await,
         }
     }
 
@@ -438,6 +442,51 @@ impl<K: KeySource, C: CredentialSource> CalendarSync<K, C> {
         };
         drop(credential);
         outcome
+    }
+
+    /// El camino Microsoft Graph de una vuelta: la credencial con la capacidad
+    /// `calendar` del servicio de cuentas, la ventana de la base (o la de hoy la
+    /// primera vez), y la bajada de `/me/events` que hace el backend de Graph,
+    /// con su estado. Espejo de cómo contactos despacha a su backend de Graph.
+    async fn sync_account_graph(&self, account_id: &str) -> CalendarOutcome {
+        let credential = match GraphCredentialSource
+            .credential(account_id, CALENDAR_AREA)
+            .await
+        {
+            Ok(credential) => credential,
+            Err(CredentialError::Denied) => {
+                tracing::info!("'{account_id}': sin permiso para el calendario");
+                self.set_status(account_id, AreaState::Unavailable, DENIED_DETAIL)
+                    .await;
+                return CalendarOutcome::Denied;
+            }
+            Err(CredentialError::Failed(detail)) => {
+                tracing::warn!(
+                    "'{account_id}': no se obtuvo la credencial del calendario: {detail}"
+                );
+                let shown = "no se obtuvo la credencial de la cuenta del servicio de cuentas";
+                self.set_status(account_id, AreaState::Failed, shown).await;
+                return CalendarOutcome::Failed(shown.into());
+            }
+        };
+
+        // La ventana con la que se expanden las ocurrencias: la de la base, o la
+        // de hoy la primera vez. Si la base está cerrada, el backend lo detecta
+        // en su `prepare_for_sync` y devuelve `StoreClosed`.
+        let today = Window::around((self.clock)());
+        let window = match self.store(account_id, |s| s.calendar_window()).await {
+            Ok(stored) => stored.unwrap_or(today),
+            Err(_) => today,
+        };
+
+        let ctx = GraphSyncContext {
+            manager: &self.manager,
+            account_id,
+            notify: self.notify.clone(),
+            window,
+            expansion: self.expansion,
+        };
+        GraphApiBackend.sync(ctx, &credential).await
     }
 
     async fn run(

@@ -20,9 +20,9 @@ display_name = "Microsoft"
 # `kind = "graph"` y no el oauth2 por omisión: calendario y contactos de
 # Microsoft **no** se hablan por CalDAV/CardDAV —Microsoft no los expone—, sino
 # por Microsoft Graph. Con esto el sincronizador enruta los contactos al backend
-# de Graph (`/me/contacts`, la carpeta de contactos del usuario) en vez de a
-# CardDAV, y el día que exista el backend de calendario pasa lo mismo con el
-# calendario. El **flujo de conexión sigue siendo OAuth2**: Graph es OAuth2 de
+# de Graph (`/me/contacts`, la carpeta de contactos del usuario) y el calendario
+# al suyo (`/me/events`) en vez de a CardDAV/CalDAV. El **flujo de conexión
+# sigue siendo OAuth2**: Graph es OAuth2 de
 # Microsoft —mismo intercambio de código con PKCE contra
 # login.microsoftonline.com—, por eso `auth_url` y `token_url` están acá igual
 # que en un proveedor oauth2.
@@ -31,9 +31,9 @@ kind = "graph"
 auth_url = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
 token_url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 
-# La base de Microsoft Graph, para los backends de Graph (contactos y, más
-# adelante, calendario). Las direcciones de cada capacidad la repiten abajo con
-# su ruta; se deja también acá porque la estructura del proveedor la declara.
+# La base de Microsoft Graph, para los backends de Graph (contactos y
+# calendario). Las direcciones de cada capacidad la repiten abajo con su ruta;
+# se deja también acá porque la estructura del proveedor la declara.
 graph_url = "https://graph.microsoft.com/v1.0"
 
 # client_id = "00000000-0000-0000-0000-000000000000"
@@ -104,8 +104,10 @@ smtp_port = 587
 
 [endpoints.calendar]
 # Microsoft Graph Calendar: la colección de calendarios de la cuenta. El backend
-# de lectura de calendario Graph todavía no existe (fase 2); se guarda la
-# dirección para que la capacidad quede disponible y para documentar dónde vive.
+# de lectura de calendario Graph (`calendar_sync::graph`) lee los eventos del
+# usuario (`/me/events`); la escritura por Graph es fase 2
+# (Vasak-OS/vasak-accounts#97). Se guarda la colección base para que la capacidad
+# quede disponible y para documentar dónde vive.
 url = "https://graph.microsoft.com/v1.0/me/calendars"
 
 [endpoints.contacts]

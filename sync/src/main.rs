@@ -66,6 +66,7 @@ mod contacts_sync;
 mod dav;
 mod dav_sync;
 mod email_sync;
+mod graph;
 mod html;
 mod ical;
 mod images;
