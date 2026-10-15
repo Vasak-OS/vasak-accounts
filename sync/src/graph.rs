@@ -311,3 +311,226 @@ pub async fn fetch_all_pages<T: DeserializeOwned>(
 
     Err(GraphFetchError::TooManyPages)
 }
+
+/// Maquinaria de endpoint falso de Microsoft Graph para las pruebas de los
+/// backends que lo consumen (contactos y calendario).
+///
+/// Habla HTTP/1.1 de verdad contra `reqwest` —sin atajos—, sirve una cola de
+/// respuestas JSON y anota cada pedido —su ruta, su cabecera `Authorization` y
+/// su `Prefer`— para que una prueba pueda decir «a este host no se le mandó el
+/// token» o «se pidieron las fechas en UTC». Vive junto al módulo compartido que
+/// prueba, al estilo de [`crate::dav::fake`], para que contactos y calendario
+/// reusen la misma defensa en vez de copiarla.
+#[cfg(test)]
+pub mod fake {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::GraphCredential;
+
+    /// El token que la credencial lleva al endpoint falso. Lo único que prueba
+    /// «no se le mandó el token a otro host» es que ese host no lo haya
+    /// recibido.
+    pub const TOKEN: &str = "token-secreto-de-prueba";
+
+    /// Un pedido HTTP tal como llegó al endpoint falso de Graph.
+    #[derive(Clone)]
+    pub struct GraphRequest {
+        pub path: String,
+        pub authorization: String,
+        /// La cabecera `Prefer`, vacía si no vino: el calendario la usa para
+        /// pedir las fechas en UTC (`outlook.timezone="UTC"`).
+        pub prefer: String,
+    }
+
+    /// Lo que el endpoint falso sabe contestar.
+    struct FakeGraphState {
+        /// Respuestas `(estado, cuerpo JSON)` a servir en orden de llegada.
+        responses: VecDeque<(u16, String)>,
+        /// Cada pedido que llegó, con sus cabeceras: para poder decir «este host
+        /// no recibió el token» o «se pidió en UTC».
+        requests: Vec<GraphRequest>,
+        /// Si la cola se vacía: con `Some(origin)` se generan páginas únicas sin
+        /// fin (para el tope de páginas); con `None` se contesta 500.
+        auto_next: Option<String>,
+        /// Contador de páginas autogeneradas, para que cada `nextLink` sea único
+        /// y no dispare el deduplicado.
+        auto_count: usize,
+    }
+
+    /// Un servidor HTTP/JSON de mentira en `127.0.0.1`, al estilo de
+    /// `crate::dav::fake`.
+    #[derive(Clone)]
+    pub struct FakeGraph {
+        state: Arc<Mutex<FakeGraphState>>,
+        port: u16,
+    }
+
+    impl FakeGraph {
+        pub async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let state = Arc::new(Mutex::new(FakeGraphState {
+                responses: VecDeque::new(),
+                requests: Vec::new(),
+                auto_next: None,
+                auto_count: 0,
+            }));
+            let shared = Arc::clone(&state);
+            tokio::spawn(async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    let state = Arc::clone(&shared);
+                    tokio::spawn(serve_graph(socket, state));
+                }
+            });
+            Self { state, port }
+        }
+
+        pub fn origin(&self) -> String {
+            format!("http://127.0.0.1:{}", self.port)
+        }
+
+        /// La raíz que la credencial le pasa al sincronizador; en producción es
+        /// [`super::GRAPH_BASE_URL`]. El host y el puerto de esta URL son el
+        /// único origen al que el sincronizador adjunta el token.
+        pub fn base_url(&self) -> String {
+            format!("{}/v1.0", self.origin())
+        }
+
+        /// Encola una respuesta JSON con estado 200.
+        pub fn push(&self, body: impl Into<String>) {
+            self.state
+                .lock()
+                .unwrap()
+                .responses
+                .push_back((200, body.into()));
+        }
+
+        /// Encola una respuesta con un estado arbitrario.
+        pub fn push_status(&self, status: u16, body: impl Into<String>) {
+            self.state
+                .lock()
+                .unwrap()
+                .responses
+                .push_back((status, body.into()));
+        }
+
+        /// A partir de que se vacíe la cola, generar páginas únicas sin fin: para
+        /// llegar al tope de páginas sin que se dispare el deduplicado.
+        pub fn auto_paginate(&self) {
+            let origin = self.origin();
+            self.state.lock().unwrap().auto_next = Some(origin);
+        }
+
+        pub fn requests(&self) -> Vec<GraphRequest> {
+            self.state.lock().unwrap().requests.clone()
+        }
+    }
+
+    async fn serve_graph(mut socket: tokio::net::TcpStream, state: Arc<Mutex<FakeGraphState>>) {
+        let mut buffer = Vec::new();
+        loop {
+            // La cabecera entera.
+            let header_end = loop {
+                if let Some(end) = find(&buffer, b"\r\n\r\n") {
+                    break end;
+                }
+                let mut chunk = [0u8; 8192];
+                match socket.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                }
+            };
+            let head = String::from_utf8_lossy(&buffer[..header_end]).into_owned();
+            let mut lines = head.split("\r\n");
+            let request_line = lines.next().unwrap_or("").to_string();
+            let path = request_line
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .to_string();
+            let mut authorization = String::new();
+            let mut prefer = String::new();
+            let mut length = 0usize;
+            for line in lines {
+                if let Some((name, value)) = line.split_once(':') {
+                    let name = name.trim().to_ascii_lowercase();
+                    let value = value.trim();
+                    if name == "authorization" {
+                        authorization = value.to_string();
+                    } else if name == "prefer" {
+                        prefer = value.to_string();
+                    } else if name == "content-length" {
+                        length = value.parse().unwrap_or(0);
+                    }
+                }
+            }
+            let body_start = header_end + 4;
+            while buffer.len() < body_start + length {
+                let mut chunk = [0u8; 8192];
+                match socket.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                }
+            }
+            buffer.drain(..body_start + length);
+
+            let (status, body) = {
+                let mut state = state.lock().unwrap();
+                state.requests.push(GraphRequest {
+                    path: path.clone(),
+                    authorization: authorization.clone(),
+                    prefer: prefer.clone(),
+                });
+                match state.responses.pop_front() {
+                    Some(answer) => answer,
+                    None => {
+                        match state.auto_next.clone() {
+                            Some(origin) => {
+                                state.auto_count += 1;
+                                let n = state.auto_count;
+                                (
+                                200,
+                                format!("{{\"value\":[],\"@odata.nextLink\":\"{origin}/auto/{n}\"}}"),
+                            )
+                            }
+                            None => (500, String::new()),
+                        }
+                    }
+                }
+            };
+
+            let out = format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            let mut bytes = out.into_bytes();
+            bytes.extend_from_slice(body.as_bytes());
+            if socket.write_all(&bytes).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// Un cliente HTTP con el plazo de conexión del servicio, como en
+    /// producción.
+    pub fn client() -> reqwest::Client {
+        super::http_client().unwrap()
+    }
+
+    /// Una credencial que apunta al endpoint falso, con el token de prueba y
+    /// `user_id` «me».
+    pub fn credential_for(server: &FakeGraph) -> GraphCredential {
+        GraphCredential {
+            access_token: zeroize::Zeroizing::new(TOKEN.to_string()),
+            user_id: "me".to_string(),
+            base_url: server.base_url(),
+        }
+    }
+}

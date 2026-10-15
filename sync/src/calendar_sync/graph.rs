@@ -880,4 +880,475 @@ mod tests {
         )
         .is_none());
     }
+
+    // ── Pruebas definitivas: endpoint falso, paginación y hallazgos de
+    // seguridad. Escritas por qa, reusando la maquinaria de `crate::graph::fake`
+    // —la misma que usan las pruebas de contactos—. ──────────────────────────
+
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use chrono::TimeZone;
+
+    use crate::graph::fake::{client, credential_for, FakeGraph, TOKEN};
+    use crate::store::key::fake::FakeKeys;
+    use crate::store::lifecycle::{AccountListing, Consent, ListedAccount, Locations};
+    use crate::store::paths::tests::TempDir;
+
+    const ACCOUNT: &str = "cuenta";
+    /// Mediodía UTC del 26 de septiembre de 2026, como en las pruebas de CalDAV:
+    /// la ventana de expansión se arma alrededor de este instante, y los eventos
+    /// de las pruebas caen dentro de ella.
+    const TODAY: i64 = 1_790_424_000;
+
+    fn test_window() -> Window {
+        Window::around(chrono::Utc.timestamp_opt(TODAY, 0).unwrap())
+    }
+
+    /// Un evento completo, con todos los campos que se convierten a `VEVENT`,
+    /// para comprobar la conversión de punta a punta pasando por el endpoint
+    /// falso y el almacén.
+    fn evento_completo_json() -> &'static str {
+        r#"{
+            "id": "AAA-1",
+            "iCalUId": "uid-full",
+            "subject": "Reunión de equipo",
+            "bodyPreview": "Repaso semanal",
+            "start": { "dateTime": "2026-09-28T14:00:00.0000000", "timeZone": "UTC" },
+            "end": { "dateTime": "2026-09-28T15:00:00.0000000", "timeZone": "UTC" },
+            "isAllDay": false,
+            "location": { "displayName": "Sala 3" },
+            "organizer": { "emailAddress": { "name": "Ada", "address": "ada@example.com" } },
+            "attendees": [
+                { "emailAddress": { "name": "Bob", "address": "bob@example.com" },
+                  "status": { "response": "accepted" } }
+            ],
+            "categories": ["Trabajo", "Importante"],
+            "importance": "high",
+            "lastModifiedDateTime": "2026-09-01T10:00:00.0000000"
+        }"#
+    }
+
+    /// El almacén local y el gestor, con la cuenta lista y el área de calendario
+    /// activada, para correr `GraphApiBackend::sync` de punta a punta.
+    struct Fixture {
+        _temp: TempDir,
+        manager: Arc<StoreManager<FakeKeys>>,
+        server: FakeGraph,
+    }
+
+    impl Fixture {
+        async fn new(label: &str) -> Self {
+            let temp = TempDir::new(label);
+            let keys = FakeKeys::default();
+            let manager = Arc::new(StoreManager::new(
+                keys,
+                Ok(Locations {
+                    stores: temp.0.join("data/stores"),
+                    settings: temp.0.join("config/stores.json"),
+                }),
+            ));
+            manager
+                .accounts_listed(
+                    AccountListing::Listed(vec![ListedAccount {
+                        id: ACCOUNT.into(),
+                        display_name: "Trabajo".into(),
+                        capabilities: vec!["calendar".into()],
+                        needs_reauth: false,
+                    }]),
+                    Instant::now(),
+                )
+                .await;
+            assert!(manager
+                .activate_area(CALENDAR_AREA, ACCOUNT, Consent::Granted)
+                .await
+                .unwrap());
+            let server = FakeGraph::start().await;
+            Self {
+                _temp: temp,
+                manager,
+                server,
+            }
+        }
+
+        async fn sync(&self) -> CalendarOutcome {
+            let ctx = GraphSyncContext {
+                manager: &self.manager,
+                account_id: ACCOUNT,
+                notify: Arc::new(|| {}),
+                window: test_window(),
+                expansion: ExpansionLimits::DEFAULT,
+            };
+            GraphApiBackend
+                .sync(ctx, &credential_for(&self.server))
+                .await
+        }
+
+        async fn synced(&self) -> CalendarReport {
+            match self.sync().await {
+                CalendarOutcome::Synced(report) => report,
+                other => panic!("la vuelta no terminó bien: {other:?}"),
+            }
+        }
+
+        async fn calendar_names(&self) -> Vec<String> {
+            self.manager
+                .with_store(ACCOUNT, |store| {
+                    let c = store.connection();
+                    Ok(
+                        c.prepare("SELECT display_name FROM calendars ORDER BY display_name")
+                            .unwrap()
+                            .query_map([], |row| row.get::<_, String>(0))
+                            .unwrap()
+                            .collect::<Result<Vec<_>, _>>()
+                            .unwrap(),
+                    )
+                })
+                .await
+                .expect("la base tenía que estar abierta")
+        }
+
+        /// El iCalendar crudo guardado para un UID.
+        async fn raw_for(&self, uid: &'static str) -> String {
+            self.manager
+                .with_store(ACCOUNT, move |store| {
+                    Ok(store
+                        .connection()
+                        .query_row(
+                            "SELECT raw_ical FROM calendar_objects WHERE uid = ?1",
+                            [uid],
+                            |r| r.get::<_, String>(0),
+                        )
+                        .unwrap())
+                })
+                .await
+                .expect("la base tenía que estar abierta")
+        }
+
+        async fn count(&self, sql: &'static str) -> i64 {
+            self.manager
+                .with_store(ACCOUNT, move |store| {
+                    Ok(store.connection().query_row(sql, [], |r| r.get(0)).unwrap())
+                })
+                .await
+                .expect("la base tenía que estar abierta")
+        }
+    }
+
+    /// (1) Paginación: dos páginas con `nextLink` al **mismo host** se siguen,
+    /// todos los eventos se upsertan en «Graph Calendar», cada pedido lleva el
+    /// token y pide las fechas en UTC, y los `VEVENT` salen con los campos
+    /// correctos —incluido un evento de día completo y uno recurrente—.
+    #[tokio::test]
+    async fn la_paginacion_del_mismo_host_trae_y_convierte_todos_los_eventos() {
+        let f = Fixture::new("graph-cal-paginacion").await;
+        let origin = f.server.origin();
+        // Página 1: el completo y un evento de día completo, con nextLink al
+        // mismo host.
+        f.server.push(format!(
+            "{{\"value\":[{completo},{{\
+               \"id\":\"AAA-2\",\"iCalUId\":\"uid-allday\",\"subject\":\"Feriado\",\
+               \"isAllDay\":true,\
+               \"start\":{{\"dateTime\":\"2026-10-01T00:00:00.0000000\",\"timeZone\":\"UTC\"}},\
+               \"end\":{{\"dateTime\":\"2026-10-02T00:00:00.0000000\",\"timeZone\":\"UTC\"}}}}],\
+             \"@odata.nextLink\":\"{origin}/v1.0/me/events?$skip=100\"}}",
+            completo = evento_completo_json()
+        ));
+        // Página 2: un evento recurrente semanal, sin nextLink.
+        f.server.push(
+            r#"{"value":[{
+                "id": "AAA-3", "iCalUId": "uid-weekly", "subject": "Semanal",
+                "start": { "dateTime": "2026-09-28T09:00:00.0000000", "timeZone": "UTC" },
+                "end": { "dateTime": "2026-09-28T09:30:00.0000000", "timeZone": "UTC" },
+                "recurrence": {
+                    "pattern": { "type": "weekly", "interval": 1, "daysOfWeek": ["monday"] },
+                    "range": { "type": "numbered", "numberOfOccurrences": 5 }
+                }
+            }]}"#,
+        );
+
+        let report = f.synced().await;
+        assert_eq!(report.fetched, 3, "tres eventos entre las dos páginas");
+        assert_eq!(
+            f.count("SELECT count(*) FROM calendar_objects").await,
+            3,
+            "los tres se guardaron"
+        );
+        assert_eq!(f.calendar_names().await, vec!["Graph Calendar".to_string()]);
+
+        // Se pidieron las dos páginas; cada pedido llevó el token (la base_url es
+        // el único origen al que se adjunta) y pidió las fechas en UTC.
+        let requests = f.server.requests();
+        assert_eq!(requests.len(), 2, "se siguió el nextLink del mismo host");
+        for r in &requests {
+            assert_eq!(r.authorization, format!("Bearer {TOKEN}"));
+            assert_eq!(
+                r.prefer, "outlook.timezone=\"UTC\"",
+                "cada pedido pide las fechas en UTC"
+            );
+        }
+        assert!(
+            requests[0].path.starts_with("/v1.0/users/me/events"),
+            "la URL inicial sale de la base_url: {}",
+            requests[0].path
+        );
+
+        // El completo: UID desde iCalUId, fechas con TZ (UTC), SUMMARY, LOCATION,
+        // ORGANIZER, ATTENDEE con PARTSTAT, CATEGORIES y PRIORITY.
+        let completo = f.raw_for("uid-full").await;
+        assert!(completo.contains("UID:uid-full\r\n"), "{completo:?}");
+        assert!(completo.contains("SUMMARY:Reunión de equipo\r\n"));
+        assert!(completo.contains("DESCRIPTION:Repaso semanal\r\n"));
+        assert!(completo.contains("DTSTART:20260928T140000Z\r\n"));
+        assert!(completo.contains("DTEND:20260928T150000Z\r\n"));
+        assert!(completo.contains("LOCATION:Sala 3\r\n"));
+        assert!(completo.contains("ORGANIZER;CN=\"Ada\":mailto:ada@example.com\r\n"));
+        assert!(
+            completo.contains("ATTENDEE;CN=\"Bob\";PARTSTAT=ACCEPTED:mailto:bob@example.com\r\n")
+        );
+        assert!(completo.contains("CATEGORIES:Trabajo,Importante\r\n"));
+        assert!(completo.contains("PRIORITY:1\r\n"));
+
+        // El de día completo va con `VALUE=DATE`.
+        let allday = f.raw_for("uid-allday").await;
+        assert!(
+            allday.contains("DTSTART;VALUE=DATE:20261001\r\n"),
+            "{allday:?}"
+        );
+        assert!(
+            allday.contains("DTEND;VALUE=DATE:20261002\r\n"),
+            "{allday:?}"
+        );
+
+        // El recurrente lleva su RRULE.
+        let weekly = f.raw_for("uid-weekly").await;
+        assert!(weekly.contains("RRULE:FREQ=WEEKLY"), "{weekly:?}");
+        assert!(weekly.contains("BYDAY=MO"), "{weekly:?}");
+        assert!(weekly.contains("COUNT=5"), "{weekly:?}");
+    }
+
+    /// (2 · módulo compartido) Un `nextLink` a **otro host** aborta la
+    /// sincronización con `UntrustedNextLink` y **no** le manda el token a ese
+    /// host: no hay una segunda petición al atacante. El mismo host sí se sigue.
+    ///
+    /// Es la defensa que vive en `crate::graph::fetch_all_pages`, compartida con
+    /// contactos; esta prueba la ejercita por el camino del calendario.
+    /// Rojo-sin-arreglo: si se quita la validación `same_origin`, el
+    /// sincronizador sigue el enlace, el atacante recibe el token y esta prueba
+    /// falla.
+    #[tokio::test]
+    async fn un_next_link_a_otro_host_aborta_sin_mandar_el_token() {
+        let victima = FakeGraph::start().await;
+        let atacante = FakeGraph::start().await;
+        victima.push(format!(
+            "{{\"value\":[{{\"id\":\"AAA\",\"iCalUId\":\"u\"}}],\
+             \"@odata.nextLink\":\"{}/v1.0/me/events?$skip=100\"}}",
+            atacante.origin()
+        ));
+
+        let result = GraphApiBackend::fetch_all_events(&client(), &credential_for(&victima)).await;
+        assert!(
+            matches!(result, Err(GraphFetchError::UntrustedNextLink)),
+            "un nextLink a otro host tiene que abortar con UntrustedNextLink, dio {result:?}"
+        );
+
+        let de_la_victima = victima.requests();
+        assert_eq!(de_la_victima.len(), 1);
+        assert_eq!(de_la_victima[0].authorization, format!("Bearer {TOKEN}"));
+        assert!(
+            atacante.requests().is_empty(),
+            "el token no debe viajar al host del nextLink no confiable"
+        );
+    }
+
+    /// (2 · módulo compartido) El contrapunto: un `nextLink` al **mismo host** sí
+    /// se sigue, y los eventos de las dos páginas vuelven.
+    #[tokio::test]
+    async fn un_next_link_del_mismo_host_se_sigue() {
+        let server = FakeGraph::start().await;
+        let origin = server.origin();
+        server.push(format!(
+            "{{\"value\":[{{\"id\":\"A\",\"iCalUId\":\"a\"}}],\
+             \"@odata.nextLink\":\"{origin}/v1.0/me/events?$skip=100\"}}"
+        ));
+        server.push(r#"{"value":[{"id":"B","iCalUId":"b"}]}"#);
+
+        let result = GraphApiBackend::fetch_all_events(&client(), &credential_for(&server)).await;
+        let events = result.expect("el nextLink del mismo host se sigue");
+        assert_eq!(events.len(), 2);
+        assert_eq!(server.requests().len(), 2);
+    }
+
+    /// (3 · inyección por UID/iCalUId) Un `iCalUId` con `\r\n` —y una `VALARM` o
+    /// un `ATTENDEE` enteros incrustados— **no** fabrica propiedades nuevas ni
+    /// parte/cierra el `VEVENT`: el salto queda escapado como `\n` dentro del
+    /// valor del UID. El UID es el campo que se olvidó en contactos; acá se
+    /// cubre explícito.
+    ///
+    /// Rojo-sin-arreglo: si el `UID:` vuelve a emitir el valor crudo
+    /// (`format!("UID:{uid}\r\n")` sin `escape_text`), el `\r\n` abre líneas
+    /// reales y un segundo `UID`, y esta prueba falla.
+    #[test]
+    fn un_ical_uid_con_salto_no_fabrica_propiedades_ni_parte_el_vevent() {
+        for payload in [
+            r#"X\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT5M\r\nEND:VALARM\r\nUID:Y"#,
+            r#"X\r\nATTENDEE:mailto:evil@example.com"#,
+        ] {
+            let event = event_from(&format!(r#"{{ "id": "x", "iCalUId": "{payload}" }}"#));
+            let ical = GraphApiBackend::event_to_ical(&event);
+            let lineas: Vec<&str> = ical.split("\r\n").collect();
+
+            assert_eq!(
+                lineas.iter().filter(|l| l.starts_with("UID:")).count(),
+                1,
+                "el UID partido no debe fabricar un segundo UID (payload={payload}): {ical:?}"
+            );
+            assert_eq!(
+                lineas
+                    .iter()
+                    .filter(|l| l.trim_start() == "BEGIN:VALARM")
+                    .count(),
+                0,
+                "no debe fabricarse una VALARM (payload={payload}): {ical:?}"
+            );
+            assert!(
+                !ical.contains("\r\nACTION:DISPLAY"),
+                "la VALARM inyectada no debe quedar como línea (payload={payload}): {ical:?}"
+            );
+            assert!(
+                !ical.contains("\r\nATTENDEE:mailto:evil"),
+                "el ATTENDEE inyectado no debe quedar como línea (payload={payload}): {ical:?}"
+            );
+        }
+
+        // El salto queda escapado como `\n` dentro del valor del UID.
+        let event =
+            event_from(r#"{ "id": "x", "iCalUId": "X\r\nBEGIN:VALARM\r\nEND:VALARM\r\nUID:Y" }"#);
+        let ical = GraphApiBackend::event_to_ical(&event);
+        assert!(ical.contains("UID:X\\nBEGIN:VALARM"), "{ical:?}");
+    }
+
+    /// (4 · inyección por otros campos de texto) `location` y `categories` con
+    /// `;`, `,`, `\` y `\r\n` quedan escapados: ni fabrican una propiedad nueva
+    /// ni parten el `VEVENT`. `location` es un valor TEXT y `categories` una
+    /// lista de valores TEXT (cada uno escapado, juntados con comas sin escapar).
+    ///
+    /// Rojo-sin-arreglo: si alguno de los dos se emite sin `escape_text`, el
+    /// `\r\n` abre una línea real (un `SUMMARY`, un segundo `UID`) y esta prueba
+    /// falla.
+    #[test]
+    fn location_y_categories_con_metacaracteres_quedan_escapados() {
+        let event = event_from(
+            r#"{ "id": "x", "iCalUId": "u",
+                 "location": { "displayName": "Sala;3,b\\c\r\nSUMMARY:X" },
+                 "categories": ["a,b", "c;d", "e\\f", "g\r\nUID:Z"] }"#,
+        );
+        let ical = GraphApiBackend::event_to_ical(&event);
+
+        // Ningún salto real: no se fabrica un SUMMARY ni un segundo UID.
+        assert!(!ical.contains("\r\nSUMMARY:X"), "{ical:?}");
+        let lineas: Vec<&str> = ical.split("\r\n").collect();
+        assert_eq!(
+            lineas.iter().filter(|l| l.starts_with("UID:")).count(),
+            1,
+            "categories no debe fabricar un segundo UID: {ical:?}"
+        );
+
+        // `location` escapada: `;` `,` `\` escapados y el salto como `\n`.
+        assert!(
+            ical.contains(r"LOCATION:Sala\;3\,b\\c\nSUMMARY:X"),
+            "{ical:?}"
+        );
+        // `categories`: cada valor escapa su `;` `,` `\` y su salto; se juntan
+        // con comas sin escapar (que sí separan).
+        assert!(
+            ical.contains(r"CATEGORIES:a\,b,c\;d,e\\f,g\nUID:Z"),
+            "{ical:?}"
+        );
+    }
+
+    /// (5 · cotas de paginación) Un `nextLink` que se repite corta con
+    /// `PaginationLoop` sin colgarse.
+    #[tokio::test]
+    async fn un_next_link_repetido_corta_el_bucle() {
+        let server = FakeGraph::start().await;
+        let origin = server.origin();
+        let bucle = format!("{origin}/v1.0/me/events?$skip=100");
+        server.push(format!("{{\"value\":[],\"@odata.nextLink\":\"{bucle}\"}}"));
+        server.push(format!("{{\"value\":[],\"@odata.nextLink\":\"{bucle}\"}}"));
+
+        let result = GraphApiBackend::fetch_all_events(&client(), &credential_for(&server)).await;
+        assert!(
+            matches!(result, Err(GraphFetchError::PaginationLoop)),
+            "un nextLink repetido corta con PaginationLoop, dio {result:?}"
+        );
+    }
+
+    /// (5 · cotas de paginación) Superar el tope de páginas da `TooManyPages` sin
+    /// agotar memoria: el servidor genera páginas únicas sin fin.
+    #[tokio::test]
+    async fn superar_el_tope_de_paginas_aborta() {
+        let server = FakeGraph::start().await;
+        server.auto_paginate();
+
+        let result = GraphApiBackend::fetch_all_events(&client(), &credential_for(&server)).await;
+        assert!(
+            matches!(result, Err(GraphFetchError::TooManyPages)),
+            "pasado el tope de páginas se aborta con TooManyPages, dio {result:?}"
+        );
+        assert_eq!(
+            server.requests().len(),
+            graph::MAX_PAGES,
+            "se pidieron exactamente MAX_PAGES páginas antes de cortar"
+        );
+    }
+
+    /// (6 · bordes) Un HTTP de error devuelve un error tipado **sin** el cuerpo
+    /// crudo de Graph.
+    #[tokio::test]
+    async fn un_http_de_error_no_vuelca_el_cuerpo_crudo() {
+        let server = FakeGraph::start().await;
+        server.push_status(500, "cuerpo-secreto-crudo-de-graph");
+
+        let result = GraphApiBackend::fetch_all_events(&client(), &credential_for(&server)).await;
+        let err = result.expect_err("un 500 tiene que ser Err");
+        assert!(
+            matches!(err, GraphFetchError::Http(s) if s == reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        assert!(
+            !err.to_string().contains("cuerpo-secreto-crudo-de-graph"),
+            "el cuerpo crudo del error no se muestra: {err}"
+        );
+    }
+
+    /// (6 · bordes) Un JSON inválido da `Parse`, no un pánico.
+    #[tokio::test]
+    async fn un_json_invalido_da_error_de_parseo() {
+        let server = FakeGraph::start().await;
+        server.push("esto no es json {{{");
+
+        let result = GraphApiBackend::fetch_all_events(&client(), &credential_for(&server)).await;
+        assert!(
+            matches!(result, Err(GraphFetchError::Parse)),
+            "dio {result:?}"
+        );
+    }
+
+    /// (6 · bordes, de punta a punta) Un evento sin `id` se descarta; uno sin
+    /// `iCalUId` usa el `id` como UID y se guarda. Sin pánico.
+    #[tokio::test]
+    async fn un_evento_sin_id_se_descarta_y_uno_sin_ical_uid_usa_el_id() {
+        let f = Fixture::new("graph-cal-bordes").await;
+        f.server.push(
+            r#"{"value":[{"id":"","subject":"Fantasma"},{"id":"keep","subject":"Sin iCalUId"}]}"#,
+        );
+
+        let report = f.synced().await;
+        assert_eq!(report.fetched, 1, "el evento sin id no se guarda");
+        assert_eq!(f.count("SELECT count(*) FROM calendar_objects").await, 1);
+
+        let raw = f.raw_for("keep").await;
+        assert!(raw.contains("UID:keep\r\n"), "{raw:?}");
+        assert!(raw.contains("SUMMARY:Sin iCalUId\r\n"), "{raw:?}");
+    }
 }
