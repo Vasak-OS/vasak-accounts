@@ -33,6 +33,8 @@ pub mod backend;
 pub mod carddav;
 pub mod graph;
 pub mod ldap;
+#[cfg(test)]
+pub mod ldap_fake;
 
 use std::future::Future;
 use std::sync::Arc;

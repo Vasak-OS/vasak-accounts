@@ -101,3 +101,9 @@ zbus = { workspace = true, features = ["p2p", "bus-impl"] }
 # agrega a las dependencias normales porque eso también entra en el binario que
 # se instala; acá sólo se suma para las pruebas.
 tokio = { workspace = true, features = ["test-util"] }
+# Para el servidor LDAP de mentira de las pruebas (`contacts_sync/ldap_fake.rs`):
+# `lber` es la biblioteca de BER que `ldap3` ya usa por dentro, así que las
+# respuestas que arma son bytes LDAP legítimos y no suma ninguna crate nueva;
+# `bytes` es el buffer que pide su codificador. Sólo para las pruebas.
+lber = "0.5"
+bytes = "1"

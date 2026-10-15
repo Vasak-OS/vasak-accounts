@@ -1321,6 +1321,90 @@ mod tests {
         }
     }
 
+    /// El catálogo trae el proveedor LDAP, es de tipo `Ldap` y ofrece contactos.
+    /// Es lo que hace que `ListProviders` lo ofrezca y que
+    /// `backend_kind_for_account` lo resuelva al backend LDAP por su `kind`.
+    #[test]
+    fn el_proveedor_ldap_ofrece_contactos() {
+        let directorio =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/providers.d");
+        let ldap = &cargar(&directorio)["ldap"];
+
+        assert_eq!(ldap.kind, ProviderKind::Ldap);
+        assert_eq!(ldap.capabilities(), vec![CapabilityType::Contacts]);
+    }
+
+    /// LDAP es un directorio de contactos de **sólo lectura**: contactos está
+    /// disponible —la dirección la escribe la persona al conectar, como en
+    /// CardDAV—, y cualquier otra capacidad que un archivo le pusiera —calendario,
+    /// drive— LDAP no la sabe dar y se muestra apagada.
+    #[test]
+    fn ldap_solo_da_contactos_el_resto_apagado() {
+        let dir = temp_dir();
+        std::fs::write(
+            dir.join("ldap.toml"),
+            r#"
+                id = "ldap"
+                display_name = "LDAP"
+                kind = "ldap"
+                capabilities = ["contacts", "calendar"]
+            "#,
+        )
+        .unwrap();
+
+        let ldap = &cargar(&dir)["ldap"];
+        let apagadas = ldap.unavailable_capabilities();
+        assert!(
+            !apagadas.contains(&CapabilityType::Contacts),
+            "contactos tiene que estar disponible: {apagadas:?}"
+        );
+        assert!(
+            apagadas.contains(&CapabilityType::Calendar),
+            "lo que no sean contactos va apagado: {apagadas:?}"
+        );
+
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// El archivo del paquete viene **sin** los datos del servidor, así que no
+    /// está configurado; una organización que rellene `ldap_url`, `ldap_bind_dn`
+    /// y `ldap_password` en `/etc` lo deja listo para el alta pre-provisionada.
+    /// En el alta manual la contraseña no va acá: viaja cifrada en el llavero.
+    #[test]
+    fn ldap_necesita_los_tres_campos_para_estar_configurado() {
+        let base = r#"
+            id = "ldap"
+            display_name = "LDAP"
+            kind = "ldap"
+            capabilities = ["contacts"]
+        "#;
+
+        let sin_datos = temp_dir();
+        std::fs::write(sin_datos.join("ldap.toml"), base).unwrap();
+        assert!(
+            !cargar(&sin_datos)["ldap"].is_configured(),
+            "sin datos del servidor no puede estar configurado"
+        );
+        std::fs::remove_dir_all(&sin_datos).unwrap_or_default();
+
+        let completo = temp_dir();
+        std::fs::write(
+            completo.join("ldap.toml"),
+            format!(
+                "{base}\n\
+                 ldap_url = \"ldaps://ad.ejemplo.com\"\n\
+                 ldap_bind_dn = \"cn=lector,dc=ejemplo,dc=com\"\n\
+                 ldap_password = \"la-del-lector\"\n"
+            ),
+        )
+        .unwrap();
+        assert!(
+            cargar(&completo)["ldap"].is_configured(),
+            "con los tres campos tiene que quedar listo"
+        );
+        std::fs::remove_dir_all(&completo).unwrap_or_default();
+    }
+
     /// Cada capacidad que un proveedor OAuth2 ofrece tiene que decir **dónde
     /// vive**, o la cuenta se conecta bien y después ninguna aplicación sabe a
     /// qué servidor hablarle: es exactamente el fallo que se arregló acá, y no
