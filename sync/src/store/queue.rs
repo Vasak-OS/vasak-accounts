@@ -519,15 +519,19 @@ impl Store {
                     rusqlite::params![new_href, op.object_href, op.collection_href],
                 )
                 .map_err(classify)?;
-            // En operación normal el DELETE no borra nada (nadie más ocupa el
-            // `id` que el servidor recién asignó). Si borró una fila, el servidor
-            // devolvió un `id` que ya era el `href` de OTRO objeto de la colección
-            // —sólo puede pasar con un servidor adversario—: se lo deja anotado
-            // sin datos sensibles (sólo el `href` nuevo, que es el `id` del server).
+            // Si el DELETE borró una fila, lo esperable es el caso **legítimo de
+            // idempotencia**: una bajada anterior ya trajo el objeto bajo el `id`
+            // que asignó el servidor (POST idempotente por `transactionId`), así que
+            // re-basar la fila local a ese `id` desplaza esa copia ya bajada. Pasa en
+            // operación normal. El caso adversario (BAJA-2 de #118) sería que ese `id`
+            // colisione con un objeto **distinto** con su propia op pendiente, pero
+            // acá no se distingue uno de otro sin comparar el UID. Queda como traza de
+            // diagnóstico (no una advertencia), con el `href` nuevo (el `id` del
+            // servidor) y sin datos sensibles.
             if displaced > 0 {
-                tracing::warn!(
+                tracing::debug!(
                     new_href,
-                    "complete_create desplazó una fila ajena al re-basar el href (id del servidor en conflicto)"
+                    "complete_create desplazó una fila al re-basar el href (re-basado de idempotencia; no se distingue del conflicto adversario sin comparar el UID)"
                 );
             }
             // 2) Re-basar la fila local al `id` del servidor (sin `OR REPLACE`: la
