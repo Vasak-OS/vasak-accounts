@@ -1231,6 +1231,32 @@ mod end_to_end {
         );
         assert_eq!(f.op_server_raw("SRV-ID").await, None);
     }
+
+    /// **Una copia del servidor más grande que el tope no se guarda**: el `GET` de la
+    /// captura devuelve más de `MAX_OBJECT_BYTES`; la lectura capada corta con
+    /// `TooLarge`, no se guarda copia, se cuenta el intento y el local queda intacto.
+    #[tokio::test]
+    async fn una_copia_del_servidor_mas_grande_que_el_tope_no_se_guarda() {
+        let f = Fixture::new("graph-e2e-captura-grande").await;
+        f.enqueue_put("SRV-ID", "Mía", Some("\"vieja\"")).await;
+        f.server.push_status(412, "");
+        // JSON válido: sólo el tope puede rechazarlo.
+        f.server.push(server_contact(
+            &"x".repeat(crate::graph::MAX_OBJECT_BYTES),
+            "\"srv\"",
+        ));
+
+        f.replay().await;
+
+        assert_eq!(f.op_state("SRV-ID").await.as_deref(), Some("conflict"));
+        assert_eq!(f.pending().await, 1, "la op sigue en la cola");
+        assert_eq!(f.op_server_raw("SRV-ID").await, None, "no se guardó copia");
+        assert_eq!(f.op_attempts("SRV-ID").await, Some(2), "se contó la traída");
+        assert!(f
+            .stored("SRV-ID", "raw_vcard")
+            .await
+            .is_some_and(|r| r.contains("Mía")));
+    }
 }
 
 // ── De punta a punta por el camino de **calendario** (`/me/events`) ───────────
@@ -1699,5 +1725,87 @@ mod end_to_end_calendar {
             f.stored("SRV-ID", "etag").await.as_deref(),
             Some("W/\"srv\"")
         );
+    }
+}
+
+// ── Lectura capada por chunks (`graph::read_capped`) ──────────────────────────
+mod read_capped {
+    use std::time::{Duration, Instant};
+
+    use tokio::io::AsyncWriteExt;
+
+    use crate::graph::fake::{self, FakeGraph};
+    use crate::graph::{fetch_one, read_capped, CappedReadError, GraphFetchError};
+
+    async fn respuesta(server: &FakeGraph) -> reqwest::Response {
+        fake::client().get(server.origin()).send().await.unwrap()
+    }
+
+    /// Un servidor hostil: **promete** 100 MB, manda `sent` bytes y deja el socket
+    /// abierto sin mandar más (no cierra ni termina el cuerpo).
+    async fn servidor_que_promete_de_mas(sent: usize) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    // Se descarta el pedido: alcanza con contestar.
+                    let mut buf = [0u8; 4096];
+                    let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
+                    let head = "HTTP/1.1 200 OK\r\nContent-Length: 104857600\r\n\r\n";
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(&vec![b'x'; sent]).await;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        origin
+    }
+
+    /// **Corta apenas el acumulado pasa el tope**, sin esperar el resto del cuerpo: el
+    /// servidor manda 2 MB de los 100 prometidos y se queda callado. Una lectura que
+    /// bufferiza todo (`.bytes()`) esperaría hasta el plazo del pedido (60 s); la capada
+    /// contesta `TooLarge` enseguida.
+    #[tokio::test]
+    async fn un_objeto_mas_grande_que_el_tope_corta_sin_esperar_el_resto() {
+        let origin = servidor_que_promete_de_mas(2 * 1024 * 1024).await;
+        let server = FakeGraph::start().await; // sólo para la credencial
+        let mut credential = fake::credential_for(&server);
+        credential.base_url = format!("{origin}/v1.0");
+        let url =
+            crate::graph::build_url(&credential.base_url, &["users", "me", "contacts", "x"], "")
+                .unwrap();
+        let started = Instant::now();
+
+        let result = fetch_one::<serde_json::Value>(&fake::client(), &credential, url, &[]).await;
+
+        assert!(matches!(result, Err(GraphFetchError::TooLarge)));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "cortó en {:?}: no esperó el resto del cuerpo",
+            started.elapsed()
+        );
+    }
+
+    /// Un cuerpo de exactamente el tope entra; un byte más, no.
+    #[tokio::test]
+    async fn el_tope_es_inclusivo() {
+        let server = FakeGraph::start().await;
+        server.push("a".repeat(10));
+        let ok = read_capped(respuesta(&server).await, 10).await;
+        assert_eq!(ok.ok().map(|b| b.len()), Some(10));
+
+        server.push("a".repeat(11));
+        let largo = read_capped(respuesta(&server).await, 10).await;
+        assert!(matches!(largo, Err(CappedReadError::TooLarge)));
+    }
+
+    /// Un cuerpo vacío (un `204 No Content` de un `PATCH`) **no es error**.
+    #[tokio::test]
+    async fn un_cuerpo_vacio_se_acepta() {
+        let server = FakeGraph::start().await;
+        server.push_status(204, "");
+        let bytes = read_capped(respuesta(&server).await, 10).await;
+        assert!(matches!(bytes, Ok(b) if b.is_empty()));
     }
 }
