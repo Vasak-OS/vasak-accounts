@@ -1677,4 +1677,22 @@ mod tests {
         );
         assert!(f.server.requests().is_empty());
     }
+
+    /// El nombre del parámetro `TZID` no distingue mayúsculas (`tzid=`), y el valor
+    /// puede venir entre comillas: las dos formas se convierten igual que la
+    /// canónica.
+    #[test]
+    fn el_tzid_no_distingue_mayusculas_ni_comillas() {
+        for param in [
+            "tzid=America/Argentina/Buenos_Aires",
+            "TZID=\"America/Argentina/Buenos_Aires\"",
+        ] {
+            let p = dtstart(&[param], "20260915T140000");
+            assert_eq!(
+                utc(graph_datetime(&p)).as_deref(),
+                Some("2026-09-15T17:00:00"),
+                "{param}"
+            );
+        }
+    }
 }

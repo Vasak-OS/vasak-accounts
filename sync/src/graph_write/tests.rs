@@ -933,12 +933,17 @@ mod end_to_end_calendar {
         }
 
         async fn enqueue_put(&self, href: &str, base_etag: Option<&str>) {
+            self.enqueue_raw(href, ICAL, base_etag).await;
+        }
+
+        /// Como [`Self::enqueue_put`] pero con el iCal que se pase.
+        async fn enqueue_raw(&self, href: &str, raw: &str, base_etag: Option<&str>) {
             let (index, occurrences) =
-                derive_with_occurrences(ICAL, Self::window(), &ExpansionLimits::DEFAULT);
+                derive_with_occurrences(raw, Self::window(), &ExpansionLimits::DEFAULT);
             let row = ObjectRow {
                 href: href.into(),
                 etag: base_etag.map(str::to_string),
-                raw_ical: ICAL.into(),
+                raw_ical: raw.into(),
                 index,
                 occurrences,
             };
@@ -1093,5 +1098,112 @@ mod end_to_end_calendar {
             .stored("SRV-ID", "raw_ical")
             .await
             .is_some_and(|r| r.contains("Reunión")));
+    }
+
+    /// Un evento con las fechas dadas, para las pruebas de fechas irruteables.
+    fn ical_with(dtstart: &str, dtend: &str) -> String {
+        format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:u1\r\n\
+             SUMMARY:Reunión\r\n{dtstart}\r\n{dtend}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+    }
+
+    /// **Fecha irruteable en una edición: conflicto, no pérdida de dato.** Un
+    /// `DTSTART`/`DTEND` presente que no se puede llevar a UTC (flotante, `TZID`
+    /// desconocido) **no se manda sin fecha**: un `PATCH` sin `start` cerraría la op
+    /// como subida y la bajada siguiente pisaría la edición con la fecha vieja. La op
+    /// va a `conflict`, **no sale ningún pedido** y el crudo local queda intacto.
+    #[tokio::test]
+    async fn editar_con_una_fecha_irruteable_va_a_conflicto_sin_mandar_nada() {
+        let casos = [
+            (
+                "DTSTART:20260915T140000",
+                "DTEND:20260915T150000Z",
+                "flotante",
+            ),
+            (
+                "DTSTART;TZID=Mars/Olympus:20260915T140000",
+                "DTEND:20260915T150000Z",
+                "TZID desconocido en el inicio",
+            ),
+            (
+                "DTSTART:20260915T140000Z",
+                "DTEND;TZID=Mars/Olympus:20260915T150000",
+                "TZID desconocido en el fin",
+            ),
+        ];
+        for (dtstart, dtend, caso) in casos {
+            let f = Fixture::new("graph-cal-fecha-irruteable").await;
+            let raw = ical_with(dtstart, dtend);
+            f.enqueue_raw("SRV-ID", &raw, Some("W/\"cap\"")).await;
+
+            let report = f.replay().await;
+
+            assert_eq!(report.conflicts, 1, "{caso}");
+            assert_eq!(report.pushed, 0, "{caso}: no se dio por subida");
+            assert_eq!(
+                f.op_state("SRV-ID").await.as_deref(),
+                Some("conflict"),
+                "{caso}"
+            );
+            assert!(
+                f.server.requests().is_empty(),
+                "{caso}: no se mandó ningún pedido (ni un PATCH sin fecha)"
+            );
+            assert!(
+                f.stored("SRV-ID", "raw_ical")
+                    .await
+                    .is_some_and(|r| r.contains(dtstart) && r.contains(dtend)),
+                "{caso}: el crudo local quedó intacto"
+            );
+        }
+    }
+
+    /// Lo mismo al **crear**: una fecha irruteable no manda un `POST` sin fecha.
+    #[tokio::test]
+    async fn crear_con_una_fecha_irruteable_va_a_conflicto_sin_mandar_nada() {
+        const LOCAL: &str = "graph://default/nuevo.ics";
+        let f = Fixture::new("graph-cal-crear-irruteable").await;
+        f.enqueue_raw(
+            LOCAL,
+            &ical_with("DTSTART:20260915T140000", "DTEND:20260915T150000Z"),
+            None,
+        )
+        .await;
+
+        let report = f.replay().await;
+
+        assert_eq!(report.conflicts, 1);
+        assert_eq!(f.op_state(LOCAL).await.as_deref(), Some("conflict"));
+        assert!(f.server.requests().is_empty(), "no se mandó ningún POST");
+        assert!(
+            f.stored(LOCAL, "raw_ical").await.is_some(),
+            "el local sigue"
+        );
+    }
+
+    /// El camino feliz no se rompió: con un `TZID` conocido el `PATCH` sale **con**
+    /// las fechas ya en UTC y la op cierra como subida.
+    #[tokio::test]
+    async fn editar_con_tzid_conocido_manda_las_fechas_en_utc_y_cierra() {
+        let f = Fixture::new("graph-cal-tzid-feliz").await;
+        let raw = ical_with(
+            "DTSTART;TZID=America/Argentina/Buenos_Aires:20260915T140000",
+            "DTEND;TZID=America/Argentina/Buenos_Aires:20260915T150000",
+        );
+        f.enqueue_raw("SRV-ID", &raw, Some("W/\"cap\"")).await;
+        f.server
+            .push_status(200, r#"{"@odata.etag":"W/\"nuevo\""}"#);
+
+        let report = f.replay().await;
+
+        assert_eq!(report.pushed, 1);
+        assert_eq!(report.conflicts, 0);
+        let request = f.server.requests().remove(0);
+        assert_eq!(request.method, "PATCH");
+        let sent: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+        assert_eq!(sent["start"]["dateTime"], "2026-09-15T17:00:00");
+        assert_eq!(sent["end"]["dateTime"], "2026-09-15T18:00:00");
+        assert_eq!(f.pending().await, 0);
     }
 }
