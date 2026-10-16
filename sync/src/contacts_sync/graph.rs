@@ -14,8 +14,9 @@ use crate::contacts_sync::backend::{SyncContext, SyncResult};
 use crate::contacts_sync::SyncReport;
 use crate::graph::{self, GraphCredential, GraphFetchError};
 use crate::store::contacts::{ContactOp, ContactRow};
-use crate::store::key::KeySource;
+use crate::store::key::{KeyError, KeySource};
 use crate::store::lifecycle::{AreaState, CONTACTS_AREA};
+use crate::store::StoreError;
 use crate::vcard;
 
 // La credencial, su fuente, los errores de red y la paginación por
@@ -44,6 +45,11 @@ const CONTACTS_SELECT: &str = "$top=100&$select=id,displayName,givenName,surname
 #[serde(default, rename_all = "camelCase")]
 struct GraphContact {
     id: String,
+    /// El testigo de concurrencia de Graph. Se captura en la lectura para que la
+    /// escritura (`#97`) pueda mandar `If-Match: @odata.etag`: sin él la
+    /// precondición no tiene nada que enviar y el `412` nunca se dispara.
+    #[serde(rename = "@odata.etag")]
+    odata_etag: Option<String>,
     display_name: Option<String>,
     given_name: Option<String>,
     surname: Option<String>,
@@ -94,6 +100,75 @@ impl GraphPhysicalAddress {
         .iter()
         .all(|c| c.as_deref().unwrap_or("").is_empty())
     }
+}
+
+// ── Escritura por Graph (`#97`) ──────────────────────────────────────────────
+//
+// El lado de vuelta del backend: el empuje de `crate::graph_write` convierte el
+// crudo vCard de la cola a JSON de Graph. La escapada del `href`
+// (`escape_vcard_public`, la misma de la lectura) vive con su inversa en
+// `graph_write::href_for_id`, un solo lugar para las dos áreas.
+
+/// Convierte el crudo vCard de un contacto al cuerpo JSON de Graph
+/// (`/me/contacts`), subconjunto conservador (decisión 3): `displayName`,
+/// `emailAddresses`, los teléfonos repartidos por etiqueta, `companyName` y
+/// `personalNotes`. Reusa el parseo de la lectura ([`vcard::contact_from`]) en vez
+/// de reparsear a mano. Como `PATCH` fusiona, lo que no modelamos no se pisa.
+///
+/// **Sin inyección**: el cuerpo lo arma `serde_json`, que escapa los valores solo.
+pub(crate) fn contact_body_from_vcard(raw_vcard: &str) -> serde_json::Value {
+    use serde_json::json;
+    // El `href` no importa para el cuerpo (no se manda); `contact_from` lo exige.
+    let contact = vcard::contact_from(raw_vcard, "").unwrap_or_default();
+
+    let mut body = serde_json::Map::new();
+    if !contact.display_name.is_empty() {
+        body.insert("displayName".into(), json!(contact.display_name));
+    }
+
+    let emails: Vec<serde_json::Value> = contact
+        .emails
+        .iter()
+        .filter(|f| !f.value.is_empty())
+        .map(|f| json!({ "address": f.value }))
+        .collect();
+    if !emails.is_empty() {
+        body.insert("emailAddresses".into(), json!(emails));
+    }
+
+    // Graph reparte los teléfonos en tres campos; la etiqueta de la vCard decide
+    // cuál. Lo que no cae en casa ni en celular va a los de trabajo.
+    let mut business: Vec<&str> = Vec::new();
+    let mut home: Vec<&str> = Vec::new();
+    let mut mobile: Option<&str> = None;
+    for phone in &contact.phones {
+        if phone.value.is_empty() {
+            continue;
+        }
+        match phone.label.to_ascii_lowercase().as_str() {
+            "home" | "casa" => home.push(&phone.value),
+            "cell" | "mobile" | "celular" | "móvil" | "movil" => mobile = Some(&phone.value),
+            _ => business.push(&phone.value),
+        }
+    }
+    if !business.is_empty() {
+        body.insert("businessPhones".into(), json!(business));
+    }
+    if !home.is_empty() {
+        body.insert("homePhones".into(), json!(home));
+    }
+    if let Some(mobile) = mobile {
+        body.insert("mobilePhone".into(), json!(mobile));
+    }
+
+    if !contact.organization.is_empty() {
+        body.insert("companyName".into(), json!(contact.organization));
+    }
+    if !contact.notes.is_empty() {
+        body.insert("personalNotes".into(), json!(contact.notes));
+    }
+
+    serde_json::Value::Object(body)
 }
 
 /// Backend Microsoft Graph API.
@@ -147,6 +222,41 @@ impl GraphApiBackend {
             }
         };
         let mut report = SyncReport::default();
+
+        // El empuje primero: se drena la cola de escrituras por Graph antes de la
+        // bajada, igual que el camino CardDAV drena la suya. El plazo de la vuelta
+        // es el mismo que usa el resto del servicio.
+        let deadline = tokio::time::Instant::now() + crate::dav::webdav::Limits::DEFAULT.max_round;
+        match crate::graph_write::replay_graph_area(
+            manager,
+            account_id,
+            CONTACTS_AREA,
+            &client,
+            credential,
+            deadline,
+        )
+        .await
+        {
+            Ok(push) => {
+                report.pushed = push.pushed;
+                report.conflicts = push.conflicts;
+                report.pending = push.remaining;
+            }
+            // El llavero cerrado a mitad corta la vuelta como cualquier otra
+            // escritura: se pide desbloquearlo.
+            Err(StoreError::Key(KeyError::Locked)) | Err(StoreError::Missing) => {
+                set_status(AreaState::Pending, CLOSED_DETAIL).await;
+                return SyncResult::StoreClosed;
+            }
+            // Cualquier otro error de almacén (un `Sqlite`/`Io` persistente) no es
+            // «desbloqueá el llavero»: se reporta como falla, como el camino CardDAV,
+            // para no reintentarlo cada vuelta en vano.
+            Err(e) => {
+                let shown = e.public_detail();
+                set_status(AreaState::Failed, shown).await;
+                return SyncResult::Failed(shown.into());
+            }
+        }
 
         // Traer la carpeta de contactos completa (sin delta sync por ahora).
         let contacts = match Self::fetch_all_contacts(&client, credential).await {
@@ -245,11 +355,14 @@ impl GraphApiBackend {
         // de usarlo como `href`. Así un `id` con `\r\n` no puede fabricar nada
         // allí donde el `href` se vuelque a un formato por líneas.
         let href = vcard::escape_vcard_public(&contact.id);
+        let odata_etag = contact.odata_etag.clone();
         let vcard = Self::contact_to_vcard(&contact);
         let parsed = vcard::contact_from(&vcard, &href).unwrap_or_default();
         Some(ContactRow {
             href,
-            etag: None,
+            // El `@odata.etag` capturado: la fila guardada lo lleva para que la
+            // escritura por Graph (`#97`) pueda condicionar `PATCH`/`DELETE`.
+            etag: odata_etag,
             raw_vcard: vcard,
             contact: parsed,
         })
@@ -603,6 +716,22 @@ mod tests {
                 .expect("la base tenía que estar abierta")
         }
 
+        /// Los ETag guardados de cada contacto, ordenados por `href`.
+        async fn stored_etags(&self) -> Vec<Option<String>> {
+            self.manager
+                .with_store(ACCOUNT, |store| {
+                    let c = store.connection();
+                    Ok(c.prepare("SELECT etag FROM contacts ORDER BY href")
+                        .unwrap()
+                        .query_map([], |row| row.get::<_, Option<String>>(0))
+                        .unwrap()
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap())
+                })
+                .await
+                .expect("la base tenía que estar abierta")
+        }
+
         /// Los nombres de las libretas guardadas.
         async fn book_names(&self) -> Vec<String> {
             self.manager
@@ -872,6 +1001,27 @@ mod tests {
         assert!(matches!(result, Err(GraphFetchError::Parse)));
     }
 
+    /// **Captura del `@odata.etag` en la lectura (`#97`).** La escritura por Graph
+    /// condiciona `PATCH`/`DELETE` con `If-Match: @odata.etag`; para tener qué
+    /// mandar, la bajada guarda el ETag de cada contacto en su fila. Un contacto
+    /// que trae `@odata.etag` se guarda con ese ETag, no en blanco: sin esto la
+    /// precondición viajaría vacía y el `412` nunca se dispararía.
+    #[tokio::test]
+    async fn la_bajada_guarda_el_odata_etag_de_cada_contacto() {
+        let f = Fixture::new("graph_captura_etag").await;
+        f.server.push(
+            r#"{"value":[{"id":"AAA","displayName":"Ada","@odata.etag":"W/\"etag-del-servidor\""}]}"#,
+        );
+
+        f.synced().await;
+
+        assert_eq!(
+            f.stored_etags().await,
+            vec![Some("W/\"etag-del-servidor\"".to_string())],
+            "el @odata.etag de la bajada tiene que quedar en la fila para el If-Match de la escritura"
+        );
+    }
+
     /// (6) Bordes, de punta a punta: un contacto sin `id` se descarta; uno con
     /// sólo `id` y `displayName` se guarda.
     #[tokio::test]
@@ -888,5 +1038,51 @@ mod tests {
         assert_eq!(vcards.len(), 1);
         assert!(vcards[0].contains("UID:keep\r\n"));
         assert!(vcards[0].contains("FN:Solo Nombre\r\n"));
+    }
+
+    /// Un error de almacén que **no** es «llavero bloqueado» (acá, la tabla de la
+    /// cola rota: `Sqlite`) es una **falla** de la vuelta: `Failed`, sin bajar nada.
+    /// Con el mapeo viejo (todo a `StoreClosed`) se pediría desbloquear un llavero
+    /// que está bien.
+    #[tokio::test]
+    async fn un_error_de_almacen_que_no_es_el_llavero_da_failed() {
+        let f = Fixture::new("graph_store_failed").await;
+        assert!(f.manager.prepare_for_sync(CONTACTS_AREA, ACCOUNT).await);
+        f.manager
+            .with_store(ACCOUNT, |store| {
+                store
+                    .connection()
+                    .execute_batch("DROP TABLE pending_dav_ops")
+                    .map_err(|e| crate::store::StoreError::Sqlite(e.to_string()))
+            })
+            .await
+            .unwrap();
+
+        let result = f.sync().await;
+
+        assert!(
+            matches!(result, SyncResult::Failed(_)),
+            "un Sqlite no es StoreClosed: {result:?}"
+        );
+        assert!(
+            f.server.requests().is_empty(),
+            "no se bajó nada tras la falla del empuje"
+        );
+    }
+
+    /// El llavero que se bloquea justo después de abrir la base sí es
+    /// `StoreClosed`.
+    #[tokio::test]
+    async fn el_llavero_bloqueado_a_mitad_da_store_closed() {
+        let f = Fixture::new("graph_store_locked").await;
+        f.manager.keys().state().lock_after_is_locked = true;
+
+        let result = f.sync().await;
+
+        assert!(
+            matches!(result, SyncResult::StoreClosed),
+            "llavero bloqueado: {result:?}"
+        );
+        assert!(f.server.requests().is_empty());
     }
 }

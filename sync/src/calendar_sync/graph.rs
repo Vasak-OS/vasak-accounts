@@ -29,8 +29,9 @@ use crate::store::calendar::{
     derive_with_occurrences, CalendarApplied, CalendarListing, CalendarProgress, CalendarRoom,
     ObjectOp, ObjectRow, Window, WRITE_BATCH_ROWS,
 };
-use crate::store::key::KeySource;
+use crate::store::key::{KeyError, KeySource};
 use crate::store::lifecycle::{AreaState, StoreManager, CALENDAR_AREA};
+use crate::store::StoreError;
 
 /// Tope de eventos acumulados. Cota de memoria independiente del tope de
 /// páginas de [`crate::graph`], por si un servidor devuelve páginas enormes.
@@ -57,6 +58,11 @@ const PREFER_UTC: (&str, &str) = ("Prefer", "outlook.timezone=\"UTC\"");
 #[serde(default, rename_all = "camelCase")]
 struct GraphEvent {
     id: String,
+    /// El testigo de concurrencia de Graph. Se captura en la lectura para que la
+    /// escritura (`#97`) pueda mandar `If-Match: @odata.etag`: sin él la
+    /// precondición no tiene nada que enviar y el `412` nunca se dispara.
+    #[serde(rename = "@odata.etag")]
+    odata_etag: Option<String>,
     #[serde(rename = "iCalUId")]
     i_cal_uid: String,
     subject: Option<String>,
@@ -166,6 +172,142 @@ pub struct GraphSyncContext<'a, K: KeySource> {
     pub expansion: ExpansionLimits,
 }
 
+// ── Escritura por Graph (`#97`) ──────────────────────────────────────────────
+//
+// El lado de vuelta del backend: el empuje de `crate::graph_write` convierte el
+// crudo iCal de la cola a JSON de Graph. La escapada del `href` (`escape_text`, la
+// misma de la lectura) vive con su inversa en `graph_write::href_for_id`, un solo
+// lugar para las dos áreas.
+
+/// Convierte el crudo iCal de un evento al cuerpo JSON de Graph (`/me/events`),
+/// subconjunto conservador (decisión 3): `subject`, `body` (texto), `start`/`end`
+/// en UTC, `isAllDay` y `location`. Lo que no modelamos no se manda, y como
+/// `PATCH` fusiona, no se pisa en el servidor.
+///
+/// `transaction_id` sólo al **crear** (`POST`): es la idempotencia nativa de Graph
+/// para eventos —un `POST` reintentado con el mismo `transactionId` no crea un
+/// segundo evento—. En una edición va `None`.
+///
+/// `None` si el crudo no trae un `VEVENT` (p. ej. un `VTODO`, que no va a
+/// `/me/events`): el empuje lo manda a conflicto en vez de crear algo torcido.
+///
+/// **Sin inyección**: el cuerpo lo arma `serde_json`, que escapa los valores solo;
+/// no hay forma de partir una línea como en los formatos de texto.
+pub(crate) fn event_body_from_ical(
+    raw_ical: &str,
+    transaction_id: Option<&str>,
+) -> Option<serde_json::Value> {
+    use serde_json::json;
+    let document = crate::ical::parse_document(raw_ical);
+    let vevent = document.components.iter().find(|c| c.name == "VEVENT")?;
+
+    let text = |name: &str| {
+        vevent
+            .first(name)
+            .map(|p| crate::ical::unescape_text(&p.value))
+    };
+
+    let mut body = serde_json::Map::new();
+    if let Some(subject) = text("SUMMARY") {
+        body.insert("subject".into(), json!(subject));
+    }
+    if let Some(content) = text("DESCRIPTION") {
+        body.insert(
+            "body".into(),
+            json!({ "contentType": "text", "content": content }),
+        );
+    }
+    if let Some(location) = text("LOCATION") {
+        body.insert("location".into(), json!({ "displayName": location }));
+    }
+
+    let dtstart = vevent.first("DTSTART");
+    let dtend = vevent.first("DTEND");
+    let all_day = dtstart.map(is_date_only).unwrap_or(false);
+    // Un `DTSTART`/`DTEND` que existe pero no se puede convertir (flotante, `TZID`
+    // desconocido, hora inexistente o ambigua) **aborta todo el cuerpo** con `None`,
+    // no se omite la fecha. `resolve_op` lleva ese `None` a conflicto: el crudo local
+    // queda intacto y la persona lo resuelve. Mandar el `PATCH` sin la fecha la
+    // borraría en el servidor en silencio, y la bajada siguiente pisaría con la vieja
+    // (pérdida de dato). Un evento sin `DTSTART` en el crudo —si existe— se deja pasar
+    // como está.
+    if let Some(dtstart) = dtstart {
+        body.insert("start".into(), graph_datetime(dtstart)?);
+    }
+    if let Some(dtend) = dtend {
+        body.insert("end".into(), graph_datetime(dtend)?);
+    }
+    body.insert("isAllDay".into(), json!(all_day));
+
+    if let Some(id) = transaction_id {
+        body.insert("transactionId".into(), json!(id));
+    }
+    Some(serde_json::Value::Object(body))
+}
+
+/// Si una propiedad de fecha es de día completo (`VALUE=DATE`).
+fn is_date_only(property: &crate::ical::Property) -> bool {
+    property
+        .params
+        .iter()
+        .any(|p| p.eq_ignore_ascii_case("VALUE=DATE"))
+}
+
+/// Un valor de fecha-hora iCal (`20260915T140000Z`, `20260915T140000` o, de día
+/// completo, `20260915`) al `dateTime` de Graph (`2026-09-15T14:00:00`), siempre
+/// en UTC —la lectura las pide así (`Prefer: outlook.timezone="UTC"`)—. `None` si
+/// el valor no tiene al menos una fecha de ocho dígitos.
+fn graph_datetime(property: &crate::ical::Property) -> Option<serde_json::Value> {
+    use chrono::TimeZone;
+    use serde_json::json;
+
+    let value = property.value.as_str();
+    let bytes = value.as_bytes();
+    if bytes.len() < 8 || !bytes[..8].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let date = format!("{}-{}-{}", &value[0..4], &value[4..6], &value[6..8]);
+
+    // Sólo fecha (día completo, `VALUE=DATE`): medianoche UTC. El `isAllDay` lo marca
+    // aparte quien llama.
+    let has_time =
+        bytes.len() >= 15 && bytes[8] == b'T' && bytes[9..15].iter().all(u8::is_ascii_digit);
+    if !has_time {
+        return Some(json!({ "dateTime": format!("{date}T00:00:00"), "timeZone": "UTC" }));
+    }
+    let time = format!("{}:{}:{}", &value[9..11], &value[11..13], &value[13..15]);
+
+    // Con hora y sufijo `Z`: ya es UTC.
+    if value.ends_with('Z') {
+        return Some(json!({ "dateTime": format!("{date}T{time}"), "timeZone": "UTC" }));
+    }
+
+    // Con hora y `TZID=`: se interpreta en esa zona y se convierte a UTC. Una zona
+    // desconocida, o una hora que en esa zona no existe o es ambigua (cambio de
+    // horario), devuelve `None`: mejor rutear la op a conflicto que mandar —y que la
+    // bajada persista— una hora corrida.
+    // `Property::param` compara el nombre del parámetro sin distinguir mayúsculas
+    // (los nombres de parámetro iCal son case-insensitive: `TZID=` o `tzid=`) y le
+    // saca las comillas a un `TZID="America/…"`; se reusa en vez de un `strip_prefix`
+    // propio, que se comía los dos casos.
+    if let Some(tzid) = property.param("TZID") {
+        let zone: chrono_tz::Tz = tzid.parse().ok()?;
+        let naive =
+            NaiveDateTime::parse_from_str(&format!("{date}T{time}"), "%Y-%m-%dT%H:%M:%S").ok()?;
+        let utc = zone
+            .from_local_datetime(&naive)
+            .single()?
+            .with_timezone(&chrono::Utc);
+        return Some(json!({
+            "dateTime": utc.format("%Y-%m-%dT%H:%M:%S").to_string(),
+            "timeZone": "UTC"
+        }));
+    }
+
+    // Hora flotante (ni `Z` ni `TZID`): no se adivina la zona. `None` → conflicto.
+    None
+}
+
 /// Backend Microsoft Graph API para calendario.
 ///
 /// Sincroniza los eventos del calendario del usuario (`/me/events`) contra el
@@ -213,6 +355,37 @@ impl GraphApiBackend {
             }
         };
 
+        // El empuje primero: se drena la cola de escrituras por Graph antes de la
+        // bajada, igual que el camino CardDAV drena la suya antes de bajar. El
+        // plazo de la vuelta es el mismo que usa el resto del servicio.
+        let deadline = tokio::time::Instant::now() + crate::dav::webdav::Limits::DEFAULT.max_round;
+        let push = match crate::graph_write::replay_graph_area(
+            manager,
+            account_id,
+            CALENDAR_AREA,
+            &client,
+            credential,
+            deadline,
+        )
+        .await
+        {
+            Ok(report) => report,
+            // El llavero cerrado a mitad corta la vuelta como cualquier otra
+            // escritura: se pide desbloquearlo.
+            Err(StoreError::Key(KeyError::Locked)) | Err(StoreError::Missing) => {
+                set_status(AreaState::Pending, CLOSED_DETAIL).await;
+                return CalendarOutcome::StoreClosed;
+            }
+            // Cualquier otro error de almacén (un `Sqlite`/`Io` persistente) no es
+            // «desbloqueá el llavero»: se reporta como falla, como el camino CalDAV,
+            // para no reintentarlo cada vuelta en vano.
+            Err(e) => {
+                let shown = e.public_detail();
+                set_status(AreaState::Failed, shown).await;
+                return CalendarOutcome::Failed(shown.into());
+            }
+        };
+
         // Traer los eventos completos (sin delta sync por ahora).
         let events = match Self::fetch_all_events(&client, credential).await {
             Ok(events) => events,
@@ -257,6 +430,9 @@ impl GraphApiBackend {
 
         let mut report = CalendarReport {
             calendars: 1,
+            pushed: push.pushed,
+            conflicts: push.conflicts,
+            pending: push.remaining,
             ..CalendarReport::default()
         };
 
@@ -361,7 +537,9 @@ impl GraphApiBackend {
         }
         Some(ObjectRow {
             href,
-            etag: None,
+            // El `@odata.etag` capturado: la fila guardada lo lleva para que la
+            // escritura por Graph (`#97`) pueda condicionar `PATCH`/`DELETE`.
+            etag: event.odata_etag.clone(),
             raw_ical: ical,
             index,
             occurrences,
@@ -1350,5 +1528,171 @@ mod tests {
         let raw = f.raw_for("keep").await;
         assert!(raw.contains("UID:keep\r\n"), "{raw:?}");
         assert!(raw.contains("SUMMARY:Sin iCalUId\r\n"), "{raw:?}");
+    }
+
+    // ── `graph_datetime`: zonas, flotantes y horas que no existen (`#97`) ─────
+
+    fn dtstart(params: &[&str], value: &str) -> crate::ical::Property {
+        crate::ical::Property {
+            name: "DTSTART".into(),
+            params: params.iter().map(|p| p.to_string()).collect(),
+            value: value.into(),
+        }
+    }
+
+    fn utc(value: Option<serde_json::Value>) -> Option<String> {
+        value.map(|v| {
+            assert_eq!(v["timeZone"], "UTC", "siempre sale en UTC");
+            v["dateTime"].as_str().unwrap().to_string()
+        })
+    }
+
+    /// Con `TZID` la hora se interpreta en esa zona y **se convierte a UTC**:
+    /// Buenos Aires es UTC-3, así que las 14:00 locales son las 17:00 UTC. Sin la
+    /// conversión (la versión vieja ponía la hora tal cual en UTC) el evento caería
+    /// tres horas antes.
+    #[test]
+    fn una_hora_con_tzid_se_convierte_a_utc() {
+        let p = dtstart(&["TZID=America/Argentina/Buenos_Aires"], "20260915T140000");
+        assert_eq!(
+            utc(graph_datetime(&p)).as_deref(),
+            Some("2026-09-15T17:00:00")
+        );
+    }
+
+    /// Una hora con sufijo `Z` ya es UTC: sale sin cambio.
+    #[test]
+    fn una_hora_con_z_ya_es_utc() {
+        let p = dtstart(&[], "20260915T140000Z");
+        assert_eq!(
+            utc(graph_datetime(&p)).as_deref(),
+            Some("2026-09-15T14:00:00")
+        );
+    }
+
+    /// Un día completo (sólo fecha) sale a medianoche UTC.
+    #[test]
+    fn una_fecha_sin_hora_sale_a_medianoche() {
+        let p = dtstart(&["VALUE=DATE"], "20260915");
+        assert_eq!(
+            utc(graph_datetime(&p)).as_deref(),
+            Some("2026-09-15T00:00:00")
+        );
+    }
+
+    /// Una zona que no se conoce no se adivina: `None`.
+    #[test]
+    fn un_tzid_desconocido_da_none() {
+        let p = dtstart(&["TZID=Mars/Olympus_Mons"], "20260915T140000");
+        assert!(graph_datetime(&p).is_none());
+    }
+
+    /// Una hora flotante (ni `Z` ni `TZID`) no se adivina: `None`.
+    #[test]
+    fn una_hora_flotante_da_none() {
+        let p = dtstart(&[], "20260915T140000");
+        assert!(graph_datetime(&p).is_none());
+    }
+
+    /// Una hora que en su zona **no existe** (el salto adelante del cambio de
+    /// horario) o es **ambigua** (el retroceso la repite) da `None`, no una hora
+    /// corrida.
+    #[test]
+    fn una_hora_inexistente_o_ambigua_por_cambio_de_horario_da_none() {
+        // 2026-03-08 02:30 en Nueva York: el reloj salta de 02:00 a 03:00.
+        let inexistente = dtstart(&["TZID=America/New_York"], "20260308T023000");
+        assert!(graph_datetime(&inexistente).is_none(), "inexistente");
+        // 2026-11-01 01:30 en Nueva York: ocurre dos veces.
+        let ambigua = dtstart(&["TZID=America/New_York"], "20261101T013000");
+        assert!(graph_datetime(&ambigua).is_none(), "ambigua");
+        // Y una hora normal de la misma zona sí se convierte (EDT, UTC-4).
+        let normal = dtstart(&["TZID=America/New_York"], "20260915T140000");
+        assert_eq!(
+            utc(graph_datetime(&normal)).as_deref(),
+            Some("2026-09-15T18:00:00")
+        );
+    }
+
+    /// De punta a punta por el cuerpo: un evento con `TZID` sale con `start` y
+    /// `end` ya en UTC.
+    #[test]
+    fn el_cuerpo_de_un_evento_con_tzid_sale_en_utc() {
+        let ical = "BEGIN:VEVENT\r\nUID:u\r\nSUMMARY:x\r\n\
+            DTSTART;TZID=America/Argentina/Buenos_Aires:20260915T140000\r\n\
+            DTEND;TZID=America/Argentina/Buenos_Aires:20260915T150000\r\n\
+            END:VEVENT\r\n";
+        let body = event_body_from_ical(ical, None).expect("es un VEVENT");
+        assert_eq!(body["start"]["dateTime"], "2026-09-15T17:00:00");
+        assert_eq!(body["end"]["dateTime"], "2026-09-15T18:00:00");
+    }
+
+    // ── Mapeo de errores de almacén del empuje (`#97`) ────────────────────────
+
+    /// Un error de almacén que **no** es «llavero bloqueado» (acá, la tabla de la
+    /// cola rota: `Sqlite`) es una **falla** de la vuelta, no «desbloqueá el
+    /// llavero»: se reporta `Failed` y no se baja nada. Con el mapeo viejo (todo a
+    /// `StoreClosed`) la persona vería un pedido de desbloqueo que no arregla nada.
+    #[tokio::test]
+    async fn un_error_de_almacen_que_no_es_el_llavero_da_failed() {
+        let f = Fixture::new("graph_cal_store_failed").await;
+        f.manager
+            .prepare_for_sync(CALENDAR_AREA, ACCOUNT)
+            .await
+            .then_some(())
+            .expect("la base tenía que quedar abierta");
+        f.manager
+            .with_store(ACCOUNT, |store| {
+                store
+                    .connection()
+                    .execute_batch("DROP TABLE pending_dav_ops")
+                    .map_err(|e| StoreError::Sqlite(e.to_string()))
+            })
+            .await
+            .unwrap();
+
+        let outcome = f.sync().await;
+
+        assert!(
+            matches!(outcome, CalendarOutcome::Failed(_)),
+            "un Sqlite no es StoreClosed: {outcome:?}"
+        );
+        assert!(
+            f.server.requests().is_empty(),
+            "no se bajó nada tras la falla del empuje"
+        );
+    }
+
+    /// El llavero que se bloquea justo después de abrir la base sí es
+    /// `StoreClosed`: se pide desbloquearlo.
+    #[tokio::test]
+    async fn el_llavero_bloqueado_a_mitad_da_store_closed() {
+        let f = Fixture::new("graph_cal_store_locked").await;
+        f.manager.keys().state().lock_after_is_locked = true;
+
+        let outcome = f.sync().await;
+
+        assert!(
+            matches!(outcome, CalendarOutcome::StoreClosed),
+            "llavero bloqueado: {outcome:?}"
+        );
+        assert!(f.server.requests().is_empty());
+    }
+
+    /// El nombre del parámetro `TZID` no distingue mayúsculas (`tzid=`), y el valor
+    /// puede venir entre comillas: las dos formas se convierten igual que la
+    /// canónica.
+    #[test]
+    fn el_tzid_no_distingue_mayusculas_ni_comillas() {
+        for param in [
+            "tzid=America/Argentina/Buenos_Aires",
+            "TZID=\"America/Argentina/Buenos_Aires\"",
+        ] {
+            let p = dtstart(&[param], "20260915T140000");
+            assert_eq!(
+                utc(graph_datetime(&p)).as_deref(),
+                Some("2026-09-15T17:00:00"),
+                "{param}"
+            );
+        }
     }
 }
