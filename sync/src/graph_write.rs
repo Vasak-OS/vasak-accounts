@@ -167,16 +167,16 @@ async fn resolve_op<K: KeySource>(
                             return close(manager, account_id, Close::Conflict(op, detail)).await;
                         }
                     };
-                    match run(deadline, create(client, credential, segment(area), &json)).await {
-                        Timed::Elapsed => {
-                            retry_or_escalate(op, "plazo de la vuelta".into(), report)
-                        }
-                        Timed::Done(Ok(created)) => {
+                    let request = create(client, credential, segment(area), &json);
+                    match tokio::time::timeout_at(deadline, request).await {
+                        // Pasó el plazo de la vuelta: se reintenta.
+                        Err(_) => retry_or_escalate(op, "plazo de la vuelta".into(), report),
+                        Ok(Ok(created)) => {
                             report.pushed += 1;
                             let new_href = href_for_id(area, &created.id);
                             Close::Create(op, new_href, created.etag)
                         }
-                        Timed::Done(Err(e)) => on_error(op, e, report),
+                        Ok(Err(e)) => on_error(op, e, report),
                     }
                 }
                 // Editar: `PATCH` con `If-Match`.
@@ -190,20 +190,14 @@ async fn resolve_op<K: KeySource>(
                         }
                     };
                     let id = id_from_href(area, &op.object_href);
-                    match run(
-                        deadline,
-                        update(client, credential, segment(area), &id, &etag, &json),
-                    )
-                    .await
-                    {
-                        Timed::Elapsed => {
-                            retry_or_escalate(op, "plazo de la vuelta".into(), report)
-                        }
-                        Timed::Done(Ok(new_etag)) => {
+                    let request = update(client, credential, segment(area), &id, &etag, &json);
+                    match tokio::time::timeout_at(deadline, request).await {
+                        Err(_) => retry_or_escalate(op, "plazo de la vuelta".into(), report),
+                        Ok(Ok(new_etag)) => {
                             report.pushed += 1;
                             Close::Put(op, new_etag)
                         }
-                        Timed::Done(Err(e)) => on_error(op, e, report),
+                        Ok(Err(e)) => on_error(op, e, report),
                     }
                 }
             }
@@ -216,19 +210,15 @@ async fn resolve_op<K: KeySource>(
                 return close(manager, account_id, Close::Delete(op)).await;
             };
             let id = id_from_href(area, &op.object_href);
-            match run(
-                deadline,
-                delete(client, credential, segment(area), &id, &etag),
-            )
-            .await
-            {
-                Timed::Elapsed => retry_or_escalate(op, "plazo de la vuelta".into(), report),
+            let request = delete(client, credential, segment(area), &id, &etag);
+            match tokio::time::timeout_at(deadline, request).await {
+                Err(_) => retry_or_escalate(op, "plazo de la vuelta".into(), report),
                 // El `404` idempotente lo mapea `classify` a `Ok(())`.
-                Timed::Done(Ok(())) => {
+                Ok(Ok(())) => {
                     report.pushed += 1;
                     Close::Delete(op)
                 }
-                Timed::Done(Err(e)) => on_error(op, e, report),
+                Ok(Err(e)) => on_error(op, e, report),
             }
         }
     };
@@ -551,23 +541,6 @@ async fn close<K: KeySource>(
             Close::Retry(op, detail) => store.retry_later(&op, &detail),
         })
         .await
-}
-
-/// El resultado de un pedido con el plazo de la vuelta encima.
-enum Timed<T> {
-    Done(T),
-    Elapsed,
-}
-
-/// Corre un pedido a la red cortándolo si pasa el plazo de la vuelta.
-async fn run<T>(
-    deadline: tokio::time::Instant,
-    request: impl std::future::Future<Output = T>,
-) -> Timed<T> {
-    match tokio::time::timeout_at(deadline, request).await {
-        Ok(value) => Timed::Done(value),
-        Err(_) => Timed::Elapsed,
-    }
 }
 
 #[cfg(test)]

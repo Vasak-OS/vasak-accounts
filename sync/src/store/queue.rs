@@ -428,21 +428,36 @@ impl Store {
         op: &PendingOp,
         new_etag: Option<&str>,
     ) -> Result<(), StoreError> {
-        let (table, coltable, colcol) = area_tables(&op.area)
-            .ok_or_else(|| StoreError::InvalidArgument("área sin cola".into()))?;
-        let transaction = self.connection.transaction().map_err(classify)?;
-        if !Self::close_op(&transaction, op)? {
-            return Ok(());
-        }
-        transaction
-            .execute(
+        self.complete_put_scoped(op, |transaction, table, coltable, colcol| {
+            transaction.execute(
                 &format!(
                     "UPDATE {table} SET etag = ?1, pending_op = NULL
                       WHERE href = ?2 AND {colcol} = (SELECT id FROM {coltable} WHERE href = ?3)"
                 ),
                 rusqlite::params![new_etag, op.object_href, op.collection_href],
             )
-            .map_err(classify)?;
+        })
+    }
+
+    /// El esqueleto común de los cierres de `put` que tocan la fila guardada
+    /// ([`Self::complete_put`], [`Self::complete_create`]): resuelve las tablas del
+    /// área, abre la transacción, **cierra la op condicional a `id`+`revision`**
+    /// (`close_op`: si una edición nueva la reemplazó mientras el empuje hablaba con
+    /// la red, no se toca nada —lost-update—), corre el `UPDATE` que arma `run_update`
+    /// —con su alcance de colección— y confirma. Lo único que cambia entre los dos
+    /// cierres es ese `UPDATE` y sus parámetros; el `OR REPLACE` de la creación va
+    /// en el suyo. No sube la generación (un `put` no cambia qué objetos hay).
+    fn complete_put_scoped<F>(&mut self, op: &PendingOp, run_update: F) -> Result<(), StoreError>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>, &str, &str, &str) -> rusqlite::Result<usize>,
+    {
+        let (table, coltable, colcol) = area_tables(&op.area)
+            .ok_or_else(|| StoreError::InvalidArgument("área sin cola".into()))?;
+        let transaction = self.connection.transaction().map_err(classify)?;
+        if !Self::close_op(&transaction, op)? {
+            return Ok(());
+        }
+        run_update(&transaction, table, coltable, colcol).map_err(classify)?;
         transaction.commit().map_err(classify)
     }
 
@@ -468,22 +483,15 @@ impl Store {
         new_href: &str,
         new_etag: Option<&str>,
     ) -> Result<(), StoreError> {
-        let (table, coltable, colcol) = area_tables(&op.area)
-            .ok_or_else(|| StoreError::InvalidArgument("área sin cola".into()))?;
-        let transaction = self.connection.transaction().map_err(classify)?;
-        if !Self::close_op(&transaction, op)? {
-            return Ok(());
-        }
-        transaction
-            .execute(
+        self.complete_put_scoped(op, |transaction, table, coltable, colcol| {
+            transaction.execute(
                 &format!(
                     "UPDATE OR REPLACE {table} SET href = ?1, etag = ?2, pending_op = NULL
                       WHERE href = ?3 AND {colcol} = (SELECT id FROM {coltable} WHERE href = ?4)"
                 ),
                 rusqlite::params![new_href, new_etag, op.object_href, op.collection_href],
             )
-            .map_err(classify)?;
-        transaction.commit().map_err(classify)
+        })
     }
 
     /// Cierra un `delete` que salió bien (o un `404`, idempotente): borra la
