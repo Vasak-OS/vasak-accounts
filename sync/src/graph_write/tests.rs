@@ -520,6 +520,32 @@ mod end_to_end {
             .unwrap()
         }
 
+        /// Como [`Self::replay`] pero con un plazo corto: para que un `POST` que no
+        /// contesta venza **después** de haberse enviado.
+        async fn replay_within(&self, millis: u64) -> ReplayReport {
+            let credential = self.credential();
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(millis);
+            replay_graph_area(
+                &self.manager,
+                ACCOUNT,
+                CONTACTS_AREA,
+                &fake::client(),
+                &credential,
+                deadline,
+            )
+            .await
+            .unwrap()
+        }
+
+        /// Cuántos pedidos con ese método llegaron al servidor.
+        fn count(&self, method: &str) -> usize {
+            self.server
+                .requests()
+                .iter()
+                .filter(|r| r.method == method)
+                .count()
+        }
+
         async fn op_field(&self, href: &str, column: &'static str) -> Option<String> {
             let href = href.to_string();
             self.manager
@@ -884,6 +910,113 @@ mod end_to_end {
         f.enqueue_put("SRV-ID", "Mía", Some("\"e1\"")).await;
         burn_attempts(&f, "SRV-ID", super::super::MAX_REPLAY_ATTEMPTS - 2).await;
         f.server.push_status(503, "");
+
+        let report = f.replay().await;
+
+        assert_eq!(report.retried, 1);
+        assert_eq!(report.conflicts, 0);
+        assert_eq!(f.op_state("SRV-ID").await.as_deref(), Some("ready"));
+    }
+
+    // ── Idempotencia del alta de contacto (`#118.1`) ──────────────────────────
+    //
+    // `/me/contacts` no tiene `transactionId`: si el `POST` salió y la respuesta se
+    // perdió, reintentar crea un segundo contacto. Un fallo **ambiguo** del alta de
+    // contacto va a conflicto (el crudo local queda a salvo) y **no** se reenvía.
+
+    /// Una alta de contacto con un fallo ambiguo queda en `conflict`, conserva el
+    /// crudo local y **no** vuelve a mandar el `POST` en la vuelta siguiente.
+    async fn alta_ambigua_va_a_conflicto_sin_segundo_post(f: Fixture, replay: ReplayReport) {
+        assert_eq!(
+            replay.conflicts, 1,
+            "un fallo ambiguo del alta es conflicto"
+        );
+        assert_eq!(replay.retried, 0, "no se reintenta");
+        assert_eq!(
+            f.op_state("graph://default/nuevo.vcf").await.as_deref(),
+            Some("conflict")
+        );
+        assert!(
+            f.stored("graph://default/nuevo.vcf", "raw_vcard")
+                .await
+                .is_some_and(|r| r.contains("Local")),
+            "el crudo local no se perdió"
+        );
+        assert_eq!(f.count("POST"), 1, "se mandó un solo POST");
+
+        // La vuelta siguiente, con el servidor ya sano, no reenvía el alta.
+        f.server
+            .push_status(201, r#"{"id":"SRV-ID","@odata.etag":"\"e1\""}"#);
+        f.replay().await;
+        assert_eq!(f.count("POST"), 1, "no hay un segundo POST (duplicaría)");
+        assert_eq!(
+            f.op_state("graph://default/nuevo.vcf").await.as_deref(),
+            Some("conflict")
+        );
+    }
+
+    /// El plazo de la vuelta vence **tras** enviar el `POST`.
+    #[tokio::test]
+    async fn crear_un_contacto_que_no_contesta_va_a_conflicto_y_no_reenvia() {
+        let f = Fixture::new("graph-e2e-alta-plazo").await;
+        f.enqueue_put("graph://default/nuevo.vcf", "Local", None)
+            .await;
+        f.server.push_status(0, ""); // el POST llega y nunca se contesta
+        let report = f.replay_within(600).await;
+        alta_ambigua_va_a_conflicto_sin_segundo_post(f, report).await;
+    }
+
+    /// Error de transporte en `.send()`: la conexión se corta tras recibir el `POST`.
+    #[tokio::test]
+    async fn crear_un_contacto_con_la_conexion_cortada_va_a_conflicto_y_no_reenvia() {
+        let f = Fixture::new("graph-e2e-alta-corte").await;
+        f.enqueue_put("graph://default/nuevo.vcf", "Local", None)
+            .await;
+        f.server.push_status(1, "");
+        let report = f.replay().await;
+        alta_ambigua_va_a_conflicto_sin_segundo_post(f, report).await;
+    }
+
+    /// Lectura del cuerpo cortada **tras** un `201`: el contacto ya se creó en Graph.
+    #[tokio::test]
+    async fn crear_un_contacto_con_el_cuerpo_cortado_va_a_conflicto_y_no_reenvia() {
+        let f = Fixture::new("graph-e2e-alta-cuerpo").await;
+        f.enqueue_put("graph://default/nuevo.vcf", "Local", None)
+            .await;
+        f.server.push_status(2, "");
+        let report = f.replay().await;
+        alta_ambigua_va_a_conflicto_sin_segundo_post(f, report).await;
+    }
+
+    /// `429` y `5xx` son seguros: Graph contestó **antes** de procesar, así que el
+    /// alta de contacto **sí** se reintenta (sigue `ready`, sin conflicto).
+    #[tokio::test]
+    async fn crear_un_contacto_con_429_o_5xx_sigue_reintentando() {
+        for status in [429, 500, 503] {
+            let f = Fixture::new(&format!("graph-e2e-alta-{status}")).await;
+            f.enqueue_put("graph://default/nuevo.vcf", "Local", None)
+                .await;
+            f.server.push_status(status, "");
+
+            let report = f.replay().await;
+
+            assert_eq!(report.retried, 1, "{status} se reintenta");
+            assert_eq!(report.conflicts, 0, "{status} no es conflicto");
+            assert_eq!(
+                f.op_state("graph://default/nuevo.vcf").await.as_deref(),
+                Some("ready"),
+                "{status}: la op sigue en cola"
+            );
+        }
+    }
+
+    /// El `PATCH` es idempotente (`If-Match`): un fallo ambiguo **sí** se reintenta;
+    /// sólo el alta de contacto va a conflicto.
+    #[tokio::test]
+    async fn editar_un_contacto_con_la_conexion_cortada_sigue_reintentando() {
+        let f = Fixture::new("graph-e2e-patch-corte").await;
+        f.enqueue_put("SRV-ID", "Mía", Some("\"e1\"")).await;
+        f.server.push_status(1, "");
 
         let report = f.replay().await;
 
@@ -1384,6 +1517,22 @@ mod end_to_end_calendar {
             .unwrap()
         }
 
+        /// Como [`Self::replay`] pero con un plazo corto (el `POST` vence tras enviarse).
+        async fn replay_within(&self, millis: u64) -> ReplayReport {
+            let credential = fake::credential_for(&self.server);
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(millis);
+            replay_graph_area(
+                &self.manager,
+                ACCOUNT,
+                CALENDAR_AREA,
+                &fake::client(),
+                &credential,
+                deadline,
+            )
+            .await
+            .unwrap()
+        }
+
         /// Una columna de la fila guardada del evento, o `None` si no hay fila.
         async fn stored(&self, href: &str, column: &'static str) -> Option<String> {
             let href = href.to_string();
@@ -1488,6 +1637,54 @@ mod end_to_end_calendar {
             Some("W/\"e1\"")
         );
         assert_eq!(f.pending().await, 0);
+    }
+
+    /// **El alta de evento es idempotente** (`transactionId`): un fallo ambiguo
+    /// —plazo vencido tras enviar, conexión cortada, cuerpo cortado— **se reintenta**
+    /// y **no** va a conflicto, a diferencia del alta de contacto (`#118.1`). El
+    /// reintento reenvía el mismo `transactionId`.
+    #[tokio::test]
+    async fn crear_un_evento_con_un_fallo_ambiguo_sigue_reintentando() {
+        const LOCAL: &str = "graph://default/nuevo.ics";
+        for (etiqueta, status) in [("plazo", 0), ("corte", 1), ("cuerpo", 2)] {
+            let f = Fixture::new(&format!("graph-cal-ambiguo-{etiqueta}")).await;
+            f.enqueue_put(LOCAL, None).await;
+            f.server.push_status(status, "");
+
+            let report = f.replay_within(600).await;
+
+            assert_eq!(report.retried, 1, "{etiqueta}: se reintenta");
+            assert_eq!(report.conflicts, 0, "{etiqueta}: no es conflicto");
+            assert_eq!(
+                f.op_state(LOCAL).await.as_deref(),
+                Some("ready"),
+                "{etiqueta}: la op sigue en cola"
+            );
+            assert!(
+                f.stored(LOCAL, "raw_ical").await.is_some(),
+                "{etiqueta}: el crudo local sigue"
+            );
+
+            // La vuelta siguiente reenvía el alta con el mismo `transactionId`.
+            f.server
+                .push_status(201, r#"{"id":"SRV-ID","@odata.etag":"W/\"e1\""}"#);
+            let report = f.replay().await;
+            assert_eq!(
+                report.pushed, 1,
+                "{etiqueta}: el reintento completa el alta"
+            );
+            let posts: Vec<_> = f
+                .server
+                .requests()
+                .into_iter()
+                .filter(|r| r.method == "POST")
+                .collect();
+            assert_eq!(posts.len(), 2, "{etiqueta}: el POST se reenvió");
+            for post in posts {
+                let sent: serde_json::Value = serde_json::from_str(&post.body).unwrap();
+                assert_eq!(sent["transactionId"], LOCAL, "{etiqueta}: mismo id");
+            }
+        }
     }
 
     /// **Editar**: `PATCH /me/events/{id}` con el `If-Match` capturado, **sin**

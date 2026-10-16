@@ -533,7 +533,9 @@ pub mod fake {
                 .push_back((200, body.into()));
         }
 
-        /// Encola una respuesta con un estado arbitrario.
+        /// Encola una respuesta con un estado arbitrario. Estados especiales: `0` no
+        /// contesta nunca (plazo), `1` corta la conexión sin contestar (error de
+        /// transporte), `2` manda un `201` con el cuerpo cortado.
         pub fn push_status(&self, status: u16, body: impl Into<String>) {
             self.state
                 .lock()
@@ -643,6 +645,19 @@ pub mod fake {
             // Estado 0 = «no contestar nunca»: para probar el plazo de un pedido.
             if status == 0 {
                 std::future::pending::<()>().await;
+            }
+            // Estado 1 = «cerrar sin contestar»: el pedido llegó y la conexión se corta,
+            // o sea un error de transporte en `.send()` tras haber enviado.
+            if status == 1 {
+                return;
+            }
+            // Estado 2 = un `201` que promete más cuerpo del que manda y corta: la
+            // lectura del cuerpo se corta **después** de un 2xx (el POST se procesó).
+            if status == 2 {
+                let _ = socket
+                    .write_all(b"HTTP/1.1 201 X\r\nContent-Length: 100\r\n\r\n{")
+                    .await;
+                return;
             }
             // En una redirección (3xx) el «cuerpo» encolado es el `Location`.
             let (location, body) = if (300..400).contains(&status) {
