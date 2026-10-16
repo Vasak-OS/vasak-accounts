@@ -482,10 +482,17 @@ async fn fetch_photo(url: &str) -> Result<(Vec<u8>, String), String> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(image.base64.as_bytes())
         .map_err(|_| "la foto no se pudo decodificar".to_string())?;
-    if bytes.len() > PHOTO_MAX_BYTES {
+    if !check_photo_size(&bytes) {
         return Err(format!("la foto pasa el tope de {PHOTO_MAX_BYTES} bytes"));
     }
     Ok((bytes, image.content_type))
+}
+
+/// Si los bytes de una foto entran en el tope [`PHOTO_MAX_BYTES`] (2 MB). Pura y
+/// con costura para la prueba: el tope vivía embebido en `fetch_photo` sin nada
+/// que lo cubra, así que borrarlo no ponía nada rojo.
+fn check_photo_size(bytes: &[u8]) -> bool {
+    bytes.len() <= PHOTO_MAX_BYTES
 }
 
 /// Si el host de una url de foto es de Google (`googleusercontent.com` o un

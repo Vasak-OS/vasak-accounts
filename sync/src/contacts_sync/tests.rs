@@ -331,3 +331,67 @@ mod ldap_tests {
         );
     }
 }
+
+/// El despacho de backend de contactos, sin Broker: una función pura sobre el
+/// catálogo y el `provider_type`.
+mod backend_dispatch {
+    use crate::broker::Provider;
+    use crate::contacts_sync::backend::ContactBackendKind;
+    use crate::contacts_sync::classify_backend;
+
+    fn provider(id: &str, kind: &str) -> Provider {
+        Provider {
+            id: id.to_string(),
+            display_name: id.to_string(),
+            capabilities: Vec::new(),
+            unavailable_capabilities: Vec::new(),
+            configured: true,
+            kind: kind.to_string(),
+        }
+    }
+
+    /// `id == "google"` cae en el backend de Google aunque su `kind` sea el de un
+    /// CardDAV con OAuth: es lo que le suma la pasada de la People API.
+    #[test]
+    fn google_despacha_al_backend_de_google_por_su_id() {
+        let catalog = [provider("google", "oauth2")];
+        assert_eq!(
+            classify_backend(&catalog, "google"),
+            ContactBackendKind::Google
+        );
+    }
+
+    /// El resto sale del `kind`, y lo desconocido cae en CardDAV.
+    #[test]
+    fn el_resto_despacha_por_el_kind() {
+        let catalog = [
+            provider("ms", "graph"),
+            provider("dir", "ldap"),
+            provider("fastmail", "carddav"),
+            provider("raro", "lo-que-sea"),
+        ];
+        assert_eq!(
+            classify_backend(&catalog, "ms"),
+            ContactBackendKind::GraphApi
+        );
+        assert_eq!(classify_backend(&catalog, "dir"), ContactBackendKind::Ldap);
+        assert_eq!(
+            classify_backend(&catalog, "fastmail"),
+            ContactBackendKind::CardDav
+        );
+        assert_eq!(
+            classify_backend(&catalog, "raro"),
+            ContactBackendKind::CardDav
+        );
+    }
+
+    /// Un `provider_type` que no está en el catálogo cae en CardDAV.
+    #[test]
+    fn un_proveedor_desconocido_cae_en_carddav() {
+        let catalog = [provider("google", "oauth2")];
+        assert_eq!(
+            classify_backend(&catalog, "no-existe"),
+            ContactBackendKind::CardDav
+        );
+    }
+}

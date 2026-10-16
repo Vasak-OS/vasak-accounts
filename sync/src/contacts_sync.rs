@@ -199,25 +199,7 @@ impl<K: KeySource> ContactsSync<K> {
         let account = accounts.iter().find(|a| a.id == account_id);
         let provider_type = account.map(|a| a.provider_type.as_str()).unwrap_or("");
 
-        // Buscar el proveedor en el catálogo
-        for provider in providers {
-            if provider.id == provider_type {
-                // Google es `kind=oauth2` como cualquier CardDAV con OAuth; se lo
-                // distingue por el id del proveedor, no por el kind, para sumarle
-                // la pasada de enriquecimiento por la People API.
-                if provider.id == "google" {
-                    return ContactBackendKind::Google;
-                }
-                return match provider.kind.as_str() {
-                    "graph" => ContactBackendKind::GraphApi,
-                    "ldap" => ContactBackendKind::Ldap,
-                    "carddav" => ContactBackendKind::CardDav,
-                    _ => ContactBackendKind::CardDav,
-                };
-            }
-        }
-
-        ContactBackendKind::CardDav
+        classify_backend(&providers, provider_type)
     }
 
     /// Una vuelta de una cuenta, de punta a punta, con su estado.
@@ -335,6 +317,34 @@ impl<K: KeySource> AreaSync for ContactsSync<K> {
 
 /// Decide cuándo le toca a cada cuenta.
 pub type ContactsScheduler<K> = dav_sync::DavScheduler<ContactsSync<K>>;
+
+/// Elige el backend de contactos a partir del catálogo de proveedores y el
+/// `provider_type` de la cuenta. Puro y separado del Broker para poder probar el
+/// despacho sin bus de D-Bus (en especial que `id == "google"` cae en
+/// [`ContactBackendKind::Google`] y no en el CardDAV de su `kind`).
+///
+/// Google es `kind=oauth2` como cualquier CardDAV con OAuth; se lo distingue por
+/// el id del proveedor, no por el kind, para sumarle la pasada de enriquecimiento
+/// por la People API.
+fn classify_backend(
+    providers: &[crate::broker::Provider],
+    provider_type: &str,
+) -> ContactBackendKind {
+    for provider in providers {
+        if provider.id == provider_type {
+            if provider.id == "google" {
+                return ContactBackendKind::Google;
+            }
+            return match provider.kind.as_str() {
+                "graph" => ContactBackendKind::GraphApi,
+                "ldap" => ContactBackendKind::Ldap,
+                "carddav" => ContactBackendKind::CardDav,
+                _ => ContactBackendKind::CardDav,
+            };
+        }
+    }
+    ContactBackendKind::CardDav
+}
 
 #[cfg(test)]
 mod tests;

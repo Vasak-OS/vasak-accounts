@@ -17,8 +17,8 @@ use std::time::Instant;
 use base64::Engine;
 
 use super::{
-    enrich_photos, fetch_connections, fetch_photo, is_google_photo_host, GoogleBackend,
-    PeopleError, PeopleLimits,
+    check_photo_size, enrich_photos, fetch_connections, fetch_photo, is_google_photo_host,
+    GoogleBackend, PeopleError, PeopleLimits, PHOTO_MAX_BYTES,
 };
 use crate::contacts_sync::backend::{SyncContext, SyncResult};
 use crate::dav::fake::{card, FakeDav};
@@ -647,6 +647,20 @@ async fn la_descarga_real_rechaza_un_host_que_no_es_de_google() {
     assert!(
         err.contains("host de Google"),
         "rechazo por el allowlist: {err}"
+    );
+}
+
+/// El tope de 2 MB: una foto justo en el límite entra, una de un byte más se
+/// rechaza. Sin esta guardia, una foto gigante pasaría derecho al guardado.
+#[test]
+fn el_tope_de_la_foto_deja_pasar_el_limite_y_rechaza_lo_que_lo_supera() {
+    assert!(
+        check_photo_size(&vec![0u8; PHOTO_MAX_BYTES]),
+        "2 MB justo entra"
+    );
+    assert!(
+        !check_photo_size(&vec![0u8; PHOTO_MAX_BYTES + 1]),
+        "un byte de más se rechaza"
     );
 }
 

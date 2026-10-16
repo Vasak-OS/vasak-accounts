@@ -610,9 +610,11 @@ pub mod fake {
                     Ok(n) => buffer.extend_from_slice(&chunk[..n]),
                 }
             }
-            let request_body =
-                String::from_utf8_lossy(&buffer[body_start..body_start + length]).into_owned();
-            buffer.drain(..body_start + length);
+            // Acotar el final al tamaño leído: un `Content-Length` que exceda el
+            // cuerpo recibido no debe hacer panic por slice fuera de rango.
+            let end = (body_start + length).min(buffer.len());
+            let request_body = String::from_utf8_lossy(&buffer[body_start..end]).into_owned();
+            buffer.drain(..end);
 
             let (status, body) = {
                 let mut state = state.lock().unwrap();
