@@ -599,6 +599,53 @@ mod end_to_end {
                 .await
                 .unwrap()
         }
+
+        /// El `server_raw` de la op (un BLOB) como texto: la copia del servidor que
+        /// capturó el conflicto. `op_field` no sirve acá —lee TEXT, no BLOB—.
+        async fn op_server_raw(&self, href: &str) -> Option<String> {
+            let href = href.to_string();
+            self.manager
+                .with_store(ACCOUNT, move |store| {
+                    Ok(store
+                        .connection()
+                        .query_row(
+                            "SELECT server_raw FROM pending_dav_ops WHERE object_href = ?1",
+                            [href],
+                            |r| r.get::<_, Option<Vec<u8>>>(0),
+                        )
+                        .ok()
+                        .flatten()
+                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
+                })
+                .await
+                .unwrap()
+        }
+
+        /// El id local del objeto (el que recibe `ResolveConflict`), por su `href`.
+        async fn local_id(&self, href: &str) -> i64 {
+            let href = href.to_string();
+            self.manager
+                .with_store(ACCOUNT, move |store| {
+                    Ok(store
+                        .connection()
+                        .query_row("SELECT id FROM contacts WHERE href = ?1", [href], |r| {
+                            r.get::<_, i64>(0)
+                        })
+                        .unwrap())
+                })
+                .await
+                .unwrap()
+        }
+
+        /// Aplica la decisión de la persona sobre el conflicto, como `ResolveConflict`.
+        async fn resolve(&self, id: i64, choice: crate::store::queue::ConflictChoice) {
+            self.manager
+                .with_store(ACCOUNT, move |store| {
+                    store.resolve_conflict(CONTACTS_AREA, id, choice)
+                })
+                .await
+                .unwrap();
+        }
     }
 
     /// **`412` en un `PATCH`**: la op queda en `conflict` y **el crudo local no se
@@ -844,6 +891,372 @@ mod end_to_end {
         assert_eq!(report.conflicts, 0);
         assert_eq!(f.op_state("SRV-ID").await.as_deref(), Some("ready"));
     }
+
+    // ── Resolución de conflicto de objetos Graph (`#97`) ──────────────────────
+    //
+    // La captura de la copia del servidor es propia de Graph (un `GET`, no el
+    // `multiget` DAV); la resolución (`keep_local`/`take_server`) la hace el store
+    // igual que para DAV, así que acá se ejerce de punta a punta.
+
+    /// El JSON de un contacto del servidor, para la respuesta del `GET` de la copia.
+    /// Se arma con `serde_json` para que el `@odata.etag` —que lleva comillas
+    /// (`W/"..."` o `"..."`)— quede bien escapado, como lo manda Graph de verdad.
+    fn server_contact(name: &str, etag: &str) -> String {
+        serde_json::json!({
+            "id": "SRV-ID",
+            "@odata.etag": etag,
+            "displayName": name,
+        })
+        .to_string()
+    }
+
+    /// **Captura de la copia del servidor en `412`**: tras el conflicto se trae la
+    /// versión actual del objeto por un `GET` de Graph y se guarda en la op
+    /// (`server_etag`/`server_raw`), en el mismo formato vCard que la bajada, para que
+    /// `GetConflict` muestre «la mía vs. la del servidor». El crudo local sigue intacto.
+    #[tokio::test]
+    async fn un_412_captura_la_copia_del_servidor() {
+        let f = Fixture::new("graph-e2e-captura").await;
+        f.enqueue_put("SRV-ID", "Mía", Some("\"vieja\"")).await;
+        f.server.push_status(412, ""); // el PATCH choca
+        f.server.push(server_contact("Suya", "\"srv\"")); // el GET de la copia
+
+        let report = f.replay().await;
+
+        assert_eq!(report.conflicts, 1);
+        assert_eq!(f.op_state("SRV-ID").await.as_deref(), Some("conflict"));
+        assert_eq!(
+            f.op_field("SRV-ID", "server_etag").await.as_deref(),
+            Some("\"srv\""),
+            "se guardó el ETag del servidor"
+        );
+        assert!(
+            f.op_server_raw("SRV-ID")
+                .await
+                .is_some_and(|r| r.contains("Suya")),
+            "se guardó la copia del servidor (vCard) en la op"
+        );
+        assert!(
+            f.stored("SRV-ID", "raw_vcard")
+                .await
+                .is_some_and(|r| r.contains("Mía")),
+            "el crudo local no se pisó"
+        );
+    }
+
+    /// **`take_server`**: con la copia ya capturada, la persona elige la del servidor;
+    /// se adopta en la fila (su vCard y su ETag), se descarta el cambio local y la op.
+    #[tokio::test]
+    async fn take_server_adopta_la_copia_del_servidor() {
+        let f = Fixture::new("graph-e2e-take-server").await;
+        f.enqueue_put("SRV-ID", "Mía", Some("\"vieja\"")).await;
+        f.server.push_status(412, "");
+        f.server.push(server_contact("Suya", "\"srv\""));
+        f.replay().await;
+
+        let id = f.local_id("SRV-ID").await;
+        f.resolve(id, crate::store::queue::ConflictChoice::TakeServer)
+            .await;
+
+        assert_eq!(f.pending().await, 0, "la op se descartó");
+        let raw = f
+            .stored("SRV-ID", "raw_vcard")
+            .await
+            .expect("la fila sigue");
+        assert!(raw.contains("Suya"), "se adoptó la copia del servidor");
+        assert!(!raw.contains("Mía"), "el cambio local se descartó");
+        assert_eq!(
+            f.stored("SRV-ID", "etag").await.as_deref(),
+            Some("\"srv\""),
+            "la fila quedó con el ETag del servidor"
+        );
+    }
+
+    /// **`keep_local`**: con la copia ya capturada, la persona elige la suya; la op se
+    /// re-basa sobre el ETag del servidor y vuelve a `ready`, y el **segundo empuje
+    /// re-hace el `PATCH` con `If-Match` = ese ETag** (la precondición fresca que pisa
+    /// el servidor). El crudo local no se perdió.
+    #[tokio::test]
+    async fn keep_local_reempuja_con_el_etag_del_servidor() {
+        let f = Fixture::new("graph-e2e-keep-local").await;
+        f.enqueue_put("SRV-ID", "Mía", Some("\"vieja\"")).await;
+        f.server.push_status(412, "");
+        f.server.push(server_contact("Suya", "\"srv\""));
+        f.replay().await; // conflicto con copia capturada (server_etag "srv")
+
+        let id = f.local_id("SRV-ID").await;
+        f.resolve(id, crate::store::queue::ConflictChoice::KeepLocal)
+            .await;
+        assert_eq!(
+            f.op_state("SRV-ID").await.as_deref(),
+            Some("ready"),
+            "la op vuelve a reintentarse"
+        );
+
+        // El segundo empuje re-hace el PATCH, ahora con el ETag del servidor.
+        f.server.push_status(200, r#"{"@odata.etag":"\"nuevo\""}"#);
+        let report = f.replay().await;
+
+        assert_eq!(report.pushed, 1);
+        assert_eq!(f.pending().await, 0, "el re-empuje cerró la op");
+        let requests = f.server.requests();
+        let last = requests.last().expect("hubo pedidos");
+        assert_eq!(last.method, "PATCH");
+        assert_eq!(
+            last.if_match, "\"srv\"",
+            "re-empuja con el ETag del servidor, no con el viejo"
+        );
+        assert!(
+            f.stored("SRV-ID", "raw_vcard")
+                .await
+                .is_some_and(|r| r.contains("Mía")),
+            "se subió el crudo local"
+        );
+    }
+
+    /// Si el objeto en conflicto **ya no está en el servidor** (`GET` → `404`), la
+    /// copia no se guarda, se le suma un intento (acota la re-traída) y el conflicto
+    /// sigue sin copia. El crudo local no se pierde.
+    #[tokio::test]
+    async fn una_copia_borrada_en_el_servidor_no_se_guarda_pero_cuenta_un_intento() {
+        let f = Fixture::new("graph-e2e-captura-404").await;
+        f.enqueue_put("SRV-ID", "Mía", Some("\"vieja\"")).await;
+        f.server.push_status(412, ""); // el PATCH choca
+        f.server.push_status(404, ""); // el GET de la copia: ya no está
+
+        f.replay().await;
+
+        assert_eq!(f.op_state("SRV-ID").await.as_deref(), Some("conflict"));
+        assert_eq!(
+            f.op_server_raw("SRV-ID").await,
+            None,
+            "no se guardó copia del servidor"
+        );
+        // 1 por marcar el conflicto + 1 por la traída fallida: con `>= 1` pasaba
+        // aunque nadie contara la traída.
+        assert_eq!(
+            f.op_attempts("SRV-ID").await,
+            Some(2),
+            "se contó un intento de traída, para acotar la re-traída"
+        );
+        assert_eq!(
+            f.server
+                .requests()
+                .last()
+                .map(|r| r.method.clone())
+                .as_deref(),
+            Some("GET"),
+            "se intentó traer la copia"
+        );
+        assert!(
+            f.stored("SRV-ID", "raw_vcard")
+                .await
+                .is_some_and(|r| r.contains("Mía")),
+            "el crudo local sigue intacto"
+        );
+    }
+
+    /// **Tope de re-traídas**: si la copia del servidor no se puede traer nunca (el
+    /// `GET` da 5xx vuelta tras vuelta), la op en conflicto **no pega a la red para
+    /// siempre**: se cuenta un intento por traída fallida y, al llegar a
+    /// `MAX_REPLAY_ATTEMPTS`, se deja de intentar. Tampoco se re-empuja la escritura.
+    #[tokio::test]
+    async fn la_retraida_de_una_copia_que_siempre_falla_se_corta_en_el_tope() {
+        let f = Fixture::new("graph-e2e-tope").await;
+        f.enqueue_put("SRV-ID", "Mía", Some("\"vieja\"")).await;
+        f.server.push_status(412, ""); // el PATCH choca; todo GET siguiente da 500
+
+        f.replay().await;
+        for _ in 0..(super::super::MAX_REPLAY_ATTEMPTS * 2) {
+            f.replay().await;
+        }
+
+        let gets = |f: &Fixture| {
+            f.server
+                .requests()
+                .iter()
+                .filter(|r| r.method == "GET")
+                .count()
+        };
+        let patches = f
+            .server
+            .requests()
+            .iter()
+            .filter(|r| r.method == "PATCH")
+            .count();
+        assert_eq!(patches, 1, "una op en conflicto no re-empuja la escritura");
+        assert_eq!(
+            f.op_attempts("SRV-ID").await,
+            Some(super::super::MAX_REPLAY_ATTEMPTS),
+            "los intentos se frenan en el tope"
+        );
+        let hasta_ahora = gets(&f);
+        assert!(
+            hasta_ahora < super::super::MAX_REPLAY_ATTEMPTS as usize,
+            "la traída se intentó {hasta_ahora} veces, acotada"
+        );
+        f.replay().await;
+        f.replay().await;
+        assert_eq!(gets(&f), hasta_ahora, "pasado el tope no hay más pedidos");
+        assert_eq!(f.op_state("SRV-ID").await.as_deref(), Some("conflict"));
+        assert!(
+            f.stored("SRV-ID", "raw_vcard")
+                .await
+                .is_some_and(|r| r.contains("Mía")),
+            "el crudo local sigue intacto"
+        );
+    }
+
+    /// **Un `5xx` en la captura no pierde nada** y la próxima vuelta lo recupera: tras
+    /// el `412` y un `GET` que da 500 la op sigue en conflicto, el crudo local
+    /// intacto y sin copia; en la vuelta siguiente, con el servidor sano, se guarda.
+    #[tokio::test]
+    async fn un_5xx_en_la_captura_no_pierde_el_local_y_la_proxima_vuelta_la_trae() {
+        let f = Fixture::new("graph-e2e-captura-5xx").await;
+        f.enqueue_put("SRV-ID", "Mía", Some("\"vieja\"")).await;
+        f.server.push_status(412, "");
+        f.server.push_status(503, "{}"); // el GET de la copia falla
+
+        f.replay().await;
+
+        assert_eq!(f.op_state("SRV-ID").await.as_deref(), Some("conflict"));
+        assert_eq!(f.pending().await, 1, "la op sigue en la cola");
+        assert_eq!(f.op_server_raw("SRV-ID").await, None);
+        assert!(f
+            .stored("SRV-ID", "raw_vcard")
+            .await
+            .is_some_and(|r| r.contains("Mía")));
+
+        f.server.push(server_contact("Suya", "\"srv\""));
+        f.replay().await;
+
+        assert!(f
+            .op_server_raw("SRV-ID")
+            .await
+            .is_some_and(|r| r.contains("Suya")));
+        assert_eq!(
+            f.op_field("SRV-ID", "server_etag").await.as_deref(),
+            Some("\"srv\"")
+        );
+        assert!(f
+            .stored("SRV-ID", "raw_vcard")
+            .await
+            .is_some_and(|r| r.contains("Mía")));
+    }
+
+    /// **Un `GET` que no contesta** no cuelga la vuelta ni pierde la op: el plazo de la
+    /// vuelta lo corta, se cuenta el intento y el conflicto queda con el local intacto.
+    #[tokio::test]
+    async fn una_captura_que_no_contesta_se_corta_por_el_plazo_y_no_pierde_la_op() {
+        let f = Fixture::new("graph-e2e-captura-plazo").await;
+        f.enqueue_put("SRV-ID", "Mía", Some("\"vieja\"")).await;
+        f.server.push_status(412, "");
+        f.server.push_status(0, ""); // el GET nunca contesta
+
+        let credential = f.credential();
+        let started = Instant::now();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+        let report = replay_graph_area(
+            &f.manager,
+            ACCOUNT,
+            CONTACTS_AREA,
+            &fake::client(),
+            &credential,
+            deadline,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "la vuelta respeta su plazo y no espera los 60 s del pedido"
+        );
+        assert_eq!(report.conflicts, 1);
+        assert_eq!(f.op_state("SRV-ID").await.as_deref(), Some("conflict"));
+        assert_eq!(f.op_server_raw("SRV-ID").await, None);
+        assert_eq!(f.op_attempts("SRV-ID").await, Some(2), "se contó la traída");
+        assert!(f
+            .stored("SRV-ID", "raw_vcard")
+            .await
+            .is_some_and(|r| r.contains("Mía")));
+    }
+
+    /// **El `id` va percent-codificado en la ruta del `GET`**: un `id` con `/`, `?`,
+    /// `#` o espacios no puede cambiar de recurso ni de consulta.
+    #[tokio::test]
+    async fn el_get_de_la_copia_codifica_el_id_en_la_ruta() {
+        let f = Fixture::new("graph-e2e-captura-ruta").await;
+        let id = "a/b c?d#e";
+        f.enqueue_put(id, "Mía", Some("\"vieja\"")).await;
+        f.server.push_status(412, "");
+        f.server.push(server_contact("Suya", "\"srv\""));
+
+        f.replay().await;
+
+        let requests = f.server.requests();
+        let get = requests
+            .iter()
+            .find(|r| r.method == "GET")
+            .expect("hubo GET");
+        let path = get.path.split('?').next().unwrap();
+        assert_eq!(
+            path, "/v1.0/users/me/contacts/a%2Fb%20c%3Fd%23e",
+            "{}",
+            get.path
+        );
+        assert!(get.authorization.starts_with("Bearer "));
+    }
+
+    /// **El `GET` no sigue una URL que venga en la respuesta**: un `302` hacia otro
+    /// origen no se sigue (ni se guarda lo que conteste ese origen como copia del
+    /// servidor), y el token no sale hacia allá.
+    #[tokio::test]
+    async fn el_get_de_la_copia_no_sigue_una_redireccion_a_otro_origen() {
+        let f = Fixture::new("graph-e2e-captura-redir").await;
+        let otro = FakeGraph::start().await;
+        otro.push(server_contact("Intrusa", "\"x\""));
+        f.enqueue_put("SRV-ID", "Mía", Some("\"vieja\"")).await;
+        f.server.push_status(412, "");
+        // Un 302 con `Location` a otro origen (el fake pone el cuerpo como `Location`).
+        f.server.push_status(
+            302,
+            format!("{}/v1.0/users/me/contacts/SRV-ID", otro.origin()),
+        );
+
+        f.replay().await;
+
+        assert!(
+            otro.requests().is_empty(),
+            "no se pidió nada al otro origen"
+        );
+        assert_eq!(f.op_server_raw("SRV-ID").await, None);
+    }
+
+    /// **Una copia del servidor más grande que el tope no se guarda**: el `GET` de la
+    /// captura devuelve más de `MAX_OBJECT_BYTES`; la lectura capada corta con
+    /// `TooLarge`, no se guarda copia, se cuenta el intento y el local queda intacto.
+    #[tokio::test]
+    async fn una_copia_del_servidor_mas_grande_que_el_tope_no_se_guarda() {
+        let f = Fixture::new("graph-e2e-captura-grande").await;
+        f.enqueue_put("SRV-ID", "Mía", Some("\"vieja\"")).await;
+        f.server.push_status(412, "");
+        // JSON válido: sólo el tope puede rechazarlo.
+        f.server.push(server_contact(
+            &"x".repeat(crate::graph::MAX_OBJECT_BYTES),
+            "\"srv\"",
+        ));
+
+        f.replay().await;
+
+        assert_eq!(f.op_state("SRV-ID").await.as_deref(), Some("conflict"));
+        assert_eq!(f.pending().await, 1, "la op sigue en la cola");
+        assert_eq!(f.op_server_raw("SRV-ID").await, None, "no se guardó copia");
+        assert_eq!(f.op_attempts("SRV-ID").await, Some(2), "se contó la traída");
+        assert!(f
+            .stored("SRV-ID", "raw_vcard")
+            .await
+            .is_some_and(|r| r.contains("Mía")));
+    }
 }
 
 // ── De punta a punta por el camino de **calendario** (`/me/events`) ───────────
@@ -1002,6 +1415,30 @@ mod end_to_end_calendar {
                             |r| r.get::<_, String>(0),
                         )
                         .ok())
+                })
+                .await
+                .unwrap()
+        }
+
+        /// `(server_etag, server_raw)` de la op de ese `href`.
+        async fn server_copy(&self, href: &str) -> (Option<String>, String) {
+            let href = href.to_string();
+            self.manager
+                .with_store(ACCOUNT, move |store| {
+                    Ok(store
+                        .connection()
+                        .query_row(
+                            "SELECT server_etag, server_raw FROM pending_dav_ops \
+                             WHERE object_href = ?1",
+                            [href],
+                            |r| {
+                                Ok((
+                                    r.get::<_, Option<String>>(0)?,
+                                    String::from_utf8_lossy(&r.get::<_, Vec<u8>>(1)?).into_owned(),
+                                ))
+                            },
+                        )
+                        .unwrap())
                 })
                 .await
                 .unwrap()
@@ -1205,5 +1642,170 @@ mod end_to_end_calendar {
         assert_eq!(sent["start"]["dateTime"], "2026-09-15T17:00:00");
         assert_eq!(sent["end"]["dateTime"], "2026-09-15T18:00:00");
         assert_eq!(f.pending().await, 0);
+    }
+
+    /// **Captura de la copia del servidor de un evento**: el `GET /users/me/events/{id}`
+    /// pide las fechas en UTC, y lo guardado es el iCal de la bajada con el `@odata.etag`.
+    /// `take_server` lo adopta en la fila y descarta la op.
+    #[tokio::test]
+    async fn un_412_en_un_evento_captura_la_copia_y_take_server_la_adopta() {
+        let f = Fixture::new("graph-cal-captura").await;
+        f.enqueue_put("SRV-ID", Some("W/\"vieja\"")).await;
+        f.server.push_status(412, "");
+        f.server.push(
+            serde_json::json!({
+                "id": "SRV-ID",
+                "@odata.etag": "W/\"srv\"",
+                "iCalUId": "u1",
+                "subject": "Del servidor",
+                "start": {"dateTime": "2026-09-15T17:00:00", "timeZone": "UTC"},
+                "end": {"dateTime": "2026-09-15T18:00:00", "timeZone": "UTC"},
+            })
+            .to_string(),
+        );
+
+        f.replay().await;
+
+        let requests = f.server.requests();
+        let get = requests
+            .iter()
+            .find(|r| r.method == "GET")
+            .expect("hubo GET");
+        assert!(
+            get.path.starts_with("/v1.0/users/me/events/SRV-ID"),
+            "{}",
+            get.path
+        );
+        assert!(
+            get.prefer.contains("UTC"),
+            "pide las fechas en UTC: {}",
+            get.prefer
+        );
+        let (etag, raw) = f.server_copy("SRV-ID").await;
+        assert_eq!(etag.as_deref(), Some("W/\"srv\""));
+        assert!(
+            raw.contains("BEGIN:VEVENT") && raw.contains("Del servidor"),
+            "{raw}"
+        );
+        assert!(f
+            .stored("SRV-ID", "raw_ical")
+            .await
+            .is_some_and(|r| r.contains("Reunión")));
+
+        let id: i64 = f
+            .manager
+            .with_store(ACCOUNT, |store| {
+                Ok(store
+                    .connection()
+                    .query_row(
+                        "SELECT id FROM calendar_objects WHERE href = 'SRV-ID'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap())
+            })
+            .await
+            .unwrap();
+        f.manager
+            .with_store(ACCOUNT, move |store| {
+                store.resolve_conflict(
+                    CALENDAR_AREA,
+                    id,
+                    crate::store::queue::ConflictChoice::TakeServer,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(f.pending().await, 0);
+        assert!(f
+            .stored("SRV-ID", "raw_ical")
+            .await
+            .is_some_and(|r| r.contains("Del servidor") && !r.contains("Reunión")));
+        assert_eq!(
+            f.stored("SRV-ID", "etag").await.as_deref(),
+            Some("W/\"srv\"")
+        );
+    }
+}
+
+// ── Lectura capada por chunks (`graph::read_capped`) ──────────────────────────
+mod read_capped {
+    use std::time::{Duration, Instant};
+
+    use tokio::io::AsyncWriteExt;
+
+    use crate::graph::fake::{self, FakeGraph};
+    use crate::graph::{fetch_one, read_capped, CappedReadError, GraphFetchError};
+
+    async fn respuesta(server: &FakeGraph) -> reqwest::Response {
+        fake::client().get(server.origin()).send().await.unwrap()
+    }
+
+    /// Un servidor hostil: **promete** 100 MB, manda `sent` bytes y deja el socket
+    /// abierto sin mandar más (no cierra ni termina el cuerpo).
+    async fn servidor_que_promete_de_mas(sent: usize) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    // Se descarta el pedido: alcanza con contestar.
+                    let mut buf = [0u8; 4096];
+                    let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
+                    let head = "HTTP/1.1 200 OK\r\nContent-Length: 104857600\r\n\r\n";
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(&vec![b'x'; sent]).await;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        origin
+    }
+
+    /// **Corta apenas el acumulado pasa el tope**, sin esperar el resto del cuerpo: el
+    /// servidor manda 2 MB de los 100 prometidos y se queda callado. Una lectura que
+    /// bufferiza todo (`.bytes()`) esperaría hasta el plazo del pedido (60 s); la capada
+    /// contesta `TooLarge` enseguida.
+    #[tokio::test]
+    async fn un_objeto_mas_grande_que_el_tope_corta_sin_esperar_el_resto() {
+        let origin = servidor_que_promete_de_mas(2 * 1024 * 1024).await;
+        let server = FakeGraph::start().await; // sólo para la credencial
+        let mut credential = fake::credential_for(&server);
+        credential.base_url = format!("{origin}/v1.0");
+        let url =
+            crate::graph::build_url(&credential.base_url, &["users", "me", "contacts", "x"], "")
+                .unwrap();
+        let started = Instant::now();
+
+        let result = fetch_one::<serde_json::Value>(&fake::client(), &credential, url, &[]).await;
+
+        assert!(matches!(result, Err(GraphFetchError::TooLarge)));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "cortó en {:?}: no esperó el resto del cuerpo",
+            started.elapsed()
+        );
+    }
+
+    /// Un cuerpo de exactamente el tope entra; un byte más, no.
+    #[tokio::test]
+    async fn el_tope_es_inclusivo() {
+        let server = FakeGraph::start().await;
+        server.push("a".repeat(10));
+        let ok = read_capped(respuesta(&server).await, 10).await;
+        assert_eq!(ok.ok().map(|b| b.len()), Some(10));
+
+        server.push("a".repeat(11));
+        let largo = read_capped(respuesta(&server).await, 10).await;
+        assert!(matches!(largo, Err(CappedReadError::TooLarge)));
+    }
+
+    /// Un cuerpo vacío (un `204 No Content` de un `PATCH`) **no es error**.
+    #[tokio::test]
+    async fn un_cuerpo_vacio_se_acepta() {
+        let server = FakeGraph::start().await;
+        server.push_status(204, "");
+        let bytes = read_capped(respuesta(&server).await, 10).await;
+        assert!(matches!(bytes, Ok(b) if b.is_empty()));
     }
 }
