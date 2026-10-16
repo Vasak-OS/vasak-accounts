@@ -1518,4 +1518,152 @@ mod tests {
         assert!(raw.contains("UID:keep\r\n"), "{raw:?}");
         assert!(raw.contains("SUMMARY:Sin iCalUId\r\n"), "{raw:?}");
     }
+
+    // ── `graph_datetime`: zonas, flotantes y horas que no existen (`#97`) ─────
+
+    fn dtstart(params: &[&str], value: &str) -> crate::ical::Property {
+        crate::ical::Property {
+            name: "DTSTART".into(),
+            params: params.iter().map(|p| p.to_string()).collect(),
+            value: value.into(),
+        }
+    }
+
+    fn utc(value: Option<serde_json::Value>) -> Option<String> {
+        value.map(|v| {
+            assert_eq!(v["timeZone"], "UTC", "siempre sale en UTC");
+            v["dateTime"].as_str().unwrap().to_string()
+        })
+    }
+
+    /// Con `TZID` la hora se interpreta en esa zona y **se convierte a UTC**:
+    /// Buenos Aires es UTC-3, así que las 14:00 locales son las 17:00 UTC. Sin la
+    /// conversión (la versión vieja ponía la hora tal cual en UTC) el evento caería
+    /// tres horas antes.
+    #[test]
+    fn una_hora_con_tzid_se_convierte_a_utc() {
+        let p = dtstart(&["TZID=America/Argentina/Buenos_Aires"], "20260915T140000");
+        assert_eq!(
+            utc(graph_datetime(&p)).as_deref(),
+            Some("2026-09-15T17:00:00")
+        );
+    }
+
+    /// Una hora con sufijo `Z` ya es UTC: sale sin cambio.
+    #[test]
+    fn una_hora_con_z_ya_es_utc() {
+        let p = dtstart(&[], "20260915T140000Z");
+        assert_eq!(
+            utc(graph_datetime(&p)).as_deref(),
+            Some("2026-09-15T14:00:00")
+        );
+    }
+
+    /// Un día completo (sólo fecha) sale a medianoche UTC.
+    #[test]
+    fn una_fecha_sin_hora_sale_a_medianoche() {
+        let p = dtstart(&["VALUE=DATE"], "20260915");
+        assert_eq!(
+            utc(graph_datetime(&p)).as_deref(),
+            Some("2026-09-15T00:00:00")
+        );
+    }
+
+    /// Una zona que no se conoce no se adivina: `None`.
+    #[test]
+    fn un_tzid_desconocido_da_none() {
+        let p = dtstart(&["TZID=Mars/Olympus_Mons"], "20260915T140000");
+        assert!(graph_datetime(&p).is_none());
+    }
+
+    /// Una hora flotante (ni `Z` ni `TZID`) no se adivina: `None`.
+    #[test]
+    fn una_hora_flotante_da_none() {
+        let p = dtstart(&[], "20260915T140000");
+        assert!(graph_datetime(&p).is_none());
+    }
+
+    /// Una hora que en su zona **no existe** (el salto adelante del cambio de
+    /// horario) o es **ambigua** (el retroceso la repite) da `None`, no una hora
+    /// corrida.
+    #[test]
+    fn una_hora_inexistente_o_ambigua_por_cambio_de_horario_da_none() {
+        // 2026-03-08 02:30 en Nueva York: el reloj salta de 02:00 a 03:00.
+        let inexistente = dtstart(&["TZID=America/New_York"], "20260308T023000");
+        assert!(graph_datetime(&inexistente).is_none(), "inexistente");
+        // 2026-11-01 01:30 en Nueva York: ocurre dos veces.
+        let ambigua = dtstart(&["TZID=America/New_York"], "20261101T013000");
+        assert!(graph_datetime(&ambigua).is_none(), "ambigua");
+        // Y una hora normal de la misma zona sí se convierte (EDT, UTC-4).
+        let normal = dtstart(&["TZID=America/New_York"], "20260915T140000");
+        assert_eq!(
+            utc(graph_datetime(&normal)).as_deref(),
+            Some("2026-09-15T18:00:00")
+        );
+    }
+
+    /// De punta a punta por el cuerpo: un evento con `TZID` sale con `start` y
+    /// `end` ya en UTC.
+    #[test]
+    fn el_cuerpo_de_un_evento_con_tzid_sale_en_utc() {
+        let ical = "BEGIN:VEVENT\r\nUID:u\r\nSUMMARY:x\r\n\
+            DTSTART;TZID=America/Argentina/Buenos_Aires:20260915T140000\r\n\
+            DTEND;TZID=America/Argentina/Buenos_Aires:20260915T150000\r\n\
+            END:VEVENT\r\n";
+        let body = event_body_from_ical(ical, None).expect("es un VEVENT");
+        assert_eq!(body["start"]["dateTime"], "2026-09-15T17:00:00");
+        assert_eq!(body["end"]["dateTime"], "2026-09-15T18:00:00");
+    }
+
+    // ── Mapeo de errores de almacén del empuje (`#97`) ────────────────────────
+
+    /// Un error de almacén que **no** es «llavero bloqueado» (acá, la tabla de la
+    /// cola rota: `Sqlite`) es una **falla** de la vuelta, no «desbloqueá el
+    /// llavero»: se reporta `Failed` y no se baja nada. Con el mapeo viejo (todo a
+    /// `StoreClosed`) la persona vería un pedido de desbloqueo que no arregla nada.
+    #[tokio::test]
+    async fn un_error_de_almacen_que_no_es_el_llavero_da_failed() {
+        let f = Fixture::new("graph_cal_store_failed").await;
+        f.manager
+            .prepare_for_sync(CALENDAR_AREA, ACCOUNT)
+            .await
+            .then_some(())
+            .expect("la base tenía que quedar abierta");
+        f.manager
+            .with_store(ACCOUNT, |store| {
+                store
+                    .connection()
+                    .execute_batch("DROP TABLE pending_dav_ops")
+                    .map_err(|e| StoreError::Sqlite(e.to_string()))
+            })
+            .await
+            .unwrap();
+
+        let outcome = f.sync().await;
+
+        assert!(
+            matches!(outcome, CalendarOutcome::Failed(_)),
+            "un Sqlite no es StoreClosed: {outcome:?}"
+        );
+        assert!(
+            f.server.requests().is_empty(),
+            "no se bajó nada tras la falla del empuje"
+        );
+    }
+
+    /// El llavero que se bloquea justo después de abrir la base sí es
+    /// `StoreClosed`: se pide desbloquearlo.
+    #[tokio::test]
+    async fn el_llavero_bloqueado_a_mitad_da_store_closed() {
+        let f = Fixture::new("graph_cal_store_locked").await;
+        f.manager.keys().state().lock_after_is_locked = true;
+
+        let outcome = f.sync().await;
+
+        assert!(
+            matches!(outcome, CalendarOutcome::StoreClosed),
+            "llavero bloqueado: {outcome:?}"
+        );
+        assert!(f.server.requests().is_empty());
+    }
 }

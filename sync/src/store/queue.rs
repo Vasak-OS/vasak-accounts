@@ -1334,6 +1334,68 @@ mod tests {
         assert!(!server_raw.contains("Servidor"), "quedó el crudo bajado");
     }
 
+    /// El conteo de filas del índice de búsqueda que matchean un término.
+    fn fts_hits(store: &Store, term: &str) -> i64 {
+        store
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM contacts_fts WHERE contacts_fts MATCH ?1",
+                [term],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// **Integridad del cierre de una creación sobre una fila ya bajada.** Si la
+    /// bajada ya trajo el objeto bajo el `id` del servidor y se re-basa la fila local
+    /// encima: (1) queda **una sola** fila, la local re-basada; (2) el índice de
+    /// búsqueda **no guarda al fantasma** de la fila borrada —el `DELETE` explícito
+    /// dispara el trigger `AFTER DELETE` del FTS, que el `UPDATE OR REPLACE` salteaba—;
+    /// (3) la **generación sube**, así los lectores no se quedan con la foto vieja.
+    #[test]
+    fn complete_create_sobre_una_fila_bajada_limpia_el_indice_y_sube_la_generacion() {
+        const LOCAL: &str = "graph://default/local.vcf";
+        const SERVER: &str = "AAMkServerId==";
+        let temp = TempDir::new("cola-create-fts");
+        let mut store = open_store(&temp);
+        let book = one_book(&mut store);
+        store
+            .apply_contacts(
+                &book,
+                &[ContactOp::Upsert(row(SERVER, "Fantasma", "f@x.com"))],
+                None,
+                u64::MAX,
+            )
+            .unwrap();
+        store
+            .enqueue_contact_put(&book, &row(LOCAL, "Reemplazo", "r@x.com"))
+            .unwrap();
+        assert_eq!(fts_hits(&store, "fantasma"), 1, "precondición: indexada");
+        let op = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        store.take_changes();
+        let before = super::super::read_generation(store.connection(), CONTACTS_AREA).unwrap();
+
+        store.complete_create(&op, SERVER, Some("\"srv\"")).unwrap();
+
+        // (1) Una sola fila bajo el id del servidor, con el crudo local.
+        let rows: i64 = store
+            .connection()
+            .query_row("SELECT count(*) FROM contacts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "queda una sola fila");
+        assert!(raw_of(&store, SERVER).is_some_and(|r| r.contains("Reemplazo")));
+        // (2) Sin fantasma en el índice; la fila viva sí se encuentra.
+        assert_eq!(fts_hits(&store, "fantasma"), 0, "fantasma en el FTS");
+        assert_eq!(fts_hits(&store, "reemplazo"), 1, "la re-basada se busca");
+        // (3) La generación subió y se avisó a los lectores.
+        let after = super::super::read_generation(store.connection(), CONTACTS_AREA).unwrap();
+        assert!(
+            after > before,
+            "la generación no subió: {before} -> {after}"
+        );
+        assert_eq!(store.take_changes(), vec![(CONTACTS_AREA, after)]);
+    }
+
     /// Una edición nueva sobre un objeto con op pendiente **reemplaza** la op
     /// anterior: una sola por objeto, y arranca de cero los reintentos.
     #[test]

@@ -1039,4 +1039,50 @@ mod tests {
         assert!(vcards[0].contains("UID:keep\r\n"));
         assert!(vcards[0].contains("FN:Solo Nombre\r\n"));
     }
+
+    /// Un error de almacén que **no** es «llavero bloqueado» (acá, la tabla de la
+    /// cola rota: `Sqlite`) es una **falla** de la vuelta: `Failed`, sin bajar nada.
+    /// Con el mapeo viejo (todo a `StoreClosed`) se pediría desbloquear un llavero
+    /// que está bien.
+    #[tokio::test]
+    async fn un_error_de_almacen_que_no_es_el_llavero_da_failed() {
+        let f = Fixture::new("graph_store_failed").await;
+        assert!(f.manager.prepare_for_sync(CONTACTS_AREA, ACCOUNT).await);
+        f.manager
+            .with_store(ACCOUNT, |store| {
+                store
+                    .connection()
+                    .execute_batch("DROP TABLE pending_dav_ops")
+                    .map_err(|e| crate::store::StoreError::Sqlite(e.to_string()))
+            })
+            .await
+            .unwrap();
+
+        let result = f.sync().await;
+
+        assert!(
+            matches!(result, SyncResult::Failed(_)),
+            "un Sqlite no es StoreClosed: {result:?}"
+        );
+        assert!(
+            f.server.requests().is_empty(),
+            "no se bajó nada tras la falla del empuje"
+        );
+    }
+
+    /// El llavero que se bloquea justo después de abrir la base sí es
+    /// `StoreClosed`.
+    #[tokio::test]
+    async fn el_llavero_bloqueado_a_mitad_da_store_closed() {
+        let f = Fixture::new("graph_store_locked").await;
+        f.manager.keys().state().lock_after_is_locked = true;
+
+        let result = f.sync().await;
+
+        assert!(
+            matches!(result, SyncResult::StoreClosed),
+            "llavero bloqueado: {result:?}"
+        );
+        assert!(f.server.requests().is_empty());
+    }
 }
