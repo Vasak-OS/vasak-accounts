@@ -1666,4 +1666,41 @@ mod tests {
         // El cierre sigue siendo el único: no se partió la tarjeta.
         assert_eq!(result.matches("END:VCARD").count(), 1);
     }
+
+    /// Ningún subtipo sucio (`;`, `:`, salto de línea, no ASCII) agrega parámetros
+    /// ni líneas: la `PHOTO` sigue siendo una sola propiedad con `ENCODING` y
+    /// `TYPE`, y el valor sigue siendo el base64.
+    #[test]
+    fn un_subtipo_con_separadores_no_agrega_parametros_ni_lineas() {
+        let raw = "BEGIN:VCARD\r\nFN:Ana\r\nEND:VCARD\r\n";
+        for dirty in [
+            "image/png;X-EVIL=1",
+            "image/png:evil",
+            "image/png\nX-EVIL:1",
+            "image/pnĝ",
+        ] {
+            let result = embed_photo(raw, "aGVsbG8=", dirty);
+            let mut lines = unfold_lines(&result);
+            lines.retain(|l| !l.is_empty());
+            assert_eq!(
+                lines.len(),
+                4,
+                "{dirty:?}: sólo se sumó la PHOTO: {lines:?}"
+            );
+            let photo = lines.iter().find(|l| l.starts_with("PHOTO")).unwrap();
+            let (head, value) = photo.split_once(':').unwrap();
+            assert_eq!(value, "aGVsbG8=", "{dirty:?}");
+            assert_eq!(head.matches(';').count(), 2, "{dirty:?}: {head:?}");
+        }
+    }
+
+    /// Si el subtipo se queda sin ningún carácter permitido, se omite el `TYPE`
+    /// en vez de dejar un parámetro vacío.
+    #[test]
+    fn un_subtipo_sin_nada_permitido_omite_el_parametro_type() {
+        let raw = "BEGIN:VCARD\r\nFN:Ana\r\nEND:VCARD\r\n";
+        let result = embed_photo(raw, "aGVsbG8=", "image/;:\r\n");
+        assert!(result.contains("\r\nPHOTO;ENCODING=b:aGVsbG8=\r\n"));
+        assert!(!result.contains("TYPE="));
+    }
 }
