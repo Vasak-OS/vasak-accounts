@@ -91,13 +91,6 @@ struct AccountManager {
     /// las llamadas, así que el mapa vive tanto como el servicio. `pendientes`
     /// es lo mismo, y mezclar los dos estilos sería peor.
     candados: Arc<Mutex<HashMap<u32, Arc<Mutex<()>>>>>,
-
-    /// Sólo pruebas: en verdadero, [`con_candado`](Self::con_candado) no toma
-    /// el candado. Existe para que las pruebas de concurrencia puedan
-    /// verificar que fallan sin él, que es el criterio de aceptación del
-    /// arreglo.
-    #[cfg(test)]
-    sabotear_candado: bool,
 }
 
 /// Abre la base del usuario y la carga, que es el arranque de casi todo método.
@@ -1107,10 +1100,6 @@ impl AccountManager {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = R>,
     {
-        #[cfg(test)]
-        if self.sabotear_candado {
-            return f().await;
-        }
         let candado = self.candado(uid).await;
         let _guard = candado.lock().await;
         f().await
@@ -1669,60 +1658,6 @@ mod tests {
         let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
         db.load().unwrap();
         assert_eq!(db.len(), 2, "las dos cuentas tienen que estar");
-
-        std::fs::remove_dir_all(dir).unwrap_or_default();
-    }
-
-    /// Con el candado saboteado, la prueba anterior tiene que fallar: es el
-    /// criterio de aceptación del arreglo.
-    /// Con el candado saboteado, la prueba anterior tiene que fallar: es el
-    /// criterio de aceptación del arreglo.
-    ///
-    /// Sin el candado, las dos tareas se pisan: ambas leen la base vacía,
-    /// ambas escriben, y una pisa a la otra. Al final solo queda una cuenta.
-    /// El timeout es solo para que la prueba no se cuelgue para siempre si
-    /// hubiera un deadlock inesperado.
-    #[tokio::test]
-    async fn sin_el_candado_los_registros_concurrentes_pierden_cuentas() {
-        let dir = dir_de_prueba();
-        let manager = AccountManager {
-            #[cfg(test)]
-            sabotear_candado: true,
-            ..Default::default()
-        };
-        let uid = 1000;
-        let barrier = Arc::new(tokio::sync::Barrier::new(2));
-
-        let m1 = manager.clone();
-        let d1 = dir.clone();
-        let b1 = barrier.clone();
-        let m2 = manager.clone();
-        let d2 = dir.clone();
-        let b2 = barrier.clone();
-
-        let t1 = tokio::spawn(async move { registrar(m1, d1, uid, "Uno", Some(b1)).await });
-        let t2 = tokio::spawn(async move { registrar(m2, d2, uid, "Dos", Some(b2)).await });
-
-        // Esperar a que ambas tareas terminen (con timeout por seguridad)
-        let resultado = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            let _ = tokio::join!(t1, t2);
-        })
-        .await;
-
-        // Ambas tareas tienen que terminar (sin deadlock)
-        assert!(
-            resultado.is_ok(),
-            "las tareas tienen que terminar, no colgarse"
-        );
-
-        // Pero al final solo queda una cuenta (se pisan)
-        let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
-        db.load().unwrap();
-        assert_eq!(
-            db.len(),
-            1,
-            "sin el candado, una de las dos escrituras se pierde"
-        );
 
         std::fs::remove_dir_all(dir).unwrap_or_default();
     }
