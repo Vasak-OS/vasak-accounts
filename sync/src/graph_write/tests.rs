@@ -599,6 +599,53 @@ mod end_to_end {
                 .await
                 .unwrap()
         }
+
+        /// El `server_raw` de la op (un BLOB) como texto: la copia del servidor que
+        /// capturó el conflicto. `op_field` no sirve acá —lee TEXT, no BLOB—.
+        async fn op_server_raw(&self, href: &str) -> Option<String> {
+            let href = href.to_string();
+            self.manager
+                .with_store(ACCOUNT, move |store| {
+                    Ok(store
+                        .connection()
+                        .query_row(
+                            "SELECT server_raw FROM pending_dav_ops WHERE object_href = ?1",
+                            [href],
+                            |r| r.get::<_, Option<Vec<u8>>>(0),
+                        )
+                        .ok()
+                        .flatten()
+                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
+                })
+                .await
+                .unwrap()
+        }
+
+        /// El id local del objeto (el que recibe `ResolveConflict`), por su `href`.
+        async fn local_id(&self, href: &str) -> i64 {
+            let href = href.to_string();
+            self.manager
+                .with_store(ACCOUNT, move |store| {
+                    Ok(store
+                        .connection()
+                        .query_row("SELECT id FROM contacts WHERE href = ?1", [href], |r| {
+                            r.get::<_, i64>(0)
+                        })
+                        .unwrap())
+                })
+                .await
+                .unwrap()
+        }
+
+        /// Aplica la decisión de la persona sobre el conflicto, como `ResolveConflict`.
+        async fn resolve(&self, id: i64, choice: crate::store::queue::ConflictChoice) {
+            self.manager
+                .with_store(ACCOUNT, move |store| {
+                    store.resolve_conflict(CONTACTS_AREA, id, choice)
+                })
+                .await
+                .unwrap();
+        }
     }
 
     /// **`412` en un `PATCH`**: la op queda en `conflict` y **el crudo local no se
@@ -843,6 +890,158 @@ mod end_to_end {
         assert_eq!(report.retried, 1);
         assert_eq!(report.conflicts, 0);
         assert_eq!(f.op_state("SRV-ID").await.as_deref(), Some("ready"));
+    }
+
+    // ── Resolución de conflicto de objetos Graph (`#97`) ──────────────────────
+    //
+    // La captura de la copia del servidor es propia de Graph (un `GET`, no el
+    // `multiget` DAV); la resolución (`keep_local`/`take_server`) la hace el store
+    // igual que para DAV, así que acá se ejerce de punta a punta.
+
+    /// El JSON de un contacto del servidor, para la respuesta del `GET` de la copia.
+    /// Se arma con `serde_json` para que el `@odata.etag` —que lleva comillas
+    /// (`W/"..."` o `"..."`)— quede bien escapado, como lo manda Graph de verdad.
+    fn server_contact(name: &str, etag: &str) -> String {
+        serde_json::json!({
+            "id": "SRV-ID",
+            "@odata.etag": etag,
+            "displayName": name,
+        })
+        .to_string()
+    }
+
+    /// **Captura de la copia del servidor en `412`**: tras el conflicto se trae la
+    /// versión actual del objeto por un `GET` de Graph y se guarda en la op
+    /// (`server_etag`/`server_raw`), en el mismo formato vCard que la bajada, para que
+    /// `GetConflict` muestre «la mía vs. la del servidor». El crudo local sigue intacto.
+    #[tokio::test]
+    async fn un_412_captura_la_copia_del_servidor() {
+        let f = Fixture::new("graph-e2e-captura").await;
+        f.enqueue_put("SRV-ID", "Mía", Some("\"vieja\"")).await;
+        f.server.push_status(412, ""); // el PATCH choca
+        f.server.push(server_contact("Suya", "\"srv\"")); // el GET de la copia
+
+        let report = f.replay().await;
+
+        assert_eq!(report.conflicts, 1);
+        assert_eq!(f.op_state("SRV-ID").await.as_deref(), Some("conflict"));
+        assert_eq!(
+            f.op_field("SRV-ID", "server_etag").await.as_deref(),
+            Some("\"srv\""),
+            "se guardó el ETag del servidor"
+        );
+        assert!(
+            f.op_server_raw("SRV-ID")
+                .await
+                .is_some_and(|r| r.contains("Suya")),
+            "se guardó la copia del servidor (vCard) en la op"
+        );
+        assert!(
+            f.stored("SRV-ID", "raw_vcard")
+                .await
+                .is_some_and(|r| r.contains("Mía")),
+            "el crudo local no se pisó"
+        );
+    }
+
+    /// **`take_server`**: con la copia ya capturada, la persona elige la del servidor;
+    /// se adopta en la fila (su vCard y su ETag), se descarta el cambio local y la op.
+    #[tokio::test]
+    async fn take_server_adopta_la_copia_del_servidor() {
+        let f = Fixture::new("graph-e2e-take-server").await;
+        f.enqueue_put("SRV-ID", "Mía", Some("\"vieja\"")).await;
+        f.server.push_status(412, "");
+        f.server.push(server_contact("Suya", "\"srv\""));
+        f.replay().await;
+
+        let id = f.local_id("SRV-ID").await;
+        f.resolve(id, crate::store::queue::ConflictChoice::TakeServer)
+            .await;
+
+        assert_eq!(f.pending().await, 0, "la op se descartó");
+        let raw = f
+            .stored("SRV-ID", "raw_vcard")
+            .await
+            .expect("la fila sigue");
+        assert!(raw.contains("Suya"), "se adoptó la copia del servidor");
+        assert!(!raw.contains("Mía"), "el cambio local se descartó");
+        assert_eq!(
+            f.stored("SRV-ID", "etag").await.as_deref(),
+            Some("\"srv\""),
+            "la fila quedó con el ETag del servidor"
+        );
+    }
+
+    /// **`keep_local`**: con la copia ya capturada, la persona elige la suya; la op se
+    /// re-basa sobre el ETag del servidor y vuelve a `ready`, y el **segundo empuje
+    /// re-hace el `PATCH` con `If-Match` = ese ETag** (la precondición fresca que pisa
+    /// el servidor). El crudo local no se perdió.
+    #[tokio::test]
+    async fn keep_local_reempuja_con_el_etag_del_servidor() {
+        let f = Fixture::new("graph-e2e-keep-local").await;
+        f.enqueue_put("SRV-ID", "Mía", Some("\"vieja\"")).await;
+        f.server.push_status(412, "");
+        f.server.push(server_contact("Suya", "\"srv\""));
+        f.replay().await; // conflicto con copia capturada (server_etag "srv")
+
+        let id = f.local_id("SRV-ID").await;
+        f.resolve(id, crate::store::queue::ConflictChoice::KeepLocal)
+            .await;
+        assert_eq!(
+            f.op_state("SRV-ID").await.as_deref(),
+            Some("ready"),
+            "la op vuelve a reintentarse"
+        );
+
+        // El segundo empuje re-hace el PATCH, ahora con el ETag del servidor.
+        f.server.push_status(200, r#"{"@odata.etag":"\"nuevo\""}"#);
+        let report = f.replay().await;
+
+        assert_eq!(report.pushed, 1);
+        assert_eq!(f.pending().await, 0, "el re-empuje cerró la op");
+        let requests = f.server.requests();
+        let last = requests.last().expect("hubo pedidos");
+        assert_eq!(last.method, "PATCH");
+        assert_eq!(
+            last.if_match, "\"srv\"",
+            "re-empuja con el ETag del servidor, no con el viejo"
+        );
+        assert!(
+            f.stored("SRV-ID", "raw_vcard")
+                .await
+                .is_some_and(|r| r.contains("Mía")),
+            "se subió el crudo local"
+        );
+    }
+
+    /// Si el objeto en conflicto **ya no está en el servidor** (`GET` → `404`), la
+    /// copia no se guarda, se le suma un intento (acota la re-traída) y el conflicto
+    /// sigue sin copia. El crudo local no se pierde.
+    #[tokio::test]
+    async fn una_copia_borrada_en_el_servidor_no_se_guarda_pero_cuenta_un_intento() {
+        let f = Fixture::new("graph-e2e-captura-404").await;
+        f.enqueue_put("SRV-ID", "Mía", Some("\"vieja\"")).await;
+        f.server.push_status(412, ""); // el PATCH choca
+        f.server.push_status(404, ""); // el GET de la copia: ya no está
+
+        f.replay().await;
+
+        assert_eq!(f.op_state("SRV-ID").await.as_deref(), Some("conflict"));
+        assert_eq!(
+            f.op_server_raw("SRV-ID").await,
+            None,
+            "no se guardó copia del servidor"
+        );
+        assert!(
+            f.op_attempts("SRV-ID").await.unwrap_or(0) >= 1,
+            "se contó un intento de traída, para acotar la re-traída"
+        );
+        assert!(
+            f.stored("SRV-ID", "raw_vcard")
+                .await
+                .is_some_and(|r| r.contains("Mía")),
+            "el crudo local sigue intacto"
+        );
     }
 }
 

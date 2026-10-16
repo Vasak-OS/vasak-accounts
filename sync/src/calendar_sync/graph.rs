@@ -308,6 +308,36 @@ fn graph_datetime(property: &crate::ical::Property) -> Option<serde_json::Value>
     None
 }
 
+/// Trae la versión actual de un evento del servidor
+/// (`GET /users/{user}/events/{id}`) como `(su @odata.etag, su crudo iCal)`, para la
+/// **copia del servidor** de un conflicto (`#97`, equivalente Graph del `multiget`
+/// DAV de `replay`). Devuelve el iCal con la **misma conversión que la bajada**
+/// ([`GraphApiBackend::event_to_ical`]) y las fechas en UTC ([`PREFER_UTC`]), así
+/// `GetConflict` muestra la copia del servidor en el mismo formato que para un objeto
+/// DAV, y `take_server` adopta un crudo válido.
+///
+/// `Ok(None)` si el evento ya no está (`404`): el recurso se borró en el servidor, no
+/// hay copia que guardar. La URL se arma sobre `credential.base_url` con el `id`
+/// percent-codificado; **nunca** se sigue una URL de la respuesta.
+pub(crate) async fn fetch_server_copy(
+    client: &reqwest::Client,
+    credential: &GraphCredential,
+    id: &str,
+) -> Result<Option<(Option<String>, Vec<u8>)>, GraphFetchError> {
+    let url = graph::build_url(
+        &credential.base_url,
+        &["users", &credential.user_id, "events", id],
+        EVENTS_SELECT,
+    )?;
+    let Some(event) =
+        graph::fetch_one::<GraphEvent>(client, credential, url, &[PREFER_UTC]).await?
+    else {
+        return Ok(None);
+    };
+    let raw = GraphApiBackend::event_to_ical(&event);
+    Ok(Some((event.odata_etag.clone(), raw.into_bytes())))
+}
+
 /// Backend Microsoft Graph API para calendario.
 ///
 /// Sincroniza los eventos del calendario del usuario (`/me/events`) contra el

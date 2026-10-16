@@ -171,6 +171,33 @@ pub(crate) fn contact_body_from_vcard(raw_vcard: &str) -> serde_json::Value {
     serde_json::Value::Object(body)
 }
 
+/// Trae la versión actual de un contacto del servidor
+/// (`GET /users/{user}/contacts/{id}`) como `(su @odata.etag, su crudo vCard)`, para
+/// la **copia del servidor** de un conflicto (`#97`, equivalente Graph del `multiget`
+/// DAV de `replay`). Devuelve la vCard con la **misma conversión que la bajada**
+/// ([`GraphApiBackend::contact_to_vcard`]), así `GetConflict` la muestra en el mismo
+/// formato que para un objeto DAV y `take_server` adopta un crudo válido.
+///
+/// `Ok(None)` si el contacto ya no está (`404`). La URL se arma sobre
+/// `credential.base_url` con el `id` percent-codificado; nunca se sigue una de la red.
+pub(crate) async fn fetch_server_copy(
+    client: &reqwest::Client,
+    credential: &GraphCredential,
+    id: &str,
+) -> Result<Option<(Option<String>, Vec<u8>)>, GraphFetchError> {
+    let url = graph::build_url(
+        &credential.base_url,
+        &["users", &credential.user_id, "contacts", id],
+        CONTACTS_SELECT,
+    )?;
+    let Some(contact) = graph::fetch_one::<GraphContact>(client, credential, url, &[]).await?
+    else {
+        return Ok(None);
+    };
+    let raw = GraphApiBackend::contact_to_vcard(&contact);
+    Ok(Some((contact.odata_etag.clone(), raw.into_bytes())))
+}
+
 /// Backend Microsoft Graph API.
 ///
 /// Sincroniza los contactos contra la carpeta de contactos de Microsoft Graph

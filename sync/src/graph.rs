@@ -37,6 +37,11 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// un bucle o un intento de agotar memoria.
 pub const MAX_PAGES: usize = 1_000;
 
+/// Tope del cuerpo de un objeto traído de a uno con [`fetch_one`] (la copia del
+/// servidor de un recurso en conflicto). Un evento o un contacto es chico; más que
+/// esto es un servidor roto o adversario y se corta.
+pub const MAX_OBJECT_BYTES: usize = 1024 * 1024;
+
 /// Un cliente HTTP con el plazo de conexión del servicio. Nunca
 /// `reqwest::Client::new()` pelado: ése no tiene plazo de conexión.
 pub fn http_client() -> Result<reqwest::Client, reqwest::Error> {
@@ -310,6 +315,62 @@ pub async fn fetch_all_pages<T: DeserializeOwned>(
     }
 
     Err(GraphFetchError::TooManyPages)
+}
+
+/// Trae **un solo** objeto de Graph por `GET`, deserializándolo. Como
+/// [`fetch_all_pages`] pero sin paginar: la URL ya la construyó quien llama **sobre
+/// `base_url`** (así el token sólo viaja a ese origen; acá no hay `nextLink` que
+/// validar), se le adjunta el token, `Accept` y `extra_headers` (el calendario pide
+/// las fechas en UTC). Acota la respuesta en tamaño ([`MAX_OBJECT_BYTES`]) y en plazo
+/// ([`REQUEST_TIMEOUT`]).
+///
+/// `Ok(None)` cuando el servidor contesta `404`: el objeto ya no está (la copia del
+/// servidor de un conflicto sobre un recurso borrado). Cualquier otro estado de error
+/// es [`GraphFetchError::Http`] —sólo el código, nunca el cuerpo—.
+pub async fn fetch_one<T: DeserializeOwned>(
+    client: &reqwest::Client,
+    credential: &GraphCredential,
+    url: Url,
+    extra_headers: &[(&str, &str)],
+) -> Result<Option<T>, GraphFetchError> {
+    let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
+    let mut request = client
+        .get(url.as_str())
+        .bearer_auth(credential.access_token.as_str())
+        .header("Accept", "application/json");
+    for (name, value) in extra_headers {
+        request = request.header(*name, *value);
+    }
+
+    let fetch = async {
+        // `without_url()`: el `Display` de `reqwest::Error` trae la URL (con el
+        // `user_id`), que no tiene por qué aparecer en ningún registro.
+        let response = request
+            .send()
+            .await
+            .map_err(|e| GraphFetchError::Network(e.without_url().to_string()))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(GraphFetchError::Http(response.status()));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| GraphFetchError::Network(e.without_url().to_string()))?;
+        if bytes.len() > MAX_OBJECT_BYTES {
+            return Err(GraphFetchError::TooManyItems);
+        }
+        serde_json::from_slice::<T>(&bytes)
+            .map(Some)
+            .map_err(|_| GraphFetchError::Parse)
+    };
+
+    match tokio::time::timeout_at(deadline, fetch).await {
+        Ok(result) => result,
+        Err(_) => Err(GraphFetchError::Timeout),
+    }
 }
 
 /// Maquinaria de endpoint falso de Microsoft Graph para las pruebas de los

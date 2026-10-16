@@ -31,10 +31,13 @@
 //!   éxito idempotente: el recurso ya no está, que es lo que se buscaba. Sin
 //!   `base_etag` nunca hubo recurso en el servidor: se cierra sin tocar la red.
 //! - **`412`/`409`** → la op queda en `conflict` (**no se pisa el local**), como
-//!   en DAV. **La captura de la copia del servidor para objetos Graph queda como
-//!   follow-up** (`#97`): necesita un `GET` propio de Graph, no el `multiget` DAV
-//!   de `replay`. Mientras tanto `ListConflicts` ve el conflicto; `GetConflict`
-//!   /`ResolveConflict` de objetos Graph llegan después.
+//!   en DAV, y además se **trae la copia del servidor** por un `GET` propio de Graph
+//!   (`/me/events/{id}`, `/me/contacts/{id}`, no el `multiget` DAV): se guarda en
+//!   `server_etag`/`server_raw` de la op para que `GetConflict` muestre «la mía vs la
+//!   del servidor» y `ResolveConflict` (`keep_local`/`take_server`) funcione —la
+//!   maquinaria de resolución del store es la misma de DAV; sólo la captura es propia
+//!   de Graph—. La traída respeta el plazo y, si no entra o falla, el conflicto queda
+//!   sin copia y se reintenta la próxima vuelta, acotado por [`MAX_REPLAY_ATTEMPTS`].
 //! - **Red, `429`, `5xx`** → reintentable, con tope [`MAX_REPLAY_ATTEMPTS`].
 //! - **Cualquier otro error** (credencial, `4xx` firme) → permanente: escala a
 //!   `conflict` para no trabar la colección (disponibilidad), como en `replay`.
@@ -92,12 +95,30 @@ pub async fn replay_graph_area<K: KeySource>(
             );
             break;
         }
-        // Una op ya en conflicto no se reintenta sola: la resuelve la superficie
-        // de conflicto. La captura de la copia del servidor para objetos Graph
-        // (lo que `replay` hace por el `multiget` DAV) es follow-up de `#97`, así
-        // que acá no se trae nada: el `412` ya marcó el conflicto sin perder el
-        // local, y eso es lo que este PR entrega.
+        // Una op ya en conflicto no se reintenta sola: la resuelve la superficie de
+        // conflicto. Pero si quedó **sin la copia del servidor** de una vuelta
+        // anterior (la traída falló o no entró en el plazo), se vuelve a intentar
+        // traerla ahora —acotado por [`MAX_REPLAY_ATTEMPTS`], igual que el camino
+        // DAV—: es lo único que se reintenta de una op en conflicto, y no toca el
+        // crudo local ni reintenta la escritura.
         if op.state == PendingState::Conflict {
+            if op.server_etag.is_none()
+                && op.server_raw.is_none()
+                && op.attempts < MAX_REPLAY_ATTEMPTS
+            {
+                capture_server_copy(
+                    manager,
+                    account_id,
+                    client,
+                    credential,
+                    deadline,
+                    &op.area,
+                    op.id,
+                    op.revision,
+                    &op.object_href,
+                )
+                .await?;
+            }
             continue;
         }
         resolve_op(
@@ -140,6 +161,13 @@ async fn resolve_op<K: KeySource>(
     op: PendingOp,
     report: &mut ReplayReport,
 ) -> Result<(), StoreError> {
+    // La identidad de la op, por si un `412`/`409` pide traer la copia del servidor
+    // después de cerrar el conflicto: `op` se consume al armar la decisión, así que se
+    // guarda acá lo barato (sin el `payload`).
+    let (op_id, op_revision) = (op.id, op.revision);
+    let object_href = op.object_href.clone();
+    let mut server_conflict = false;
+
     let decision = match op.kind {
         PendingKind::Put => {
             let body = match op.payload.as_deref().map(std::str::from_utf8) {
@@ -176,7 +204,10 @@ async fn resolve_op<K: KeySource>(
                             let new_href = href_for_id(area, &created.id);
                             Close::Create(op, new_href, created.etag)
                         }
-                        Ok(Err(e)) => on_error(op, e, report),
+                        Ok(Err(e)) => {
+                            server_conflict = e == GraphWriteError::Conflict;
+                            on_error(op, e, report)
+                        }
                     }
                 }
                 // Editar: `PATCH` con `If-Match`.
@@ -197,7 +228,10 @@ async fn resolve_op<K: KeySource>(
                             report.pushed += 1;
                             Close::Put(op, new_etag)
                         }
-                        Ok(Err(e)) => on_error(op, e, report),
+                        Ok(Err(e)) => {
+                            server_conflict = e == GraphWriteError::Conflict;
+                            on_error(op, e, report)
+                        }
                     }
                 }
             }
@@ -218,11 +252,37 @@ async fn resolve_op<K: KeySource>(
                     report.pushed += 1;
                     Close::Delete(op)
                 }
-                Ok(Err(e)) => on_error(op, e, report),
+                Ok(Err(e)) => {
+                    server_conflict = e == GraphWriteError::Conflict;
+                    on_error(op, e, report)
+                }
             }
         }
     };
-    close(manager, account_id, decision).await
+    close(manager, account_id, decision).await?;
+
+    // Un `412`/`409` genuino: además de dejar el conflicto, se trae la versión del
+    // servidor para que `GetConflict` muestre «local vs. servidor» y
+    // `ResolveConflict` pueda aplicar `take_server`/`keep_local`. Va **después** de
+    // cerrar el conflicto (el guardado es condicional al estado `conflict`), respeta
+    // el plazo y, si falla o no entra, deja el conflicto sin copia (se reintenta la
+    // próxima vuelta). Sólo en un conflicto genuino: un error firme que también escala
+    // a `conflict` no tiene una versión del servidor que mostrar.
+    if server_conflict {
+        capture_server_copy(
+            manager,
+            account_id,
+            client,
+            credential,
+            deadline,
+            area,
+            op_id,
+            op_revision,
+            &object_href,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Arma el cuerpo JSON de Graph desde el crudo local del área. `transaction_id`
@@ -546,6 +606,89 @@ async fn close<K: KeySource>(
             Close::Retry(op, detail) => store.retry_later(&op, &detail),
         })
         .await
+}
+
+/// Trae la versión del servidor de un recurso Graph en conflicto y la guarda cifrada
+/// en la op, **condicionada al `id` y la `revision`** (ver `Store::store_server_copy`).
+/// Es el equivalente Graph de `replay::capture_server_copy`: en vez del `multiget` DAV,
+/// un `GET` propio de Graph por área ([`fetch_server_copy`]).
+///
+/// Respeta el plazo de la vuelta: si la traída no entra, si falla, o si el recurso ya
+/// no está (`Ok(None)`), **se deja el conflicto sin copia** y se le suma un intento
+/// (`Store::count_conflict_fetch_attempt`), así la re-traída queda acotada por
+/// [`MAX_REPLAY_ATTEMPTS`]. El detalle del error no se registra: el crudo del servidor
+/// es dato privado y no tiene por qué terminar en el diario.
+#[allow(clippy::too_many_arguments)]
+async fn capture_server_copy<K: KeySource>(
+    manager: &Arc<StoreManager<K>>,
+    account_id: &str,
+    client: &reqwest::Client,
+    credential: &GraphCredential,
+    deadline: tokio::time::Instant,
+    area: &str,
+    id: i64,
+    revision: i64,
+    object_href: &str,
+) -> Result<(), StoreError> {
+    // El `id` del servidor sale del `href` guardado (su inverso de `href_for_id`), y
+    // la URL del `GET` la arma `fetch_server_copy` sobre `credential.base_url`.
+    let server_id = id_from_href(area, object_href);
+    let stored = match tokio::time::timeout_at(
+        deadline,
+        fetch_server_copy(area, client, credential, &server_id),
+    )
+    .await
+    {
+        Err(_) => {
+            tracing::info!(
+                "'{account_id}': la copia del servidor del conflicto Graph no entró en el plazo; \
+                 se trae la próxima vuelta"
+            );
+            false
+        }
+        // El recurso no volvió (se borró en el servidor): no hay copia que guardar.
+        Ok(Ok(None)) => false,
+        Ok(Err(_)) => {
+            // Sin el detalle: puede venir del servidor y el crudo es privado.
+            tracing::info!(
+                "'{account_id}': no se pudo traer la copia del servidor del conflicto Graph; \
+                 se reintenta la próxima vuelta"
+            );
+            false
+        }
+        Ok(Ok(Some((server_etag, server_raw)))) => {
+            manager
+                .with_store(account_id, move |store| {
+                    store.store_server_copy(id, revision, server_etag.as_deref(), &server_raw)
+                })
+                .await?
+        }
+    };
+
+    if !stored {
+        manager
+            .with_store(account_id, move |store| {
+                store.count_conflict_fetch_attempt(id, revision)
+            })
+            .await?;
+    }
+    Ok(())
+}
+
+/// Despacha la traída de la copia del servidor al `GET` del área: el del calendario
+/// o el de contactos, cada uno sobre su struct y su conversión de la bajada (para que
+/// el `server_raw` salga en el mismo formato iCal/vCard que un objeto DAV).
+async fn fetch_server_copy(
+    area: &str,
+    client: &reqwest::Client,
+    credential: &GraphCredential,
+    id: &str,
+) -> Result<Option<(Option<String>, Vec<u8>)>, graph::GraphFetchError> {
+    if area == CALENDAR_AREA {
+        calendar_graph::fetch_server_copy(client, credential, id).await
+    } else {
+        contacts_graph::fetch_server_copy(client, credential, id).await
+    }
 }
 
 #[cfg(test)]
