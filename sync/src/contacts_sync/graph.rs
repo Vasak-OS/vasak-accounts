@@ -14,8 +14,9 @@ use crate::contacts_sync::backend::{SyncContext, SyncResult};
 use crate::contacts_sync::SyncReport;
 use crate::graph::{self, GraphCredential, GraphFetchError};
 use crate::store::contacts::{ContactOp, ContactRow};
-use crate::store::key::KeySource;
+use crate::store::key::{KeyError, KeySource};
 use crate::store::lifecycle::{AreaState, CONTACTS_AREA};
+use crate::store::StoreError;
 use crate::vcard;
 
 // La credencial, su fuente, los errores de red y la paginación por
@@ -241,11 +242,19 @@ impl GraphApiBackend {
                 report.conflicts = push.conflicts;
                 report.pending = push.remaining;
             }
-            // Un error de almacén acá es el llavero cerrado a mitad: se corta la
-            // vuelta como cualquier otra escritura.
-            Err(_) => {
+            // El llavero cerrado a mitad corta la vuelta como cualquier otra
+            // escritura: se pide desbloquearlo.
+            Err(StoreError::Key(KeyError::Locked)) | Err(StoreError::Missing) => {
                 set_status(AreaState::Pending, CLOSED_DETAIL).await;
                 return SyncResult::StoreClosed;
+            }
+            // Cualquier otro error de almacén (un `Sqlite`/`Io` persistente) no es
+            // «desbloqueá el llavero»: se reporta como falla, como el camino CardDAV,
+            // para no reintentarlo cada vuelta en vano.
+            Err(e) => {
+                let shown = e.public_detail();
+                set_status(AreaState::Failed, shown).await;
+                return SyncResult::Failed(shown.into());
             }
         }
 

@@ -29,8 +29,9 @@ use crate::store::calendar::{
     derive_with_occurrences, CalendarApplied, CalendarListing, CalendarProgress, CalendarRoom,
     ObjectOp, ObjectRow, Window, WRITE_BATCH_ROWS,
 };
-use crate::store::key::KeySource;
+use crate::store::key::{KeyError, KeySource};
 use crate::store::lifecycle::{AreaState, StoreManager, CALENDAR_AREA};
+use crate::store::StoreError;
 
 /// Tope de eventos acumulados. Cota de memoria independiente del tope de
 /// páginas de [`crate::graph`], por si un servidor devuelve páginas enormes.
@@ -223,10 +224,10 @@ pub(crate) fn event_body_from_ical(
     let dtstart = vevent.first("DTSTART");
     let dtend = vevent.first("DTEND");
     let all_day = dtstart.map(is_date_only).unwrap_or(false);
-    if let Some(start) = dtstart.and_then(|p| graph_datetime(&p.value)) {
+    if let Some(start) = dtstart.and_then(graph_datetime) {
         body.insert("start".into(), start);
     }
-    if let Some(end) = dtend.and_then(|p| graph_datetime(&p.value)) {
+    if let Some(end) = dtend.and_then(graph_datetime) {
         body.insert("end".into(), end);
     }
     body.insert("isAllDay".into(), json!(all_day));
@@ -249,20 +250,51 @@ fn is_date_only(property: &crate::ical::Property) -> bool {
 /// completo, `20260915`) al `dateTime` de Graph (`2026-09-15T14:00:00`), siempre
 /// en UTC —la lectura las pide así (`Prefer: outlook.timezone="UTC"`)—. `None` si
 /// el valor no tiene al menos una fecha de ocho dígitos.
-fn graph_datetime(value: &str) -> Option<serde_json::Value> {
+fn graph_datetime(property: &crate::ical::Property) -> Option<serde_json::Value> {
+    use chrono::TimeZone;
     use serde_json::json;
+
+    let value = property.value.as_str();
     let bytes = value.as_bytes();
     if bytes.len() < 8 || !bytes[..8].iter().all(u8::is_ascii_digit) {
         return None;
     }
     let date = format!("{}-{}-{}", &value[0..4], &value[4..6], &value[6..8]);
-    let time =
-        if bytes.len() >= 15 && bytes[8] == b'T' && bytes[9..15].iter().all(u8::is_ascii_digit) {
-            format!("{}:{}:{}", &value[9..11], &value[11..13], &value[13..15])
-        } else {
-            "00:00:00".to_string()
-        };
-    Some(json!({ "dateTime": format!("{date}T{time}"), "timeZone": "UTC" }))
+
+    // Sólo fecha (día completo, `VALUE=DATE`): medianoche UTC. El `isAllDay` lo marca
+    // aparte quien llama.
+    let has_time =
+        bytes.len() >= 15 && bytes[8] == b'T' && bytes[9..15].iter().all(u8::is_ascii_digit);
+    if !has_time {
+        return Some(json!({ "dateTime": format!("{date}T00:00:00"), "timeZone": "UTC" }));
+    }
+    let time = format!("{}:{}:{}", &value[9..11], &value[11..13], &value[13..15]);
+
+    // Con hora y sufijo `Z`: ya es UTC.
+    if value.ends_with('Z') {
+        return Some(json!({ "dateTime": format!("{date}T{time}"), "timeZone": "UTC" }));
+    }
+
+    // Con hora y `TZID=`: se interpreta en esa zona y se convierte a UTC. Una zona
+    // desconocida, o una hora que en esa zona no existe o es ambigua (cambio de
+    // horario), devuelve `None`: mejor rutear la op a conflicto que mandar —y que la
+    // bajada persista— una hora corrida.
+    if let Some(tzid) = property.params.iter().find_map(|p| p.strip_prefix("TZID=")) {
+        let zone: chrono_tz::Tz = tzid.parse().ok()?;
+        let naive =
+            NaiveDateTime::parse_from_str(&format!("{date}T{time}"), "%Y-%m-%dT%H:%M:%S").ok()?;
+        let utc = zone
+            .from_local_datetime(&naive)
+            .single()?
+            .with_timezone(&chrono::Utc);
+        return Some(json!({
+            "dateTime": utc.format("%Y-%m-%dT%H:%M:%S").to_string(),
+            "timeZone": "UTC"
+        }));
+    }
+
+    // Hora flotante (ni `Z` ni `TZID`): no se adivina la zona. `None` → conflicto.
+    None
 }
 
 /// Backend Microsoft Graph API para calendario.
@@ -327,11 +359,19 @@ impl GraphApiBackend {
         .await
         {
             Ok(report) => report,
-            // Un error de almacén acá es el llavero cerrado a mitad: se corta la
-            // vuelta como cualquier otra escritura.
-            Err(_) => {
+            // El llavero cerrado a mitad corta la vuelta como cualquier otra
+            // escritura: se pide desbloquearlo.
+            Err(StoreError::Key(KeyError::Locked)) | Err(StoreError::Missing) => {
                 set_status(AreaState::Pending, CLOSED_DETAIL).await;
                 return CalendarOutcome::StoreClosed;
+            }
+            // Cualquier otro error de almacén (un `Sqlite`/`Io` persistente) no es
+            // «desbloqueá el llavero»: se reporta como falla, como el camino CalDAV,
+            // para no reintentarlo cada vuelta en vano.
+            Err(e) => {
+                let shown = e.public_detail();
+                set_status(AreaState::Failed, shown).await;
+                return CalendarOutcome::Failed(shown.into());
             }
         };
 

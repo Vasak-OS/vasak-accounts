@@ -410,7 +410,11 @@ async fn send_write(
     let response = request
         .send()
         .await
-        .map_err(|e| GraphWriteError::Retryable(e.to_string()))?;
+        // `without_url()`: el `Display` de `reqwest::Error` incluye la URL —con el
+        // `user_id` (que puede ser un UPN/correo) y el id del objeto—, y esto termina
+        // en `pending_dav_ops.last_error` y la superficie de conflicto. Se tacha,
+        // como el camino DAV.
+        .map_err(|e| GraphWriteError::Retryable(e.without_url().to_string()))?;
     classify(response.status(), is_delete)?;
     Ok(response)
 }
@@ -466,7 +470,8 @@ async fn read_response(response: reqwest::Response) -> Result<WriteResponse, Gra
     let bytes = response
         .bytes()
         .await
-        .map_err(|e| GraphWriteError::Retryable(e.to_string()))?;
+        // `without_url()`: no filtrar la URL (con el `user_id`) al diario de errores.
+        .map_err(|e| GraphWriteError::Retryable(e.without_url().to_string()))?;
     if bytes.len() > MAX_WRITE_RESPONSE {
         return Err(GraphWriteError::Permanent(
             "la respuesta de Graph supera el tope de tamaño".into(),

@@ -429,13 +429,18 @@ impl Store {
         new_etag: Option<&str>,
     ) -> Result<(), StoreError> {
         self.complete_put_scoped(op, |transaction, table, coltable, colcol| {
-            transaction.execute(
-                &format!(
-                    "UPDATE {table} SET etag = ?1, pending_op = NULL
+            transaction
+                .execute(
+                    &format!(
+                        "UPDATE {table} SET etag = ?1, pending_op = NULL
                       WHERE href = ?2 AND {colcol} = (SELECT id FROM {coltable} WHERE href = ?3)"
-                ),
-                rusqlite::params![new_etag, op.object_href, op.collection_href],
-            )
+                    ),
+                    rusqlite::params![new_etag, op.object_href, op.collection_href],
+                )
+                .map_err(classify)?;
+            // Un `put` normal sólo toca `etag`/`pending_op`, no un `href` visible:
+            // no sube la generación.
+            Ok(None)
         })
     }
 
@@ -443,13 +448,18 @@ impl Store {
     /// ([`Self::complete_put`], [`Self::complete_create`]): resuelve las tablas del
     /// área, abre la transacción, **cierra la op condicional a `id`+`revision`**
     /// (`close_op`: si una edición nueva la reemplazó mientras el empuje hablaba con
-    /// la red, no se toca nada —lost-update—), corre el `UPDATE` que arma `run_update`
-    /// —con su alcance de colección— y confirma. Lo único que cambia entre los dos
-    /// cierres es ese `UPDATE` y sus parámetros; el `OR REPLACE` de la creación va
-    /// en el suyo. No sube la generación (un `put` no cambia qué objetos hay).
-    fn complete_put_scoped<F>(&mut self, op: &PendingOp, run_update: F) -> Result<(), StoreError>
+    /// la red, no se toca nada —lost-update—), corre `work` —con su alcance de
+    /// colección— y confirma. `work` devuelve `Some((área, generación))` cuando el
+    /// cierre cambió filas visibles y hay que avisar a los lectores con
+    /// [`Self::note_change`] (tras el commit); `None` cuando no (un `put` normal).
+    fn complete_put_scoped<F>(&mut self, op: &PendingOp, work: F) -> Result<(), StoreError>
     where
-        F: FnOnce(&rusqlite::Transaction<'_>, &str, &str, &str) -> rusqlite::Result<usize>,
+        F: FnOnce(
+            &rusqlite::Transaction<'_>,
+            &str,
+            &str,
+            &str,
+        ) -> Result<Option<(&'static str, u64)>, StoreError>,
     {
         let (table, coltable, colcol) = area_tables(&op.area)
             .ok_or_else(|| StoreError::InvalidArgument("área sin cola".into()))?;
@@ -457,8 +467,12 @@ impl Store {
         if !Self::close_op(&transaction, op)? {
             return Ok(());
         }
-        run_update(&transaction, table, coltable, colcol).map_err(classify)?;
-        transaction.commit().map_err(classify)
+        let note = work(&transaction, table, coltable, colcol)?;
+        transaction.commit().map_err(classify)?;
+        if let Some((area_static, generation)) = note {
+            self.note_change(area_static, generation);
+        }
+        Ok(())
     }
 
     /// Cierra un `put` de **creación por Graph**: como [`Self::complete_put`]
@@ -472,25 +486,54 @@ impl Store {
     /// el `id` lo pone el servidor en el `POST`, y recién ahí se conoce.
     ///
     /// **Condicional a la revisión** y **con alcance de colección**, como el resto
-    /// de los cierres. El `UPDATE OR REPLACE`: si la bajada de una vuelta anterior
-    /// ya trajo el objeto bajo su `id` del servidor (idempotencia del `POST` por
-    /// `transactionId`), re-basar el `href` chocaría con esa fila por el `UNIQUE
-    /// (collection, href)`; `OR REPLACE` la reemplaza por la local, que es el mismo
-    /// objeto con el crudo que la persona subió.
+    /// de los cierres. Si la bajada de una vuelta anterior ya trajo el objeto bajo
+    /// su `id` del servidor (idempotencia del `POST` por `transactionId`), re-basar
+    /// el `href` chocaría con esa fila por el `UNIQUE (collection, href)`. **No se
+    /// usa `UPDATE OR REPLACE`**: su `DELETE` implícito saltea el trigger
+    /// `AFTER DELETE` del FTS cuando `recursive_triggers` está apagado (esta conexión
+    /// no lo activa) —dejaría un fantasma en el índice de búsqueda— y la cascada de
+    /// derivados. En cambio se borra **explícitamente** la fila distinta en conflicto
+    /// (el `DELETE` sí dispara el trigger y la cascada) y recién después se re-basa la
+    /// local con un `UPDATE` normal. Como se cambió un `href` visible (y quizá se borró
+    /// un duplicado), **sube la generación** y avisa a los lectores.
     pub fn complete_create(
         &mut self,
         op: &PendingOp,
         new_href: &str,
         new_etag: Option<&str>,
     ) -> Result<(), StoreError> {
-        self.complete_put_scoped(op, |transaction, table, coltable, colcol| {
-            transaction.execute(
-                &format!(
-                    "UPDATE OR REPLACE {table} SET href = ?1, etag = ?2, pending_op = NULL
-                      WHERE href = ?3 AND {colcol} = (SELECT id FROM {coltable} WHERE href = ?4)"
-                ),
-                rusqlite::params![new_href, new_etag, op.object_href, op.collection_href],
-            )
+        let area_static = area_static(&op.area)
+            .ok_or_else(|| StoreError::InvalidArgument("área sin cola".into()))?;
+        self.complete_put_scoped(op, move |transaction, table, coltable, colcol| {
+            // 1) Borrar SÓLO la fila distinta que ya ocupa `new_href` en esta
+            //    colección (una bajada anterior la trajo). El `DELETE` explícito
+            //    —a diferencia del implícito de `OR REPLACE`— dispara el trigger
+            //    `AFTER DELETE` del FTS y la cascada de derivados.
+            transaction
+                .execute(
+                    &format!(
+                        "DELETE FROM {table}
+                          WHERE href = ?1 AND href <> ?2
+                            AND {colcol} = (SELECT id FROM {coltable} WHERE href = ?3)"
+                    ),
+                    rusqlite::params![new_href, op.object_href, op.collection_href],
+                )
+                .map_err(classify)?;
+            // 2) Re-basar la fila local al `id` del servidor (sin `OR REPLACE`: la
+            //    fila en conflicto ya no está).
+            transaction
+                .execute(
+                    &format!(
+                        "UPDATE {table} SET href = ?1, etag = ?2, pending_op = NULL
+                          WHERE href = ?3 AND {colcol} = (SELECT id FROM {coltable} WHERE href = ?4)"
+                    ),
+                    rusqlite::params![new_href, new_etag, op.object_href, op.collection_href],
+                )
+                .map_err(classify)?;
+            // 3) Se cambió un `href` visible (y quizá se borró un duplicado): sube la
+            //    generación para que los lectores recarguen.
+            let generation = bump_generation(transaction, area_static)?;
+            Ok(Some((area_static, generation)))
         })
     }
 
