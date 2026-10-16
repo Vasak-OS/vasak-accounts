@@ -428,22 +428,113 @@ impl Store {
         op: &PendingOp,
         new_etag: Option<&str>,
     ) -> Result<(), StoreError> {
+        self.complete_put_scoped(op, |transaction, table, coltable, colcol| {
+            transaction
+                .execute(
+                    &format!(
+                        "UPDATE {table} SET etag = ?1, pending_op = NULL
+                      WHERE href = ?2 AND {colcol} = (SELECT id FROM {coltable} WHERE href = ?3)"
+                    ),
+                    rusqlite::params![new_etag, op.object_href, op.collection_href],
+                )
+                .map_err(classify)?;
+            // Un `put` normal sólo toca `etag`/`pending_op`, no un `href` visible:
+            // no sube la generación.
+            Ok(None)
+        })
+    }
+
+    /// El esqueleto común de los cierres de `put` que tocan la fila guardada
+    /// ([`Self::complete_put`], [`Self::complete_create`]): resuelve las tablas del
+    /// área, abre la transacción, **cierra la op condicional a `id`+`revision`**
+    /// (`close_op`: si una edición nueva la reemplazó mientras el empuje hablaba con
+    /// la red, no se toca nada —lost-update—), corre `work` —con su alcance de
+    /// colección— y confirma. `work` devuelve `Some((área, generación))` cuando el
+    /// cierre cambió filas visibles y hay que avisar a los lectores con
+    /// [`Self::note_change`] (tras el commit); `None` cuando no (un `put` normal).
+    fn complete_put_scoped<F>(&mut self, op: &PendingOp, work: F) -> Result<(), StoreError>
+    where
+        F: FnOnce(
+            &rusqlite::Transaction<'_>,
+            &str,
+            &str,
+            &str,
+        ) -> Result<Option<(&'static str, u64)>, StoreError>,
+    {
         let (table, coltable, colcol) = area_tables(&op.area)
             .ok_or_else(|| StoreError::InvalidArgument("área sin cola".into()))?;
         let transaction = self.connection.transaction().map_err(classify)?;
         if !Self::close_op(&transaction, op)? {
             return Ok(());
         }
-        transaction
-            .execute(
-                &format!(
-                    "UPDATE {table} SET etag = ?1, pending_op = NULL
-                      WHERE href = ?2 AND {colcol} = (SELECT id FROM {coltable} WHERE href = ?3)"
-                ),
-                rusqlite::params![new_etag, op.object_href, op.collection_href],
-            )
-            .map_err(classify)?;
-        transaction.commit().map_err(classify)
+        let note = work(&transaction, table, coltable, colcol)?;
+        transaction.commit().map_err(classify)?;
+        if let Some((area_static, generation)) = note {
+            self.note_change(area_static, generation);
+        }
+        Ok(())
+    }
+
+    /// Cierra un `put` de **creación por Graph**: como [`Self::complete_put`]
+    /// guarda el ETag y limpia la marca `pending_op`, pero además **re-basa el
+    /// `href`** de la fila guardada —de la dirección local sintética con la que se
+    /// creó (`graph://default/…`) al `id` que asignó el servidor— para que la
+    /// próxima bajada haga upsert sobre la misma fila y no la duplique.
+    ///
+    /// Es propio de Graph: en DAV el cliente elige el `href` del `PUT`, así que la
+    /// creación ya nace con su dirección final y `complete_put` alcanza. En Graph
+    /// el `id` lo pone el servidor en el `POST`, y recién ahí se conoce.
+    ///
+    /// **Condicional a la revisión** y **con alcance de colección**, como el resto
+    /// de los cierres. Si la bajada de una vuelta anterior ya trajo el objeto bajo
+    /// su `id` del servidor (idempotencia del `POST` por `transactionId`), re-basar
+    /// el `href` chocaría con esa fila por el `UNIQUE (collection, href)`. **No se
+    /// usa `UPDATE OR REPLACE`**: su `DELETE` implícito saltea el trigger
+    /// `AFTER DELETE` del FTS cuando `recursive_triggers` está apagado (esta conexión
+    /// no lo activa) —dejaría un fantasma en el índice de búsqueda— y la cascada de
+    /// derivados. En cambio se borra **explícitamente** la fila distinta en conflicto
+    /// (el `DELETE` sí dispara el trigger y la cascada) y recién después se re-basa la
+    /// local con un `UPDATE` normal. Como se cambió un `href` visible (y quizá se borró
+    /// un duplicado), **sube la generación** y avisa a los lectores.
+    pub fn complete_create(
+        &mut self,
+        op: &PendingOp,
+        new_href: &str,
+        new_etag: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let area_static = area_static(&op.area)
+            .ok_or_else(|| StoreError::InvalidArgument("área sin cola".into()))?;
+        self.complete_put_scoped(op, move |transaction, table, coltable, colcol| {
+            // 1) Borrar SÓLO la fila distinta que ya ocupa `new_href` en esta
+            //    colección (una bajada anterior la trajo). El `DELETE` explícito
+            //    —a diferencia del implícito de `OR REPLACE`— dispara el trigger
+            //    `AFTER DELETE` del FTS y la cascada de derivados.
+            transaction
+                .execute(
+                    &format!(
+                        "DELETE FROM {table}
+                          WHERE href = ?1 AND href <> ?2
+                            AND {colcol} = (SELECT id FROM {coltable} WHERE href = ?3)"
+                    ),
+                    rusqlite::params![new_href, op.object_href, op.collection_href],
+                )
+                .map_err(classify)?;
+            // 2) Re-basar la fila local al `id` del servidor (sin `OR REPLACE`: la
+            //    fila en conflicto ya no está).
+            transaction
+                .execute(
+                    &format!(
+                        "UPDATE {table} SET href = ?1, etag = ?2, pending_op = NULL
+                          WHERE href = ?3 AND {colcol} = (SELECT id FROM {coltable} WHERE href = ?4)"
+                    ),
+                    rusqlite::params![new_href, new_etag, op.object_href, op.collection_href],
+                )
+                .map_err(classify)?;
+            // 3) Se cambió un `href` visible (y quizá se borró un duplicado): sube la
+            //    generación para que los lectores recarguen.
+            let generation = bump_generation(transaction, area_static)?;
+            Ok(Some((area_static, generation)))
+        })
     }
 
     /// Cierra un `delete` que salió bien (o un `404`, idempotente): borra la
@@ -1174,6 +1265,135 @@ mod tests {
         store.complete_delete(&op).unwrap();
         assert_eq!(raw_of(&store, HREF), None);
         assert_eq!(store.pending_count(CONTACTS_AREA).unwrap(), 0);
+    }
+
+    /// **Creación por Graph**: cerrar un `POST` re-basa el `href` de la fila local
+    /// —de la dirección sintética al `id` del servidor— y guarda el ETag, para que
+    /// la próxima bajada haga upsert sobre la misma fila y no la duplique.
+    #[test]
+    fn complete_create_rebasa_el_href_al_id_del_servidor() {
+        const LOCAL: &str = "graph://default/local.vcf";
+        const SERVER: &str = "AAMkServerId==";
+        let temp = TempDir::new("cola-create-rebase");
+        let mut store = open_store(&temp);
+        let book = one_book(&mut store);
+        // La creación local, encolada en su href sintético.
+        store
+            .enqueue_contact_put(&book, &row(LOCAL, "Local", "l@x.com"))
+            .unwrap();
+        let op = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+
+        store.complete_create(&op, SERVER, Some("\"srv\"")).unwrap();
+
+        // El href sintético ya no está; la fila vive bajo el id del servidor, con
+        // su crudo local y el ETag del servidor, y sin marca ni op.
+        assert_eq!(raw_of(&store, LOCAL), None, "quedó el href sintético");
+        assert!(
+            raw_of(&store, SERVER).is_some_and(|r| r.contains("Local")),
+            "la fila no se re-basó al id del servidor"
+        );
+        assert_eq!(etag_of(&store, SERVER).as_deref(), Some("\"srv\""));
+        assert_eq!(pending_op_of(&store, SERVER), None);
+        assert_eq!(store.pending_count(CONTACTS_AREA).unwrap(), 0);
+    }
+
+    /// **Idempotencia del `POST` por `transactionId`**: si una bajada anterior ya
+    /// trajo el objeto bajo su `id` del servidor (porque el `POST` reintentado
+    /// devolvió el mismo id), re-basar el `href` chocaría con esa fila por el
+    /// `UNIQUE (libreta, href)`. El `UPDATE OR REPLACE` la reemplaza por la local
+    /// —el mismo objeto con el crudo que la persona subió— en vez de fallar.
+    #[test]
+    fn complete_create_reemplaza_una_fila_ya_bajada_del_servidor() {
+        const LOCAL: &str = "graph://default/local.vcf";
+        const SERVER: &str = "AAMkServerId==";
+        let temp = TempDir::new("cola-create-collision");
+        let mut store = open_store(&temp);
+        let book = one_book(&mut store);
+        // La bajada ya trajo el objeto bajo su id del servidor.
+        store
+            .apply_contacts(
+                &book,
+                &[ContactOp::Upsert(row(SERVER, "Servidor", "s@x.com"))],
+                None,
+                u64::MAX,
+            )
+            .unwrap();
+        // Y está la creación local pendiente, en su href sintético.
+        store
+            .enqueue_contact_put(&book, &row(LOCAL, "Local", "l@x.com"))
+            .unwrap();
+        let op = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+
+        store.complete_create(&op, SERVER, Some("\"srv\"")).unwrap();
+
+        // Una sola fila bajo el id del servidor, con el crudo local (no el bajado),
+        // y sin duplicado en el href sintético.
+        assert_eq!(raw_of(&store, LOCAL), None);
+        let server_raw = raw_of(&store, SERVER).expect("la fila vive bajo el id del servidor");
+        assert!(server_raw.contains("Local"), "ganó el crudo local");
+        assert!(!server_raw.contains("Servidor"), "quedó el crudo bajado");
+    }
+
+    /// El conteo de filas del índice de búsqueda que matchean un término.
+    fn fts_hits(store: &Store, term: &str) -> i64 {
+        store
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM contacts_fts WHERE contacts_fts MATCH ?1",
+                [term],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// **Integridad del cierre de una creación sobre una fila ya bajada.** Si la
+    /// bajada ya trajo el objeto bajo el `id` del servidor y se re-basa la fila local
+    /// encima: (1) queda **una sola** fila, la local re-basada; (2) el índice de
+    /// búsqueda **no guarda al fantasma** de la fila borrada —el `DELETE` explícito
+    /// dispara el trigger `AFTER DELETE` del FTS, que el `UPDATE OR REPLACE` salteaba—;
+    /// (3) la **generación sube**, así los lectores no se quedan con la foto vieja.
+    #[test]
+    fn complete_create_sobre_una_fila_bajada_limpia_el_indice_y_sube_la_generacion() {
+        const LOCAL: &str = "graph://default/local.vcf";
+        const SERVER: &str = "AAMkServerId==";
+        let temp = TempDir::new("cola-create-fts");
+        let mut store = open_store(&temp);
+        let book = one_book(&mut store);
+        store
+            .apply_contacts(
+                &book,
+                &[ContactOp::Upsert(row(SERVER, "Fantasma", "f@x.com"))],
+                None,
+                u64::MAX,
+            )
+            .unwrap();
+        store
+            .enqueue_contact_put(&book, &row(LOCAL, "Reemplazo", "r@x.com"))
+            .unwrap();
+        assert_eq!(fts_hits(&store, "fantasma"), 1, "precondición: indexada");
+        let op = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+        store.take_changes();
+        let before = super::super::read_generation(store.connection(), CONTACTS_AREA).unwrap();
+
+        store.complete_create(&op, SERVER, Some("\"srv\"")).unwrap();
+
+        // (1) Una sola fila bajo el id del servidor, con el crudo local.
+        let rows: i64 = store
+            .connection()
+            .query_row("SELECT count(*) FROM contacts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "queda una sola fila");
+        assert!(raw_of(&store, SERVER).is_some_and(|r| r.contains("Reemplazo")));
+        // (2) Sin fantasma en el índice; la fila viva sí se encuentra.
+        assert_eq!(fts_hits(&store, "fantasma"), 0, "fantasma en el FTS");
+        assert_eq!(fts_hits(&store, "reemplazo"), 1, "la re-basada se busca");
+        // (3) La generación subió y se avisó a los lectores.
+        let after = super::super::read_generation(store.connection(), CONTACTS_AREA).unwrap();
+        assert!(
+            after > before,
+            "la generación no subió: {before} -> {after}"
+        );
+        assert_eq!(store.take_changes(), vec![(CONTACTS_AREA, after)]);
     }
 
     /// Una edición nueva sobre un objeto con op pendiente **reemplaza** la op
