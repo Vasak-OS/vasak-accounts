@@ -140,6 +140,45 @@ impl<K: KeySource> ContactsSync<K> {
         }
     }
 
+    /// Lo común a los cuatro backends al pedir la credencial: `Denied` deja la
+    /// cuenta `Unavailable` y no se vuelve a preguntar hasta la hora siguiente;
+    /// `Failed` la deja en `Failed` sin filtrar el motivo. Es genérico en el tipo
+    /// de credencial porque cada fuente devuelve la suya (CardDAV, Graph, LDAP) y
+    /// sólo el camino de error se comparte. El caller hace
+    /// `match ... { Ok(c) => c, Err(outcome) => return outcome }`.
+    async fn resolve_credential<C>(
+        &self,
+        account_id: &str,
+        result: Result<C, CredentialError>,
+    ) -> Result<C, SyncResult> {
+        match result {
+            Ok(credential) => Ok(credential),
+            Err(CredentialError::Denied) => {
+                tracing::info!("'{account_id}': sin permiso para los contactos");
+                self.set_status(account_id, AreaState::Unavailable, DENIED_DETAIL)
+                    .await;
+                Err(SyncResult::Denied)
+            }
+            Err(CredentialError::Failed(detail)) => {
+                tracing::warn!(
+                    "'{account_id}': no se obtuvo la credencial de los contactos: {detail}"
+                );
+                let shown = "no se obtuvo la credencial de la cuenta del servicio de cuentas";
+                self.set_status(account_id, AreaState::Failed, shown).await;
+                Err(SyncResult::Failed(shown.into()))
+            }
+        }
+    }
+
+    /// El contexto que recibe cada backend, igual para los cuatro.
+    fn context<'a>(&'a self, account_id: &'a str) -> SyncContext<'a, K> {
+        SyncContext {
+            manager: &self.manager,
+            account_id,
+            notify: self.notify.clone(),
+        }
+    }
+
     /// Obtiene el tipo de backend para una cuenta.
     async fn backend_kind_for_account(&self, account_id: &str) -> ContactBackendKind {
         let broker = match Broker::connect().await {
@@ -199,142 +238,82 @@ impl<K: KeySource> ContactsSync<K> {
         // Determinar el backend
         let backend_kind = self.backend_kind_for_account(account_id).await;
 
-        // Ejecutar la sincronización según el backend
+        // Ejecutar la sincronización según el backend. Cada brazo sólo resuelve su
+        // credencial (con su propia fuente) y llama a su backend; el camino de
+        // error de la credencial y el armado del contexto son comunes (ver
+        // `resolve_credential` y `context`).
         match backend_kind {
             ContactBackendKind::CardDav => {
-                let credential_source = crate::dav_sync::BrokerCredentials;
-                let credential = match credential_source
-                    .credential(account_id, CONTACTS_AREA)
+                let source = crate::dav_sync::BrokerCredentials;
+                let credential = match self
+                    .resolve_credential(
+                        account_id,
+                        source.credential(account_id, CONTACTS_AREA).await,
+                    )
                     .await
                 {
                     Ok(credential) => credential,
-                    Err(CredentialError::Denied) => {
-                        tracing::info!("'{account_id}': sin permiso para los contactos");
-                        self.set_status(account_id, AreaState::Unavailable, DENIED_DETAIL)
-                            .await;
-                        return SyncResult::Denied;
-                    }
-                    Err(CredentialError::Failed(detail)) => {
-                        tracing::warn!(
-                            "'{account_id}': no se obtuvo la credencial de los contactos: {detail}"
-                        );
-                        let shown =
-                            "no se obtuvo la credencial de la cuenta del servicio de cuentas";
-                        self.set_status(account_id, AreaState::Failed, shown).await;
-                        return SyncResult::Failed(shown.into());
-                    }
+                    Err(outcome) => return outcome,
                 };
-
-                let ctx = SyncContext {
-                    manager: &self.manager,
-                    account_id,
-                    notify: self.notify.clone(),
-                };
-
                 CardDavBackend
-                    .sync(ctx, &credential, HttpPolicy::default())
+                    .sync(self.context(account_id), &credential, HttpPolicy::default())
                     .await
             }
             ContactBackendKind::Google => {
                 // Google usa la misma credencial CardDAV que el camino genérico
                 // (OAuth en `Bearer`); el backend la reusa de token para la pasada
                 // de People API, así que no se pide el token una segunda vez.
-                let credential_source = crate::dav_sync::BrokerCredentials;
-                let credential = match credential_source
-                    .credential(account_id, CONTACTS_AREA)
+                let source = crate::dav_sync::BrokerCredentials;
+                let credential = match self
+                    .resolve_credential(
+                        account_id,
+                        source.credential(account_id, CONTACTS_AREA).await,
+                    )
                     .await
                 {
                     Ok(credential) => credential,
-                    Err(CredentialError::Denied) => {
-                        tracing::info!("'{account_id}': sin permiso para los contactos");
-                        self.set_status(account_id, AreaState::Unavailable, DENIED_DETAIL)
-                            .await;
-                        return SyncResult::Denied;
-                    }
-                    Err(CredentialError::Failed(detail)) => {
-                        tracing::warn!(
-                            "'{account_id}': no se obtuvo la credencial de los contactos: {detail}"
-                        );
-                        let shown =
-                            "no se obtuvo la credencial de la cuenta del servicio de cuentas";
-                        self.set_status(account_id, AreaState::Failed, shown).await;
-                        return SyncResult::Failed(shown.into());
-                    }
+                    Err(outcome) => return outcome,
                 };
-
-                let ctx = SyncContext {
-                    manager: &self.manager,
-                    account_id,
-                    notify: self.notify.clone(),
-                };
-
                 GoogleBackend
-                    .sync(ctx, &credential, HttpPolicy::default(), None)
+                    .sync(
+                        self.context(account_id),
+                        &credential,
+                        HttpPolicy::default(),
+                        None,
+                    )
                     .await
             }
             ContactBackendKind::GraphApi => {
-                let credential_source = GraphCredentialSource;
-                let credential = match credential_source
-                    .credential(account_id, CONTACTS_AREA)
+                let source = GraphCredentialSource;
+                let credential = match self
+                    .resolve_credential(
+                        account_id,
+                        source.credential(account_id, CONTACTS_AREA).await,
+                    )
                     .await
                 {
                     Ok(credential) => credential,
-                    Err(CredentialError::Denied) => {
-                        tracing::info!("'{account_id}': sin permiso para los contactos");
-                        self.set_status(account_id, AreaState::Unavailable, DENIED_DETAIL)
-                            .await;
-                        return SyncResult::Denied;
-                    }
-                    Err(CredentialError::Failed(detail)) => {
-                        tracing::warn!(
-                            "'{account_id}': no se obtuvo la credencial de los contactos: {detail}"
-                        );
-                        let shown =
-                            "no se obtuvo la credencial de la cuenta del servicio de cuentas";
-                        self.set_status(account_id, AreaState::Failed, shown).await;
-                        return SyncResult::Failed(shown.into());
-                    }
+                    Err(outcome) => return outcome,
                 };
-
-                let ctx = SyncContext {
-                    manager: &self.manager,
-                    account_id,
-                    notify: self.notify.clone(),
-                };
-
-                GraphApiBackend.sync(ctx, &credential).await
+                GraphApiBackend
+                    .sync(self.context(account_id), &credential)
+                    .await
             }
             ContactBackendKind::Ldap => {
-                let credential_source = LdapCredentialSource;
-                let credential = match credential_source
-                    .credential(account_id, CONTACTS_AREA)
+                let source = LdapCredentialSource;
+                let credential = match self
+                    .resolve_credential(
+                        account_id,
+                        source.credential(account_id, CONTACTS_AREA).await,
+                    )
                     .await
                 {
                     Ok(credential) => credential,
-                    Err(CredentialError::Denied) => {
-                        tracing::info!("'{account_id}': sin permiso para los contactos");
-                        self.set_status(account_id, AreaState::Unavailable, DENIED_DETAIL)
-                            .await;
-                        return SyncResult::Denied;
-                    }
-                    Err(CredentialError::Failed(detail)) => {
-                        tracing::warn!(
-                            "'{account_id}': no se obtuvo la credencial de los contactos: {detail}"
-                        );
-                        let shown =
-                            "no se obtuvo la credencial de la cuenta del servicio de cuentas";
-                        self.set_status(account_id, AreaState::Failed, shown).await;
-                        return SyncResult::Failed(shown.into());
-                    }
+                    Err(outcome) => return outcome,
                 };
-
-                let ctx = SyncContext {
-                    manager: &self.manager,
-                    account_id,
-                    notify: self.notify.clone(),
-                };
-
-                LdapBackend.sync(ctx, &credential).await
+                LdapBackend
+                    .sync(self.context(account_id), &credential)
+                    .await
             }
         }
     }
