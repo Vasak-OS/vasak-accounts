@@ -16,7 +16,7 @@
 # permisos y sirve para ejercitarlo de punta a punta.
 [workspace]
 resolver = "2"
-members = ["common", "daemon", "store-client", "sync"]
+members = ["common", "daemon", "sync"]
 
 [workspace.package]
 version = "0.44.0"

@@ -2457,14 +2457,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "vasak-accounts-store-client"
-version = "0.44.0"
-dependencies = [
- "tokio",
- "zbus",
-]
-
-[[package]]
 name = "vasak-accounts-sync"
 version = "0.44.0"
 dependencies = [

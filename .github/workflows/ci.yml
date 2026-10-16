@@ -32,10 +32,4 @@ jobs:
       # llega a los tokens, y el sincronizador parsea lo que manda un servidor
       # de correo cualquiera. Estaban escritas —405 pruebas— y no las corría
       # nadie: hoy una de ellas puede romperse y mergearse sin que nadie lo note.
-      pruebas_rust: -p vasak-accounts -p vasak-accounts-sync -p vasak-accounts-store-client
-      # `vasak-accounts-store-client` tiene pruebas de bus real (tests/real_bus.rs)
-      # que levantan un `dbus-daemon` propio: comprueban el cableado contra el bus
-      # y cubren el `DbusOwnerResolver`. Sin `dbus-daemon` se omiten solas y esa
-      # parte queda sin cubrir, así que se declara el paquete para que corran y
-      # midan en CI.
-      paquetes_rust: dbus
+      pruebas_rust: -p vasak-accounts -p vasak-accounts-sync
