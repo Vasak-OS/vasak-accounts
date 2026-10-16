@@ -668,29 +668,26 @@ fn persistir(
     db.load()
         .map_err(|e| TokenError::Failed(format!("no se pudieron recargar las cuentas: {e}")))?;
 
-    let mut actualizada = match db.get(&cuenta.id) {
-        Some(actual) => actual.clone(),
-        // Si la borraron mientras hablábamos con el proveedor, no hay que
-        // resucitarla: el token que acabamos de guardar lo limpia el borrado.
-        None => return Ok(()),
-    };
-    // El vencimiento, en todas las capacidades que comparten este recurso: usan
-    // el mismo token, así que vencen juntas y ninguna lo vuelve a refrescar de
-    // más en la misma vuelta.
-    for capability in &plan.group {
-        if let Some(objeto) = actualizada
-            .capabilities
-            .get_mut(capability)
-            .and_then(|cfg| cfg.as_object_mut())
-        {
-            objeto.insert(
-                "expires_at".into(),
-                serde_json::Value::String(expira.to_rfc3339()),
-            );
+    // Si la borraron mientras hablábamos con el proveedor, `update_with` no la
+    // resucita.
+    db.update_with(&cuenta.id, |actualizada| {
+        // El vencimiento, en todas las capacidades que comparten este recurso:
+        // usan el mismo token, así que vencen juntas y ninguna lo vuelve a
+        // refrescar de más en la misma vuelta.
+        for capability in &plan.group {
+            if let Some(objeto) = actualizada
+                .capabilities
+                .get_mut(capability)
+                .and_then(|cfg| cfg.as_object_mut())
+            {
+                objeto.insert(
+                    "expires_at".into(),
+                    serde_json::Value::String(expira.to_rfc3339()),
+                );
+            }
         }
-    }
-    db.update_account(actualizada)
-        .map_err(|e| TokenError::Failed(format!("no se pudo actualizar la cuenta: {e}")))?;
+    })
+    .map_err(|e| TokenError::Failed(format!("no se pudo actualizar la cuenta: {e}")))?;
 
     tracing::info!("token de '{}' refrescado, expira {expira}", cuenta.id);
     Ok(())

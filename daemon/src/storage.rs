@@ -4,6 +4,32 @@ use std::collections::HashMap;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+/// Serializa los read-modify-write de `accounts.json` y `secrets.json`.
+///
+/// Cada pedido de D-Bus abre su propia copia, la modifica y reescribe el archivo
+/// entero: sin esto, dos cuentas del mismo usuario que refrescan a la vez —el
+/// arranque de sesión— pisan una la escritura de la otra, y la que pierde queda
+/// sin su token y pidiendo reautorización (`vasak-accounts#107`). Se toma sólo
+/// alrededor del disco, nunca a través de la red.
+///
+/// Uno por directorio —por uid—, no uno para todo el proceso: si no, un usuario
+/// que escribe mucho demoraría los refrescos de los demás. No es reentrante: lo
+/// que corre adentro no puede volver a tomarlo.
+static WRITES: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn with_write_lock<T>(directory: &Path, f: impl FnOnce() -> T) -> T {
+    let lock = WRITES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(directory.to_path_buf())
+        .or_default()
+        .clone();
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    f()
+}
+
 // ---------------------------------------------------------------------------
 // CapabilityType — enum polimórfico snake_case
 // ---------------------------------------------------------------------------
@@ -626,17 +652,55 @@ impl AccountDatabase {
     }
 
     /// Persiste el estado actual de `accounts` a `accounts.json`.
-    pub fn save(&self) -> Result<(), StorageError> {
+    fn save(&self) -> Result<(), StorageError> {
         let data = serde_json::to_string_pretty(&self.accounts)?;
         write_private(&self.path, data.as_bytes())?;
         Ok(())
     }
 
+    /// Aplica `change` sobre lo que hay **en disco ahora**, no sobre la copia
+    /// cargada al empezar el pedido, y guarda si `change` dice que cambió algo.
+    /// Así lo que otro pedido guardó en el medio no se pierde (ver [`WRITES`]).
+    fn modify<T>(
+        &mut self,
+        change: impl FnOnce(&mut Vec<Account>) -> (T, bool),
+    ) -> Result<T, StorageError> {
+        let directory = self.path.parent().unwrap_or(Path::new("")).to_path_buf();
+        with_write_lock(&directory, || {
+            self.load()?;
+            let (result, changed) = change(&mut self.accounts);
+            if changed {
+                self.save()?;
+            }
+            Ok(result)
+        })
+    }
+
+    /// Cambia **sólo lo que `change` toca** de una cuenta, sobre su versión en
+    /// disco: reemplazarla entera con una copia vieja pisaría, por ejemplo, la
+    /// marca de reautorización que otro pedido le puso en el medio. Devuelve si
+    /// la cuenta seguía existiendo; si la borraron, no se la resucita.
+    pub fn update_with(
+        &mut self,
+        id: &str,
+        change: impl FnOnce(&mut Account),
+    ) -> Result<bool, StorageError> {
+        self.modify(|accounts| match accounts.iter_mut().find(|a| a.id == id) {
+            Some(account) => {
+                change(account);
+                (true, true)
+            }
+            None => (false, false),
+        })
+    }
+
     /// Agrega una cuenta, persiste y retorna el ID asignado.
     pub fn add(&mut self, account: Account) -> Result<String, StorageError> {
         let id = account.id.clone();
-        self.accounts.push(account);
-        self.save()?;
+        self.modify(|accounts| {
+            accounts.push(account);
+            ((), true)
+        })?;
         Ok(id)
     }
 
@@ -665,19 +729,21 @@ impl AccountDatabase {
 
     pub fn update_account(&mut self, updated: Account) -> Result<(), StorageError> {
         let id = updated.id.clone();
-        let pos = self
-            .accounts
-            .iter()
-            .position(|a| a.id == id)
-            .ok_or_else(|| {
-                StorageError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("Account '{}' not found for update", id),
-                ))
-            })?;
-        self.accounts[pos] = updated;
-        self.save()?;
-        Ok(())
+        let found = self.modify(|accounts| match accounts.iter().position(|a| a.id == id) {
+            Some(pos) => {
+                accounts[pos] = updated;
+                (true, true)
+            }
+            None => (false, false),
+        })?;
+        if found {
+            Ok(())
+        } else {
+            Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Account '{}' not found for update", id),
+            )))
+        }
     }
 
     /// Marca —o desmarca— que una cuenta necesita volver a autorizarse.
@@ -686,26 +752,22 @@ impl AccountDatabase {
     /// señal sólo cuando hay algo nuevo, y no en cada refresco fallido de una
     /// cuenta que ya estaba marcada.
     pub fn set_needs_reauth(&mut self, id: &str, needs: bool) -> Result<bool, StorageError> {
-        let Some(cuenta) = self.accounts.iter_mut().find(|a| a.id == id) else {
-            return Ok(false);
-        };
-        if cuenta.needs_reauth == needs {
-            return Ok(false);
-        }
-        cuenta.needs_reauth = needs;
-        self.save()?;
-        Ok(true)
+        self.modify(|accounts| match accounts.iter_mut().find(|a| a.id == id) {
+            Some(cuenta) if cuenta.needs_reauth != needs => {
+                cuenta.needs_reauth = needs;
+                (true, true)
+            }
+            _ => (false, false),
+        })
     }
 
     pub fn remove(&mut self, id: &str) -> Result<bool, StorageError> {
-        let len = self.accounts.len();
-        self.accounts.retain(|a| a.id != id);
-        if self.accounts.len() != len {
-            self.save()?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        self.modify(|accounts| {
+            let len = accounts.len();
+            accounts.retain(|a| a.id != id);
+            let removed = accounts.len() != len;
+            (removed, removed)
+        })
     }
 }
 
@@ -734,11 +796,13 @@ impl SecretStore {
     fn load(
         directory: &std::path::Path,
     ) -> Result<HashMap<String, HashMap<String, String>>, StorageError> {
-        let path = directory.join(Self::FILE_NAME);
-        if !path.exists() {
-            return Ok(HashMap::new());
+        // Sólo «no existe» es vacío: un archivo ilegible tomado por vacío haría
+        // que la próxima escritura borre todos los tokens del usuario.
+        match std::fs::read_to_string(directory.join(Self::FILE_NAME)) {
+            Ok(data) => Ok(serde_json::from_str(&data)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+            Err(e) => Err(StorageError::Io(e)),
         }
-        Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
     }
 
     fn persist(
@@ -777,12 +841,14 @@ impl SecretStore {
         key: &str,
         secret: &str,
     ) -> Result<(), StorageError> {
-        let mut secrets = Self::load(directory)?;
-        secrets
-            .entry(account_id.to_string())
-            .or_default()
-            .insert(key.to_string(), secret.to_string());
-        Self::persist(directory, &secrets)
+        with_write_lock(directory, || {
+            let mut secrets = Self::load(directory)?;
+            secrets
+                .entry(account_id.to_string())
+                .or_default()
+                .insert(key.to_string(), secret.to_string());
+            Self::persist(directory, &secrets)
+        })
     }
 
     pub fn get_secret(uid: u32, account_id: &str, key: &str) -> Result<String, StorageError> {
@@ -827,11 +893,13 @@ impl SecretStore {
         directory: &std::path::Path,
         account_id: &str,
     ) -> Result<(), StorageError> {
-        let mut secrets = Self::load(directory)?;
-        if secrets.remove(account_id).is_some() {
-            Self::persist(directory, &secrets)?;
-        }
-        Ok(())
+        with_write_lock(directory, || {
+            let mut secrets = Self::load(directory)?;
+            if secrets.remove(account_id).is_some() {
+                Self::persist(directory, &secrets)?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -2185,5 +2253,187 @@ pub(crate) mod tests {
         assert!(AccountDatabase::directory_for(1000)
             .to_string_lossy()
             .ends_with("/1000"));
+    }
+
+    const HILOS: usize = 16;
+
+    /// Corre `tarea(i)` en `HILOS` hilos que arrancan juntos, para maximizar el
+    /// solapamiento de los pedidos.
+    fn correr_a_la_vez(tarea: impl Fn(usize) + Sync) {
+        let barrera = std::sync::Barrier::new(HILOS);
+        std::thread::scope(|s| {
+            for i in 0..HILOS {
+                let (barrera, tarea) = (&barrera, &tarea);
+                s.spawn(move || {
+                    barrera.wait();
+                    tarea(i);
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn los_secretos_de_cuentas_distintas_guardados_a_la_vez_no_se_pisan() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        AccountDatabase::in_directory(dir.clone()).unwrap();
+
+        correr_a_la_vez(|i| {
+            SecretStore::store_secret_in(&dir, &format!("cuenta-{i}"), "token", &format!("t{i}"))
+                .unwrap();
+        });
+
+        for i in 0..HILOS {
+            assert_eq!(
+                SecretStore::get_secret_in(&dir, &format!("cuenta-{i}"), "token").unwrap(),
+                format!("t{i}"),
+                "se perdió el secreto de cuenta-{i}"
+            );
+        }
+        remove_test_database(&dir);
+    }
+
+    #[test]
+    fn dos_copias_viejas_de_la_base_no_se_pisan_al_actualizar_cuentas_distintas() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let mut base = AccountDatabase::in_directory(dir.clone()).unwrap();
+        base.load().unwrap();
+        let a = base.add(sample_account()).unwrap();
+        let b = base.add(sample_account()).unwrap();
+
+        // Cada pedido cargó su copia antes de que el otro guardara.
+        let mut copia_a = AccountDatabase::in_directory(dir.clone()).unwrap();
+        let mut copia_b = AccountDatabase::in_directory(dir.clone()).unwrap();
+        copia_a.load().unwrap();
+        copia_b.load().unwrap();
+
+        let mut nueva = copia_a.get(&a).unwrap().clone();
+        nueva.display_name = "Renombrada".into();
+        copia_a.update_account(nueva).unwrap();
+        copia_b.set_needs_reauth(&b, true).unwrap();
+
+        let mut final_ = AccountDatabase::in_directory(dir.clone()).unwrap();
+        final_.load().unwrap();
+        assert_eq!(final_.get(&a).unwrap().display_name, "Renombrada");
+        assert!(final_.get(&b).unwrap().needs_reauth);
+        remove_test_database(&dir);
+    }
+
+    #[test]
+    fn marcar_reautorizacion_en_cuentas_distintas_a_la_vez_no_pierde_marcas() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let mut base = AccountDatabase::in_directory(dir.clone()).unwrap();
+        base.load().unwrap();
+        let ids: Vec<String> = (0..HILOS)
+            .map(|_| base.add(sample_account()).unwrap())
+            .collect();
+
+        // Cada hilo carga su copia antes de la barrera, como un pedido real.
+        let copias: Vec<std::sync::Mutex<AccountDatabase>> = (0..HILOS)
+            .map(|_| {
+                let mut db = AccountDatabase::in_directory(dir.clone()).unwrap();
+                db.load().unwrap();
+                std::sync::Mutex::new(db)
+            })
+            .collect();
+        correr_a_la_vez(|i| {
+            copias[i]
+                .lock()
+                .unwrap()
+                .set_needs_reauth(&ids[i], true)
+                .unwrap();
+        });
+
+        let mut final_ = AccountDatabase::in_directory(dir.clone()).unwrap();
+        final_.load().unwrap();
+        for id in &ids {
+            assert!(
+                final_.get(id).unwrap().needs_reauth,
+                "se perdió la marca de {id}"
+            );
+        }
+        remove_test_database(&dir);
+    }
+
+    #[test]
+    fn cambiar_un_campo_desde_una_copia_vieja_no_pisa_la_marca_de_reautorizacion() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let mut base = AccountDatabase::in_directory(dir.clone()).unwrap();
+        base.load().unwrap();
+        let id = base.add(sample_account()).unwrap();
+
+        // El pedido que refresca el token cargó su copia antes de la marca.
+        let mut vieja = AccountDatabase::in_directory(dir.clone()).unwrap();
+        vieja.load().unwrap();
+        let mut otra = AccountDatabase::in_directory(dir.clone()).unwrap();
+        otra.load().unwrap();
+        assert!(otra.set_needs_reauth(&id, true).unwrap());
+
+        let hallada = vieja
+            .update_with(&id, |a| a.display_name = "Cambiada".into())
+            .unwrap();
+
+        assert!(hallada);
+        let mut final_ = AccountDatabase::in_directory(dir.clone()).unwrap();
+        final_.load().unwrap();
+        assert_eq!(final_.get(&id).unwrap().display_name, "Cambiada");
+        assert!(final_.get(&id).unwrap().needs_reauth, "se perdió la marca");
+        remove_test_database(&dir);
+    }
+
+    #[test]
+    fn cambiar_una_cuenta_borrada_devuelve_false_y_no_la_resucita() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let mut base = AccountDatabase::in_directory(dir.clone()).unwrap();
+        base.load().unwrap();
+        let id = base.add(sample_account()).unwrap();
+
+        let mut vieja = AccountDatabase::in_directory(dir.clone()).unwrap();
+        vieja.load().unwrap();
+        assert!(base.remove(&id).unwrap());
+
+        let hallada = vieja
+            .update_with(&id, |a| a.display_name = "Fantasma".into())
+            .unwrap();
+
+        assert!(!hallada);
+        let mut final_ = AccountDatabase::in_directory(dir.clone()).unwrap();
+        final_.load().unwrap();
+        assert!(final_.get(&id).is_none(), "la cuenta borrada reapareció");
+        remove_test_database(&dir);
+    }
+
+    #[test]
+    fn un_secrets_json_ilegible_es_error_y_no_se_pisan_los_demas_secretos() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        AccountDatabase::in_directory(dir.clone()).unwrap();
+        SecretStore::store_secret_in(&dir, "vieja", "token", "valioso").unwrap();
+
+        // Un enlace a un directorio: leerlo falla aunque se corra como root
+        // (donde `chmod 000` no alcanza) y, a diferencia de un directorio
+        // pelado, un `rename` sí lo podría reemplazar. Si la lectura fallida se
+        // tomara por vacía, la escritura lo pisaría con un archivo de una sola
+        // clave.
+        let ruta = dir.join("secrets.json");
+        let respaldo = dir.join("secrets.bak");
+        std::fs::rename(&ruta, &respaldo).unwrap();
+        std::os::unix::fs::symlink(&dir, &ruta).unwrap();
+
+        let resultado = SecretStore::store_secret_in(&dir, "nueva", "token", "otro");
+
+        assert!(resultado.is_err(), "debió fallar, no tomarlo por vacío");
+        assert!(
+            std::fs::symlink_metadata(&ruta)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "se reemplazó el secrets.json ilegible"
+        );
+        std::fs::remove_file(&ruta).unwrap();
+        std::fs::rename(&respaldo, &ruta).unwrap();
+        assert_eq!(
+            SecretStore::get_secret_in(&dir, "vieja", "token").unwrap(),
+            "valioso"
+        );
+        remove_test_database(&dir);
     }
 }
