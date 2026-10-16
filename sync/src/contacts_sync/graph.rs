@@ -722,6 +722,22 @@ mod tests {
                 .expect("la base tenía que estar abierta")
         }
 
+        /// Los ETag guardados de cada contacto, ordenados por `href`.
+        async fn stored_etags(&self) -> Vec<Option<String>> {
+            self.manager
+                .with_store(ACCOUNT, |store| {
+                    let c = store.connection();
+                    Ok(c.prepare("SELECT etag FROM contacts ORDER BY href")
+                        .unwrap()
+                        .query_map([], |row| row.get::<_, Option<String>>(0))
+                        .unwrap()
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap())
+                })
+                .await
+                .expect("la base tenía que estar abierta")
+        }
+
         /// Los nombres de las libretas guardadas.
         async fn book_names(&self) -> Vec<String> {
             self.manager
@@ -989,6 +1005,27 @@ mod tests {
 
         let result = GraphApiBackend::fetch_all_contacts(&client(), &credential_for(&server)).await;
         assert!(matches!(result, Err(GraphFetchError::Parse)));
+    }
+
+    /// **Captura del `@odata.etag` en la lectura (`#97`).** La escritura por Graph
+    /// condiciona `PATCH`/`DELETE` con `If-Match: @odata.etag`; para tener qué
+    /// mandar, la bajada guarda el ETag de cada contacto en su fila. Un contacto
+    /// que trae `@odata.etag` se guarda con ese ETag, no en blanco: sin esto la
+    /// precondición viajaría vacía y el `412` nunca se dispararía.
+    #[tokio::test]
+    async fn la_bajada_guarda_el_odata_etag_de_cada_contacto() {
+        let f = Fixture::new("graph_captura_etag").await;
+        f.server.push(
+            r#"{"value":[{"id":"AAA","displayName":"Ada","@odata.etag":"W/\"etag-del-servidor\""}]}"#,
+        );
+
+        f.synced().await;
+
+        assert_eq!(
+            f.stored_etags().await,
+            vec![Some("W/\"etag-del-servidor\"".to_string())],
+            "el @odata.etag de la bajada tiene que quedar en la fila para el If-Match de la escritura"
+        );
     }
 
     /// (6) Bordes, de punta a punta: un contacto sin `id` se descarta; uno con

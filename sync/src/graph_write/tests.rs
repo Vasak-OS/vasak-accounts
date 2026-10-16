@@ -77,6 +77,19 @@ fn el_cuerpo_escapa_la_inyeccion_en_el_json() {
     assert_eq!(round["subject"], "Malo\n\"isAllDay\":true x");
 }
 
+/// Un evento sin fechas (sólo `SUMMARY`) se serializa sin `start`/`end` y con
+/// `isAllDay` en falso, sin romper: `PATCH` fusiona, así que no pisa las fechas del
+/// servidor.
+#[test]
+fn un_evento_sin_fechas_no_pone_start_ni_end() {
+    let ical = "BEGIN:VEVENT\r\nUID:u\r\nSUMMARY:Sin fecha\r\nEND:VEVENT\r\n";
+    let body = event_body_from_ical(ical, None).expect("es un VEVENT");
+    assert_eq!(body["subject"], "Sin fecha");
+    assert!(body.get("start").is_none(), "sin start");
+    assert!(body.get("end").is_none(), "sin end");
+    assert_eq!(body["isAllDay"], false);
+}
+
 const CONTACT_VCARD: &str = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:c1\r\nFN:Ana Pérez\r\n\
     EMAIL:ana@x.com\r\nTEL;TYPE=WORK:+5411000\r\nTEL;TYPE=HOME:+5411111\r\n\
     TEL;TYPE=CELL:+5411222\r\nORG:Vasak\r\nNOTE:una nota\r\nEND:VCARD\r\n";
@@ -258,4 +271,504 @@ fn el_id_se_percent_codifica_en_la_ruta() {
         "el id no se percent-codificó: {}",
         url.path()
     );
+}
+
+// ── Clasificación del estado HTTP ─────────────────────────────────────────────
+
+/// Un `429` (rate limit) es reintentable, no conflicto: no se pierde el cambio por
+/// un límite temporal.
+#[test]
+fn un_429_es_reintentable() {
+    let error = classify(reqwest::StatusCode::TOO_MANY_REQUESTS, false).expect_err("429 es error");
+    assert!(matches!(error, GraphWriteError::Retryable(_)));
+}
+
+/// Un `409` (conflicto) es [`GraphWriteError::Conflict`], igual que el `412`.
+#[test]
+fn un_409_es_conflicto() {
+    let error = classify(reqwest::StatusCode::CONFLICT, false).expect_err("409 es error");
+    assert_eq!(error, GraphWriteError::Conflict);
+}
+
+/// Un `4xx` firme que no es `409`/`412`/`404` (p. ej. `400`) es permanente: escala
+/// a conflicto para no trabar la colección, no se reintenta en bucle.
+#[test]
+fn un_400_es_permanente() {
+    let error = classify(reqwest::StatusCode::BAD_REQUEST, false).expect_err("400 es error");
+    assert!(matches!(error, GraphWriteError::Permanent(_)));
+}
+
+/// Un `2xx` es éxito, tanto en un `DELETE` como en el resto.
+#[test]
+fn un_2xx_es_exito() {
+    assert!(classify(reqwest::StatusCode::OK, false).is_ok());
+    assert!(classify(reqwest::StatusCode::NO_CONTENT, true).is_ok());
+}
+
+// ── Lectura de la respuesta de escritura (`read_response` vía `create`) ────────
+
+/// Un cuerpo que no es JSON válido, tras un `201`, es permanente (respuesta
+/// ilegible): no se reintenta un `POST` que ya creó algo, va a conflicto.
+#[tokio::test]
+async fn un_cuerpo_ilegible_es_permanente() {
+    let server = FakeGraph::start().await;
+    server.push_status(201, "esto no es json {{{");
+    let credential = fake::credential_for(&server);
+    let client = fake::client();
+
+    let error = create(&client, &credential, "contacts", &body())
+        .await
+        .expect_err("un cuerpo ilegible es error");
+    assert!(matches!(error, GraphWriteError::Permanent(_)));
+}
+
+/// Un cuerpo de respuesta que supera el tope de tamaño es permanente: un servidor
+/// roto o adversario no puede hacer leer sin límite.
+#[tokio::test]
+async fn un_cuerpo_sobredimensionado_es_permanente() {
+    let server = FakeGraph::start().await;
+    let gordo = format!(
+        "{{\"id\":\"X\",\"pad\":\"{}\"}}",
+        "a".repeat(super::MAX_WRITE_RESPONSE + 16)
+    );
+    server.push_status(201, gordo);
+    let credential = fake::credential_for(&server);
+    let client = fake::client();
+
+    let error = create(&client, &credential, "contacts", &body())
+        .await
+        .expect_err("un cuerpo gigante es error");
+    assert!(matches!(error, GraphWriteError::Permanent(_)));
+}
+
+/// Un `201` **sin `id`** es permanente: no hay a qué re-basar el `href`, y
+/// reintentar el `POST` duplicaría; va a conflicto.
+#[tokio::test]
+async fn un_201_sin_id_es_permanente() {
+    let server = FakeGraph::start().await;
+    server.push_status(201, "{}");
+    let credential = fake::credential_for(&server);
+    let client = fake::client();
+
+    let error = create(&client, &credential, "contacts", &body())
+        .await
+        .expect_err("un 201 sin id es error");
+    assert!(matches!(error, GraphWriteError::Permanent(_)));
+}
+
+// ── De punta a punta: `replay_graph_area` contra el fake y un almacén de verdad ─
+//
+// Las pruebas de arriba miran el alambre (`create`/`update`/`delete`) y la
+// serialización por separado, y `store::queue` prueba los cierres contra la base.
+// Falta el **pegamento**: `replay_graph_area` drena la cola contra el servidor y,
+// según el estado que contesta, deja la op cerrada, en conflicto o para
+// reintentar —**sin perder el crudo local**—. Eso es lo que ve la persona, y es lo
+// que ningún test cubría de punta a punta. Se monta un `StoreManager` con el
+// llavero falso, se encola una op y se drena contra el `FakeGraph`, igual que las
+// pruebas de borrador de `replay` para el camino DAV.
+mod end_to_end {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use crate::graph::fake::{self, FakeGraph};
+    use crate::graph::GraphCredential;
+    use crate::graph_write::replay_graph_area;
+    use crate::replay::ReplayReport;
+    use crate::store::contacts::{ContactOp, ContactRow, StoredAddressBook};
+    use crate::store::key::fake::FakeKeys;
+    use crate::store::lifecycle::{
+        AccountListing, Consent, ListedAccount, Locations, StoreManager, CONTACTS_AREA,
+    };
+    use crate::store::paths::tests::TempDir;
+    use crate::vcard;
+
+    const ACCOUNT: &str = "cuenta";
+    const BOOK: &str = "https://x/a/";
+
+    struct Fixture {
+        _temp: TempDir,
+        manager: Arc<StoreManager<FakeKeys>>,
+        server: FakeGraph,
+        book: StoredAddressBook,
+    }
+
+    impl Fixture {
+        async fn new(label: &str) -> Self {
+            let temp = TempDir::new(label);
+            let manager = Arc::new(StoreManager::new(
+                FakeKeys::default(),
+                Ok(Locations {
+                    stores: temp.0.join("data/stores"),
+                    settings: temp.0.join("config/stores.json"),
+                }),
+            ));
+            manager
+                .accounts_listed(
+                    AccountListing::Listed(vec![ListedAccount {
+                        id: ACCOUNT.into(),
+                        display_name: "Trabajo".into(),
+                        capabilities: vec!["contacts".into()],
+                        needs_reauth: false,
+                    }]),
+                    Instant::now(),
+                )
+                .await;
+            manager
+                .activate_area(CONTACTS_AREA, ACCOUNT, Consent::Granted)
+                .await
+                .unwrap();
+            assert!(
+                manager.prepare_for_sync(CONTACTS_AREA, ACCOUNT).await,
+                "la base tenía que quedar abierta"
+            );
+            let book = manager
+                .with_store(ACCOUNT, |store| {
+                    Ok(store
+                        .upsert_address_books(&[(BOOK.into(), "A".into())])?
+                        .remove(0))
+                })
+                .await
+                .unwrap();
+            Self {
+                _temp: temp,
+                server: FakeGraph::start().await,
+                manager,
+                book,
+            }
+        }
+
+        fn credential(&self) -> GraphCredential {
+            fake::credential_for(&self.server)
+        }
+
+        fn card(href: &str, name: &str, base_etag: Option<&str>) -> ContactRow {
+            let raw = format!("BEGIN:VCARD\r\nFN:{name}\r\nEND:VCARD");
+            ContactRow {
+                href: href.into(),
+                etag: base_etag.map(str::to_string),
+                contact: vcard::contact_from(&raw, href).unwrap(),
+                raw_vcard: raw,
+            }
+        }
+
+        /// Encola un `put`: `base_etag` nulo lo hace **crear** (`POST`); con
+        /// `base_etag`, **editar** (`PATCH` con `If-Match`).
+        async fn enqueue_put(&self, href: &str, name: &str, base_etag: Option<&str>) {
+            let book = self.book.clone();
+            let row = Self::card(href, name, base_etag);
+            self.manager
+                .with_store(ACCOUNT, move |store| store.enqueue_contact_put(&book, &row))
+                .await
+                .unwrap();
+        }
+
+        async fn enqueue_delete(&self, href: &str, base_etag: Option<&str>) {
+            let href = href.to_string();
+            let base = base_etag.map(str::to_string);
+            self.manager
+                .with_store(ACCOUNT, move |store| {
+                    store.enqueue_delete(CONTACTS_AREA, BOOK, &href, base.as_deref())
+                })
+                .await
+                .unwrap();
+        }
+
+        /// Una bajada del servidor del mismo objeto, por el camino normal de la
+        /// caché (`apply_contacts`): para probar que no duplica tras una creación.
+        async fn download(&self, href: &str, name: &str) {
+            let book = self.book.clone();
+            let row = Self::card(href, name, Some("\"srv\""));
+            self.manager
+                .with_store(ACCOUNT, move |store| {
+                    store
+                        .apply_contacts(&book, &[ContactOp::Upsert(Box::new(row))], None, u64::MAX)
+                        .map(|_| ())
+                })
+                .await
+                .unwrap();
+        }
+
+        async fn replay(&self) -> ReplayReport {
+            let credential = self.credential();
+            let client = fake::client();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            replay_graph_area(
+                &self.manager,
+                ACCOUNT,
+                CONTACTS_AREA,
+                &client,
+                &credential,
+                deadline,
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn op_field(&self, href: &str, column: &'static str) -> Option<String> {
+            let href = href.to_string();
+            self.manager
+                .with_store(ACCOUNT, move |store| {
+                    Ok(store
+                        .connection()
+                        .query_row(
+                            &format!("SELECT {column} FROM pending_dav_ops WHERE object_href = ?1"),
+                            [href],
+                            |r| r.get::<_, String>(0),
+                        )
+                        .ok())
+                })
+                .await
+                .unwrap()
+        }
+
+        async fn op_state(&self, href: &str) -> Option<String> {
+            self.op_field(href, "state").await
+        }
+
+        async fn op_attempts(&self, href: &str) -> Option<i64> {
+            let href = href.to_string();
+            self.manager
+                .with_store(ACCOUNT, move |store| {
+                    Ok(store
+                        .connection()
+                        .query_row(
+                            "SELECT attempts FROM pending_dav_ops WHERE object_href = ?1",
+                            [href],
+                            |r| r.get::<_, i64>(0),
+                        )
+                        .ok())
+                })
+                .await
+                .unwrap()
+        }
+
+        async fn stored(&self, href: &str, column: &'static str) -> Option<String> {
+            let href = href.to_string();
+            self.manager
+                .with_store(ACCOUNT, move |store| {
+                    Ok(store
+                        .connection()
+                        .query_row(
+                            &format!("SELECT {column} FROM contacts WHERE href = ?1"),
+                            [href],
+                            |r| r.get::<_, Option<String>>(0),
+                        )
+                        .ok()
+                        .flatten())
+                })
+                .await
+                .unwrap()
+        }
+
+        async fn pending(&self) -> i64 {
+            self.manager
+                .with_store(ACCOUNT, |store| store.pending_count(CONTACTS_AREA))
+                .await
+                .unwrap()
+        }
+
+        async fn row_count(&self, href: &str) -> i64 {
+            let href = href.to_string();
+            self.manager
+                .with_store(ACCOUNT, move |store| {
+                    Ok(store
+                        .connection()
+                        .query_row(
+                            "SELECT count(*) FROM contacts WHERE href = ?1",
+                            [href],
+                            |r| r.get::<_, i64>(0),
+                        )
+                        .unwrap())
+                })
+                .await
+                .unwrap()
+        }
+    }
+
+    /// **`412` en un `PATCH`**: la op queda en `conflict` y **el crudo local no se
+    /// pierde** —sigue la fila, re-leíble y re-intentable por la superficie de
+    /// conflicto—.
+    #[tokio::test]
+    async fn un_412_deja_la_op_en_conflicto_y_conserva_el_crudo_local() {
+        let f = Fixture::new("graph-e2e-412").await;
+        f.enqueue_put("SRV-ID", "Mía", Some("\"vieja\"")).await;
+        f.server.push_status(412, "");
+
+        let report = f.replay().await;
+
+        assert_eq!(report.conflicts, 1);
+        assert_eq!(f.op_state("SRV-ID").await.as_deref(), Some("conflict"));
+        assert_eq!(f.pending().await, 1, "la op sigue para resolverse");
+        assert!(
+            f.stored("SRV-ID", "raw_vcard")
+                .await
+                .is_some_and(|r| r.contains("Mía")),
+            "el crudo local no se perdió"
+        );
+    }
+
+    /// **`DELETE` con `404`**: es éxito idempotente —el recurso ya no está, que es
+    /// lo que se buscaba—. La op se completa, no queda colgada.
+    #[tokio::test]
+    async fn borrar_con_404_completa_la_op_idempotente() {
+        let f = Fixture::new("graph-e2e-del404").await;
+        f.download("SRV-ID", "Ana").await; // una fila al día que después se borra
+        f.enqueue_delete("SRV-ID", Some("\"e1\"")).await;
+        f.server.push_status(404, "");
+
+        let report = f.replay().await;
+
+        assert_eq!(report.pushed, 1, "un 404 al borrar cuenta como éxito");
+        assert_eq!(f.pending().await, 0, "la op no queda colgada");
+        assert_eq!(
+            f.stored("SRV-ID", "raw_vcard").await,
+            None,
+            "la fila se borró"
+        );
+    }
+
+    /// **`PATCH` con `404`**: el objeto desapareció en el servidor → conflicto, no
+    /// éxito. No se pierde el cambio local.
+    #[tokio::test]
+    async fn editar_con_404_queda_en_conflicto() {
+        let f = Fixture::new("graph-e2e-patch404").await;
+        f.enqueue_put("SRV-ID", "Mía", Some("\"e1\"")).await;
+        f.server.push_status(404, "");
+
+        let report = f.replay().await;
+
+        assert_eq!(report.conflicts, 1);
+        assert_eq!(f.op_state("SRV-ID").await.as_deref(), Some("conflict"));
+        assert!(
+            f.stored("SRV-ID", "raw_vcard")
+                .await
+                .is_some_and(|r| r.contains("Mía")),
+            "el cambio local no se perdió"
+        );
+    }
+
+    /// **Creación por `POST`**: tras el `POST`, el `href` local se re-basa al `id`
+    /// del servidor y el ETag queda guardado; una bajada posterior del mismo objeto
+    /// **no lo duplica**.
+    #[tokio::test]
+    async fn crear_rebasa_el_href_al_id_del_servidor_y_no_duplica() {
+        const LOCAL: &str = "graph://default/nuevo.vcf";
+        let f = Fixture::new("graph-e2e-create").await;
+        f.enqueue_put(LOCAL, "Local", None).await; // base_etag nulo → crear
+        f.server
+            .push_status(201, r#"{"id":"SRV-ID","@odata.etag":"\"e1\""}"#);
+
+        let report = f.replay().await;
+        assert_eq!(report.pushed, 1);
+
+        let server_href = crate::contacts_sync::graph::href_for_id("SRV-ID");
+        assert_eq!(
+            f.stored(LOCAL, "raw_vcard").await,
+            None,
+            "el href sintético se fue"
+        );
+        assert!(
+            f.stored(&server_href, "raw_vcard")
+                .await
+                .is_some_and(|r| r.contains("Local")),
+            "la fila vive bajo el id del servidor con el crudo local"
+        );
+        assert_eq!(
+            f.stored(&server_href, "etag").await.as_deref(),
+            Some("\"e1\""),
+            "el ETag del servidor quedó guardado"
+        );
+        assert_eq!(f.pending().await, 0);
+
+        // Una bajada posterior del mismo objeto, por su id del servidor, no lo
+        // duplica: sigue habiendo una sola fila.
+        f.download(&server_href, "Local").await;
+        assert_eq!(f.row_count(&server_href).await, 1, "no se duplicó");
+    }
+
+    /// **`5xx`**: transitorio → se reintenta (`retry_later`), la op sigue en
+    /// `ready` con un intento más. **No** se marca conflicto firme a la primera.
+    #[tokio::test]
+    async fn un_5xx_reintenta_y_no_marca_conflicto() {
+        let f = Fixture::new("graph-e2e-5xx").await;
+        f.enqueue_put("SRV-ID", "Mía", Some("\"e1\"")).await;
+        f.server.push_status(503, "");
+
+        let report = f.replay().await;
+
+        assert_eq!(report.retried, 1);
+        assert_eq!(report.conflicts, 0, "un 5xx no es conflicto firme");
+        assert_eq!(
+            f.op_state("SRV-ID").await.as_deref(),
+            Some("ready"),
+            "sigue reintentable"
+        );
+        assert_eq!(f.op_attempts("SRV-ID").await, Some(1));
+    }
+
+    /// **`If-Match` correcto**: el `PATCH` manda el `@odata.etag` capturado —el
+    /// `base_etag` de la op— y **no vacío**: la precondición que dispara el `412`.
+    #[tokio::test]
+    async fn el_patch_manda_el_etag_capturado_no_vacio() {
+        let f = Fixture::new("graph-e2e-ifmatch").await;
+        f.enqueue_put("SRV-ID", "Mía", Some("W/\"cap\"")).await;
+        f.server
+            .push_status(200, r#"{"@odata.etag":"W/\"nuevo\""}"#);
+
+        f.replay().await;
+
+        let request = f.server.requests().remove(0);
+        assert_eq!(request.method, "PATCH");
+        assert!(
+            !request.if_match.is_empty(),
+            "la precondición no viaja vacía"
+        );
+        assert_eq!(
+            request.if_match, "W/\"cap\"",
+            "manda el etag capturado, no otro"
+        );
+    }
+
+    /// **`DELETE` sin `base_etag`**: nunca hubo recurso en el servidor (se creó y se
+    /// borró local sin subir), así que el borrado se cierra **sin tocar la red**.
+    #[tokio::test]
+    async fn borrar_sin_etag_cierra_sin_tocar_la_red() {
+        let f = Fixture::new("graph-e2e-del-sin-etag").await;
+        f.download("SRV-ID", "Ana").await;
+        f.enqueue_delete("SRV-ID", None).await;
+        // No se encola ninguna respuesta: si tocara la red, el fake daría 500 y la
+        // op no se completaría.
+
+        let report = f.replay().await;
+
+        assert_eq!(report.pushed, 1);
+        assert_eq!(f.pending().await, 0, "el borrado se cerró");
+        assert_eq!(f.stored("SRV-ID", "raw_vcard").await, None);
+        assert!(
+            f.server.requests().is_empty(),
+            "no se mandó ningún pedido a la red"
+        );
+    }
+
+    /// **`POST` que no devuelve `id`**: es permanente (no hay a qué re-basar el
+    /// `href`; reintentar duplicaría) → la op escala a `conflict` **sin perder el
+    /// crudo local** ni duplicar.
+    #[tokio::test]
+    async fn crear_sin_id_escala_a_conflicto_sin_perder_el_local() {
+        const LOCAL: &str = "graph://default/nuevo.vcf";
+        let f = Fixture::new("graph-e2e-create-sin-id").await;
+        f.enqueue_put(LOCAL, "Local", None).await;
+        f.server.push_status(201, "{}");
+
+        let report = f.replay().await;
+
+        assert_eq!(report.conflicts, 1);
+        assert_eq!(f.op_state(LOCAL).await.as_deref(), Some("conflict"));
+        assert!(
+            f.stored(LOCAL, "raw_vcard")
+                .await
+                .is_some_and(|r| r.contains("Local")),
+            "el crudo local sigue en su href sintético"
+        );
+    }
 }
