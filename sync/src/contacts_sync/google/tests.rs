@@ -463,6 +463,21 @@ fn solo_se_baja_la_foto_de_un_host_de_google() {
 async fn un_contacto_sin_email_no_se_casa_ni_con_un_correo_vacio() {
     let (_temp, manager) = store("google_contacto_sin_email").await;
     let id = seed(&manager, "Sin", "").await;
+    // Por si una fila con correo vacío llegara al almacén (no debería): igual no
+    // es una clave de casamiento.
+    manager
+        .with_store(ACCOUNT, move |s| {
+            s.connection()
+                .execute(
+                    "INSERT OR REPLACE INTO contact_emails (contact_id, position, label, value)
+                     VALUES (?1, 0, '', '')",
+                    [id],
+                )
+                .unwrap();
+            Ok(())
+        })
+        .await
+        .unwrap();
 
     let server = FakeGraph::start().await;
     server.push(
