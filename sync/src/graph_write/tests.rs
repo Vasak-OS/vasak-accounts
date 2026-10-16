@@ -273,6 +273,22 @@ fn el_id_se_percent_codifica_en_la_ruta() {
     );
 }
 
+// ── `href` ↔ `id` del servidor ────────────────────────────────────────────────
+
+/// El `href` guardado y el `id` del servidor se invierten en **las dos áreas**,
+/// también con un `id` que se escapa (`;`, `,`, `\`): si no, un `PATCH`/`DELETE`
+/// iría a un `id` distinto del que Graph asignó.
+#[test]
+fn el_href_y_el_id_se_invierten_en_las_dos_areas() {
+    use crate::store::lifecycle::CONTACTS_AREA;
+    for area in [CALENDAR_AREA, CONTACTS_AREA] {
+        for id in ["AAMkAGI2=", "a;b,c\\d"] {
+            let href = href_for_id(area, id);
+            assert_eq!(id_from_href(area, &href), id, "{area}: {href}");
+        }
+    }
+}
+
 // ── Clasificación del estado HTTP ─────────────────────────────────────────────
 
 /// Un `429` (rate limit) es reintentable, no conflicto: no se pierde el cambio por
@@ -770,5 +786,312 @@ mod end_to_end {
                 .is_some_and(|r| r.contains("Local")),
             "el crudo local sigue en su href sintético"
         );
+    }
+
+    /// Deja la op de un objeto con `attempts` reintentos ya contados, como si
+    /// hubiera fallado por red esas veces en vueltas anteriores.
+    async fn burn_attempts(f: &Fixture, href: &str, attempts: i64) {
+        let href = href.to_string();
+        f.manager
+            .with_store(ACCOUNT, move |store| {
+                let op = store
+                    .pending_ops(CONTACTS_AREA)?
+                    .into_iter()
+                    .find(|o| o.object_href == href)
+                    .expect("la op está encolada");
+                for _ in 0..attempts {
+                    store.retry_later(&op, "red caída")?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    /// **Escalada por tope**: una op que ya agotó sus reintentos y vuelve a fallar
+    /// por algo transitorio (`503`) **escala a `conflict`** en vez de reintentarse
+    /// para siempre y trabar la colección. El crudo local no se pierde.
+    #[tokio::test]
+    async fn una_op_que_agoto_los_reintentos_escala_a_conflicto() {
+        let f = Fixture::new("graph-e2e-escalada").await;
+        f.enqueue_put("SRV-ID", "Mía", Some("\"e1\"")).await;
+        burn_attempts(&f, "SRV-ID", super::super::MAX_REPLAY_ATTEMPTS - 1).await;
+        f.server.push_status(503, "");
+
+        let report = f.replay().await;
+
+        assert_eq!(report.conflicts, 1, "pasó el tope: escala");
+        assert_eq!(report.retried, 0);
+        assert_eq!(f.op_state("SRV-ID").await.as_deref(), Some("conflict"));
+        assert!(f
+            .stored("SRV-ID", "raw_vcard")
+            .await
+            .is_some_and(|r| r.contains("Mía")));
+    }
+
+    /// El borde de abajo: con un intento menos del tope, el mismo `503` todavía
+    /// **reintenta** —no escala antes de tiempo—.
+    #[tokio::test]
+    async fn una_op_un_intento_antes_del_tope_todavia_reintenta() {
+        let f = Fixture::new("graph-e2e-antes-del-tope").await;
+        f.enqueue_put("SRV-ID", "Mía", Some("\"e1\"")).await;
+        burn_attempts(&f, "SRV-ID", super::super::MAX_REPLAY_ATTEMPTS - 2).await;
+        f.server.push_status(503, "");
+
+        let report = f.replay().await;
+
+        assert_eq!(report.retried, 1);
+        assert_eq!(report.conflicts, 0);
+        assert_eq!(f.op_state("SRV-ID").await.as_deref(), Some("ready"));
+    }
+}
+
+// ── De punta a punta por el camino de **calendario** (`/me/events`) ───────────
+//
+// Espejo de `end_to_end` de contactos: ejerce la rama `CALENDAR_AREA` de
+// `segment`, `build_body`, `href_for_id` e `id_from_href` por `replay_graph_area`.
+mod end_to_end_calendar {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use crate::graph::fake::{self, FakeGraph};
+    use crate::graph_write::replay_graph_area;
+    use crate::ical::recurrence::ExpansionLimits;
+    use crate::replay::ReplayReport;
+    use crate::store::calendar::{
+        derive_with_occurrences, CalendarListing, ObjectRow, StoredCalendar, Window,
+    };
+    use crate::store::key::fake::FakeKeys;
+    use crate::store::lifecycle::{
+        AccountListing, Consent, ListedAccount, Locations, StoreManager, CALENDAR_AREA,
+    };
+    use crate::store::paths::tests::TempDir;
+
+    const ACCOUNT: &str = "cuenta";
+    const COLLECTION: &str = "https://x/cal/";
+    const TODAY: i64 = 1_790_424_000;
+    const ICAL: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:u1\r\n\
+        SUMMARY:Reunión\r\nDTSTART:20260105T140000Z\r\nDTEND:20260105T150000Z\r\n\
+        END:VEVENT\r\nEND:VCALENDAR\r\n";
+
+    struct Fixture {
+        _temp: TempDir,
+        manager: Arc<StoreManager<FakeKeys>>,
+        server: FakeGraph,
+        calendar: StoredCalendar,
+    }
+
+    impl Fixture {
+        async fn new(label: &str) -> Self {
+            let temp = TempDir::new(label);
+            let manager = Arc::new(StoreManager::new(
+                FakeKeys::default(),
+                Ok(Locations {
+                    stores: temp.0.join("data/stores"),
+                    settings: temp.0.join("config/stores.json"),
+                }),
+            ));
+            manager
+                .accounts_listed(
+                    AccountListing::Listed(vec![ListedAccount {
+                        id: ACCOUNT.into(),
+                        display_name: "Trabajo".into(),
+                        capabilities: vec!["calendar".into()],
+                        needs_reauth: false,
+                    }]),
+                    Instant::now(),
+                )
+                .await;
+            manager
+                .activate_area(CALENDAR_AREA, ACCOUNT, Consent::Granted)
+                .await
+                .unwrap();
+            assert!(manager.prepare_for_sync(CALENDAR_AREA, ACCOUNT).await);
+            let calendar = manager
+                .with_store(ACCOUNT, |store| {
+                    Ok(store
+                        .upsert_calendars(&[CalendarListing {
+                            href: COLLECTION.into(),
+                            display_name: "Personal".into(),
+                            color: None,
+                            components: vec!["VEVENT".into()],
+                        }])?
+                        .remove(0))
+                })
+                .await
+                .unwrap();
+            Self {
+                _temp: temp,
+                server: FakeGraph::start().await,
+                manager,
+                calendar,
+            }
+        }
+
+        fn window() -> Window {
+            Window::around(chrono::DateTime::from_timestamp(TODAY, 0).unwrap())
+        }
+
+        async fn enqueue_put(&self, href: &str, base_etag: Option<&str>) {
+            let (index, occurrences) =
+                derive_with_occurrences(ICAL, Self::window(), &ExpansionLimits::DEFAULT);
+            let row = ObjectRow {
+                href: href.into(),
+                etag: base_etag.map(str::to_string),
+                raw_ical: ICAL.into(),
+                index,
+                occurrences,
+            };
+            let calendar = self.calendar.clone();
+            self.manager
+                .with_store(ACCOUNT, move |store| {
+                    store.enqueue_calendar_put(&calendar, &row, Self::window())
+                })
+                .await
+                .unwrap();
+        }
+
+        async fn replay(&self) -> ReplayReport {
+            let credential = fake::credential_for(&self.server);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            replay_graph_area(
+                &self.manager,
+                ACCOUNT,
+                CALENDAR_AREA,
+                &fake::client(),
+                &credential,
+                deadline,
+            )
+            .await
+            .unwrap()
+        }
+
+        /// Una columna de la fila guardada del evento, o `None` si no hay fila.
+        async fn stored(&self, href: &str, column: &'static str) -> Option<String> {
+            let href = href.to_string();
+            self.manager
+                .with_store(ACCOUNT, move |store| {
+                    Ok(store
+                        .connection()
+                        .query_row(
+                            &format!("SELECT {column} FROM calendar_objects WHERE href = ?1"),
+                            [href],
+                            |r| r.get::<_, Option<String>>(0),
+                        )
+                        .ok()
+                        .flatten())
+                })
+                .await
+                .unwrap()
+        }
+
+        async fn op_state(&self, href: &str) -> Option<String> {
+            let href = href.to_string();
+            self.manager
+                .with_store(ACCOUNT, move |store| {
+                    Ok(store
+                        .connection()
+                        .query_row(
+                            "SELECT state FROM pending_dav_ops WHERE object_href = ?1",
+                            [href],
+                            |r| r.get::<_, String>(0),
+                        )
+                        .ok())
+                })
+                .await
+                .unwrap()
+        }
+
+        async fn pending(&self) -> i64 {
+            self.manager
+                .with_store(ACCOUNT, |store| store.pending_count(CALENDAR_AREA))
+                .await
+                .unwrap()
+        }
+    }
+
+    /// **Crear**: `POST /me/events` con `transactionId` (idempotencia de Graph) sacado
+    /// del `href` local, sin `If-Match`; el `href` se re-basa al `id` del servidor y
+    /// el ETag queda guardado.
+    #[tokio::test]
+    async fn crear_un_evento_hace_post_con_transaction_id_y_rebasa_el_href() {
+        const LOCAL: &str = "graph://default/nuevo.ics";
+        let f = Fixture::new("graph-cal-create").await;
+        f.enqueue_put(LOCAL, None).await;
+        f.server
+            .push_status(201, r#"{"id":"SRV-ID","@odata.etag":"W/\"e1\""}"#);
+
+        let report = f.replay().await;
+        assert_eq!(report.pushed, 1);
+
+        let request = f.server.requests().remove(0);
+        assert_eq!(request.method, "POST");
+        assert!(
+            request.path.contains("/users/me/events"),
+            "{}",
+            request.path
+        );
+        assert!(request.if_match.is_empty());
+        let sent: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+        assert_eq!(sent["subject"], "Reunión");
+        assert_eq!(sent["transactionId"], LOCAL, "idempotencia estable");
+
+        assert_eq!(f.stored(LOCAL, "raw_ical").await, None, "se re-basó");
+        assert!(f
+            .stored("SRV-ID", "raw_ical")
+            .await
+            .is_some_and(|r| r.contains("Reunión")));
+        assert_eq!(
+            f.stored("SRV-ID", "etag").await.as_deref(),
+            Some("W/\"e1\"")
+        );
+        assert_eq!(f.pending().await, 0);
+    }
+
+    /// **Editar**: `PATCH /me/events/{id}` con el `If-Match` capturado, **sin**
+    /// `transactionId`; con la respuesta se guarda el ETag nuevo.
+    #[tokio::test]
+    async fn editar_un_evento_hace_patch_con_if_match_y_sin_transaction_id() {
+        let f = Fixture::new("graph-cal-patch").await;
+        f.enqueue_put("SRV-ID", Some("W/\"cap\"")).await;
+        f.server
+            .push_status(200, r#"{"@odata.etag":"W/\"nuevo\""}"#);
+
+        let report = f.replay().await;
+        assert_eq!(report.pushed, 1);
+
+        let request = f.server.requests().remove(0);
+        assert_eq!(request.method, "PATCH");
+        assert!(
+            request.path.contains("/users/me/events/SRV-ID"),
+            "{}",
+            request.path
+        );
+        assert_eq!(request.if_match, "W/\"cap\"");
+        let sent: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+        assert!(sent.get("transactionId").is_none());
+        assert_eq!(
+            f.stored("SRV-ID", "etag").await.as_deref(),
+            Some("W/\"nuevo\"")
+        );
+        assert_eq!(f.pending().await, 0);
+    }
+
+    /// **`412` en un evento**: la op queda en `conflict` y el crudo local no se
+    /// pierde.
+    #[tokio::test]
+    async fn un_412_en_un_evento_deja_conflicto_y_conserva_el_local() {
+        let f = Fixture::new("graph-cal-412").await;
+        f.enqueue_put("SRV-ID", Some("W/\"vieja\"")).await;
+        f.server.push_status(412, "");
+
+        let report = f.replay().await;
+
+        assert_eq!(report.conflicts, 1);
+        assert_eq!(f.op_state("SRV-ID").await.as_deref(), Some("conflict"));
+        assert!(f
+            .stored("SRV-ID", "raw_ical")
+            .await
+            .is_some_and(|r| r.contains("Reunión")));
     }
 }
