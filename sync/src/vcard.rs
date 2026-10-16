@@ -808,6 +808,76 @@ pub fn split_cards(raw: &str) -> Vec<String> {
     cards
 }
 
+/// Devuelve `raw` con una propiedad `PHOTO` embebida (vCard 3.0) agregada antes
+/// de su `END:VCARD`.
+///
+/// Es el camino de lectura del enriquecimiento de Google (`vasak-accounts#111`):
+/// la foto la trae la People API y vive **fuera del crudo guardado**, en la tabla
+/// `contact_enrichment`; acá se la suma al vCard de salida sin tocar lo que se
+/// guardó (así el replay de una edición local sin confirmar no la pisa).
+///
+/// La foto va en base64 con `ENCODING=b` y el `TYPE` sale del subtipo del tipo de
+/// medio real de la descarga (`image/jpeg` → `JPEG`). El valor pasa por
+/// [`escape_vcard_public`] como todo campo enriquecido —el base64 no lleva
+/// caracteres especiales, pero la regla es que nada entre crudo al vCard— y la
+/// línea se pliega a 75 octetos (RFC 2426) para que un intérprete estricto no
+/// rechace una sola línea larguísima.
+///
+/// Si `raw` no tiene `END:VCARD`, se devuelve tal cual: sin dónde insertar, no se
+/// inventa una tarjeta.
+pub fn embed_photo(raw: &str, base64: &str, media_type: &str) -> String {
+    let upper = raw.to_ascii_uppercase();
+    let Some(pos) = upper.rfind("END:VCARD") else {
+        return raw.to_string();
+    };
+
+    // El subtipo (`jpeg`, `png`, …) sale de un allowlist controlado
+    // (`images::accepted_type`), así que es un token limpio para el parámetro
+    // `TYPE`; el valor base64 sí pasa por el escape de siempre.
+    let subtype = media_type
+        .split('/')
+        .nth(1)
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    let type_param = if subtype.is_empty() {
+        String::new()
+    } else {
+        format!(";TYPE={subtype}")
+    };
+    let line = format!(
+        "PHOTO;ENCODING=b{type_param}:{}",
+        escape_vcard_public(base64)
+    );
+
+    format!("{}{}\r\n{}", &raw[..pos], fold_line(&line), &raw[pos..])
+}
+
+/// Pliega una línea de propiedad a 75 octetos (RFC 2426): la continuación empieza
+/// con un espacio, que al des-plegar ([`unfold_lines`]) se descarta. Todo lo que
+/// se pliega acá es ASCII (nombre de propiedad y base64), así que los cortes caen
+/// siempre en un borde de carácter.
+fn fold_line(line: &str) -> String {
+    if line.len() <= 75 {
+        return line.to_string();
+    }
+    let mut out = String::new();
+    let mut index = 0;
+    let mut first = true;
+    while index < line.len() {
+        // La primera línea lleva 75 octetos; las siguientes 74, porque el espacio
+        // de continuación cuenta como el primero de los 75.
+        let take = if first { 75 } else { 74 };
+        let end = (index + take).min(line.len());
+        if !first {
+            out.push_str("\r\n ");
+        }
+        out.push_str(&line[index..end]);
+        index = end;
+        first = false;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1523,5 +1593,55 @@ mod tests {
         let cards = split_cards(unclosed);
         assert_eq!(cards.len(), 1);
         assert_eq!(contact_from(&cards[0], "").unwrap().display_name, "Ana");
+    }
+
+    /// `embed_photo` suma la `PHOTO` antes del `END:VCARD`, con el `TYPE` que sale
+    /// del tipo de medio y el base64 tal cual (no lleva caracteres a escapar), y
+    /// no toca el resto de la tarjeta.
+    #[test]
+    fn embed_photo_agrega_la_foto_antes_del_cierre() {
+        let raw = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Ana\r\nEND:VCARD\r\n";
+        let result = embed_photo(raw, "aGVsbG8=", "image/png");
+
+        assert!(result.contains("FN:Ana"), "conserva lo que había");
+        assert!(result.contains("PHOTO;ENCODING=b;TYPE=PNG:aGVsbG8="));
+        // La foto va antes del cierre, no después.
+        let photo_at = result.find("PHOTO").unwrap();
+        let end_at = result.find("END:VCARD").unwrap();
+        assert!(photo_at < end_at, "la PHOTO va antes del END:VCARD");
+    }
+
+    /// Una línea `PHOTO` larga se pliega a 75 octetos y al des-plegar
+    /// ([`unfold_lines`]) vuelve a ser una sola, sin espacios de más.
+    #[test]
+    fn una_foto_larga_se_pliega_y_se_despliega_sin_perder_nada() {
+        let base64 = "A".repeat(400);
+        let raw = "BEGIN:VCARD\r\nFN:Ana\r\nEND:VCARD\r\n";
+        let result = embed_photo(raw, &base64, "image/jpeg");
+
+        // Se plegó: hay más de una línea física para la propiedad.
+        assert!(result.contains("\r\n "), "la línea larga se plegó");
+        // Ninguna línea física pasa de 75 octetos.
+        for line in result.split("\r\n") {
+            assert!(
+                line.len() <= 75,
+                "línea de {} octetos: {line:?}",
+                line.len()
+            );
+        }
+        // Al des-plegar, la propiedad vuelve entera.
+        let property = format!("PHOTO;ENCODING=b;TYPE=JPEG:{base64}");
+        assert!(
+            unfold_lines(&result).iter().any(|l| l == &property),
+            "la PHOTO vuelve entera al des-plegar"
+        );
+    }
+
+    /// Sin `END:VCARD` donde insertar, la tarjeta se devuelve tal cual: no se
+    /// inventa una.
+    #[test]
+    fn sin_cierre_no_se_inserta_la_foto() {
+        let raw = "BEGIN:VCARD\r\nFN:Ana\r\n";
+        assert_eq!(embed_photo(raw, "aGVsbG8=", "image/png"), raw);
     }
 }
