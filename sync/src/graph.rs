@@ -338,11 +338,20 @@ pub mod fake {
     /// Un pedido HTTP tal como llegó al endpoint falso de Graph.
     #[derive(Clone)]
     pub struct GraphRequest {
+        /// El método (`GET`, `POST`, `PATCH`, `DELETE`): lo mira la escritura
+        /// (`#97`) para distinguir crear de editar de borrar.
+        pub method: String,
         pub path: String,
         pub authorization: String,
         /// La cabecera `Prefer`, vacía si no vino: el calendario la usa para
         /// pedir las fechas en UTC (`outlook.timezone="UTC"`).
         pub prefer: String,
+        /// La cabecera `If-Match`, vacía si no vino: la escritura (`#97`) manda
+        /// acá el `@odata.etag` de precondición.
+        pub if_match: String,
+        /// El cuerpo del pedido, vacío si no trajo: la escritura manda el JSON del
+        /// objeto.
+        pub body: String,
     }
 
     /// Lo que el endpoint falso sabe contestar.
@@ -446,6 +455,11 @@ pub mod fake {
             let head = String::from_utf8_lossy(&buffer[..header_end]).into_owned();
             let mut lines = head.split("\r\n");
             let request_line = lines.next().unwrap_or("").to_string();
+            let method = request_line
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string();
             let path = request_line
                 .split_whitespace()
                 .nth(1)
@@ -453,6 +467,7 @@ pub mod fake {
                 .to_string();
             let mut authorization = String::new();
             let mut prefer = String::new();
+            let mut if_match = String::new();
             let mut length = 0usize;
             for line in lines {
                 if let Some((name, value)) = line.split_once(':') {
@@ -462,6 +477,8 @@ pub mod fake {
                         authorization = value.to_string();
                     } else if name == "prefer" {
                         prefer = value.to_string();
+                    } else if name == "if-match" {
+                        if_match = value.to_string();
                     } else if name == "content-length" {
                         length = value.parse().unwrap_or(0);
                     }
@@ -475,14 +492,19 @@ pub mod fake {
                     Ok(n) => buffer.extend_from_slice(&chunk[..n]),
                 }
             }
+            let request_body =
+                String::from_utf8_lossy(&buffer[body_start..body_start + length]).into_owned();
             buffer.drain(..body_start + length);
 
             let (status, body) = {
                 let mut state = state.lock().unwrap();
                 state.requests.push(GraphRequest {
+                    method: method.clone(),
                     path: path.clone(),
                     authorization: authorization.clone(),
                     prefer: prefer.clone(),
+                    if_match: if_match.clone(),
+                    body: request_body,
                 });
                 match state.responses.pop_front() {
                     Some(answer) => answer,

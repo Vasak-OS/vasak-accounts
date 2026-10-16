@@ -44,6 +44,11 @@ const CONTACTS_SELECT: &str = "$top=100&$select=id,displayName,givenName,surname
 #[serde(default, rename_all = "camelCase")]
 struct GraphContact {
     id: String,
+    /// El testigo de concurrencia de Graph. Se captura en la lectura para que la
+    /// escritura (`#97`) pueda mandar `If-Match: @odata.etag`: sin él la
+    /// precondición no tiene nada que enviar y el `412` nunca se dispara.
+    #[serde(rename = "@odata.etag")]
+    odata_etag: Option<String>,
     display_name: Option<String>,
     given_name: Option<String>,
     surname: Option<String>,
@@ -94,6 +99,90 @@ impl GraphPhysicalAddress {
         .iter()
         .all(|c| c.as_deref().unwrap_or("").is_empty())
     }
+}
+
+// ── Escritura por Graph (`#97`) ──────────────────────────────────────────────
+//
+// El lado de vuelta del backend: el empuje de `crate::graph_write` convierte el
+// crudo vCard de la cola a JSON de Graph y arma/invierte el `href`. Vive acá, junto
+// a la lectura, para que la escapada del `href` (`escape_vcard_public` de la
+// lectura) y su inverso queden en un solo lugar y no se separen.
+
+/// El `href` que la fila guardada usa para un `id` del servidor, **con la misma
+/// escapada que la lectura** (`contact_to_row`): así un `POST` recién creado se
+/// re-basa a la fila que la próxima bajada haría upsert, sin duplicar.
+pub(crate) fn href_for_id(id: &str) -> String {
+    vcard::escape_vcard_public(id)
+}
+
+/// El `id` del servidor a partir del `href` guardado: el inverso de
+/// [`href_for_id`], para interpolarlo en la ruta de `PATCH`/`DELETE`. Para un `id`
+/// real de Graph es la identidad; deshace la escapada sólo si el `id` trajera
+/// `;`, `,` o `\`.
+pub(crate) fn id_from_href(href: &str) -> String {
+    vcard::unescape_text(href)
+}
+
+/// Convierte el crudo vCard de un contacto al cuerpo JSON de Graph
+/// (`/me/contacts`), subconjunto conservador (decisión 3): `displayName`,
+/// `emailAddresses`, los teléfonos repartidos por etiqueta, `companyName` y
+/// `personalNotes`. Reusa el parseo de la lectura ([`vcard::contact_from`]) en vez
+/// de reparsear a mano. Como `PATCH` fusiona, lo que no modelamos no se pisa.
+///
+/// **Sin inyección**: el cuerpo lo arma `serde_json`, que escapa los valores solo.
+pub(crate) fn contact_body_from_vcard(raw_vcard: &str) -> serde_json::Value {
+    use serde_json::json;
+    // El `href` no importa para el cuerpo (no se manda); `contact_from` lo exige.
+    let contact = vcard::contact_from(raw_vcard, "").unwrap_or_default();
+
+    let mut body = serde_json::Map::new();
+    if !contact.display_name.is_empty() {
+        body.insert("displayName".into(), json!(contact.display_name));
+    }
+
+    let emails: Vec<serde_json::Value> = contact
+        .emails
+        .iter()
+        .filter(|f| !f.value.is_empty())
+        .map(|f| json!({ "address": f.value }))
+        .collect();
+    if !emails.is_empty() {
+        body.insert("emailAddresses".into(), json!(emails));
+    }
+
+    // Graph reparte los teléfonos en tres campos; la etiqueta de la vCard decide
+    // cuál. Lo que no cae en casa ni en celular va a los de trabajo.
+    let mut business: Vec<&str> = Vec::new();
+    let mut home: Vec<&str> = Vec::new();
+    let mut mobile: Option<&str> = None;
+    for phone in &contact.phones {
+        if phone.value.is_empty() {
+            continue;
+        }
+        match phone.label.to_ascii_lowercase().as_str() {
+            "home" | "casa" => home.push(&phone.value),
+            "cell" | "mobile" | "celular" | "móvil" | "movil" => mobile = Some(&phone.value),
+            _ => business.push(&phone.value),
+        }
+    }
+    if !business.is_empty() {
+        body.insert("businessPhones".into(), json!(business));
+    }
+    if !home.is_empty() {
+        body.insert("homePhones".into(), json!(home));
+    }
+    if let Some(mobile) = mobile {
+        body.insert("mobilePhone".into(), json!(mobile));
+    }
+
+    if !contact.organization.is_empty() {
+        body.insert("companyName".into(), json!(contact.organization));
+    }
+    if !contact.notes.is_empty() {
+        body.insert("personalNotes".into(), json!(contact.notes));
+    }
+
+    serde_json::Value::Object(body)
 }
 
 /// Backend Microsoft Graph API.
@@ -147,6 +236,33 @@ impl GraphApiBackend {
             }
         };
         let mut report = SyncReport::default();
+
+        // El empuje primero: se drena la cola de escrituras por Graph antes de la
+        // bajada, igual que el camino CardDAV drena la suya. El plazo de la vuelta
+        // es el mismo que usa el resto del servicio.
+        let deadline = tokio::time::Instant::now() + crate::dav::webdav::Limits::DEFAULT.max_round;
+        match crate::graph_write::replay_graph_area(
+            manager,
+            account_id,
+            CONTACTS_AREA,
+            &client,
+            credential,
+            deadline,
+        )
+        .await
+        {
+            Ok(push) => {
+                report.pushed = push.pushed;
+                report.conflicts = push.conflicts;
+                report.pending = push.remaining;
+            }
+            // Un error de almacén acá es el llavero cerrado a mitad: se corta la
+            // vuelta como cualquier otra escritura.
+            Err(_) => {
+                set_status(AreaState::Pending, CLOSED_DETAIL).await;
+                return SyncResult::StoreClosed;
+            }
+        }
 
         // Traer la carpeta de contactos completa (sin delta sync por ahora).
         let contacts = match Self::fetch_all_contacts(&client, credential).await {
@@ -245,11 +361,14 @@ impl GraphApiBackend {
         // de usarlo como `href`. Así un `id` con `\r\n` no puede fabricar nada
         // allí donde el `href` se vuelque a un formato por líneas.
         let href = vcard::escape_vcard_public(&contact.id);
+        let odata_etag = contact.odata_etag.clone();
         let vcard = Self::contact_to_vcard(&contact);
         let parsed = vcard::contact_from(&vcard, &href).unwrap_or_default();
         Some(ContactRow {
             href,
-            etag: None,
+            // El `@odata.etag` capturado: la fila guardada lo lleva para que la
+            // escritura por Graph (`#97`) pueda condicionar `PATCH`/`DELETE`.
+            etag: odata_etag,
             raw_vcard: vcard,
             contact: parsed,
         })

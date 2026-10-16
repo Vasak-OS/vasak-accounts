@@ -446,6 +446,46 @@ impl Store {
         transaction.commit().map_err(classify)
     }
 
+    /// Cierra un `put` de **creación por Graph**: como [`Self::complete_put`]
+    /// guarda el ETag y limpia la marca `pending_op`, pero además **re-basa el
+    /// `href`** de la fila guardada —de la dirección local sintética con la que se
+    /// creó (`graph://default/…`) al `id` que asignó el servidor— para que la
+    /// próxima bajada haga upsert sobre la misma fila y no la duplique.
+    ///
+    /// Es propio de Graph: en DAV el cliente elige el `href` del `PUT`, así que la
+    /// creación ya nace con su dirección final y `complete_put` alcanza. En Graph
+    /// el `id` lo pone el servidor en el `POST`, y recién ahí se conoce.
+    ///
+    /// **Condicional a la revisión** y **con alcance de colección**, como el resto
+    /// de los cierres. El `UPDATE OR REPLACE`: si la bajada de una vuelta anterior
+    /// ya trajo el objeto bajo su `id` del servidor (idempotencia del `POST` por
+    /// `transactionId`), re-basar el `href` chocaría con esa fila por el `UNIQUE
+    /// (collection, href)`; `OR REPLACE` la reemplaza por la local, que es el mismo
+    /// objeto con el crudo que la persona subió.
+    pub fn complete_create(
+        &mut self,
+        op: &PendingOp,
+        new_href: &str,
+        new_etag: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let (table, coltable, colcol) = area_tables(&op.area)
+            .ok_or_else(|| StoreError::InvalidArgument("área sin cola".into()))?;
+        let transaction = self.connection.transaction().map_err(classify)?;
+        if !Self::close_op(&transaction, op)? {
+            return Ok(());
+        }
+        transaction
+            .execute(
+                &format!(
+                    "UPDATE OR REPLACE {table} SET href = ?1, etag = ?2, pending_op = NULL
+                      WHERE href = ?3 AND {colcol} = (SELECT id FROM {coltable} WHERE href = ?4)"
+                ),
+                rusqlite::params![new_href, new_etag, op.object_href, op.collection_href],
+            )
+            .map_err(classify)?;
+        transaction.commit().map_err(classify)
+    }
+
     /// Cierra un `delete` que salió bien (o un `404`, idempotente): borra la
     /// fila guardada —con sus derivados, por la cascada— y la op. Sube la
     /// generación: el objeto ya no está de verdad.
@@ -1174,6 +1214,73 @@ mod tests {
         store.complete_delete(&op).unwrap();
         assert_eq!(raw_of(&store, HREF), None);
         assert_eq!(store.pending_count(CONTACTS_AREA).unwrap(), 0);
+    }
+
+    /// **Creación por Graph**: cerrar un `POST` re-basa el `href` de la fila local
+    /// —de la dirección sintética al `id` del servidor— y guarda el ETag, para que
+    /// la próxima bajada haga upsert sobre la misma fila y no la duplique.
+    #[test]
+    fn complete_create_rebasa_el_href_al_id_del_servidor() {
+        const LOCAL: &str = "graph://default/local.vcf";
+        const SERVER: &str = "AAMkServerId==";
+        let temp = TempDir::new("cola-create-rebase");
+        let mut store = open_store(&temp);
+        let book = one_book(&mut store);
+        // La creación local, encolada en su href sintético.
+        store
+            .enqueue_contact_put(&book, &row(LOCAL, "Local", "l@x.com"))
+            .unwrap();
+        let op = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+
+        store.complete_create(&op, SERVER, Some("\"srv\"")).unwrap();
+
+        // El href sintético ya no está; la fila vive bajo el id del servidor, con
+        // su crudo local y el ETag del servidor, y sin marca ni op.
+        assert_eq!(raw_of(&store, LOCAL), None, "quedó el href sintético");
+        assert!(
+            raw_of(&store, SERVER).is_some_and(|r| r.contains("Local")),
+            "la fila no se re-basó al id del servidor"
+        );
+        assert_eq!(etag_of(&store, SERVER).as_deref(), Some("\"srv\""));
+        assert_eq!(pending_op_of(&store, SERVER), None);
+        assert_eq!(store.pending_count(CONTACTS_AREA).unwrap(), 0);
+    }
+
+    /// **Idempotencia del `POST` por `transactionId`**: si una bajada anterior ya
+    /// trajo el objeto bajo su `id` del servidor (porque el `POST` reintentado
+    /// devolvió el mismo id), re-basar el `href` chocaría con esa fila por el
+    /// `UNIQUE (libreta, href)`. El `UPDATE OR REPLACE` la reemplaza por la local
+    /// —el mismo objeto con el crudo que la persona subió— en vez de fallar.
+    #[test]
+    fn complete_create_reemplaza_una_fila_ya_bajada_del_servidor() {
+        const LOCAL: &str = "graph://default/local.vcf";
+        const SERVER: &str = "AAMkServerId==";
+        let temp = TempDir::new("cola-create-collision");
+        let mut store = open_store(&temp);
+        let book = one_book(&mut store);
+        // La bajada ya trajo el objeto bajo su id del servidor.
+        store
+            .apply_contacts(
+                &book,
+                &[ContactOp::Upsert(row(SERVER, "Servidor", "s@x.com"))],
+                None,
+                u64::MAX,
+            )
+            .unwrap();
+        // Y está la creación local pendiente, en su href sintético.
+        store
+            .enqueue_contact_put(&book, &row(LOCAL, "Local", "l@x.com"))
+            .unwrap();
+        let op = store.pending_ops(CONTACTS_AREA).unwrap().remove(0);
+
+        store.complete_create(&op, SERVER, Some("\"srv\"")).unwrap();
+
+        // Una sola fila bajo el id del servidor, con el crudo local (no el bajado),
+        // y sin duplicado en el href sintético.
+        assert_eq!(raw_of(&store, LOCAL), None);
+        let server_raw = raw_of(&store, SERVER).expect("la fila vive bajo el id del servidor");
+        assert!(server_raw.contains("Local"), "ganó el crudo local");
+        assert!(!server_raw.contains("Servidor"), "quedó el crudo bajado");
     }
 
     /// Una edición nueva sobre un objeto con op pendiente **reemplaza** la op

@@ -57,6 +57,11 @@ const PREFER_UTC: (&str, &str) = ("Prefer", "outlook.timezone=\"UTC\"");
 #[serde(default, rename_all = "camelCase")]
 struct GraphEvent {
     id: String,
+    /// El testigo de concurrencia de Graph. Se captura en la lectura para que la
+    /// escritura (`#97`) pueda mandar `If-Match: @odata.etag`: sin él la
+    /// precondición no tiene nada que enviar y el `412` nunca se dispara.
+    #[serde(rename = "@odata.etag")]
+    odata_etag: Option<String>,
     #[serde(rename = "iCalUId")]
     i_cal_uid: String,
     subject: Option<String>,
@@ -166,6 +171,115 @@ pub struct GraphSyncContext<'a, K: KeySource> {
     pub expansion: ExpansionLimits,
 }
 
+// ── Escritura por Graph (`#97`) ──────────────────────────────────────────────
+//
+// El lado de vuelta del backend: el empuje de `crate::graph_write` convierte el
+// crudo iCal de la cola a JSON de Graph y arma/invierte el `href`. Vive acá, junto
+// a la lectura, para que la escapada del `href` (`escape_text` de la lectura) y su
+// inverso queden en un solo lugar y no se separen.
+
+/// El `href` que la fila guardada usa para un `id` del servidor, **con la misma
+/// escapada que la lectura** (`event_to_row`): así un `POST` recién creado se
+/// re-basa a la fila que la próxima bajada haría upsert, sin duplicar.
+pub(crate) fn href_for_id(id: &str) -> String {
+    escape_text(id)
+}
+
+/// El `id` del servidor a partir del `href` guardado: el inverso de
+/// [`href_for_id`], para interpolarlo en la ruta de `PATCH`/`DELETE`. Para un `id`
+/// real de Graph (base64url) es la identidad; deshace la escapada sólo si el `id`
+/// trajera `;`, `,` o `\`.
+pub(crate) fn id_from_href(href: &str) -> String {
+    crate::ical::unescape_text(href)
+}
+
+/// Convierte el crudo iCal de un evento al cuerpo JSON de Graph (`/me/events`),
+/// subconjunto conservador (decisión 3): `subject`, `body` (texto), `start`/`end`
+/// en UTC, `isAllDay` y `location`. Lo que no modelamos no se manda, y como
+/// `PATCH` fusiona, no se pisa en el servidor.
+///
+/// `transaction_id` sólo al **crear** (`POST`): es la idempotencia nativa de Graph
+/// para eventos —un `POST` reintentado con el mismo `transactionId` no crea un
+/// segundo evento—. En una edición va `None`.
+///
+/// `None` si el crudo no trae un `VEVENT` (p. ej. un `VTODO`, que no va a
+/// `/me/events`): el empuje lo manda a conflicto en vez de crear algo torcido.
+///
+/// **Sin inyección**: el cuerpo lo arma `serde_json`, que escapa los valores solo;
+/// no hay forma de partir una línea como en los formatos de texto.
+pub(crate) fn event_body_from_ical(
+    raw_ical: &str,
+    transaction_id: Option<&str>,
+) -> Option<serde_json::Value> {
+    use serde_json::json;
+    let document = crate::ical::parse_document(raw_ical);
+    let vevent = document.components.iter().find(|c| c.name == "VEVENT")?;
+
+    let text = |name: &str| {
+        vevent
+            .first(name)
+            .map(|p| crate::ical::unescape_text(&p.value))
+    };
+
+    let mut body = serde_json::Map::new();
+    if let Some(subject) = text("SUMMARY") {
+        body.insert("subject".into(), json!(subject));
+    }
+    if let Some(content) = text("DESCRIPTION") {
+        body.insert(
+            "body".into(),
+            json!({ "contentType": "text", "content": content }),
+        );
+    }
+    if let Some(location) = text("LOCATION") {
+        body.insert("location".into(), json!({ "displayName": location }));
+    }
+
+    let dtstart = vevent.first("DTSTART");
+    let dtend = vevent.first("DTEND");
+    let all_day = dtstart.map(is_date_only).unwrap_or(false);
+    if let Some(start) = dtstart.and_then(|p| graph_datetime(&p.value)) {
+        body.insert("start".into(), start);
+    }
+    if let Some(end) = dtend.and_then(|p| graph_datetime(&p.value)) {
+        body.insert("end".into(), end);
+    }
+    body.insert("isAllDay".into(), json!(all_day));
+
+    if let Some(id) = transaction_id {
+        body.insert("transactionId".into(), json!(id));
+    }
+    Some(serde_json::Value::Object(body))
+}
+
+/// Si una propiedad de fecha es de día completo (`VALUE=DATE`).
+fn is_date_only(property: &crate::ical::Property) -> bool {
+    property
+        .params
+        .iter()
+        .any(|p| p.eq_ignore_ascii_case("VALUE=DATE"))
+}
+
+/// Un valor de fecha-hora iCal (`20260915T140000Z`, `20260915T140000` o, de día
+/// completo, `20260915`) al `dateTime` de Graph (`2026-09-15T14:00:00`), siempre
+/// en UTC —la lectura las pide así (`Prefer: outlook.timezone="UTC"`)—. `None` si
+/// el valor no tiene al menos una fecha de ocho dígitos.
+fn graph_datetime(value: &str) -> Option<serde_json::Value> {
+    use serde_json::json;
+    let bytes = value.as_bytes();
+    if bytes.len() < 8 || !bytes[..8].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let date = format!("{}-{}-{}", &value[0..4], &value[4..6], &value[6..8]);
+    let time =
+        if bytes.len() >= 15 && bytes[8] == b'T' && bytes[9..15].iter().all(u8::is_ascii_digit) {
+            format!("{}:{}:{}", &value[9..11], &value[11..13], &value[13..15])
+        } else {
+            "00:00:00".to_string()
+        };
+    Some(json!({ "dateTime": format!("{date}T{time}"), "timeZone": "UTC" }))
+}
+
 /// Backend Microsoft Graph API para calendario.
 ///
 /// Sincroniza los eventos del calendario del usuario (`/me/events`) contra el
@@ -213,6 +327,29 @@ impl GraphApiBackend {
             }
         };
 
+        // El empuje primero: se drena la cola de escrituras por Graph antes de la
+        // bajada, igual que el camino CardDAV drena la suya antes de bajar. El
+        // plazo de la vuelta es el mismo que usa el resto del servicio.
+        let deadline = tokio::time::Instant::now() + crate::dav::webdav::Limits::DEFAULT.max_round;
+        let push = match crate::graph_write::replay_graph_area(
+            manager,
+            account_id,
+            CALENDAR_AREA,
+            &client,
+            credential,
+            deadline,
+        )
+        .await
+        {
+            Ok(report) => report,
+            // Un error de almacén acá es el llavero cerrado a mitad: se corta la
+            // vuelta como cualquier otra escritura.
+            Err(_) => {
+                set_status(AreaState::Pending, CLOSED_DETAIL).await;
+                return CalendarOutcome::StoreClosed;
+            }
+        };
+
         // Traer los eventos completos (sin delta sync por ahora).
         let events = match Self::fetch_all_events(&client, credential).await {
             Ok(events) => events,
@@ -257,6 +394,9 @@ impl GraphApiBackend {
 
         let mut report = CalendarReport {
             calendars: 1,
+            pushed: push.pushed,
+            conflicts: push.conflicts,
+            pending: push.remaining,
             ..CalendarReport::default()
         };
 
@@ -361,7 +501,9 @@ impl GraphApiBackend {
         }
         Some(ObjectRow {
             href,
-            etag: None,
+            // El `@odata.etag` capturado: la fila guardada lo lleva para que la
+            // escritura por Graph (`#97`) pueda condicionar `PATCH`/`DELETE`.
+            etag: event.odata_etag.clone(),
             raw_ical: ical,
             index,
             occurrences,
