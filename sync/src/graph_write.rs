@@ -205,6 +205,9 @@ async fn resolve_op<K: KeySource>(
                     // El alta de evento es idempotente por `transactionId`, así que un
                     // fallo ambiguo se reintenta; el alta de contacto no, y va a
                     // conflicto en vez de duplicar (ver [`on_error`]).
+                    // shortcut: trata «no-calendar» como contactos porque hoy solo esas
+                    // dos áreas pasan por acá (ver `segment`); si se agrega otra, su alta
+                    // ambigua caería en conflicto por omisión — hacer el área explícita al ampliar.
                     let ambiguous_is_conflict = area != CALENDAR_AREA;
                     let request = create(client, credential, segment(area), &json);
                     match tokio::time::timeout_at(deadline, request).await {
