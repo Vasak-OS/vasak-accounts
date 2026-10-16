@@ -38,7 +38,14 @@
 //!   maquinaria de resolución del store es la misma de DAV; sólo la captura es propia
 //!   de Graph—. La traída respeta el plazo y, si no entra o falla, el conflicto queda
 //!   sin copia y se reintenta la próxima vuelta, acotado por [`MAX_REPLAY_ATTEMPTS`].
-//! - **Red, `429`, `5xx`** → reintentable, con tope [`MAX_REPLAY_ATTEMPTS`].
+//! - **`429`/`5xx`** (Graph respondió **antes** de procesar) → reintentable, con
+//!   tope [`MAX_REPLAY_ATTEMPTS`].
+//! - **Fallo ambiguo** (transporte en `.send()`, lectura del cuerpo cortada, o el
+//!   plazo vencido **tras** enviar: Graph pudo haber procesado el pedido) →
+//!   reintentable para `PATCH`/`DELETE` (idempotentes) y el alta de evento
+//!   (idempotente por `transactionId`), pero **conflicto** para el alta de
+//!   contacto: `/me/contacts` no tiene `transactionId`, así que un reintento
+//!   crearía un segundo contacto. El crudo local queda a salvo y decide la persona.
 //! - **Cualquier otro error** (credencial, `4xx` firme) → permanente: escala a
 //!   `conflict` para no trabar la colección (disponibilidad), como en `replay`.
 //!
@@ -195,10 +202,21 @@ async fn resolve_op<K: KeySource>(
                             return close(manager, account_id, Close::Conflict(op, detail)).await;
                         }
                     };
+                    // El alta de evento es idempotente por `transactionId`, así que un
+                    // fallo ambiguo se reintenta; el alta de contacto no, y va a
+                    // conflicto en vez de duplicar (ver [`on_error`]).
+                    let ambiguous_is_conflict = area != CALENDAR_AREA;
                     let request = create(client, credential, segment(area), &json);
                     match tokio::time::timeout_at(deadline, request).await {
-                        // Pasó el plazo de la vuelta: se reintenta.
-                        Err(_) => retry_or_escalate(op, "plazo de la vuelta".into(), report),
+                        // Pasó el plazo de la vuelta **tras enviar**: es ambiguo, Graph
+                        // pudo haber procesado el `POST`. Se rutea como el resto de los
+                        // fallos ambiguos (reintento salvo alta de contacto).
+                        Err(_) => on_error(
+                            op,
+                            GraphWriteError::AmbiguousRetryable("plazo de la vuelta".into()),
+                            report,
+                            ambiguous_is_conflict,
+                        ),
                         Ok(Ok(created)) => {
                             report.pushed += 1;
                             let new_href = href_for_id(area, &created.id);
@@ -206,7 +224,7 @@ async fn resolve_op<K: KeySource>(
                         }
                         Ok(Err(e)) => {
                             server_conflict = e == GraphWriteError::Conflict;
-                            on_error(op, e, report)
+                            on_error(op, e, report, ambiguous_is_conflict)
                         }
                     }
                 }
@@ -223,6 +241,8 @@ async fn resolve_op<K: KeySource>(
                     let id = id_from_href(area, &op.object_href);
                     let request = update(client, credential, segment(area), &id, &etag, &json);
                     match tokio::time::timeout_at(deadline, request).await {
+                        // `PATCH` es idempotente (`If-Match`): un fallo ambiguo o el
+                        // plazo se reintentan sin riesgo de duplicar.
                         Err(_) => retry_or_escalate(op, "plazo de la vuelta".into(), report),
                         Ok(Ok(new_etag)) => {
                             report.pushed += 1;
@@ -230,7 +250,7 @@ async fn resolve_op<K: KeySource>(
                         }
                         Ok(Err(e)) => {
                             server_conflict = e == GraphWriteError::Conflict;
-                            on_error(op, e, report)
+                            on_error(op, e, report, false)
                         }
                     }
                 }
@@ -246,6 +266,7 @@ async fn resolve_op<K: KeySource>(
             let id = id_from_href(area, &op.object_href);
             let request = delete(client, credential, segment(area), &id, &etag);
             match tokio::time::timeout_at(deadline, request).await {
+                // `DELETE` es idempotente (un `404` es éxito): se reintenta sin riesgo.
                 Err(_) => retry_or_escalate(op, "plazo de la vuelta".into(), report),
                 // El `404` idempotente lo mapea `classify` a `Ok(())`.
                 Ok(Ok(())) => {
@@ -254,7 +275,7 @@ async fn resolve_op<K: KeySource>(
                 }
                 Ok(Err(e)) => {
                     server_conflict = e == GraphWriteError::Conflict;
-                    on_error(op, e, report)
+                    on_error(op, e, report, false)
                 }
             }
         }
@@ -328,8 +349,16 @@ enum GraphWriteError {
     /// `412`/`409`, o un `PATCH`/`DELETE` que dio `404` (el recurso cambió o
     /// desapareció en el servidor): conflicto, no se pisa el local.
     Conflict,
-    /// Red, `429`, `5xx`: se reintenta mientras no pase el tope.
+    /// `429`/`5xx` que Graph respondió **antes** de procesar el pedido: seguro de
+    /// reintentar, mientras no pase el tope.
     Retryable(String),
+    /// Fallo **ambiguo** tras enviar —error de transporte en `.send()`, lectura
+    /// del cuerpo cortada, o el plazo de la vuelta vencido—: Graph **pudo** haber
+    /// procesado el pedido. Para `PATCH`/`DELETE` (idempotentes) y el alta de
+    /// evento (idempotente por `transactionId`) se reintenta como un `Retryable`;
+    /// para el alta (`POST`) de contacto, que no tiene `transactionId`, un
+    /// reintento duplicaría, así que lo rutea a conflicto [`on_error`].
+    AmbiguousRetryable(String),
     /// Firme (credencial, `4xx` que no es `412`/`409`/`404`, respuesta ilegible):
     /// escala a conflicto para no trabar la colección.
     Permanent(String),
@@ -340,6 +369,7 @@ impl GraphWriteError {
         match self {
             GraphWriteError::Conflict => "el recurso cambió en el servidor".into(),
             GraphWriteError::Retryable(e) => e.clone(),
+            GraphWriteError::AmbiguousRetryable(e) => e.clone(),
             GraphWriteError::Permanent(e) => e.clone(),
         }
     }
@@ -474,7 +504,11 @@ async fn send_write(
         // `user_id` (que puede ser un UPN/correo) y el id del objeto—, y esto termina
         // en `pending_dav_ops.last_error` y la superficie de conflicto. Se tacha,
         // como el camino DAV.
-        .map_err(|e| GraphWriteError::Retryable(e.without_url().to_string()))?;
+        //
+        // Un error acá es **ambiguo**: el pedido ya salió, así que Graph pudo haberlo
+        // procesado antes de que se cortara. Para un alta de contacto eso no se puede
+        // reintentar sin arriesgar un duplicado (lo rutea `on_error`).
+        .map_err(|e| GraphWriteError::AmbiguousRetryable(e.without_url().to_string()))?;
     classify(response.status(), is_delete)?;
     Ok(response)
 }
@@ -531,8 +565,10 @@ async fn read_response(response: reqwest::Response) -> Result<WriteResponse, Gra
     let bytes = graph::read_capped(response, MAX_WRITE_RESPONSE)
         .await
         .map_err(|e| match e {
-            // `without_url()` ya lo aplica `read_capped`.
-            graph::CappedReadError::Network(detail) => GraphWriteError::Retryable(detail),
+            // `without_url()` ya lo aplica `read_capped`. Cortar la lectura del cuerpo
+            // es ambiguo: el estado ya vino 2xx, o sea que el `POST` creó el recurso;
+            // reintentar un alta de contacto lo duplicaría (lo rutea `on_error`).
+            graph::CappedReadError::Network(detail) => GraphWriteError::AmbiguousRetryable(detail),
             graph::CappedReadError::TooLarge => {
                 GraphWriteError::Permanent("la respuesta de Graph supera el tope de tamaño".into())
             }
@@ -550,13 +586,36 @@ async fn read_response(response: reqwest::Response) -> Result<WriteResponse, Gra
 /// Decide qué hacer con el error de una escritura, y cuenta en el informe. Mismo
 /// criterio que [`crate::replay`]: conflicto se marca, reintentable se reintenta
 /// hasta el tope, y lo firme escala a conflicto para no trabar la colección.
-fn on_error(op: PendingOp, error: GraphWriteError, report: &mut ReplayReport) -> Close {
+///
+/// `ambiguous_is_conflict` lo decide quien llama: es `true` sólo para el alta
+/// (`POST`) de contacto, que no tiene `transactionId` y por eso no puede
+/// reintentarse tras un fallo ambiguo sin arriesgar un duplicado. En ese único
+/// caso un [`GraphWriteError::AmbiguousRetryable`] va a conflicto (se conserva el
+/// crudo local y decide la persona); en cualquier otro se reintenta como un
+/// `Retryable`.
+fn on_error(
+    op: PendingOp,
+    error: GraphWriteError,
+    report: &mut ReplayReport,
+    ambiguous_is_conflict: bool,
+) -> Close {
     match error {
         GraphWriteError::Conflict => {
             report.conflicts += 1;
             Close::Conflict(op, error.detail())
         }
         GraphWriteError::Retryable(_) => retry_or_escalate(op, error.detail(), report),
+        GraphWriteError::AmbiguousRetryable(detail) => {
+            if ambiguous_is_conflict {
+                report.conflicts += 1;
+                Close::Conflict(
+                    op,
+                    format!("posible duplicado, no se reintenta el alta de contacto: {detail}"),
+                )
+            } else {
+                retry_or_escalate(op, detail, report)
+            }
+        }
         GraphWriteError::Permanent(_) => {
             report.conflicts += 1;
             Close::Conflict(op, error.detail())
