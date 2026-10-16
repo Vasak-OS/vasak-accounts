@@ -1032,9 +1032,21 @@ mod end_to_end {
             None,
             "no se guardó copia del servidor"
         );
-        assert!(
-            f.op_attempts("SRV-ID").await.unwrap_or(0) >= 1,
+        // 1 por marcar el conflicto + 1 por la traída fallida: con `>= 1` pasaba
+        // aunque nadie contara la traída.
+        assert_eq!(
+            f.op_attempts("SRV-ID").await,
+            Some(2),
             "se contó un intento de traída, para acotar la re-traída"
+        );
+        assert_eq!(
+            f.server
+                .requests()
+                .last()
+                .map(|r| r.method.clone())
+                .as_deref(),
+            Some("GET"),
+            "se intentó traer la copia"
         );
         assert!(
             f.stored("SRV-ID", "raw_vcard")
@@ -1042,6 +1054,182 @@ mod end_to_end {
                 .is_some_and(|r| r.contains("Mía")),
             "el crudo local sigue intacto"
         );
+    }
+
+    /// **Tope de re-traídas**: si la copia del servidor no se puede traer nunca (el
+    /// `GET` da 5xx vuelta tras vuelta), la op en conflicto **no pega a la red para
+    /// siempre**: se cuenta un intento por traída fallida y, al llegar a
+    /// `MAX_REPLAY_ATTEMPTS`, se deja de intentar. Tampoco se re-empuja la escritura.
+    #[tokio::test]
+    async fn la_retraida_de_una_copia_que_siempre_falla_se_corta_en_el_tope() {
+        let f = Fixture::new("graph-e2e-tope").await;
+        f.enqueue_put("SRV-ID", "Mía", Some("\"vieja\"")).await;
+        f.server.push_status(412, ""); // el PATCH choca; todo GET siguiente da 500
+
+        f.replay().await;
+        for _ in 0..(super::super::MAX_REPLAY_ATTEMPTS * 2) {
+            f.replay().await;
+        }
+
+        let gets = |f: &Fixture| {
+            f.server
+                .requests()
+                .iter()
+                .filter(|r| r.method == "GET")
+                .count()
+        };
+        let patches = f
+            .server
+            .requests()
+            .iter()
+            .filter(|r| r.method == "PATCH")
+            .count();
+        assert_eq!(patches, 1, "una op en conflicto no re-empuja la escritura");
+        assert_eq!(
+            f.op_attempts("SRV-ID").await,
+            Some(super::super::MAX_REPLAY_ATTEMPTS),
+            "los intentos se frenan en el tope"
+        );
+        let hasta_ahora = gets(&f);
+        assert!(
+            hasta_ahora < super::super::MAX_REPLAY_ATTEMPTS as usize,
+            "la traída se intentó {hasta_ahora} veces, acotada"
+        );
+        f.replay().await;
+        f.replay().await;
+        assert_eq!(gets(&f), hasta_ahora, "pasado el tope no hay más pedidos");
+        assert_eq!(f.op_state("SRV-ID").await.as_deref(), Some("conflict"));
+        assert!(
+            f.stored("SRV-ID", "raw_vcard")
+                .await
+                .is_some_and(|r| r.contains("Mía")),
+            "el crudo local sigue intacto"
+        );
+    }
+
+    /// **Un `5xx` en la captura no pierde nada** y la próxima vuelta lo recupera: tras
+    /// el `412` y un `GET` que da 500 la op sigue en conflicto, el crudo local
+    /// intacto y sin copia; en la vuelta siguiente, con el servidor sano, se guarda.
+    #[tokio::test]
+    async fn un_5xx_en_la_captura_no_pierde_el_local_y_la_proxima_vuelta_la_trae() {
+        let f = Fixture::new("graph-e2e-captura-5xx").await;
+        f.enqueue_put("SRV-ID", "Mía", Some("\"vieja\"")).await;
+        f.server.push_status(412, "");
+        f.server.push_status(503, "{}"); // el GET de la copia falla
+
+        f.replay().await;
+
+        assert_eq!(f.op_state("SRV-ID").await.as_deref(), Some("conflict"));
+        assert_eq!(f.pending().await, 1, "la op sigue en la cola");
+        assert_eq!(f.op_server_raw("SRV-ID").await, None);
+        assert!(f
+            .stored("SRV-ID", "raw_vcard")
+            .await
+            .is_some_and(|r| r.contains("Mía")));
+
+        f.server.push(server_contact("Suya", "\"srv\""));
+        f.replay().await;
+
+        assert!(f
+            .op_server_raw("SRV-ID")
+            .await
+            .is_some_and(|r| r.contains("Suya")));
+        assert_eq!(
+            f.op_field("SRV-ID", "server_etag").await.as_deref(),
+            Some("\"srv\"")
+        );
+        assert!(f
+            .stored("SRV-ID", "raw_vcard")
+            .await
+            .is_some_and(|r| r.contains("Mía")));
+    }
+
+    /// **Un `GET` que no contesta** no cuelga la vuelta ni pierde la op: el plazo de la
+    /// vuelta lo corta, se cuenta el intento y el conflicto queda con el local intacto.
+    #[tokio::test]
+    async fn una_captura_que_no_contesta_se_corta_por_el_plazo_y_no_pierde_la_op() {
+        let f = Fixture::new("graph-e2e-captura-plazo").await;
+        f.enqueue_put("SRV-ID", "Mía", Some("\"vieja\"")).await;
+        f.server.push_status(412, "");
+        f.server.push_status(0, ""); // el GET nunca contesta
+
+        let credential = f.credential();
+        let started = Instant::now();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+        let report = replay_graph_area(
+            &f.manager,
+            ACCOUNT,
+            CONTACTS_AREA,
+            &fake::client(),
+            &credential,
+            deadline,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "la vuelta respeta su plazo y no espera los 60 s del pedido"
+        );
+        assert_eq!(report.conflicts, 1);
+        assert_eq!(f.op_state("SRV-ID").await.as_deref(), Some("conflict"));
+        assert_eq!(f.op_server_raw("SRV-ID").await, None);
+        assert_eq!(f.op_attempts("SRV-ID").await, Some(2), "se contó la traída");
+        assert!(f
+            .stored("SRV-ID", "raw_vcard")
+            .await
+            .is_some_and(|r| r.contains("Mía")));
+    }
+
+    /// **El `id` va percent-codificado en la ruta del `GET`**: un `id` con `/`, `?`,
+    /// `#` o espacios no puede cambiar de recurso ni de consulta.
+    #[tokio::test]
+    async fn el_get_de_la_copia_codifica_el_id_en_la_ruta() {
+        let f = Fixture::new("graph-e2e-captura-ruta").await;
+        let id = "a/b c?d#e";
+        f.enqueue_put(id, "Mía", Some("\"vieja\"")).await;
+        f.server.push_status(412, "");
+        f.server.push(server_contact("Suya", "\"srv\""));
+
+        f.replay().await;
+
+        let requests = f.server.requests();
+        let get = requests
+            .iter()
+            .find(|r| r.method == "GET")
+            .expect("hubo GET");
+        let path = get.path.split('?').next().unwrap();
+        assert_eq!(
+            path, "/v1.0/users/me/contacts/a%2Fb%20c%3Fd%23e",
+            "{}",
+            get.path
+        );
+        assert!(get.authorization.starts_with("Bearer "));
+    }
+
+    /// **El `GET` no sigue una URL que venga en la respuesta**: un `302` hacia otro
+    /// origen no se sigue (ni se guarda lo que conteste ese origen como copia del
+    /// servidor), y el token no sale hacia allá.
+    #[tokio::test]
+    async fn el_get_de_la_copia_no_sigue_una_redireccion_a_otro_origen() {
+        let f = Fixture::new("graph-e2e-captura-redir").await;
+        let otro = FakeGraph::start().await;
+        otro.push(server_contact("Intrusa", "\"x\""));
+        f.enqueue_put("SRV-ID", "Mía", Some("\"vieja\"")).await;
+        f.server.push_status(412, "");
+        // Un 302 con `Location` a otro origen (el fake pone el cuerpo como `Location`).
+        f.server.push_status(
+            302,
+            format!("{}/v1.0/users/me/contacts/SRV-ID", otro.origin()),
+        );
+
+        f.replay().await;
+
+        assert!(
+            otro.requests().is_empty(),
+            "no se pidió nada al otro origen"
+        );
+        assert_eq!(f.op_server_raw("SRV-ID").await, None);
     }
 }
 
@@ -1201,6 +1389,30 @@ mod end_to_end_calendar {
                             |r| r.get::<_, String>(0),
                         )
                         .ok())
+                })
+                .await
+                .unwrap()
+        }
+
+        /// `(server_etag, server_raw)` de la op de ese `href`.
+        async fn server_copy(&self, href: &str) -> (Option<String>, String) {
+            let href = href.to_string();
+            self.manager
+                .with_store(ACCOUNT, move |store| {
+                    Ok(store
+                        .connection()
+                        .query_row(
+                            "SELECT server_etag, server_raw FROM pending_dav_ops \
+                             WHERE object_href = ?1",
+                            [href],
+                            |r| {
+                                Ok((
+                                    r.get::<_, Option<String>>(0)?,
+                                    String::from_utf8_lossy(&r.get::<_, Vec<u8>>(1)?).into_owned(),
+                                ))
+                            },
+                        )
+                        .unwrap())
                 })
                 .await
                 .unwrap()
@@ -1404,5 +1616,88 @@ mod end_to_end_calendar {
         assert_eq!(sent["start"]["dateTime"], "2026-09-15T17:00:00");
         assert_eq!(sent["end"]["dateTime"], "2026-09-15T18:00:00");
         assert_eq!(f.pending().await, 0);
+    }
+
+    /// **Captura de la copia del servidor de un evento**: el `GET /users/me/events/{id}`
+    /// pide las fechas en UTC, y lo guardado es el iCal de la bajada con el `@odata.etag`.
+    /// `take_server` lo adopta en la fila y descarta la op.
+    #[tokio::test]
+    async fn un_412_en_un_evento_captura_la_copia_y_take_server_la_adopta() {
+        let f = Fixture::new("graph-cal-captura").await;
+        f.enqueue_put("SRV-ID", Some("W/\"vieja\"")).await;
+        f.server.push_status(412, "");
+        f.server.push(
+            serde_json::json!({
+                "id": "SRV-ID",
+                "@odata.etag": "W/\"srv\"",
+                "iCalUId": "u1",
+                "subject": "Del servidor",
+                "start": {"dateTime": "2026-09-15T17:00:00", "timeZone": "UTC"},
+                "end": {"dateTime": "2026-09-15T18:00:00", "timeZone": "UTC"},
+            })
+            .to_string(),
+        );
+
+        f.replay().await;
+
+        let requests = f.server.requests();
+        let get = requests
+            .iter()
+            .find(|r| r.method == "GET")
+            .expect("hubo GET");
+        assert!(
+            get.path.starts_with("/v1.0/users/me/events/SRV-ID"),
+            "{}",
+            get.path
+        );
+        assert!(
+            get.prefer.contains("UTC"),
+            "pide las fechas en UTC: {}",
+            get.prefer
+        );
+        let (etag, raw) = f.server_copy("SRV-ID").await;
+        assert_eq!(etag.as_deref(), Some("W/\"srv\""));
+        assert!(
+            raw.contains("BEGIN:VEVENT") && raw.contains("Del servidor"),
+            "{raw}"
+        );
+        assert!(f
+            .stored("SRV-ID", "raw_ical")
+            .await
+            .is_some_and(|r| r.contains("Reunión")));
+
+        let id: i64 = f
+            .manager
+            .with_store(ACCOUNT, |store| {
+                Ok(store
+                    .connection()
+                    .query_row(
+                        "SELECT id FROM calendar_objects WHERE href = 'SRV-ID'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap())
+            })
+            .await
+            .unwrap();
+        f.manager
+            .with_store(ACCOUNT, move |store| {
+                store.resolve_conflict(
+                    CALENDAR_AREA,
+                    id,
+                    crate::store::queue::ConflictChoice::TakeServer,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(f.pending().await, 0);
+        assert!(f
+            .stored("SRV-ID", "raw_ical")
+            .await
+            .is_some_and(|r| r.contains("Del servidor") && !r.contains("Reunión")));
+        assert_eq!(
+            f.stored("SRV-ID", "etag").await.as_deref(),
+            Some("W/\"srv\"")
+        );
     }
 }

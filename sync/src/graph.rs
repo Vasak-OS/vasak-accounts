@@ -47,6 +47,10 @@ pub const MAX_OBJECT_BYTES: usize = 1024 * 1024;
 pub fn http_client() -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        // Graph no redirige: seguir un `Location` de la respuesta es seguir una URL
+        // que puso la red (el token se descarta, pero lo que conteste ese origen se
+        // guardaría como dato de Graph).
         .build()
 }
 
@@ -585,8 +589,18 @@ pub mod fake {
                 }
             };
 
+            // Estado 0 = «no contestar nunca»: para probar el plazo de un pedido.
+            if status == 0 {
+                std::future::pending::<()>().await;
+            }
+            // En una redirección (3xx) el «cuerpo» encolado es el `Location`.
+            let (location, body) = if (300..400).contains(&status) {
+                (format!("Location: {body}\r\n"), String::new())
+            } else {
+                (String::new(), body)
+            };
             let out = format!(
-                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n{location}Content-Length: {}\r\n\r\n",
                 body.len()
             );
             let mut bytes = out.into_bytes();
