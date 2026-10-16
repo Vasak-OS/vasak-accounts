@@ -78,6 +78,20 @@ pub enum Applied {
     OverCap,
 }
 
+/// El enlace de un contacto local con su persona de la People API de Google
+/// (P5, `vasak-accounts#111`): el `resourceName` con el que se la vuelve a pedir
+/// y los testigos con los que una corrida incremental decide si la persona o su
+/// foto cambiaron. Vive en la tabla `contact_enrichment`, **fuera del
+/// `raw_vcard`**, para no pisar una edición local sin confirmar al reescribir el
+/// crudo (ver la migración `V7`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactEnrichment {
+    pub contact_id: i64,
+    pub resource_name: String,
+    pub etag: Option<String>,
+    pub photo_etag: Option<String>,
+}
+
 fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
@@ -510,6 +524,55 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()
+            .map_err(classify)
+    }
+
+    /// El enlace de enriquecimiento de un contacto por su `id`. `None` si
+    /// todavía no se lo casó con ninguna persona de People API.
+    pub fn contact_enrichment(
+        &self,
+        contact_id: i64,
+    ) -> Result<Option<ContactEnrichment>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT contact_id, resource_name, etag, photo_etag
+                   FROM contact_enrichment WHERE contact_id = ?1",
+                [contact_id],
+                |row| {
+                    Ok(ContactEnrichment {
+                        contact_id: row.get(0)?,
+                        resource_name: row.get(1)?,
+                        etag: row.get(2)?,
+                        photo_etag: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(classify)
+    }
+
+    /// Guarda (o reemplaza) el enlace de un contacto: un enlace por contacto, así
+    /// que una corrida nueva de People API pisa el `resourceName` y los testigos
+    /// del anterior. Si el contacto no está en esta base, la clave foránea lo
+    /// rechaza; si otra fila ya reclamó ese `resource_name`, lo rechaza el
+    /// `UNIQUE`.
+    pub fn upsert_contact_enrichment(&self, link: &ContactEnrichment) -> Result<(), StoreError> {
+        self.connection
+            .execute(
+                "INSERT INTO contact_enrichment (contact_id, resource_name, etag, photo_etag)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (contact_id) DO UPDATE SET
+                     resource_name = excluded.resource_name,
+                     etag = excluded.etag,
+                     photo_etag = excluded.photo_etag",
+                rusqlite::params![
+                    link.contact_id,
+                    link.resource_name,
+                    link.etag,
+                    link.photo_etag
+                ],
+            )
+            .map(|_| ())
             .map_err(classify)
     }
 }
@@ -1125,5 +1188,65 @@ pub(crate) mod tests {
         );
         // La libreta no se borró: borrarla se habría llevado «b» por la cascada.
         assert_eq!(store.address_books().unwrap().len(), 1);
+    }
+
+    /// Guardar un enlace de enriquecimiento y leerlo de vuelta; y que una
+    /// segunda escritura del mismo contacto pisa la anterior en vez de duplicar.
+    #[test]
+    fn el_enlace_de_enriquecimiento_va_y_vuelve_y_el_upsert_pisa() {
+        let temp = TempDir::new("enriquecimiento");
+        let mut store = open_store(&temp);
+        let book = store
+            .upsert_address_books(&[("https://x/a/".into(), "A".into())])
+            .unwrap()
+            .remove(0);
+        store
+            .apply_contacts(
+                &book,
+                &[ContactOp::Upsert(row(
+                    "https://x/a/1.vcf",
+                    "Ana",
+                    "a@x.com",
+                ))],
+                None,
+                u64::MAX,
+            )
+            .unwrap();
+        let contact_id = store
+            .contact_id_by_href(book.id, "https://x/a/1.vcf")
+            .unwrap()
+            .unwrap();
+
+        // Antes de casar, no hay enlace.
+        assert_eq!(store.contact_enrichment(contact_id).unwrap(), None);
+
+        let link = ContactEnrichment {
+            contact_id,
+            resource_name: "people/c1".into(),
+            etag: Some("\"e1\"".into()),
+            photo_etag: None,
+        };
+        store.upsert_contact_enrichment(&link).unwrap();
+        assert_eq!(store.contact_enrichment(contact_id).unwrap(), Some(link));
+
+        // Una corrida nueva pisa el enlace: mismo contacto, una sola fila.
+        let updated = ContactEnrichment {
+            contact_id,
+            resource_name: "people/c1".into(),
+            etag: Some("\"e2\"".into()),
+            photo_etag: Some("\"p2\"".into()),
+        };
+        store.upsert_contact_enrichment(&updated).unwrap();
+        assert_eq!(store.contact_enrichment(contact_id).unwrap(), Some(updated));
+        assert_eq!(count(&store, "SELECT count(*) FROM contact_enrichment"), 1);
+
+        // Un contacto que no existe lo rechaza la clave foránea.
+        let orphan = ContactEnrichment {
+            contact_id: contact_id + 999,
+            resource_name: "people/c2".into(),
+            etag: None,
+            photo_etag: None,
+        };
+        assert!(store.upsert_contact_enrichment(&orphan).is_err());
     }
 }
