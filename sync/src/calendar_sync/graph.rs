@@ -224,11 +224,18 @@ pub(crate) fn event_body_from_ical(
     let dtstart = vevent.first("DTSTART");
     let dtend = vevent.first("DTEND");
     let all_day = dtstart.map(is_date_only).unwrap_or(false);
-    if let Some(start) = dtstart.and_then(graph_datetime) {
-        body.insert("start".into(), start);
+    // Un `DTSTART`/`DTEND` que existe pero no se puede convertir (flotante, `TZID`
+    // desconocido, hora inexistente o ambigua) **aborta todo el cuerpo** con `None`,
+    // no se omite la fecha. `resolve_op` lleva ese `None` a conflicto: el crudo local
+    // queda intacto y la persona lo resuelve. Mandar el `PATCH` sin la fecha la
+    // borraría en el servidor en silencio, y la bajada siguiente pisaría con la vieja
+    // (pérdida de dato). Un evento sin `DTSTART` en el crudo —si existe— se deja pasar
+    // como está.
+    if let Some(dtstart) = dtstart {
+        body.insert("start".into(), graph_datetime(dtstart)?);
     }
-    if let Some(end) = dtend.and_then(graph_datetime) {
-        body.insert("end".into(), end);
+    if let Some(dtend) = dtend {
+        body.insert("end".into(), graph_datetime(dtend)?);
     }
     body.insert("isAllDay".into(), json!(all_day));
 
@@ -279,7 +286,11 @@ fn graph_datetime(property: &crate::ical::Property) -> Option<serde_json::Value>
     // desconocida, o una hora que en esa zona no existe o es ambigua (cambio de
     // horario), devuelve `None`: mejor rutear la op a conflicto que mandar —y que la
     // bajada persista— una hora corrida.
-    if let Some(tzid) = property.params.iter().find_map(|p| p.strip_prefix("TZID=")) {
+    // `Property::param` compara el nombre del parámetro sin distinguir mayúsculas
+    // (los nombres de parámetro iCal son case-insensitive: `TZID=` o `tzid=`) y le
+    // saca las comillas a un `TZID="America/…"`; se reusa en vez de un `strip_prefix`
+    // propio, que se comía los dos casos.
+    if let Some(tzid) = property.param("TZID") {
         let zone: chrono_tz::Tz = tzid.parse().ok()?;
         let naive =
             NaiveDateTime::parse_from_str(&format!("{date}T{time}"), "%Y-%m-%dT%H:%M:%S").ok()?;
