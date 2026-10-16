@@ -22,11 +22,13 @@ static WRITES: std::sync::LazyLock<
 fn with_write_lock<T>(directory: &Path, f: impl FnOnce() -> T) -> T {
     let lock = WRITES
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .entry(directory.to_path_buf())
         .or_default()
         .clone();
-    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     f()
 }
 
@@ -85,7 +87,10 @@ pub struct UnknownCapability(pub String);
 
 impl std::fmt::Display for UnknownCapability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let validas: Vec<&str> = CapabilityType::ALL.iter().map(|c| c.as_id()).collect();
+        let validas: Vec<&str> = CapabilityType::ALL
+            .iter()
+            .map(CapabilityType::as_id)
+            .collect();
         write!(
             f,
             "capacidad '{}' desconocida; las válidas son: {}",
