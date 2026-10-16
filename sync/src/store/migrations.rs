@@ -518,6 +518,45 @@ ALTER TABLE pending_dav_ops ADD COLUMN server_etag TEXT;
 ALTER TABLE pending_dav_ops ADD COLUMN server_raw BLOB;
 ";
 
+/// v7 (PR 1 de P5, `vasak-accounts#111`): el enlace de un contacto con su
+/// persona de la People API de Google.
+///
+/// Google sincroniza los contactos por CardDAV; la People API los **enriquece**
+/// (la foto, sobre todo, que el CardDAV de Google no suele traer embebida), no
+/// los reemplaza. El enriquecimiento vive **fuera del `raw_vcard`** —en esta
+/// tabla aparte y no dentro del crudo— por la decisión de diseño de la issue:
+/// el crudo es la fuente de la escritura conservadora (decisión 3 del taller) y
+/// lo pisa el replay de una edición local sin confirmar; meter la foto ahí la
+/// borraría en la próxima bajada. Al colgar del contacto por clave foránea con
+/// `ON DELETE CASCADE`, el enlace se va cuando se va el contacto, y toda la
+/// tabla desaparece con la base cuando un `ClearStore` o un
+/// `SetStoreEnabled(false)` la rehace vacía (ver `lifecycle::StoreManager`).
+///
+/// - **`contact_id`**: a qué contacto local enriquece. Es la clave primaria:
+///   un enlace por contacto. El contacto se identifica por su `id` entero, como
+///   en `contact_emails` y `contact_phones`, no por el `href` ni el `uid`.
+/// - **`resource_name`**: el `people/c<id>` con el que la People API vuelve a
+///   pedir esa persona. Una corrida incremental lo reusa en vez de re-casar por
+///   email. `UNIQUE` en toda la base (una base por cuenta): dos contactos no
+///   apuntan a la misma persona.
+/// - **`etag`** y **`photo_etag`**: los testigos con los que la corrida
+///   siguiente decide si la persona —y su foto, que versiona aparte— cambiaron
+///   desde la última, y se saltea traerlas si no. Nulos mientras no se hayan
+///   traído por primera vez.
+///
+/// Sin red todavía: PR1 es sólo la tabla y sus accesores; la pasada de People
+/// API es el PR2 (ver `vasak-accounts#111`).
+const V7: &str = "
+CREATE TABLE contact_enrichment (
+    contact_id    INTEGER PRIMARY KEY REFERENCES contacts (id) ON DELETE CASCADE,
+    resource_name TEXT NOT NULL,
+    etag          TEXT,
+    photo_etag    TEXT
+) STRICT;
+
+CREATE UNIQUE INDEX contact_enrichment_by_resource ON contact_enrichment (resource_name);
+";
+
 /// Todas las migraciones, en orden.
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
@@ -527,6 +566,7 @@ pub fn migrations() -> Migrations<'static> {
         M::up(V4),
         M::up(V5),
         M::up(V6),
+        M::up(V7),
     ])
 }
 
@@ -563,7 +603,7 @@ mod tests {
         let mut connection = Connection::open_in_memory().unwrap();
         apply(&mut connection).unwrap();
         let version = schema_version(&connection).unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
 
         let tables = |c: &Connection| -> Vec<String> {
             let mut statement = c
@@ -621,6 +661,8 @@ mod tests {
             "messages_fts_forget",
             "pending_dav_ops",
             "pending_dav_ops_by_area",
+            "contact_enrichment",
+            "contact_enrichment_by_resource",
         ] {
             assert!(before.iter().any(|t| t == table), "falta {table}");
         }
@@ -686,7 +728,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 6);
+        assert_eq!(schema_version(&connection).unwrap(), 7);
 
         // Lo que había sigue, y la marca nueva es NULL.
         let object_mark: Option<String> = connection
@@ -729,7 +771,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 6);
+        assert_eq!(schema_version(&connection).unwrap(), 7);
 
         // La op sigue, en conflicto, y las columnas nuevas son NULL.
         let (state, server_etag, server_raw): (String, Option<String>, Option<Vec<u8>>) =
@@ -759,6 +801,113 @@ mod tests {
             )
             .unwrap();
         assert_eq!(server_raw.as_deref(), Some(&[3u8, 4u8][..]));
+    }
+
+    /// **v6 → v7 no pierde nada**: un contacto de una base del PR del correo
+    /// sigue ahí después de migrar, la tabla de enriquecimiento nueva existe y
+    /// arranca vacía, y se puede enlazar ese contacto con una persona de People
+    /// API.
+    #[test]
+    fn de_v6_a_v7_suma_la_tabla_de_enriquecimiento_vacia() {
+        let mut connection = at_version(6);
+        assert_eq!(schema_version(&connection).unwrap(), 6);
+        connection
+            .execute(
+                "INSERT INTO address_books (id, href, display_name, updated_at)
+                 VALUES (1, 'https://x/a/', 'A', 'ayer')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO contacts
+                   (id, address_book_id, href, etag, uid, display_name, sort_key, raw_vcard,
+                    updated_at)
+                 VALUES (1, 1, 'https://x/a/ana.vcf', '\"v1\"', 'u1', 'Ana', 'ana',
+                    'BEGIN:VCARD', 'ayer')",
+                [],
+            )
+            .unwrap();
+
+        apply(&mut connection).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 7);
+
+        // El contacto sigue, y la tabla nueva arranca vacía.
+        let contacts: i64 = connection
+            .query_row("SELECT count(*) FROM contacts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(contacts, 1);
+        let links: i64 = connection
+            .query_row("SELECT count(*) FROM contact_enrichment", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(links, 0);
+
+        // Se puede enlazar el contacto con una persona, y leerlo de vuelta.
+        connection
+            .execute(
+                "INSERT INTO contact_enrichment (contact_id, resource_name, etag, photo_etag)
+                 VALUES (1, 'people/c1', '\"e1\"', '\"p1\"')",
+                [],
+            )
+            .unwrap();
+        let (resource, etag, photo): (String, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT resource_name, etag, photo_etag FROM contact_enrichment WHERE contact_id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(resource, "people/c1");
+        assert_eq!(etag.as_deref(), Some("\"e1\""));
+        assert_eq!(photo.as_deref(), Some("\"p1\""));
+    }
+
+    /// El enlace cuelga del contacto: al borrar el contacto se va con él
+    /// (`ON DELETE CASCADE`), y dos contactos no pueden apuntar a la misma
+    /// persona (`resource_name` `UNIQUE`).
+    #[test]
+    fn el_enlace_de_enriquecimiento_cuelga_del_contacto_y_la_persona_es_unica() {
+        let connection = at_version(7);
+        connection
+            .execute(
+                "INSERT INTO address_books (id, href, display_name, updated_at)
+                 VALUES (1, 'https://x/a/', 'A', 'ayer')",
+                [],
+            )
+            .unwrap();
+        let insert_contact = "INSERT INTO contacts
+               (id, address_book_id, href, etag, uid, display_name, sort_key, raw_vcard, updated_at)
+             VALUES (?1, 1, ?2, '\"v1\"', ?3, 'N', 'n', 'BEGIN:VCARD', 'ayer')";
+        connection
+            .execute(insert_contact, ["1", "https://x/a/1.vcf", "u1"])
+            .unwrap();
+        connection
+            .execute(insert_contact, ["2", "https://x/a/2.vcf", "u2"])
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO contact_enrichment (contact_id, resource_name) VALUES (1, 'people/c1')",
+                [],
+            )
+            .unwrap();
+        // Un segundo contacto no puede reclamar la misma persona.
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO contact_enrichment (contact_id, resource_name) VALUES (2, 'people/c1')",
+                    [],
+                )
+                .is_err(),
+            "dos contactos no apuntan a la misma persona"
+        );
+        // Al borrar el contacto, su enlace se va en cascada.
+        connection
+            .execute("DELETE FROM contacts WHERE id = 1", [])
+            .unwrap();
+        let links: i64 = connection
+            .query_row("SELECT count(*) FROM contact_enrichment", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(links, 0);
     }
 
     /// La marca `pending_op` sólo acepta los dos valores conocidos, o `NULL`.
@@ -902,7 +1051,7 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .unwrap();
-        let all = [V1, V2, V3, V4, V5, V6];
+        let all = [V1, V2, V3, V4, V5, V6, V7];
         Migrations::new(all[..version].iter().map(|sql| M::up(sql)).collect())
             .to_latest(&mut connection)
             .unwrap();
@@ -929,7 +1078,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 6);
+        assert_eq!(schema_version(&connection).unwrap(), 7);
         let message: String = connection
             .query_row("SELECT message FROM sync_log", [], |row| row.get(0))
             .unwrap();
@@ -1230,7 +1379,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 6);
+        assert_eq!(schema_version(&connection).unwrap(), 7);
         assert_eq!(found(&connection, "jose"), vec![id]);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_emails"), 1);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_phones"), 1);
@@ -1401,7 +1550,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 6);
+        assert_eq!(schema_version(&connection).unwrap(), 7);
         assert_eq!(found(&connection, "jose"), vec![id]);
         assert_eq!(count(&connection, "SELECT count(*) FROM occurrences"), 2);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_emails"), 1);
