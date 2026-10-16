@@ -42,6 +42,45 @@ pub const MAX_PAGES: usize = 1_000;
 /// esto es un servidor roto o adversario y se corta.
 pub const MAX_OBJECT_BYTES: usize = 1024 * 1024;
 
+/// Tope del cuerpo de **una página** de un listado ([`fetch_all_pages`]). Con
+/// `$top=100` y descripciones de hasta `MAX_DESCRIPTION` por ítem una página legítima
+/// entra de sobra; mucho más es un servidor que intenta agotar la memoria.
+pub const MAX_PAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Lo que puede salir mal al leer un cuerpo con [`read_capped`]: la red se cortó, o el
+/// cuerpo pasó el tope. Quien llama lo mapea a su propio error.
+pub enum CappedReadError {
+    Network(String),
+    TooLarge,
+}
+
+/// Lee el cuerpo de una respuesta **por chunks, abortando en cuanto el acumulado pasa
+/// `max`**, sin bufferizar el cuerpo entero antes de chequear: `Content-Length` es lo
+/// que el servidor **promete**, no lo que manda, así que un servidor hostil que
+/// promete un kilobyte y manda un gigabyte no puede agotar la memoria del servicio.
+/// Permite un cuerpo vacío (un `204 No Content` válido). Mismo criterio que el lector
+/// capado del flujo de imágenes ([`crate::images`]), pero con el tope por parámetro y
+/// sin rechazar el cuerpo vacío.
+pub async fn read_capped(
+    response: reqwest::Response,
+    max: usize,
+) -> Result<Vec<u8>, CappedReadError> {
+    use futures_util::StreamExt;
+
+    let mut received: Vec<u8> = Vec::new();
+    let mut chunks = response.bytes_stream();
+    while let Some(chunk) = chunks.next().await {
+        // `without_url()`: el error de red no tiene por qué llevar la URL (con el
+        // `user_id`) a ningún registro.
+        let chunk = chunk.map_err(|e| CappedReadError::Network(e.without_url().to_string()))?;
+        if received.len() + chunk.len() > max {
+            return Err(CappedReadError::TooLarge);
+        }
+        received.extend_from_slice(&chunk);
+    }
+    Ok(received)
+}
+
 /// Un cliente HTTP con el plazo de conexión del servicio. Nunca
 /// `reqwest::Client::new()` pelado: ése no tiene plazo de conexión.
 pub fn http_client() -> Result<reqwest::Client, reqwest::Error> {
@@ -156,6 +195,9 @@ pub enum GraphFetchError {
     TooManyPages,
     /// Se superó el tope de elementos acumulados.
     TooManyItems,
+    /// El cuerpo de la respuesta superó el tope de bytes ([`read_capped`]): se cortó
+    /// la lectura sin bufferizarlo entero.
+    TooLarge,
     /// Se agotó el plazo de un pedido.
     Timeout,
 }
@@ -183,6 +225,9 @@ impl std::fmt::Display for GraphFetchError {
             }
             GraphFetchError::TooManyItems => {
                 write!(f, "demasiados elementos; se abortó la sincronización")
+            }
+            GraphFetchError::TooLarge => {
+                write!(f, "la respuesta de Graph superó el tope de tamaño")
             }
             GraphFetchError::Timeout => write!(f, "se agotó el tiempo de espera de Graph"),
         }
@@ -289,10 +334,15 @@ pub async fn fetch_all_pages<T: DeserializeOwned>(
                 // vuelca al estado que ve quien usa el sistema.
                 return Err(GraphFetchError::Http(response.status()));
             }
-            response
-                .json::<GraphPage<T>>()
+            // Lectura capada por chunks: una página que pasa el tope se corta sin
+            // bufferizarla entera (`Content-Length` es promesa, no garantía).
+            let bytes = read_capped(response, MAX_PAGE_BYTES)
                 .await
-                .map_err(|_| GraphFetchError::Parse)
+                .map_err(|e| match e {
+                    CappedReadError::Network(detail) => GraphFetchError::Network(detail),
+                    CappedReadError::TooLarge => GraphFetchError::TooLarge,
+                })?;
+            serde_json::from_slice::<GraphPage<T>>(&bytes).map_err(|_| GraphFetchError::Parse)
         };
 
         let data = match tokio::time::timeout_at(deadline, fetch_page).await {
@@ -359,13 +409,14 @@ pub async fn fetch_one<T: DeserializeOwned>(
         if !response.status().is_success() {
             return Err(GraphFetchError::Http(response.status()));
         }
-        let bytes = response
-            .bytes()
+        // Lectura capada por chunks: se aborta en cuanto pasa el tope, sin
+        // bufferizar el cuerpo entero.
+        let bytes = read_capped(response, MAX_OBJECT_BYTES)
             .await
-            .map_err(|e| GraphFetchError::Network(e.without_url().to_string()))?;
-        if bytes.len() > MAX_OBJECT_BYTES {
-            return Err(GraphFetchError::TooManyItems);
-        }
+            .map_err(|e| match e {
+                CappedReadError::Network(detail) => GraphFetchError::Network(detail),
+                CappedReadError::TooLarge => GraphFetchError::TooLarge,
+            })?;
         serde_json::from_slice::<T>(&bytes)
             .map(Some)
             .map_err(|_| GraphFetchError::Parse)

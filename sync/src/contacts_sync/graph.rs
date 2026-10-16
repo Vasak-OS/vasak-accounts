@@ -37,6 +37,13 @@ const CONTACTS_SELECT: &str = "$top=100&$select=id,displayName,givenName,surname
      emailAddresses,businessPhones,homePhones,mobilePhone,homeAddress,businessAddress,otherAddress,\
      companyName,jobTitle,birthday,personalNotes";
 
+/// Los mismos campos que [`CONTACTS_SELECT`] pero **sin `$top`**: para el `GET` de una
+/// sola entidad (la copia del servidor de un conflicto). `$top` es un parámetro de
+/// listado y no va en el `GET` de un objeto.
+const CONTACTS_SELECT_ITEM: &str = "$select=id,displayName,givenName,surname,middleName,\
+     emailAddresses,businessPhones,homePhones,mobilePhone,homeAddress,businessAddress,otherAddress,\
+     companyName,jobTitle,birthday,personalNotes";
+
 /// Un contacto de la carpeta de contactos de Microsoft Graph.
 ///
 /// Todo opcional y con `default`: es dato de red, así que un campo que no venga
@@ -188,7 +195,7 @@ pub(crate) async fn fetch_server_copy(
     let url = graph::build_url(
         &credential.base_url,
         &["users", &credential.user_id, "contacts", id],
-        CONTACTS_SELECT,
+        CONTACTS_SELECT_ITEM,
     )?;
     let Some(contact) = graph::fetch_one::<GraphContact>(client, credential, url, &[]).await?
     else {

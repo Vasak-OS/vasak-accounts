@@ -523,20 +523,20 @@ fn classify(status: reqwest::StatusCode, is_delete: bool) -> Result<(), GraphWri
     }
 }
 
-/// Lee el cuerpo de una respuesta de escritura, **acotado en tamaño**
-/// ([`MAX_WRITE_RESPONSE`]), y le saca `id`/`@odata.etag`. Un cuerpo vacío
-/// —`204 No Content` de un `PATCH`— devuelve todo en `None`, que es válido.
+/// Lee el cuerpo de una respuesta de escritura **acotado por chunks**
+/// ([`MAX_WRITE_RESPONSE`], abortando en cuanto pasa el tope, sin bufferizarlo
+/// entero), y le saca `id`/`@odata.etag`. Un cuerpo vacío —`204 No Content` de un
+/// `PATCH`— devuelve todo en `None`, que es válido.
 async fn read_response(response: reqwest::Response) -> Result<WriteResponse, GraphWriteError> {
-    let bytes = response
-        .bytes()
+    let bytes = graph::read_capped(response, MAX_WRITE_RESPONSE)
         .await
-        // `without_url()`: no filtrar la URL (con el `user_id`) al diario de errores.
-        .map_err(|e| GraphWriteError::Retryable(e.without_url().to_string()))?;
-    if bytes.len() > MAX_WRITE_RESPONSE {
-        return Err(GraphWriteError::Permanent(
-            "la respuesta de Graph supera el tope de tamaño".into(),
-        ));
-    }
+        .map_err(|e| match e {
+            // `without_url()` ya lo aplica `read_capped`.
+            graph::CappedReadError::Network(detail) => GraphWriteError::Retryable(detail),
+            graph::CappedReadError::TooLarge => {
+                GraphWriteError::Permanent("la respuesta de Graph supera el tope de tamaño".into())
+            }
+        })?;
     if bytes.is_empty() {
         return Ok(WriteResponse {
             id: None,

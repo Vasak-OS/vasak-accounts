@@ -47,6 +47,12 @@ const DEFAULT_CALENDAR_NAME: &str = "Graph Calendar";
 const EVENTS_SELECT: &str = "$top=100&$select=id,iCalUId,subject,bodyPreview,start,end,isAllDay,\
      location,organizer,attendees,recurrence,categories,importance,lastModifiedDateTime,isCancelled";
 
+/// Los mismos campos que [`EVENTS_SELECT`] pero **sin `$top`**: para el `GET` de una
+/// sola entidad (la copia del servidor de un conflicto). `$top` es un parámetro de
+/// listado y no va en el `GET` de un objeto.
+const EVENTS_SELECT_ITEM: &str = "$select=id,iCalUId,subject,bodyPreview,start,end,isAllDay,\
+     location,organizer,attendees,recurrence,categories,importance,lastModifiedDateTime,isCancelled";
+
 /// Pedir las fechas en UTC en vez de en nombres de zona de Windows.
 const PREFER_UTC: (&str, &str) = ("Prefer", "outlook.timezone=\"UTC\"");
 
@@ -327,7 +333,7 @@ pub(crate) async fn fetch_server_copy(
     let url = graph::build_url(
         &credential.base_url,
         &["users", &credential.user_id, "events", id],
-        EVENTS_SELECT,
+        EVENTS_SELECT_ITEM,
     )?;
     let Some(event) =
         graph::fetch_one::<GraphEvent>(client, credential, url, &[PREFER_UTC]).await?
