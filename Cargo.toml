@@ -19,7 +19,11 @@ resolver = "2"
 members = ["common", "daemon", "sync"]
 
 [workspace.package]
+<<<<<<< HEAD
 version = "0.44.1"
+=======
+version = "0.45.0"
+>>>>>>> 6835f9ea0945bda0aa216750eea05a8599b388c3
 edition = "2021"
 authors = ["Vasak Group", "Joaquin (Pato) Decima"]
 license = "GPL-3.0-only"

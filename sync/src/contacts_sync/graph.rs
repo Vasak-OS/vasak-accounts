@@ -37,6 +37,13 @@ const CONTACTS_SELECT: &str = "$top=100&$select=id,displayName,givenName,surname
      emailAddresses,businessPhones,homePhones,mobilePhone,homeAddress,businessAddress,otherAddress,\
      companyName,jobTitle,birthday,personalNotes";
 
+/// Los mismos campos que [`CONTACTS_SELECT`] pero **sin `$top`**: para el `GET` de una
+/// sola entidad (la copia del servidor de un conflicto). `$top` es un parámetro de
+/// listado y no va en el `GET` de un objeto.
+const CONTACTS_SELECT_ITEM: &str = "$select=id,displayName,givenName,surname,middleName,\
+     emailAddresses,businessPhones,homePhones,mobilePhone,homeAddress,businessAddress,otherAddress,\
+     companyName,jobTitle,birthday,personalNotes";
+
 /// Un contacto de la carpeta de contactos de Microsoft Graph.
 ///
 /// Todo opcional y con `default`: es dato de red, así que un campo que no venga
@@ -169,6 +176,33 @@ pub(crate) fn contact_body_from_vcard(raw_vcard: &str) -> serde_json::Value {
     }
 
     serde_json::Value::Object(body)
+}
+
+/// Trae la versión actual de un contacto del servidor
+/// (`GET /users/{user}/contacts/{id}`) como `(su @odata.etag, su crudo vCard)`, para
+/// la **copia del servidor** de un conflicto (`#97`, equivalente Graph del `multiget`
+/// DAV de `replay`). Devuelve la vCard con la **misma conversión que la bajada**
+/// ([`GraphApiBackend::contact_to_vcard`]), así `GetConflict` la muestra en el mismo
+/// formato que para un objeto DAV y `take_server` adopta un crudo válido.
+///
+/// `Ok(None)` si el contacto ya no está (`404`). La URL se arma sobre
+/// `credential.base_url` con el `id` percent-codificado; nunca se sigue una de la red.
+pub(crate) async fn fetch_server_copy(
+    client: &reqwest::Client,
+    credential: &GraphCredential,
+    id: &str,
+) -> Result<Option<(Option<String>, Vec<u8>)>, GraphFetchError> {
+    let url = graph::build_url(
+        &credential.base_url,
+        &["users", &credential.user_id, "contacts", id],
+        CONTACTS_SELECT_ITEM,
+    )?;
+    let Some(contact) = graph::fetch_one::<GraphContact>(client, credential, url, &[]).await?
+    else {
+        return Ok(None);
+    };
+    let raw = GraphApiBackend::contact_to_vcard(&contact);
+    Ok(Some((contact.odata_etag.clone(), raw.into_bytes())))
 }
 
 /// Backend Microsoft Graph API.

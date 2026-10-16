@@ -47,6 +47,12 @@ const DEFAULT_CALENDAR_NAME: &str = "Graph Calendar";
 const EVENTS_SELECT: &str = "$top=100&$select=id,iCalUId,subject,bodyPreview,start,end,isAllDay,\
      location,organizer,attendees,recurrence,categories,importance,lastModifiedDateTime,isCancelled";
 
+/// Los mismos campos que [`EVENTS_SELECT`] pero **sin `$top`**: para el `GET` de una
+/// sola entidad (la copia del servidor de un conflicto). `$top` es un parámetro de
+/// listado y no va en el `GET` de un objeto.
+const EVENTS_SELECT_ITEM: &str = "$select=id,iCalUId,subject,bodyPreview,start,end,isAllDay,\
+     location,organizer,attendees,recurrence,categories,importance,lastModifiedDateTime,isCancelled";
+
 /// Pedir las fechas en UTC en vez de en nombres de zona de Windows.
 const PREFER_UTC: (&str, &str) = ("Prefer", "outlook.timezone=\"UTC\"");
 
@@ -306,6 +312,36 @@ fn graph_datetime(property: &crate::ical::Property) -> Option<serde_json::Value>
 
     // Hora flotante (ni `Z` ni `TZID`): no se adivina la zona. `None` → conflicto.
     None
+}
+
+/// Trae la versión actual de un evento del servidor
+/// (`GET /users/{user}/events/{id}`) como `(su @odata.etag, su crudo iCal)`, para la
+/// **copia del servidor** de un conflicto (`#97`, equivalente Graph del `multiget`
+/// DAV de `replay`). Devuelve el iCal con la **misma conversión que la bajada**
+/// ([`GraphApiBackend::event_to_ical`]) y las fechas en UTC ([`PREFER_UTC`]), así
+/// `GetConflict` muestra la copia del servidor en el mismo formato que para un objeto
+/// DAV, y `take_server` adopta un crudo válido.
+///
+/// `Ok(None)` si el evento ya no está (`404`): el recurso se borró en el servidor, no
+/// hay copia que guardar. La URL se arma sobre `credential.base_url` con el `id`
+/// percent-codificado; **nunca** se sigue una URL de la respuesta.
+pub(crate) async fn fetch_server_copy(
+    client: &reqwest::Client,
+    credential: &GraphCredential,
+    id: &str,
+) -> Result<Option<(Option<String>, Vec<u8>)>, GraphFetchError> {
+    let url = graph::build_url(
+        &credential.base_url,
+        &["users", &credential.user_id, "events", id],
+        EVENTS_SELECT_ITEM,
+    )?;
+    let Some(event) =
+        graph::fetch_one::<GraphEvent>(client, credential, url, &[PREFER_UTC]).await?
+    else {
+        return Ok(None);
+    };
+    let raw = GraphApiBackend::event_to_ical(&event);
+    Ok(Some((event.odata_etag.clone(), raw.into_bytes())))
 }
 
 /// Backend Microsoft Graph API para calendario.
