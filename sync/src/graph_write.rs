@@ -245,24 +245,28 @@ fn build_body(area: &str, raw: &str, transaction_id: Option<&str>) -> Option<ser
     }
 }
 
-/// El `href` que la fila guardada usa para un `id` del servidor, con la **misma**
-/// escapada que la bajada del área (así la próxima bajada hace upsert sobre la
-/// misma fila, sin duplicar).
-fn href_for_id(area: &str, id: &str) -> String {
+/// El `href` que la fila guardada usa para un `id` del servidor, con la **misma
+/// escapada que la bajada de cada área** (`escape_text` en calendario,
+/// `escape_vcard_public` en contactos): así un `POST` recién creado se re-basa a la
+/// fila que la próxima bajada haría upsert, sin duplicar. Único lugar donde vive la
+/// escapada del lado escritura, para que no se separe entre las dos áreas.
+pub(crate) fn href_for_id(area: &str, id: &str) -> String {
     if area == CALENDAR_AREA {
-        calendar_graph::href_for_id(id)
+        crate::serialize::escape_text(id)
     } else {
-        contacts_graph::href_for_id(id)
+        crate::vcard::escape_vcard_public(id)
     }
 }
 
 /// El `id` del servidor a partir del `href` guardado: el inverso de
-/// [`href_for_id`], para interpolarlo en la ruta de `PATCH`/`DELETE`.
-fn id_from_href(area: &str, href: &str) -> String {
+/// [`href_for_id`], para interpolarlo en la ruta de `PATCH`/`DELETE`. Para un `id`
+/// real de Graph es la identidad; deshace la escapada sólo si el `id` trajera
+/// `;`, `,` o `\`.
+pub(crate) fn id_from_href(area: &str, href: &str) -> String {
     if area == CALENDAR_AREA {
-        calendar_graph::id_from_href(href)
+        crate::ical::unescape_text(href)
     } else {
-        contacts_graph::id_from_href(href)
+        crate::vcard::unescape_text(href)
     }
 }
 
@@ -317,16 +321,16 @@ async fn create(
     segment: &str,
     body: &serde_json::Value,
 ) -> Result<Created, GraphWriteError> {
-    let url = collection_url(credential, segment)?;
-    let response = client
-        .post(url)
-        .bearer_auth(credential.access_token.as_str())
-        .header("Accept", "application/json")
-        .json(body)
-        .send()
-        .await
-        .map_err(|e| GraphWriteError::Retryable(e.to_string()))?;
-    classify(response.status(), false)?;
+    let url = graph_url(credential, &["users", &credential.user_id, segment])?;
+    let response = send_write(
+        client,
+        credential,
+        reqwest::Method::POST,
+        url,
+        None,
+        Some(body),
+    )
+    .await?;
     let parsed = read_response(response).await?;
     match parsed.id {
         Some(id) if !id.is_empty() => Ok(Created {
@@ -352,16 +356,15 @@ async fn update(
     body: &serde_json::Value,
 ) -> Result<Option<String>, GraphWriteError> {
     let url = object_url(credential, segment, id)?;
-    let response = client
-        .patch(url)
-        .bearer_auth(credential.access_token.as_str())
-        .header("Accept", "application/json")
-        .header("If-Match", etag)
-        .json(body)
-        .send()
-        .await
-        .map_err(|e| GraphWriteError::Retryable(e.to_string()))?;
-    classify(response.status(), false)?;
+    let response = send_write(
+        client,
+        credential,
+        reqwest::Method::PATCH,
+        url,
+        Some(etag),
+        Some(body),
+    )
+    .await?;
     Ok(read_response(response).await?.etag)
 }
 
@@ -375,49 +378,71 @@ async fn delete(
     etag: &str,
 ) -> Result<(), GraphWriteError> {
     let url = object_url(credential, segment, id)?;
-    let response = client
-        .delete(url)
-        .bearer_auth(credential.access_token.as_str())
-        .header("If-Match", etag)
+    send_write(
+        client,
+        credential,
+        reqwest::Method::DELETE,
+        url,
+        Some(etag),
+        None,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Manda un pedido de escritura y clasifica su estado. Lo común a crear, editar y
+/// borrar: el token en `Authorization`, el `Accept` cuando hay respuesta que leer,
+/// el `If-Match` de precondición si lo hay, y el cuerpo JSON si lo hay. Un error de
+/// red es reintentable. El `is_delete` de [`classify`] sale de si el método es
+/// `DELETE` (es el único que trata un `404` como éxito idempotente).
+async fn send_write(
+    client: &reqwest::Client,
+    credential: &GraphCredential,
+    method: reqwest::Method,
+    url: url::Url,
+    if_match: Option<&str>,
+    body: Option<&serde_json::Value>,
+) -> Result<reqwest::Response, GraphWriteError> {
+    let is_delete = method == reqwest::Method::DELETE;
+    let mut request = client
+        .request(method, url)
+        .bearer_auth(credential.access_token.as_str());
+    // El `DELETE` no lee cuerpo de respuesta; los demás sí.
+    if !is_delete {
+        request = request.header("Accept", "application/json");
+    }
+    if let Some(etag) = if_match {
+        request = request.header("If-Match", etag);
+    }
+    if let Some(body) = body {
+        request = request.json(body);
+    }
+    let response = request
         .send()
         .await
         .map_err(|e| GraphWriteError::Retryable(e.to_string()))?;
-    classify(response.status(), true)
+    classify(response.status(), is_delete)?;
+    Ok(response)
 }
 
-/// La URL de la colección (`/users/{user}/{segmento}`), construida **sobre la
-/// base de la credencial**: el único origen al que viaja el token.
-fn collection_url(
-    credential: &GraphCredential,
-    segment: &str,
-) -> Result<url::Url, GraphWriteError> {
-    let mut url = graph::build_url(
-        &credential.base_url,
-        &["users", &credential.user_id, segment],
-        "",
-    )
-    .map_err(|e| GraphWriteError::Permanent(e.to_string()))?;
-    // `build_url` deja `?` por la query vacía; se limpia.
+/// Una URL de Graph construida **sobre la base de la credencial** —el único origen
+/// al que viaja el token— a partir de los segmentos de ruta. [`graph::build_url`]
+/// percent-codifica cada segmento, así que un `id` con `/`, `?` o `#` no puede
+/// alterar la ruta ni colar una query; el `?` que deja la query vacía se limpia.
+fn graph_url(credential: &GraphCredential, segments: &[&str]) -> Result<url::Url, GraphWriteError> {
+    let mut url = graph::build_url(&credential.base_url, segments, "")
+        .map_err(|e| GraphWriteError::Permanent(e.to_string()))?;
     url.set_query(None);
     Ok(url)
 }
 
-/// La URL de un objeto (`/users/{user}/{segmento}/{id}`). El `id` entra como un
-/// segmento más, así que [`graph::build_url`] lo percent-codifica: un `id` con
-/// `/`, `?` o `#` no puede alterar la ruta ni colar una query.
+/// La URL de un objeto (`/users/{user}/{segmento}/{id}`), sobre [`graph_url`].
 fn object_url(
     credential: &GraphCredential,
     segment: &str,
     id: &str,
 ) -> Result<url::Url, GraphWriteError> {
-    let mut url = graph::build_url(
-        &credential.base_url,
-        &["users", &credential.user_id, segment, id],
-        "",
-    )
-    .map_err(|e| GraphWriteError::Permanent(e.to_string()))?;
-    url.set_query(None);
-    Ok(url)
+    graph_url(credential, &["users", &credential.user_id, segment, id])
 }
 
 /// Clasifica el estado HTTP de una escritura. `is_delete` cambia qué se hace con

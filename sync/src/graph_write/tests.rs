@@ -661,7 +661,7 @@ mod end_to_end {
         let report = f.replay().await;
         assert_eq!(report.pushed, 1);
 
-        let server_href = crate::contacts_sync::graph::href_for_id("SRV-ID");
+        let server_href = crate::vcard::escape_vcard_public("SRV-ID");
         assert_eq!(
             f.stored(LOCAL, "raw_vcard").await,
             None,

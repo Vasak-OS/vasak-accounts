@@ -104,24 +104,9 @@ impl GraphPhysicalAddress {
 // ── Escritura por Graph (`#97`) ──────────────────────────────────────────────
 //
 // El lado de vuelta del backend: el empuje de `crate::graph_write` convierte el
-// crudo vCard de la cola a JSON de Graph y arma/invierte el `href`. Vive acá, junto
-// a la lectura, para que la escapada del `href` (`escape_vcard_public` de la
-// lectura) y su inverso queden en un solo lugar y no se separen.
-
-/// El `href` que la fila guardada usa para un `id` del servidor, **con la misma
-/// escapada que la lectura** (`contact_to_row`): así un `POST` recién creado se
-/// re-basa a la fila que la próxima bajada haría upsert, sin duplicar.
-pub(crate) fn href_for_id(id: &str) -> String {
-    vcard::escape_vcard_public(id)
-}
-
-/// El `id` del servidor a partir del `href` guardado: el inverso de
-/// [`href_for_id`], para interpolarlo en la ruta de `PATCH`/`DELETE`. Para un `id`
-/// real de Graph es la identidad; deshace la escapada sólo si el `id` trajera
-/// `;`, `,` o `\`.
-pub(crate) fn id_from_href(href: &str) -> String {
-    vcard::unescape_text(href)
-}
+// crudo vCard de la cola a JSON de Graph. La escapada del `href`
+// (`escape_vcard_public`, la misma de la lectura) vive con su inversa en
+// `graph_write::href_for_id`, un solo lugar para las dos áreas.
 
 /// Convierte el crudo vCard de un contacto al cuerpo JSON de Graph
 /// (`/me/contacts`), subconjunto conservador (decisión 3): `displayName`,
