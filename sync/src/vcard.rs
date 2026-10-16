@@ -833,11 +833,17 @@ pub fn embed_photo(raw: &str, base64: &str, media_type: &str) -> String {
 
     // El subtipo (`jpeg`, `png`, …) sale de un allowlist controlado
     // (`images::accepted_type`), así que es un token limpio para el parámetro
-    // `TYPE`; el valor base64 sí pasa por el escape de siempre.
-    let subtype = media_type
+    // `TYPE`; el valor base64 sí pasa por el escape de siempre. Igual se filtra el
+    // token a `[A-Za-z0-9-]` como auto-defensa por si apareciera otro llamador:
+    // cualquier char fuera de ese set se descarta y no entra crudo al vCard. El
+    // caso bueno (jpeg/png/…) pasa sin cambios.
+    let subtype: String = media_type
         .split('/')
         .nth(1)
         .unwrap_or("")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect::<String>()
         .to_ascii_uppercase();
     let type_param = if subtype.is_empty() {
         String::new()
@@ -1643,5 +1649,21 @@ mod tests {
     fn sin_cierre_no_se_inserta_la_foto() {
         let raw = "BEGIN:VCARD\r\nFN:Ana\r\n";
         assert_eq!(embed_photo(raw, "aGVsbG8=", "image/png"), raw);
+    }
+
+    /// Un subtipo con caracteres fuera de `[A-Za-z0-9-]` (un llamador que pase un
+    /// tipo de medio sucio) se filtra antes de armar el parámetro `TYPE`: no entra
+    /// nada crudo —ni un salto de línea ni un `:`— que rompa el vCard.
+    #[test]
+    fn un_subtipo_sucio_se_filtra_en_el_parametro_type() {
+        let raw = "BEGIN:VCARD\r\nFN:Ana\r\nEND:VCARD\r\n";
+        let result = embed_photo(raw, "aGVsbG8=", "image/png\r\nX-EVIL:1");
+
+        // El subtipo queda sólo con lo permitido (`-` sobrevive, `:` y el salto
+        // de línea no); lo inyectado se descartó.
+        assert!(result.contains("PHOTO;ENCODING=b;TYPE=PNGX-EVIL1:aGVsbG8="));
+        assert!(!result.contains("X-EVIL:1"), "no entró la línea inyectada");
+        // El cierre sigue siendo el único: no se partió la tarjeta.
+        assert_eq!(result.matches("END:VCARD").count(), 1);
     }
 }

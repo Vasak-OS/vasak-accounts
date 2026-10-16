@@ -509,7 +509,7 @@ impl Store {
             //    colección (una bajada anterior la trajo). El `DELETE` explícito
             //    —a diferencia del implícito de `OR REPLACE`— dispara el trigger
             //    `AFTER DELETE` del FTS y la cascada de derivados.
-            transaction
+            let displaced = transaction
                 .execute(
                     &format!(
                         "DELETE FROM {table}
@@ -519,6 +519,17 @@ impl Store {
                     rusqlite::params![new_href, op.object_href, op.collection_href],
                 )
                 .map_err(classify)?;
+            // En operación normal el DELETE no borra nada (nadie más ocupa el
+            // `id` que el servidor recién asignó). Si borró una fila, el servidor
+            // devolvió un `id` que ya era el `href` de OTRO objeto de la colección
+            // —sólo puede pasar con un servidor adversario—: se lo deja anotado
+            // sin datos sensibles (sólo el `href` nuevo, que es el `id` del server).
+            if displaced > 0 {
+                tracing::warn!(
+                    new_href,
+                    "complete_create desplazó una fila ajena al re-basar el href (id del servidor en conflicto)"
+                );
+            }
             // 2) Re-basar la fila local al `id` del servidor (sin `OR REPLACE`: la
             //    fila en conflicto ya no está).
             transaction
