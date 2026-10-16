@@ -575,6 +575,87 @@ impl Store {
             .map(|_| ())
             .map_err(classify)
     }
+
+    /// Los bytes de la foto de un contacto y su tipo de medio, o `None` si no
+    /// tiene foto guardada (sin enlace, o con enlace pero sin foto todavía).
+    ///
+    /// Aparte de [`Self::contact_enrichment`] a propósito: la pasada de matching
+    /// e incrementalidad sólo necesita el `resourceName` y los testigos, y no
+    /// quiere cargar el `BLOB` de la foto en cada fila. El `BLOB` se lee sólo acá,
+    /// en el camino de lectura que lo inyecta al vCard de salida.
+    pub fn contact_photo(&self, contact_id: i64) -> Result<Option<(Vec<u8>, String)>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT photo, photo_media_type FROM contact_enrichment
+                  WHERE contact_id = ?1 AND photo IS NOT NULL AND photo_media_type IS NOT NULL",
+                [contact_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(classify)
+    }
+
+    /// Guarda los bytes de la foto de un contacto y su tipo de medio, en la fila
+    /// de enriquecimiento que ya tiene que existir (la crea
+    /// [`Self::upsert_contact_enrichment`] con el `resourceName` y los testigos).
+    ///
+    /// Sube la generación de los contactos en la misma transacción, igual que
+    /// cualquier otra escritura que cambia lo que una aplicación ve: una foto
+    /// nueva aparece en la próxima lectura sin esperar a que el contacto cambie
+    /// por otra cosa. Si no había fila para ese contacto —nada que enriquecer—,
+    /// no toca nada ni sube la generación.
+    pub fn set_contact_photo(
+        &mut self,
+        contact_id: i64,
+        photo: &[u8],
+        media_type: &str,
+    ) -> Result<(), StoreError> {
+        let transaction = self.connection.transaction().map_err(classify)?;
+        let changed = transaction
+            .execute(
+                "UPDATE contact_enrichment SET photo = ?2, photo_media_type = ?3
+                  WHERE contact_id = ?1",
+                rusqlite::params![contact_id, photo, media_type],
+            )
+            .map_err(classify)?;
+        let generation = if changed > 0 {
+            Some(bump_generation(&transaction, CONTACTS_AREA)?)
+        } else {
+            None
+        };
+        transaction.commit().map_err(classify)?;
+        if let Some(generation) = generation {
+            self.note_change(CONTACTS_AREA, generation);
+        }
+        Ok(())
+    }
+
+    /// Un mapa de correo (en minúsculas) al `id` del contacto local que lo lleva,
+    /// para casar por email a las personas de la People API.
+    ///
+    /// **Sólo contactos sin op pendiente** (`pending_op IS NULL`): una edición
+    /// local sin confirmar no se enriquece, igual que el guard de
+    /// [`Self::apply_contacts`] y del borrado masivo. Un correo que aparece en más
+    /// de un contacto queda apuntando al último; en una agenda personal es raro, y
+    /// cualquiera de los dos es un casamiento válido.
+    pub fn contact_ids_by_email(&self) -> Result<HashMap<String, i64>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT e.value, e.contact_id FROM contact_emails e
+                   JOIN contacts c ON c.id = e.contact_id
+                  WHERE c.pending_op IS NULL AND e.value != ''",
+            )
+            .map_err(classify)?;
+        let rows = statement
+            .query_map([], |row| {
+                let value: String = row.get(0)?;
+                let id: i64 = row.get(1)?;
+                Ok((value.to_ascii_lowercase(), id))
+            })
+            .map_err(classify)?;
+        rows.collect::<Result<HashMap<_, _>, _>>().map_err(classify)
+    }
 }
 
 fn upsert_contact(

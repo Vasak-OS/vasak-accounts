@@ -31,18 +31,19 @@
 
 pub mod backend;
 pub mod carddav;
+pub mod google;
 pub mod graph;
 pub mod ldap;
 #[cfg(test)]
 pub mod ldap_fake;
 
-use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::broker::{Account, Broker, Provider};
+use crate::broker::Broker;
 use crate::contacts_sync::backend::{ContactBackendKind, SyncContext, SyncResult};
 use crate::contacts_sync::carddav::CardDavBackend;
+use crate::contacts_sync::google::GoogleBackend;
 use crate::contacts_sync::graph::GraphApiBackend;
 use crate::contacts_sync::ldap::{LdapBackend, LdapCredentialSource};
 use crate::dav::webdav::HttpPolicy;
@@ -100,6 +101,12 @@ pub struct SyncReport {
     pub conflicts: usize,
     /// Escrituras locales que siguen pendientes al terminar la vuelta.
     pub pending: usize,
+    /// Fotos que la pasada de enriquecimiento (People API de Google) bajó y
+    /// guardó en esta vuelta.
+    pub photos_fetched: usize,
+    /// Fotos que no se re-bajaron porque el `resourceName` y el `photo_etag`
+    /// guardados coincidían (corrida incremental).
+    pub photos_unchanged: usize,
 }
 
 /// La sincronización de contactos de todas las cuentas.
@@ -156,6 +163,12 @@ impl<K: KeySource> ContactsSync<K> {
         // Buscar el proveedor en el catálogo
         for provider in providers {
             if provider.id == provider_type {
+                // Google es `kind=oauth2` como cualquier CardDAV con OAuth; se lo
+                // distingue por el id del proveedor, no por el kind, para sumarle
+                // la pasada de enriquecimiento por la People API.
+                if provider.id == "google" {
+                    return ContactBackendKind::Google;
+                }
                 return match provider.kind.as_str() {
                     "graph" => ContactBackendKind::GraphApi,
                     "ldap" => ContactBackendKind::Ldap,
@@ -220,6 +233,43 @@ impl<K: KeySource> ContactsSync<K> {
 
                 CardDavBackend
                     .sync(ctx, &credential, HttpPolicy::default())
+                    .await
+            }
+            ContactBackendKind::Google => {
+                // Google usa la misma credencial CardDAV que el camino genérico
+                // (OAuth en `Bearer`); el backend la reusa de token para la pasada
+                // de People API, así que no se pide el token una segunda vez.
+                let credential_source = crate::dav_sync::BrokerCredentials;
+                let credential = match credential_source
+                    .credential(account_id, CONTACTS_AREA)
+                    .await
+                {
+                    Ok(credential) => credential,
+                    Err(CredentialError::Denied) => {
+                        tracing::info!("'{account_id}': sin permiso para los contactos");
+                        self.set_status(account_id, AreaState::Unavailable, DENIED_DETAIL)
+                            .await;
+                        return SyncResult::Denied;
+                    }
+                    Err(CredentialError::Failed(detail)) => {
+                        tracing::warn!(
+                            "'{account_id}': no se obtuvo la credencial de los contactos: {detail}"
+                        );
+                        let shown =
+                            "no se obtuvo la credencial de la cuenta del servicio de cuentas";
+                        self.set_status(account_id, AreaState::Failed, shown).await;
+                        return SyncResult::Failed(shown.into());
+                    }
+                };
+
+                let ctx = SyncContext {
+                    manager: &self.manager,
+                    account_id,
+                    notify: self.notify.clone(),
+                };
+
+                GoogleBackend
+                    .sync(ctx, &credential, HttpPolicy::default(), None)
                     .await
             }
             ContactBackendKind::GraphApi => {

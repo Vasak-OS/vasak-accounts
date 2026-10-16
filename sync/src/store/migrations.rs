@@ -557,6 +557,30 @@ CREATE TABLE contact_enrichment (
 CREATE UNIQUE INDEX contact_enrichment_by_resource ON contact_enrichment (resource_name);
 ";
 
+/// v8 (PR 2 de P5, `vasak-accounts#111`): el payload de la foto que la People API
+/// de Google trae y el CardDAV de Google no suele traer embebida.
+///
+/// V7 guardó el *enlace* (resourceName/etag/photo_etag), no los *bytes*: no había
+/// dónde ponerlos. La foto NO puede ir en el `raw_vcard` —la pisaría el replay de
+/// una edición local sin confirmar (decisión 3 del taller)— ni en un archivo en
+/// disco —el almacén es completo y cifrado (decisión 1), y una foto de contacto
+/// es dato privado—. Por eso vive acá, en dos columnas nuevas de la misma fila
+/// del enlace, dentro de la base cifrada:
+///
+/// - **`photo`**: los bytes crudos de la imagen, un `BLOB`. La lectura
+///   (`contacts_read::cards_page`) los inyecta como una propiedad `PHOTO` al
+///   vCard de salida, fuera del crudo guardado.
+/// - **`photo_media_type`**: el `Content-Type` real con el que se descargó
+///   (`image/jpeg`, `image/png`, …), para armar la línea `PHOTO`. No se adivina.
+///
+/// Las dos nulas mientras no se bajó ninguna foto; se llenan por separado de los
+/// testigos (`Store::set_contact_photo`) para que la pasada de matching e
+/// incrementalidad no cargue el `BLOB` en cada `contact_enrichment()`.
+const V8: &str = "
+ALTER TABLE contact_enrichment ADD COLUMN photo BLOB;
+ALTER TABLE contact_enrichment ADD COLUMN photo_media_type TEXT;
+";
+
 /// Todas las migraciones, en orden.
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
@@ -567,6 +591,7 @@ pub fn migrations() -> Migrations<'static> {
         M::up(V5),
         M::up(V6),
         M::up(V7),
+        M::up(V8),
     ])
 }
 
@@ -603,7 +628,7 @@ mod tests {
         let mut connection = Connection::open_in_memory().unwrap();
         apply(&mut connection).unwrap();
         let version = schema_version(&connection).unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
 
         let tables = |c: &Connection| -> Vec<String> {
             let mut statement = c
@@ -728,7 +753,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 7);
+        assert_eq!(schema_version(&connection).unwrap(), 8);
 
         // Lo que había sigue, y la marca nueva es NULL.
         let object_mark: Option<String> = connection
@@ -771,7 +796,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 7);
+        assert_eq!(schema_version(&connection).unwrap(), 8);
 
         // La op sigue, en conflicto, y las columnas nuevas son NULL.
         let (state, server_etag, server_raw): (String, Option<String>, Option<Vec<u8>>) =
@@ -830,7 +855,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 7);
+        assert_eq!(schema_version(&connection).unwrap(), 8);
 
         // El contacto sigue, y la tabla nueva arranca vacía.
         let contacts: i64 = connection
@@ -908,6 +933,71 @@ mod tests {
             .query_row("SELECT count(*) FROM contact_enrichment", [], |r| r.get(0))
             .unwrap();
         assert_eq!(links, 0);
+    }
+
+    /// **v7 → v8 no pierde nada**: un enlace de enriquecimiento de una base del
+    /// PR1 sigue ahí después de migrar, las dos columnas nuevas de la foto
+    /// arrancan nulas, y se les pueden guardar los bytes y el tipo.
+    #[test]
+    fn de_v7_a_v8_suma_las_columnas_de_la_foto_nulas() {
+        let mut connection = at_version(7);
+        connection
+            .execute(
+                "INSERT INTO address_books (id, href, display_name, updated_at)
+                 VALUES (1, 'https://x/a/', 'A', 'ayer')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO contacts
+                   (id, address_book_id, href, etag, uid, display_name, sort_key, raw_vcard,
+                    updated_at)
+                 VALUES (1, 1, 'https://x/a/ana.vcf', '\"v1\"', 'u1', 'Ana', 'ana',
+                    'BEGIN:VCARD', 'ayer')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO contact_enrichment (contact_id, resource_name, etag, photo_etag)
+                 VALUES (1, 'people/c1', '\"e1\"', '\"p1\"')",
+                [],
+            )
+            .unwrap();
+
+        apply(&mut connection).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 8);
+
+        // El enlace sigue, y las columnas nuevas arrancan nulas.
+        let (resource, photo, media): (String, Option<Vec<u8>>, Option<String>) = connection
+            .query_row(
+                "SELECT resource_name, photo, photo_media_type
+                   FROM contact_enrichment WHERE contact_id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(resource, "people/c1");
+        assert_eq!(photo, None);
+        assert_eq!(media, None);
+
+        // Se les pueden guardar los bytes y el tipo.
+        connection
+            .execute(
+                "UPDATE contact_enrichment SET photo = ?1, photo_media_type = ?2 WHERE contact_id = 1",
+                rusqlite::params![&[1u8, 2u8, 3u8][..], "image/jpeg"],
+            )
+            .unwrap();
+        let (photo, media): (Option<Vec<u8>>, Option<String>) = connection
+            .query_row(
+                "SELECT photo, photo_media_type FROM contact_enrichment WHERE contact_id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(photo.as_deref(), Some(&[1u8, 2u8, 3u8][..]));
+        assert_eq!(media.as_deref(), Some("image/jpeg"));
     }
 
     /// La marca `pending_op` sólo acepta los dos valores conocidos, o `NULL`.
@@ -1078,7 +1168,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 7);
+        assert_eq!(schema_version(&connection).unwrap(), 8);
         let message: String = connection
             .query_row("SELECT message FROM sync_log", [], |row| row.get(0))
             .unwrap();
@@ -1379,7 +1469,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 7);
+        assert_eq!(schema_version(&connection).unwrap(), 8);
         assert_eq!(found(&connection, "jose"), vec![id]);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_emails"), 1);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_phones"), 1);
@@ -1550,7 +1640,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 7);
+        assert_eq!(schema_version(&connection).unwrap(), 8);
         assert_eq!(found(&connection, "jose"), vec![id]);
         assert_eq!(count(&connection, "SELECT count(*) FROM occurrences"), 2);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_emails"), 1);

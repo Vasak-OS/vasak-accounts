@@ -331,12 +331,13 @@ fn cards_page(
 ) -> Result<Page<ContactCard>, StoreError> {
     let mut sql = String::from(
         "SELECT c.id, c.address_book_id, c.sort_key, c.href, c.raw_vcard,
-                c.etag, c.pending_op, pdo.state
+                c.etag, c.pending_op, pdo.state, ce.photo, ce.photo_media_type
            FROM contacts c
            JOIN address_books ab ON ab.id = c.address_book_id
            LEFT JOIN pending_dav_ops pdo
                   ON pdo.area = 'contacts' AND pdo.object_href = c.href
                  AND pdo.collection_href = ab.href
+           LEFT JOIN contact_enrichment ce ON ce.contact_id = c.id
           WHERE c.display_name != ''
             AND (c.pending_op IS NULL OR c.pending_op != 'delete')",
     );
@@ -362,11 +363,24 @@ fn cards_page(
         let sort_key: String = row.get(2).map_err(classify)?;
         let pending_op: Option<String> = row.get(6).map_err(classify)?;
         let op_state: Option<String> = row.get(7).map_err(classify)?;
+        let raw_vcard: String = row.get(4).map_err(classify)?;
+        // La foto del enriquecimiento (People API de Google) se inyecta al vCard
+        // de salida, nunca al crudo guardado, y **sólo si no hay op pendiente**:
+        // una tarjeta con una edición local sin confirmar se sirve tal cual.
+        let photo: Option<Vec<u8>> = row.get(8).map_err(classify)?;
+        let photo_media_type: Option<String> = row.get(9).map_err(classify)?;
+        let vcard = match (pending_op.as_deref(), photo, photo_media_type) {
+            (None, Some(bytes), Some(media_type)) => {
+                let base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                vcard::embed_photo(&raw_vcard, &base64, &media_type)
+            }
+            _ => raw_vcard,
+        };
         let card = ContactCard {
             id: id.to_string(),
             address_book_id: row.get::<_, i64>(1).map_err(classify)?.to_string(),
             href: row.get(3).map_err(classify)?,
-            vcard: row.get(4).map_err(classify)?,
+            vcard,
             etag: row
                 .get::<_, Option<String>>(5)
                 .map_err(classify)?

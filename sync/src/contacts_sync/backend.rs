@@ -39,4 +39,8 @@ pub enum ContactBackendKind {
     CardDav,
     GraphApi,
     Ldap,
+    /// Google: CardDAV (como [`Self::CardDav`]) más una pasada de enriquecimiento
+    /// por la People API. No se distingue por `kind` —Google es `oauth2`— sino por
+    /// `provider.id == "google"` en el despacho.
+    Google,
 }
