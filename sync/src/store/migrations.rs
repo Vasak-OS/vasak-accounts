@@ -1000,6 +1000,40 @@ mod tests {
         assert_eq!(media.as_deref(), Some("image/jpeg"));
     }
 
+    /// Las columnas de la foto existen tras migrar de cero y **aplicar dos veces
+    /// no las toca**: `aplicar_dos_veces_no_cambia_nada` compara sólo los nombres
+    /// de `sqlite_master`, que no ven las columnas.
+    #[test]
+    fn aplicar_dos_veces_conserva_las_columnas_de_la_foto() {
+        let columns = |c: &Connection| -> Vec<(String, String)> {
+            let mut statement = c
+                .prepare(
+                    "SELECT name, type FROM pragma_table_info('contact_enrichment') ORDER BY cid",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let mut connection = Connection::open_in_memory().unwrap();
+        apply(&mut connection).unwrap();
+        let before = columns(&connection);
+        assert!(
+            before.contains(&("photo".into(), "BLOB".into())),
+            "{before:?}"
+        );
+        assert!(
+            before.contains(&("photo_media_type".into(), "TEXT".into())),
+            "{before:?}"
+        );
+
+        apply(&mut connection).unwrap();
+        assert_eq!(columns(&connection), before);
+        assert_eq!(schema_version(&connection).unwrap(), 8);
+    }
+
     /// La marca `pending_op` sólo acepta los dos valores conocidos, o `NULL`.
     #[test]
     fn la_marca_pending_op_esta_acotada() {
