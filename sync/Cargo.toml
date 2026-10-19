@@ -84,6 +84,26 @@ vasak-accounts-common.workspace = true
 # Cliente LDAP para sincronización de contactos contra Active Directory.
 # default-features = false para evitar native-tls; tls-rustls-ring para LDAPS con rustls+ring.
 ldap3 = { version = "0.12", default-features = false, features = ["tls-rustls-ring"] }
+# S/MIME (vasak-mail#78). Todo RustCrypto puro, sin bibliotecas compartidas
+# nuevas (verificado con `readelf`: el único NEEDED fuera de la libc sigue
+# siendo `libcrypto.so.3`, de SQLCipher). Van pineados a la generación der-0.7:
+# `cms` 0.2 fija esa línea (x509-cert 0.2, spki 0.7, pkcs5 0.7, pkcs8 0.10), y
+# no se mezcla con la der-0.8 (0.3/0.8) para no duplicar der/x509/aes/cbc en el
+# árbol. `cms` va sin `builder` acá: PR2 sólo parsea el `.p12`; firmar y cifrar
+# (que sí piden `builder`) son PR3/PR4. Ver `store/smime_key.rs`.
+# `kdf` para derivar la clave del MAC del PFX (HMAC con el KDF de PKCS#12) y
+# verificarlo antes de confiar en el contenido del `.p12`. Ver `verify_mac`.
+pkcs12 = { version = "0.1", features = ["kdf"] }
+cms = "0.2"
+pkcs5 = { version = "0.7", features = ["pbes2", "alloc"] }
+pkcs8 = { version = "0.10", features = ["encryption", "alloc"] }
+der = { version = "0.7", features = ["alloc", "oid"] }
+const-oid = { version = "0.9", features = ["db"] }
+spki = { version = "0.7", features = ["alloc"] }
+# El HMAC del MAC del `.p12` y su hash. Ya estaban en el candado (los trae
+# `pbkdf2`/`pkcs5`): no suman crate nueva ni biblioteca compartida.
+hmac = "0.12"
+sha2 = "0.10"
 
 [dev-dependencies]
 # Leer la superficie de `AccountsSync` y `AccountsStore` desde su `Introspect`,
