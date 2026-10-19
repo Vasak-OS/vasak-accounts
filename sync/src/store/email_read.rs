@@ -125,6 +125,24 @@ pub struct MessageSummary {
     pub size: i64,
 }
 
+/// Resumen acotado de una interacción de correo con una dirección.
+///
+/// Lo mínimo para pintar el historial en la ficha de un contacto: cuándo, de
+/// qué, de quién, y con qué UID se abre después en la aplicación de correo.
+/// **Sin cuerpo** y sin el resto de la casilla: lo que ve otra aplicación es un
+/// índice, no el correo.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InteractionSummary {
+    pub uid: u64,
+    pub date_ts: i64,
+    pub subject: String,
+    pub from_addr: String,
+}
+
+/// Cuántas filas candidatas (las que el prefiltro `LIKE` deja pasar) recorre
+/// [`Store::messages_with`] como mucho antes de cortar.
+pub const INTERACTIONS_SCAN_CAP: usize = 2000;
+
 /// Un mensaje entero (cuando se abre).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MessageFull {
@@ -465,6 +483,78 @@ impl Store {
         })
     }
 
+    /// Los últimos `limit` mensajes intercambiados con `address`: los que esa
+    /// dirección mandó (en `from`) o recibió (en `to` o `cc`), de **todas** las
+    /// casillas, más nuevos primero. Es el historial de correo con una persona
+    /// que muestra la ficha de un contacto.
+    ///
+    /// `address` se compara **entera** (ver [`header_has_address`]): `ana@x.com`
+    /// no empareja con `ana@x.com.ar` ni con `bana@x.com`. Es lo que separa
+    /// «me escribí con esta persona» de «con alguien de un dominio parecido», y
+    /// la diferencia importa porque esto decide qué correo ve otra aplicación.
+    ///
+    /// Devuelve metadatos acotados ([`InteractionSummary`]): fecha, asunto,
+    /// remitente y UID. **Nunca el cuerpo** ni el resto de la casilla.
+    ///
+    /// El `LIKE` del SQL es sólo un prefiltro barato —acota a las filas que
+    /// contienen la dirección como subcadena—; la igualdad la decide
+    /// [`header_has_address`] en Rust. Se recorren como mucho
+    /// [`INTERACTIONS_SCAN_CAP`] filas candidatas.
+    ///
+    /// shortcut: con más de INTERACTIONS_SCAN_CAP coincidencias de subcadena
+    /// podría saltarse una exacta muy vieja; subir el tope o paginar si una
+    /// casilla real lo alcanza (hoy `limit` es chico y el prefiltro muy selectivo).
+    pub fn messages_with(
+        &self,
+        address: &str,
+        limit: usize,
+    ) -> Result<Vec<InteractionSummary>, StoreError> {
+        let needle = address.trim().to_ascii_lowercase();
+        if needle.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let like = format!("%{}%", like_escape(&needle));
+
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT m.uid, m.date_ts, m.subject, m.from_addr, m.to_addrs, m.cc_addrs
+                 FROM messages m
+                 WHERE lower(m.from_addr) LIKE ?1 ESCAPE '\\'
+                    OR lower(m.to_addrs)  LIKE ?1 ESCAPE '\\'
+                    OR lower(m.cc_addrs)  LIKE ?1 ESCAPE '\\'
+                 ORDER BY m.sort_key DESC, m.id
+                 LIMIT ?2",
+            )
+            .map_err(classify)?;
+        let mut rows = statement
+            .query(rusqlite::params![like, INTERACTIONS_SCAN_CAP as i64])
+            .map_err(classify)?;
+
+        let mut items = Vec::new();
+        while let Some(row) = rows.next().map_err(classify)? {
+            let from_addr: String = row.get(3).map_err(classify)?;
+            let to_addrs: String = row.get(4).map_err(classify)?;
+            let cc_addrs: String = row.get(5).map_err(classify)?;
+            if !(header_has_address(&from_addr, &needle)
+                || header_has_address(&to_addrs, &needle)
+                || header_has_address(&cc_addrs, &needle))
+            {
+                continue;
+            }
+            items.push(InteractionSummary {
+                uid: row.get::<_, i64>(0).map_err(classify)? as u64,
+                date_ts: row.get(1).map_err(classify)?,
+                subject: row.get(2).map_err(classify)?,
+                from_addr,
+            });
+            if items.len() == limit {
+                break;
+            }
+        }
+        Ok(items)
+    }
+
     /// Un mensaje entero (para abrir).
     pub fn get_message(&self, message_id: i64) -> Result<Option<MessageFull>, StoreError> {
         let mut statement = self
@@ -574,6 +664,60 @@ impl Store {
             .map_err(classify)?;
         rows.collect::<Result<_, _>>().map_err(classify)
     }
+}
+
+/// Si `address` (ya normalizada: minúsculas, sin espacios al borde) aparece
+/// como una dirección **completa** dentro de `field` —el valor crudo de un
+/// encabezado `From`, `To` o `Cc`, que puede traer nombres y varias
+/// direcciones, p. ej. `"Ana Pérez <ana@x.com>, Bob <bob@y.com>"`—.
+///
+/// Compara la dirección entera, no una subcadena: exige que a cada lado del
+/// match haya un **borde** y no otro carácter de dirección, así `ana@x.com` no
+/// empareja con `ana@x.com.ar` (lo que sigue es `.`) ni con `bana@x.com` (lo que
+/// precede es `b`). Esa es la propiedad que cuida la privacidad acá: una
+/// aplicación que pide el historial con una persona no termina viendo el de otra
+/// de un dominio parecido.
+fn header_has_address(field: &str, address: &str) -> bool {
+    if address.is_empty() {
+        return false;
+    }
+    let haystack = field.to_ascii_lowercase();
+    let bytes = haystack.as_bytes();
+    let mut from = 0;
+    while let Some(offset) = haystack[from..].find(address) {
+        let start = from + offset;
+        let end = start + address.len();
+        let before_is_border = start == 0 || !is_address_char(bytes[start - 1] as char);
+        let after_is_border = end == bytes.len() || !is_address_char(bytes[end] as char);
+        if before_is_border && after_is_border {
+            return true;
+        }
+        // Un carácter entero, no un byte: `start + 1` caería dentro de uno multibyte.
+        from = start + haystack[start..].chars().next().map_or(1, char::len_utf8);
+    }
+    false
+}
+
+/// Los caracteres que pueden formar parte de una dirección (`atext` de RFC 5322
+/// más `@` y `.`). Un byte que no es uno de éstos separa una dirección de lo que
+/// la rodea en un encabezado. Un byte no ASCII —una tilde de un nombre— no es
+/// uno de éstos, así que también cuenta como borde, que es lo correcto.
+fn is_address_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "@.!#$%&'*+-/=?^_`{|}~".contains(c)
+}
+
+/// Escapa `%`, `_` y `\` para que viajen como literales en un patrón `LIKE`
+/// (con `ESCAPE '\'`). Una dirección rara vez los trae, pero `_` es válido en la
+/// parte local y sin esto emparejaría cualquier carácter en el prefiltro.
+fn like_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn message_from_row(row: &Row) -> Result<MessageSummary, StoreError> {
@@ -1085,5 +1229,362 @@ mod tests {
             .unwrap();
         assert_eq!(page3.items.len(), 1);
         assert!(page3.next_cursor.is_none());
+    }
+
+    // ---- MessagesWith: historial de correo con una dirección ----
+
+    use super::{header_has_address, INTERACTIONS_SCAN_CAP};
+
+    /// Un mensaje con los tres encabezados de dirección a mano.
+    fn mail(
+        mailbox_id: i64,
+        uid: u32,
+        from: &str,
+        to: &str,
+        cc: &str,
+        subject: &str,
+        date_ts: i64,
+    ) -> MessageOp {
+        MessageOp::Upsert(Box::new(MessageRow {
+            mailbox_id,
+            uid: uid.into(),
+            message_id: Some(format!("<m{mailbox_id}-{uid}@x>")),
+            from_addr: from.into(),
+            to_addrs: to.into(),
+            cc_addrs: cc.into(),
+            bcc_addrs: "".into(),
+            reply_to: None,
+            subject: subject.into(),
+            date_ts,
+            sort_key: date_ts,
+            flags_seen: false,
+            flags_answered: false,
+            flags_flagged: false,
+            flags_draft: false,
+            flags_deleted: false,
+            has_attachments: false,
+            size: 100,
+        }))
+    }
+
+    /// Una base con dos casillas (Recibidos y Enviados); devuelve sus ids.
+    fn store_with_inbox_and_sent() -> (TempDir, Store, i64, i64) {
+        let (temp, mut store) = make_store();
+        store
+            .upsert_mailboxes(&[
+                MailboxListing {
+                    name: "INBOX".into(),
+                    display_name: "Bandeja".into(),
+                    role: MailboxRole::Inbox,
+                },
+                MailboxListing {
+                    name: "Sent".into(),
+                    display_name: "Enviados".into(),
+                    role: MailboxRole::Sent,
+                },
+            ])
+            .unwrap();
+        let boxes = store.mailboxes().unwrap();
+        let id_of = |name: &str| boxes.iter().find(|b| b.name == name).unwrap().id;
+        let (inbox, sent) = (id_of("INBOX"), id_of("Sent"));
+        (temp, store, inbox, sent)
+    }
+
+    #[test]
+    fn la_direccion_se_compara_entera_y_sin_distinguir_mayusculas() {
+        // Coinciden.
+        for field in [
+            "ana@x.com",
+            "ANA@X.COM",
+            "Ana Pérez <ana@x.com>",
+            "\"Pérez, Ana\" <Ana@X.com>",
+            "bob@y.com, ana@x.com",
+            "Bob <bob@y.com>,Ana <ana@x.com>, Eva <eva@z.com>",
+            "<ana@x.com>",
+            "ana@x.com;bob@y.com",
+        ] {
+            assert!(
+                header_has_address(field, "ana@x.com"),
+                "{field} tenía que coincidir"
+            );
+        }
+        // Vecinos que NO son la persona: por dominio, por parte local, por
+        // prefijo y por sufijo.
+        for field in [
+            "ana@x.com.ar",
+            "bana@x.com",
+            "ana@x.co",
+            "ana@xx.com",
+            "mana@x.com.mx, <ana@x.org>",
+            "ana+promo@x.com",
+            "sub.ana@x.com",
+            "ana@x.com-old",
+            "Nombre <bana@x.com>",
+            "",
+        ] {
+            assert!(
+                !header_has_address(field, "ana@x.com"),
+                "{field} NO tenía que coincidir"
+            );
+        }
+        // Una dirección vacía no empareja con nada.
+        assert!(!header_has_address("ana@x.com", ""));
+    }
+
+    #[test]
+    fn una_direccion_que_empieza_con_un_caracter_no_ascii_no_hace_caer_la_busqueda() {
+        // El avance por bytes tras un match descartado no puede partir un
+        // carácter UTF-8: caería con un panic en el servicio.
+        assert!(!header_has_address("xñandu@x.com", "ñandu@x.com"));
+        assert!(header_has_address("Ñandú <ñandu@x.com>", "ñandu@x.com"));
+    }
+
+    #[test]
+    fn el_historial_junta_recibidos_y_enviados_mas_nuevos_primero_y_sin_vecinos() {
+        let (_t, mut store, inbox, sent) = store_with_inbox_and_sent();
+        store
+            .apply_messages(
+                vec![
+                    // Ana escribe (from).
+                    mail(
+                        inbox,
+                        1,
+                        "Ana Pérez <ana@x.com>",
+                        "yo@x.com",
+                        "",
+                        "recibido viejo",
+                        100,
+                    ),
+                    mail(inbox, 2, "ana@x.com", "yo@x.com", "", "recibido nuevo", 400),
+                    // Vecinos que no son Ana.
+                    mail(
+                        inbox,
+                        3,
+                        "ana@x.com.ar",
+                        "yo@x.com",
+                        "",
+                        "vecino dominio",
+                        450,
+                    ),
+                    mail(
+                        inbox,
+                        4,
+                        "bana@x.com",
+                        "yo@x.com",
+                        "",
+                        "vecino prefijo",
+                        460,
+                    ),
+                    mail(inbox, 5, "ana@x.co", "yo@x.com", "", "vecino tld", 470),
+                    // Un tercero.
+                    mail(inbox, 6, "eva@z.com", "yo@x.com", "", "ajeno", 480),
+                ],
+                inbox,
+            )
+            .unwrap();
+        store
+            .apply_messages(
+                vec![
+                    // Yo le escribo (to, con más destinatarios) y la copio (cc).
+                    mail(
+                        sent,
+                        1,
+                        "yo@x.com",
+                        "Bob <bob@y.com>, Ana <ANA@x.com>",
+                        "",
+                        "enviado to",
+                        300,
+                    ),
+                    mail(
+                        sent,
+                        2,
+                        "yo@x.com",
+                        "bob@y.com",
+                        "ana@x.com",
+                        "enviado cc",
+                        200,
+                    ),
+                    mail(
+                        sent,
+                        3,
+                        "yo@x.com",
+                        "ana@x.com.ar",
+                        "bana@x.com",
+                        "enviado vecino",
+                        500,
+                    ),
+                ],
+                sent,
+            )
+            .unwrap();
+
+        let items = store.messages_with("ana@x.com", 50).unwrap();
+        let subjects: Vec<&str> = items.iter().map(|i| i.subject.as_str()).collect();
+        assert_eq!(
+            subjects,
+            vec![
+                "recibido nuevo",
+                "enviado to",
+                "enviado cc",
+                "recibido viejo"
+            ],
+            "from + to + cc de las dos casillas, desc por fecha, sin vecinos"
+        );
+        assert!(items.windows(2).all(|w| w[0].date_ts >= w[1].date_ts));
+
+        // La comparación no distingue mayúsculas en lo que se pide.
+        assert_eq!(store.messages_with("  ANA@X.COM ", 50).unwrap().len(), 4);
+
+        // Un N chico corta los más viejos, no los nuevos.
+        let top2 = store.messages_with("ana@x.com", 2).unwrap();
+        let subjects: Vec<&str> = top2.iter().map(|i| i.subject.as_str()).collect();
+        assert_eq!(subjects, vec!["recibido nuevo", "enviado to"]);
+
+        // Sin dirección o sin cupo: nada.
+        assert!(store.messages_with("", 50).unwrap().is_empty());
+        assert!(store.messages_with("   ", 50).unwrap().is_empty());
+        assert!(store.messages_with("ana@x.com", 0).unwrap().is_empty());
+        // Una dirección que nadie usó: vacío, no error.
+        assert!(store.messages_with("nadie@x.com", 50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn el_guion_bajo_y_el_porcentaje_de_la_direccion_no_son_comodines() {
+        let (_t, mut store, inbox, _sent) = store_with_inbox_and_sent();
+        store
+            .apply_messages(
+                vec![
+                    mail(
+                        inbox,
+                        1,
+                        "ana_b@x.com",
+                        "yo@x.com",
+                        "",
+                        "con guion bajo",
+                        100,
+                    ),
+                    mail(inbox, 2, "anaxb@x.com", "yo@x.com", "", "otra persona", 200),
+                ],
+                inbox,
+            )
+            .unwrap();
+        let items = store.messages_with("ana_b@x.com", 10).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].subject, "con guion bajo");
+        // `%` tampoco abre el filtro a todo el buzón.
+        assert!(store.messages_with("%", 10).unwrap().is_empty());
+        assert!(store.messages_with("_", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn el_resumen_del_historial_no_lleva_el_cuerpo() {
+        let (_t, mut store, inbox, _sent) = store_with_inbox_and_sent();
+        store
+            .apply_messages(
+                vec![mail(inbox, 1, "ana@x.com", "yo@x.com", "", "hola", 100)],
+                inbox,
+            )
+            .unwrap();
+        let id = store.list_messages(inbox, None, 10).unwrap().items[0].id;
+        store
+            .upsert_message_body(MessageBodyRow {
+                message_id: id,
+                text_body: Some("CUERPO-SECRETO".into()),
+                html_body: Some("<p>CUERPO-SECRETO</p>".into()),
+                truncated: false,
+            })
+            .unwrap();
+        let items = store.messages_with("ana@x.com", 10).unwrap();
+        let json = serde_json::to_string(&items).unwrap();
+        assert!(
+            !json.contains("CUERPO-SECRETO"),
+            "el resumen filtró el cuerpo: {json}"
+        );
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let mut keys: Vec<&str> = value[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort();
+        assert_eq!(keys, vec!["date_ts", "from_addr", "subject", "uid"]);
+        assert_eq!(value[0]["uid"], 1);
+    }
+
+    /// Si el `_` de la dirección no se escapara en el `LIKE`, el prefiltro
+    /// dejaría pasar a cualquiera con un carácter en su lugar, y esas filas
+    /// —más nuevas— agotarían el tope antes de llegar a la exacta.
+    #[test]
+    fn el_guion_bajo_sin_escapar_gastaria_el_tope_con_filas_ajenas() {
+        let (_t, mut store, inbox, _sent) = store_with_inbox_and_sent();
+        let mut ops = vec![mail(
+            inbox,
+            1,
+            "ana_b@x.com",
+            "yo@x.com",
+            "",
+            "la exacta",
+            10,
+        )];
+        for i in 0..(INTERACTIONS_SCAN_CAP + 10) {
+            ops.push(mail(
+                inbox,
+                (i + 2) as u32,
+                "anaxb@x.com",
+                "yo@x.com",
+                "",
+                "ajena",
+                1_000 + i as i64,
+            ));
+        }
+        store.apply_messages(ops, inbox).unwrap();
+        let items = store.messages_with("ana_b@x.com", 5).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].subject, "la exacta");
+    }
+
+    #[test]
+    fn con_mas_candidatos_que_el_tope_no_explota_y_devuelve_los_mas_nuevos() {
+        let (_t, mut store, inbox, _sent) = store_with_inbox_and_sent();
+        let extra = 50;
+        // Más candidatos de subcadena que el tope: ninguno es Ana exacta salvo
+        // los más nuevos.
+        let mut ops = Vec::new();
+        for i in 0..(INTERACTIONS_SCAN_CAP + extra) {
+            ops.push(mail(
+                inbox,
+                (i + 1) as u32,
+                "ana@x.com.ar",
+                "yo@x.com",
+                "",
+                "vecino",
+                1_000 + i as i64,
+            ));
+        }
+        // Las exactas, más nuevas que todas las del vecino.
+        ops.push(mail(
+            inbox,
+            90_001,
+            "ana@x.com",
+            "yo@x.com",
+            "",
+            "exacta 1",
+            900_000,
+        ));
+        ops.push(mail(
+            inbox,
+            90_002,
+            "ana@x.com",
+            "yo@x.com",
+            "",
+            "exacta 2",
+            900_001,
+        ));
+        store.apply_messages(ops, inbox).unwrap();
+
+        let items = store.messages_with("ana@x.com", 10).unwrap();
+        let subjects: Vec<&str> = items.iter().map(|i| i.subject.as_str()).collect();
+        assert_eq!(subjects, vec!["exacta 2", "exacta 1"]);
     }
 }
