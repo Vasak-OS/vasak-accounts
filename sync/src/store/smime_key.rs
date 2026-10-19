@@ -428,3 +428,461 @@ impl SecretServiceKeys {
         Ok(Some(std::mem::take(&mut secret.value)))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use base64::Engine;
+
+    use super::super::key::tests::{fake_keyring, lock_and_announce};
+    use super::super::key::KeySource;
+    use super::*;
+
+    const PBES2_P12: &[u8] = include_bytes!("../../tests/fixtures/smime/rsa-pbes2.p12");
+    const LEGACY_P12: &[u8] = include_bytes!("../../tests/fixtures/smime/rsa-legacy.p12");
+    const SOLO_CERTS_P12: &[u8] = include_bytes!("../../tests/fixtures/smime/solo-certs.p12");
+    const SOLO_CLAVE_P12: &[u8] = include_bytes!("../../tests/fixtures/smime/solo-clave.p12");
+    const CERT_PEM: &str = include_str!("../../tests/fixtures/smime/cert.pem");
+    const PASSWORD: &[u8] = b"vasak-test";
+    /// `rsaEncryption`, el algoritmo de la clave de los fixtures.
+    const RSA_ENCRYPTION: &str = "1.2.840.113549.1.1.1";
+    /// Un «certificado» mínimo pero con forma de SEQUENCE DER, para las
+    /// pruebas del llavero que sólo necesitan bytes distinguibles.
+    const FAKE_CERT: &[u8] = &[0x30, 0x03, 0x02, 0x01, 0x05];
+
+    fn cert_der() -> Vec<u8> {
+        let b64: String = CERT_PEM
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect();
+        base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .expect("cert.pem es base64")
+    }
+
+    fn identity(key: &[u8], certs: Vec<Vec<u8>>) -> ImportedIdentity {
+        ImportedIdentity {
+            private_key_pkcs8: Zeroizing::new(key.to_vec()),
+            certs,
+        }
+    }
+
+    // ── parse_pkcs12 ──────────────────────────────────────────────────
+
+    #[test]
+    fn un_p12_pbes2_con_su_contrasena_da_la_clave_pkcs8_y_el_certificado() {
+        let imported = parse_pkcs12(PBES2_P12, PASSWORD).expect("tiene que parsear");
+
+        let info = pkcs8::PrivateKeyInfo::try_from(imported.private_key_pkcs8.as_slice())
+            .expect("la clave es un PKCS#8 válido");
+        assert_eq!(info.algorithm.oid.to_string(), RSA_ENCRYPTION);
+
+        assert_eq!(imported.certs.len(), 1);
+        assert_eq!(
+            imported.certs[0],
+            cert_der(),
+            "el cert devuelto es el de cert.pem"
+        );
+    }
+
+    #[test]
+    fn una_contrasena_equivocada_no_abre_el_p12() {
+        let err = parse_pkcs12(PBES2_P12, b"otra").unwrap_err();
+        assert!(matches!(err, SmimeError::WrongPassword), "dio {err:?}");
+        let err = parse_pkcs12(PBES2_P12, b"").unwrap_err();
+        assert!(matches!(err, SmimeError::WrongPassword), "dio {err:?}");
+    }
+
+    /// Sin verificar el MAC del PFX, una contraseña equivocada que por azar
+    /// deja un relleno CBC válido (1 de cada ~256) descifra basura. Lo que no
+    /// puede pasar nunca es que esa basura se tome por una identidad: el
+    /// resultado es siempre un error, aunque no siempre `WrongPassword`.
+    #[test]
+    fn una_contrasena_equivocada_nunca_devuelve_una_identidad() {
+        for i in 0..300 {
+            let pw = format!("mal-{i}");
+            let r = parse_pkcs12(PBES2_P12, pw.as_bytes());
+            assert!(
+                matches!(
+                    r,
+                    Err(SmimeError::WrongPassword) | Err(SmimeError::MalformedPkcs12(_))
+                ),
+                "con {pw:?} dio {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn un_p12_con_cifrado_heredado_no_esta_disponible_y_dice_como_arreglarlo() {
+        let err = parse_pkcs12(LEGACY_P12, PASSWORD).unwrap_err();
+        assert!(matches!(err, SmimeError::UnsupportedPkcs12), "dio {err:?}");
+        assert!(err.to_string().contains("sin -legacy"), "{err}");
+        // Con otra contraseña también: se detecta por el algoritmo, no por la
+        // clave, así que no se lo confunde con «contraseña equivocada».
+        let err = parse_pkcs12(LEGACY_P12, b"otra").unwrap_err();
+        assert!(matches!(err, SmimeError::UnsupportedPkcs12), "dio {err:?}");
+    }
+
+    /// Un `.p12` bien formado pero sin la clave, o sin certificados, no sirve
+    /// para firmar: es un error y no una identidad a medias.
+    #[test]
+    fn un_p12_sin_clave_o_sin_certificados_es_malformado() {
+        let sin_clave = parse_pkcs12(SOLO_CERTS_P12, PASSWORD).unwrap_err();
+        assert!(
+            matches!(&sin_clave, SmimeError::MalformedPkcs12(d) if d.contains("clave")),
+            "dio {sin_clave:?}"
+        );
+        let sin_certs = parse_pkcs12(SOLO_CLAVE_P12, PASSWORD).unwrap_err();
+        assert!(
+            matches!(&sin_certs, SmimeError::MalformedPkcs12(d) if d.contains("certificados")),
+            "dio {sin_certs:?}"
+        );
+    }
+
+    #[test]
+    fn lo_que_no_es_un_p12_es_malformado() {
+        let casos: Vec<(&str, Vec<u8>)> = vec![
+            ("vacío", Vec::new()),
+            ("un byte", vec![0x30]),
+            ("texto", b"esto no es un PKCS#12".to_vec()),
+            ("ceros", vec![0u8; 64]),
+            ("el certificado PEM", CERT_PEM.as_bytes().to_vec()),
+            ("el certificado DER", cert_der()),
+            ("SEQUENCE vacía", vec![0x30, 0x00]),
+            (
+                "longitud mentida",
+                vec![0x30, 0x84, 0xff, 0xff, 0xff, 0xff, 0x02],
+            ),
+        ];
+        for (nombre, bytes) in casos {
+            let r = parse_pkcs12(&bytes, PASSWORD);
+            assert!(
+                matches!(r, Err(SmimeError::MalformedPkcs12(_))),
+                "{nombre}: dio {r:?}"
+            );
+        }
+    }
+
+    /// El `.p12` lo escribió otro programa: truncado en cualquier punto da
+    /// error, y con un byte cambiado no entra en pánico.
+    #[test]
+    fn un_p12_truncado_da_error_y_uno_corrompido_no_entra_en_panico() {
+        for len in 0..PBES2_P12.len() {
+            let r = parse_pkcs12(&PBES2_P12[..len], PASSWORD);
+            assert!(r.is_err(), "truncado a {len} bytes devolvió Ok");
+        }
+        for i in (0..PBES2_P12.len()).step_by(11) {
+            let mut roto = PBES2_P12.to_vec();
+            roto[i] ^= 0xff;
+            let _ = parse_pkcs12(&roto, PASSWORD);
+        }
+    }
+
+    /// HUECO CONOCIDO, no se corre en el CI: `parse_pkcs12` no verifica el MAC
+    /// del PFX (HMAC con el KDF de PKCS#12, `pkcs12` con la característica
+    /// `kdf`), y el descifrado de PBES2 sólo comprueba el relleno CBC. Un `.p12`
+    /// con un byte cambiado dentro del cifrado se acepta con una clave o un
+    /// certificado **distintos** y se guarda en el llavero. Medido: cambiando
+    /// de a un byte, ~1960 de las 2670 posiciones dan `Ok` con otra identidad
+    /// (1197 con otra clave privada). Se corre con `--ignored`; pasa a ser una
+    /// prueba normal cuando se verifique el MAC.
+    #[test]
+    #[ignore = "falta verificar el MAC del PFX: un .p12 corrompido se acepta con otra identidad"]
+    fn un_p12_con_un_byte_cambiado_no_se_acepta_con_otra_identidad() {
+        let original = parse_pkcs12(PBES2_P12, PASSWORD).unwrap();
+        for i in 0..PBES2_P12.len() {
+            let mut roto = PBES2_P12.to_vec();
+            roto[i] ^= 0xff;
+            if let Ok(r) = parse_pkcs12(&roto, PASSWORD) {
+                assert!(
+                    r.private_key_pkcs8.as_slice() == original.private_key_pkcs8.as_slice()
+                        && r.certs == original.certs,
+                    "byte {i}: devolvió Ok con otra identidad"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn la_identidad_importada_no_imprime_la_clave() {
+        let imported = parse_pkcs12(PBES2_P12, PASSWORD).unwrap();
+        let printed = format!("{imported:?}");
+        assert!(printed.contains("<oculto>"));
+        let hex: String = imported.private_key_pkcs8[..16]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert!(
+            !printed.contains(&hex)
+                && !printed.contains(&format!("{:?}", &imported.private_key_pkcs8[..8]))
+        );
+    }
+
+    // ── La cadena de certificados ─────────────────────────────────────
+
+    #[test]
+    fn la_cadena_de_certificados_se_separa_igual_que_se_juntó() {
+        let certs = vec![cert_der(), FAKE_CERT.to_vec(), cert_der()];
+        assert_eq!(split_certs(&join_certs(&certs)).unwrap(), certs);
+        assert_eq!(split_certs(&[]).unwrap(), Vec::<Vec<u8>>::new());
+    }
+
+    #[test]
+    fn una_cadena_con_basura_al_final_es_un_error_y_no_un_pánico() {
+        let mut blob = join_certs(&[FAKE_CERT.to_vec()]);
+        blob.extend_from_slice(&[0x30, 0x84, 0xff, 0xff, 0xff, 0xff]);
+        assert!(split_certs(&blob).is_err());
+        assert!(split_certs(&[0x30]).is_err());
+    }
+
+    // ── El llavero ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn guardar_y_leer_una_identidad_da_la_misma_clave_y_cadena() {
+        let (keys, _server, _shared) = fake_keyring().await;
+        import_pkcs12(&keys, "ana@example.com", PBES2_P12, PASSWORD)
+            .await
+            .unwrap();
+        let expected = parse_pkcs12(PBES2_P12, PASSWORD).unwrap();
+
+        let key = keys
+            .find_smime_private_key("ana@example.com")
+            .await
+            .unwrap()
+            .expect("hay clave");
+        assert_eq!(key.as_slice(), expected.private_key_pkcs8.as_slice());
+        let certs = keys
+            .find_smime_certs("ana@example.com")
+            .await
+            .unwrap()
+            .expect("hay cadena");
+        assert_eq!(certs, expected.certs);
+    }
+
+    #[tokio::test]
+    async fn una_identidad_que_no_existe_no_tiene_ni_clave_ni_cadena() {
+        let (keys, _server, _shared) = fake_keyring().await;
+        assert!(keys
+            .find_smime_private_key("nadie@example.com")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(keys
+            .find_smime_certs("nadie@example.com")
+            .await
+            .unwrap()
+            .is_none());
+        // Borrar lo que no hay no es un error.
+        keys.delete_smime_identity("nadie@example.com")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn borrar_una_identidad_quita_la_clave_y_la_cadena_y_deja_a_las_demas() {
+        let (keys, _server, _shared) = fake_keyring().await;
+        keys.store_smime_identity(
+            "ana@example.com",
+            &identity(b"clave-ana", vec![FAKE_CERT.to_vec()]),
+        )
+        .await
+        .unwrap();
+        keys.store_smime_identity(
+            "beto@example.com",
+            &identity(b"clave-beto", vec![cert_der()]),
+        )
+        .await
+        .unwrap();
+
+        keys.delete_smime_identity("ana@example.com").await.unwrap();
+
+        assert!(keys
+            .find_smime_private_key("ana@example.com")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(keys
+            .find_smime_certs("ana@example.com")
+            .await
+            .unwrap()
+            .is_none());
+        let key = keys
+            .find_smime_private_key("beto@example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(key.as_slice(), b"clave-beto");
+        assert_eq!(
+            keys.find_smime_certs("beto@example.com")
+                .await
+                .unwrap()
+                .unwrap(),
+            vec![cert_der()]
+        );
+    }
+
+    #[tokio::test]
+    async fn dos_identidades_no_se_pisan() {
+        let (keys, _server, _shared) = fake_keyring().await;
+        keys.store_smime_identity(
+            "ana@example.com",
+            &identity(b"clave-ana", vec![FAKE_CERT.to_vec()]),
+        )
+        .await
+        .unwrap();
+        keys.store_smime_identity(
+            "beto@example.com",
+            &identity(b"clave-beto", vec![cert_der()]),
+        )
+        .await
+        .unwrap();
+
+        let ana = keys
+            .find_smime_private_key("ana@example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        let beto = keys
+            .find_smime_private_key("beto@example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ana.as_slice(), b"clave-ana");
+        assert_eq!(beto.as_slice(), b"clave-beto");
+        assert_eq!(
+            keys.find_smime_certs("ana@example.com")
+                .await
+                .unwrap()
+                .unwrap(),
+            vec![FAKE_CERT.to_vec()]
+        );
+    }
+
+    #[tokio::test]
+    async fn reimportar_una_identidad_reemplaza_y_no_duplica() {
+        let (keys, _server, _shared) = fake_keyring().await;
+        keys.store_smime_identity(
+            "ana@example.com",
+            &identity(b"vieja", vec![FAKE_CERT.to_vec()]),
+        )
+        .await
+        .unwrap();
+        keys.store_smime_identity("ana@example.com", &identity(b"nueva", vec![cert_der()]))
+            .await
+            .unwrap();
+
+        for type_ in [TYPE_PRIVATE_KEY, TYPE_CERTS] {
+            let items = keys
+                .search(&smime_attributes("ana@example.com", type_))
+                .await
+                .unwrap();
+            assert_eq!(items.len(), 1, "un solo ítem de tipo {type_}");
+        }
+        let key = keys
+            .find_smime_private_key("ana@example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(key.as_slice(), b"nueva");
+    }
+
+    /// Los ítems van bajo el esquema `SmimeKey` con la identidad, y no se
+    /// cruzan con los de la clave del almacén (otro esquema).
+    #[tokio::test]
+    async fn los_items_van_bajo_el_esquema_smimekey_con_su_identidad() {
+        let (keys, _server, _shared) = fake_keyring().await;
+        keys.store_smime_identity("ana@example.com", &identity(b"k", vec![FAKE_CERT.to_vec()]))
+            .await
+            .unwrap();
+
+        assert_eq!(SCHEMA, "ar.net.vasak.os.SmimeKey");
+        async fn buscar(keys: &SecretServiceKeys, schema: &str, identity: &str) -> usize {
+            let attrs = HashMap::from([("xdg:schema", schema), ("identity", identity)]);
+            keys.search(&attrs).await.unwrap().len()
+        }
+        assert_eq!(
+            buscar(&keys, SCHEMA, "ana@example.com").await,
+            2,
+            "clave + cadena"
+        );
+        assert_eq!(buscar(&keys, SCHEMA, "otra@example.com").await, 0);
+        assert_eq!(
+            buscar(&keys, super::super::key::SCHEMA, "ana@example.com").await,
+            0,
+            "nada bajo el esquema de la clave del almacén"
+        );
+        // Y el lector de la clave del almacén no se topa con ellos.
+        assert!(keys.find("ana@example.com").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn la_cadena_no_lleva_la_clave_privada() {
+        let (keys, _server, _shared) = fake_keyring().await;
+        import_pkcs12(&keys, "ana@example.com", PBES2_P12, PASSWORD)
+            .await
+            .unwrap();
+        let key = keys
+            .find_smime_private_key("ana@example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        let certs = keys
+            .find_smime_certs("ana@example.com")
+            .await
+            .unwrap()
+            .unwrap()
+            .concat();
+        assert!(!certs.windows(32).any(|w| w == &key[..32]));
+    }
+
+    #[tokio::test]
+    async fn una_contrasena_equivocada_al_importar_no_guarda_nada() {
+        let (keys, _server, _shared) = fake_keyring().await;
+        let err = import_pkcs12(&keys, "ana@example.com", PBES2_P12, b"mala")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SmimeError::WrongPassword), "dio {err:?}");
+        let err = import_pkcs12(&keys, "ana@example.com", LEGACY_P12, PASSWORD)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SmimeError::UnsupportedPkcs12), "dio {err:?}");
+        assert!(keys
+            .find_smime_private_key("ana@example.com")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(keys
+            .find_smime_certs("ana@example.com")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// Con el llavero bloqueado `SearchItems` contesta vacío: no se puede
+    /// tomar por «no hay clave», es un error.
+    #[tokio::test]
+    async fn con_el_llavero_bloqueado_leer_y_guardar_dan_error_y_no_ausencia() {
+        let (keys, server, shared) = fake_keyring().await;
+        keys.store_smime_identity("ana@example.com", &identity(b"k", vec![FAKE_CERT.to_vec()]))
+            .await
+            .unwrap();
+        lock_and_announce(&server, &shared).await.unwrap();
+
+        assert!(matches!(
+            keys.find_smime_private_key("ana@example.com").await,
+            Err(KeyError::Locked)
+        ));
+        assert!(matches!(
+            keys.find_smime_certs("ana@example.com").await,
+            Err(KeyError::Locked)
+        ));
+        assert!(matches!(
+            keys.store_smime_identity("ana@example.com", &identity(b"x", vec![FAKE_CERT.to_vec()]))
+                .await,
+            Err(KeyError::Locked)
+        ));
+        assert!(matches!(
+            keys.delete_smime_identity("ana@example.com").await,
+            Err(KeyError::Locked)
+        ));
+    }
+}

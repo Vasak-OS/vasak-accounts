@@ -12,4 +12,9 @@ prueba, como los `.pem` de prueba de los propios crates de RustCrypto.
 - `rsa-legacy.p12` — exportado con `-legacy` (PBE heredado RC2/3DES). **Tiene que
   dar `SmimeError::UnsupportedPkcs12`.**
 
-Contraseña de los dos: `vasak-test`.
+- `solo-certs.p12` — PBES2, **sólo el certificado, sin clave**. Tiene que dar
+  `MalformedPkcs12` («no trae clave»).
+- `solo-clave.p12` — PBES2, **sólo la clave, sin certificados**. Tiene que dar
+  `MalformedPkcs12` («no trae certificados»).
+
+Contraseña de todos: `vasak-test`.
