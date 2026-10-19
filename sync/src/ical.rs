@@ -602,6 +602,69 @@ pub fn event_of(component: &Component, zones: &Zones) -> Option<Event> {
     })
 }
 
+/// Cuántas categorías de un evento se leen, como mucho. Un evento con más de
+/// sesenta y cuatro etiquetas es un archivo armado para hacer crecer la fila,
+/// no una agenda de alguien.
+pub const MAX_CATEGORIES: usize = 64;
+
+/// Parte un valor de lista de iCalendar (`a,b\,c`) por las comas que **no**
+/// están escapadas. No deshace lo escapado —cada parte conserva sus barras para
+/// que [`unescape_text`] lo haga después—: así una coma dentro de un valor
+/// (`\,`) no lo corta en dos.
+fn split_escaped_list(value: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    for c in value.chars() {
+        if escaped {
+            current.push('\\');
+            current.push(c);
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == ',' {
+            parts.push(std::mem::take(&mut current));
+        } else {
+            current.push(c);
+        }
+    }
+    if escaped {
+        current.push('\\');
+    }
+    parts.push(current);
+    parts
+}
+
+/// Las categorías de un componente (RFC 5545 §3.8.1.2): una o más líneas
+/// `CATEGORIES`, cada una una lista separada por comas con escapes. Se parten
+/// por la coma sin escapar, se deshace lo escapado y se muestran sin controles,
+/// como cualquier otro texto, con tope de cantidad. Las vacías se descartan.
+pub fn categories_of(component: &Component) -> Vec<String> {
+    let mut out = Vec::new();
+    for property in component.all("CATEGORIES") {
+        for raw in split_escaped_list(&property.value) {
+            let text = visible(&unescape_text(&raw), MAX_TEXT);
+            if !text.is_empty() {
+                out.push(text);
+            }
+            if out.len() >= MAX_CATEGORIES {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+/// El color propio de un evento (RFC 7986 §5.9): un nombre de color CSS3, para
+/// mostrar. Vacío o ausente es `None`. No es un `TEXT` escapado —es un token—,
+/// así que sólo se le sacan los controles y se recorta.
+pub fn color_of(component: &Component) -> Option<String> {
+    component
+        .first("COLOR")
+        .map(|p| visible(p.value.trim(), 64))
+        .filter(|color| !color.is_empty())
+}
+
 /// Saca los eventos de un iCalendar.
 ///
 /// Sólo `VEVENT`: un calendario trae también tareas y notas, y mostrarlas como
@@ -1086,5 +1149,122 @@ mod tests {
         assert_eq!(clipped("añb", 2), "a");
         assert_eq!(visible("ññññ", 3), "ñ");
         assert_eq!(visible_multiline("uno\n\tdos\u{1}", 100), "uno\n\tdos");
+    }
+
+    /// El `VEVENT` de las pruebas de `CATEGORIES` y `COLOR`, con las líneas de
+    /// más que se le pasen.
+    fn event_with(lines: &str) -> Component {
+        let ical = format!(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:a\r\nDTSTART:20260915T140000Z\r\n\
+             {lines}END:VEVENT\r\nEND:VCALENDAR\r\n"
+        );
+        parse_document(&ical).components.remove(0)
+    }
+
+    /// **`CATEGORIES`**: se parte por la coma sin escapar y una coma escapada
+    /// (`\,`) queda **dentro** de su valor. Partir por cualquier coma deja
+    /// `["a", "b\\", "c"]` y la categoría `b,c` desaparece en dos.
+    #[test]
+    fn una_coma_escapada_no_parte_la_categoria() {
+        let event = event_with("CATEGORIES:a,b\\,c\r\n");
+        assert_eq!(categories_of(&event), vec!["a", "b,c"]);
+    }
+
+    /// Varias líneas `CATEGORIES` se suman, con sus parámetros, y lo vacío se
+    /// descarta. Una barra al final del valor no se traga nada ni rompe.
+    #[test]
+    fn las_categorias_de_varias_lineas_se_suman_y_las_vacias_se_descartan() {
+        let event = event_with(
+            "CATEGORIES;LANGUAGE=es:Trabajo,,Importante,\r\nCATEGORIES:Casa, \r\nCATEGORIES:fin\\\r\n",
+        );
+        assert_eq!(
+            categories_of(&event),
+            vec!["Trabajo", "Importante", "Casa", "fin\\"]
+        );
+        assert!(categories_of(&event_with("CATEGORIES:\r\n")).is_empty());
+        assert!(categories_of(&event_with("")).is_empty());
+    }
+
+    /// Los controles de una categoría se sacan, como en cualquier texto que se
+    /// muestra: el salto escapado (`\n`) pasa a espacio y un BEL se va. Ninguna
+    /// categoría llega con un salto de línea real que un cliente pueda tomar por
+    /// otra propiedad.
+    #[test]
+    fn los_controles_de_una_categoria_no_llegan() {
+        let event = event_with("CATEGORIES:uno\\ndos\u{7},tres\u{1b}[31m\r\n");
+        let categories = categories_of(&event);
+        assert_eq!(categories, vec!["uno dos", "tres[31m"]);
+        assert!(categories
+            .iter()
+            .all(|c| !c.chars().any(|ch| ch.is_control())));
+    }
+
+    /// El tope de cantidad: sesenta y cuatro entran, la sesenta y cinco no, ni
+    /// aunque vengan en líneas distintas.
+    #[test]
+    fn las_categorias_tienen_tope_de_cantidad() {
+        let list = |n: usize| {
+            (0..n)
+                .map(|i| format!("c{i}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+
+        let justo = categories_of(&event_with(&format!(
+            "CATEGORIES:{}\r\n",
+            list(MAX_CATEGORIES)
+        )));
+        assert_eq!(justo.len(), MAX_CATEGORIES);
+
+        let de_mas = categories_of(&event_with(&format!("CATEGORIES:{}\r\n", list(100))));
+        assert_eq!(de_mas.len(), MAX_CATEGORIES);
+        assert_eq!(de_mas.last().unwrap(), "c63");
+
+        let en_lineas = categories_of(&event_with(&format!(
+            "CATEGORIES:{}\r\nCATEGORIES:{}\r\n",
+            list(40),
+            list(40)
+        )));
+        assert_eq!(en_lineas.len(), MAX_CATEGORIES);
+    }
+
+    /// Y el de largo: una categoría enorme se recorta, no crece la fila.
+    #[test]
+    fn una_categoria_enorme_se_recorta() {
+        let event = event_with(&format!("CATEGORIES:{}\r\n", "x".repeat(MAX_TEXT * 4)));
+        let categories = categories_of(&event);
+        assert_eq!(categories.len(), 1);
+        assert_eq!(categories[0].len(), MAX_TEXT);
+    }
+
+    /// **`COLOR`** (RFC 7986): el token tal cual, sin espacios alrededor; vacío
+    /// o ausente es `None`.
+    #[test]
+    fn el_color_del_evento_se_lee_y_lo_vacio_es_none() {
+        assert_eq!(
+            color_of(&event_with("COLOR:turquoise\r\n")).as_deref(),
+            Some("turquoise")
+        );
+        assert_eq!(
+            color_of(&event_with("COLOR:  tomato \r\n")).as_deref(),
+            Some("tomato")
+        );
+        assert_eq!(color_of(&event_with("COLOR:\r\n")), None);
+        assert_eq!(color_of(&event_with("COLOR:   \r\n")), None);
+        assert_eq!(color_of(&event_with("")), None);
+        // Sólo controles: tampoco queda nada que mostrar.
+        assert_eq!(color_of(&event_with("COLOR:\u{7}\u{1b}\r\n")), None);
+    }
+
+    /// Los controles del color se sacan —no es un `TEXT`, pero se muestra— y
+    /// el tope es 64 bytes.
+    #[test]
+    fn el_color_no_trae_controles_y_tiene_tope() {
+        assert_eq!(
+            color_of(&event_with("COLOR:tur\u{7}quo\u{1b}ise\r\n")).as_deref(),
+            Some("turquoise")
+        );
+        let color = color_of(&event_with(&format!("COLOR:{}\r\n", "a".repeat(500)))).unwrap();
+        assert_eq!(color.len(), 64);
     }
 }

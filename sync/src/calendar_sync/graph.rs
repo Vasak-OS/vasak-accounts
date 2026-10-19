@@ -1341,6 +1341,103 @@ mod tests {
         assert!(weekly.contains("COUNT=5"), "{weekly:?}");
     }
 
+    /// **Categorías de Graph en el DTO** (`vasak-calendar#6`, punto 2): lo que
+    /// Graph llama `categories` se sintetiza como `CATEGORIES` y de ahí sale al
+    /// índice del objeto —con la coma de adentro entera— y al DTO de
+    /// `ListOccurrences` y `GetEvent`. Graph no tiene color propio por evento
+    /// (sólo `categories` con color en el maestro, que no se baja): `event_color`
+    /// es `None`. Un evento sin `categories` trae la lista vacía.
+    #[tokio::test]
+    async fn las_categorias_de_graph_llegan_al_dto_y_el_color_propio_es_none() {
+        use crate::store::calendar_read::{account_occurrences, get_event, Range};
+
+        let f = Fixture::new("graph-cal-categorias").await;
+        f.server.push(format!(
+            "{{\"value\":[{completo},{{\
+               \"id\":\"AAA-4\",\"iCalUId\":\"uid-coma\",\"subject\":\"Con coma\",\
+               \"start\":{{\"dateTime\":\"2026-09-29T09:00:00.0000000\",\"timeZone\":\"UTC\"}},\
+               \"end\":{{\"dateTime\":\"2026-09-29T10:00:00.0000000\",\"timeZone\":\"UTC\"}},\
+               \"categories\":[\"Cliente, grande\"]}},{{\
+               \"id\":\"AAA-5\",\"iCalUId\":\"uid-sin\",\"subject\":\"Sin etiquetas\",\
+               \"start\":{{\"dateTime\":\"2026-09-30T09:00:00.0000000\",\"timeZone\":\"UTC\"}},\
+               \"end\":{{\"dateTime\":\"2026-09-30T10:00:00.0000000\",\"timeZone\":\"UTC\"}}}}]}}",
+            completo = evento_completo_json()
+        ));
+        f.synced().await;
+
+        // Sólo salen los escalares de la lectura (ver `cleartext-logging`).
+        type Row = (String, Vec<String>, Option<String>);
+        let (listed, details): (Vec<Row>, Vec<Row>) = f
+            .manager
+            .with_store(ACCOUNT, |store| {
+                let Ok(page) = account_occurrences(
+                    store.connection(),
+                    ACCOUNT,
+                    Range::parse("2026-09-27T00:00:00Z", "2026-10-02T00:00:00Z").unwrap(),
+                    None,
+                    None,
+                    100,
+                    &ExpansionLimits::DEFAULT,
+                ) else {
+                    panic!("no se pudieron leer las ocurrencias");
+                };
+                let listed: Vec<Row> = page
+                    .rows
+                    .iter()
+                    .map(|(_, i)| (i.title.clone(), i.categories.clone(), i.event_color.clone()))
+                    .collect();
+                let details = (1..=3)
+                    .map(|id| {
+                        let Ok(Some(e)) = get_event(
+                            store.connection(),
+                            ACCOUNT,
+                            id,
+                            None,
+                            &ExpansionLimits::DEFAULT,
+                        ) else {
+                            panic!("no se pudo leer el evento {id}");
+                        };
+                        (e.title, e.categories, e.event_color)
+                    })
+                    .collect();
+                Ok((listed, details))
+            })
+            .await
+            .expect("la base tenía que estar abierta");
+
+        let esperado: Vec<Row> = vec![
+            (
+                "Reunión de equipo".into(),
+                vec!["Trabajo".into(), "Importante".into()],
+                None,
+            ),
+            ("Con coma".into(), vec!["Cliente, grande".into()], None),
+            ("Sin etiquetas".into(), Vec::new(), None),
+        ];
+        assert_eq!(listed, esperado);
+        assert_eq!(details, esperado);
+    }
+
+    /// En la conversión: las categorías llegan al índice tal cual, sin partir la
+    /// que trae una coma, y Graph no pone color propio.
+    #[test]
+    fn la_conversion_de_un_evento_de_graph_lleva_categorias_al_indice() {
+        let event = event_from(
+            r#"{ "id": "x", "iCalUId": "u", "subject": "S",
+                 "start": { "dateTime": "2026-09-28T14:00:00.0000000", "timeZone": "UTC" },
+                 "end": { "dateTime": "2026-09-28T15:00:00.0000000", "timeZone": "UTC" },
+                 "categories": ["Trabajo", "a,b", "c;d"] }"#,
+        );
+        let row = GraphApiBackend::event_to_row(
+            &event,
+            Window::around(chrono::Utc::now()),
+            &ExpansionLimits::DEFAULT,
+        )
+        .expect("el evento tiene id");
+        assert_eq!(row.index.categories, vec!["Trabajo", "a,b", "c;d"]);
+        assert_eq!(row.index.color, None);
+    }
+
     /// (2 · módulo compartido) Un `nextLink` a **otro host** aborta la
     /// sincronización con `UntrustedNextLink` y **no** le manda el token a ese
     /// host: no hay una segunda petición al atacante. El mismo host sí se sigue.

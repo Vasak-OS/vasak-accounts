@@ -537,9 +537,12 @@ impl<K: KeySource> StoreApi<K> {
     /// cuentas con calendario que se ven en `[from, to)` (RFC 3339, como mucho
     /// 400 días), de los calendarios de `calendar_ids` (vacío: todos), por
     /// comienzo. `{items: [{event_id, occurrence_id, calendar_id, title, start,
-    /// end, all_day, floating, color}], next_cursor, truncated}`: `start` y
-    /// `end` en UTC —un día completo, a medianoche UTC y con `all_day`—,
-    /// `floating` si la hora es la de quien mira. Fuera de la ventana del
+    /// end, all_day, floating, color, categories, event_color}], next_cursor,
+    /// truncated}`: `start` y `end` en UTC —un día completo, a medianoche UTC y
+    /// con `all_day`—, `floating` si la hora es la de quien mira. `color` es el
+    /// del calendario (la marca al costado); `categories` las etiquetas del
+    /// evento y `event_color` su color propio (`COLOR`, RFC 7986), o `null`.
+    /// Fuera de la ventana del
     /// almacén se expande en el momento, con topes: `truncated` dice que algo
     /// quedó afuera. El cursor y los topes son los de `ListContacts`: `limit` 0
     /// pide 100, nada pasa de 1000, y **el final es `next_cursor == null`**.
@@ -603,8 +606,10 @@ impl<K: KeySource> StoreApi<K> {
 
     /// Un evento entero, leído de su iCalendar en el momento: `{event_id,
     /// occurrence_id, calendar_id, uid, title, description, location, start,
-    /// end, all_day, timezone, timezone_unknown, floating, status, recurrence,
-    /// alarms, organizer, attendees, truncated}`. Con `occurrence_id` vacío, el
+    /// end, all_day, timezone, timezone_unknown, floating, status, categories,
+    /// event_color, recurrence, alarms, organizer, attendees, truncated}`.
+    /// `categories` son las etiquetas del evento y `event_color` su color propio
+    /// (`COLOR`, RFC 7986), o `null`. Con `occurrence_id` vacío, el
     /// evento; con el de una vez, esa vez —la excepción, si la tiene—. `null`
     /// si no está. Nunca el iCalendar crudo ni la dirección en el servidor. Uno
     /// que no entra en 1 MiB llega recortado, con `truncated: true`.
