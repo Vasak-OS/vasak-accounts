@@ -692,7 +692,8 @@ fn header_has_address(field: &str, address: &str) -> bool {
         if before_is_border && after_is_border {
             return true;
         }
-        from = start + 1;
+        // Un carácter entero, no un byte: `start + 1` caería dentro de uno multibyte.
+        from = start + haystack[start..].chars().next().map_or(1, char::len_utf8);
     }
     false
 }
@@ -1328,6 +1329,14 @@ mod tests {
         }
         // Una dirección vacía no empareja con nada.
         assert!(!header_has_address("ana@x.com", ""));
+    }
+
+    #[test]
+    fn una_direccion_que_empieza_con_un_caracter_no_ascii_no_hace_caer_la_busqueda() {
+        // El avance por bytes tras un match descartado no puede partir un
+        // carácter UTF-8: caería con un panic en el servicio.
+        assert!(!header_has_address("xñandu@x.com", "ñandu@x.com"));
+        assert!(header_has_address("Ñandú <ñandu@x.com>", "ñandu@x.com"));
     }
 
     #[test]
