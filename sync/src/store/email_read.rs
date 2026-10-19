@@ -125,6 +125,24 @@ pub struct MessageSummary {
     pub size: i64,
 }
 
+/// Resumen acotado de una interacción de correo con una dirección.
+///
+/// Lo mínimo para pintar el historial en la ficha de un contacto: cuándo, de
+/// qué, de quién, y con qué UID se abre después en la aplicación de correo.
+/// **Sin cuerpo** y sin el resto de la casilla: lo que ve otra aplicación es un
+/// índice, no el correo.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InteractionSummary {
+    pub uid: u64,
+    pub date_ts: i64,
+    pub subject: String,
+    pub from_addr: String,
+}
+
+/// Cuántas filas candidatas (las que el prefiltro `LIKE` deja pasar) recorre
+/// [`Store::messages_with`] como mucho antes de cortar.
+pub const INTERACTIONS_SCAN_CAP: usize = 2000;
+
 /// Un mensaje entero (cuando se abre).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MessageFull {
@@ -465,6 +483,78 @@ impl Store {
         })
     }
 
+    /// Los últimos `limit` mensajes intercambiados con `address`: los que esa
+    /// dirección mandó (en `from`) o recibió (en `to` o `cc`), de **todas** las
+    /// casillas, más nuevos primero. Es el historial de correo con una persona
+    /// que muestra la ficha de un contacto.
+    ///
+    /// `address` se compara **entera** (ver [`header_has_address`]): `ana@x.com`
+    /// no empareja con `ana@x.com.ar` ni con `bana@x.com`. Es lo que separa
+    /// «me escribí con esta persona» de «con alguien de un dominio parecido», y
+    /// la diferencia importa porque esto decide qué correo ve otra aplicación.
+    ///
+    /// Devuelve metadatos acotados ([`InteractionSummary`]): fecha, asunto,
+    /// remitente y UID. **Nunca el cuerpo** ni el resto de la casilla.
+    ///
+    /// El `LIKE` del SQL es sólo un prefiltro barato —acota a las filas que
+    /// contienen la dirección como subcadena—; la igualdad la decide
+    /// [`header_has_address`] en Rust. Se recorren como mucho
+    /// [`INTERACTIONS_SCAN_CAP`] filas candidatas.
+    ///
+    /// shortcut: con más de INTERACTIONS_SCAN_CAP coincidencias de subcadena
+    /// podría saltarse una exacta muy vieja; subir el tope o paginar si una
+    /// casilla real lo alcanza (hoy `limit` es chico y el prefiltro muy selectivo).
+    pub fn messages_with(
+        &self,
+        address: &str,
+        limit: usize,
+    ) -> Result<Vec<InteractionSummary>, StoreError> {
+        let needle = address.trim().to_ascii_lowercase();
+        if needle.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let like = format!("%{}%", like_escape(&needle));
+
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT m.uid, m.date_ts, m.subject, m.from_addr, m.to_addrs, m.cc_addrs
+                 FROM messages m
+                 WHERE lower(m.from_addr) LIKE ?1 ESCAPE '\\'
+                    OR lower(m.to_addrs)  LIKE ?1 ESCAPE '\\'
+                    OR lower(m.cc_addrs)  LIKE ?1 ESCAPE '\\'
+                 ORDER BY m.sort_key DESC, m.id
+                 LIMIT ?2",
+            )
+            .map_err(classify)?;
+        let mut rows = statement
+            .query(rusqlite::params![like, INTERACTIONS_SCAN_CAP as i64])
+            .map_err(classify)?;
+
+        let mut items = Vec::new();
+        while let Some(row) = rows.next().map_err(classify)? {
+            let from_addr: String = row.get(3).map_err(classify)?;
+            let to_addrs: String = row.get(4).map_err(classify)?;
+            let cc_addrs: String = row.get(5).map_err(classify)?;
+            if !(header_has_address(&from_addr, &needle)
+                || header_has_address(&to_addrs, &needle)
+                || header_has_address(&cc_addrs, &needle))
+            {
+                continue;
+            }
+            items.push(InteractionSummary {
+                uid: row.get::<_, i64>(0).map_err(classify)? as u64,
+                date_ts: row.get(1).map_err(classify)?,
+                subject: row.get(2).map_err(classify)?,
+                from_addr,
+            });
+            if items.len() == limit {
+                break;
+            }
+        }
+        Ok(items)
+    }
+
     /// Un mensaje entero (para abrir).
     pub fn get_message(&self, message_id: i64) -> Result<Option<MessageFull>, StoreError> {
         let mut statement = self
@@ -574,6 +664,59 @@ impl Store {
             .map_err(classify)?;
         rows.collect::<Result<_, _>>().map_err(classify)
     }
+}
+
+/// Si `address` (ya normalizada: minúsculas, sin espacios al borde) aparece
+/// como una dirección **completa** dentro de `field` —el valor crudo de un
+/// encabezado `From`, `To` o `Cc`, que puede traer nombres y varias
+/// direcciones, p. ej. `"Ana Pérez <ana@x.com>, Bob <bob@y.com>"`—.
+///
+/// Compara la dirección entera, no una subcadena: exige que a cada lado del
+/// match haya un **borde** y no otro carácter de dirección, así `ana@x.com` no
+/// empareja con `ana@x.com.ar` (lo que sigue es `.`) ni con `bana@x.com` (lo que
+/// precede es `b`). Esa es la propiedad que cuida la privacidad acá: una
+/// aplicación que pide el historial con una persona no termina viendo el de otra
+/// de un dominio parecido.
+fn header_has_address(field: &str, address: &str) -> bool {
+    if address.is_empty() {
+        return false;
+    }
+    let haystack = field.to_ascii_lowercase();
+    let bytes = haystack.as_bytes();
+    let mut from = 0;
+    while let Some(offset) = haystack[from..].find(address) {
+        let start = from + offset;
+        let end = start + address.len();
+        let before_is_border = start == 0 || !is_address_char(bytes[start - 1] as char);
+        let after_is_border = end == bytes.len() || !is_address_char(bytes[end] as char);
+        if before_is_border && after_is_border {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+/// Los caracteres que pueden formar parte de una dirección (`atext` de RFC 5322
+/// más `@` y `.`). Un byte que no es uno de éstos separa una dirección de lo que
+/// la rodea en un encabezado. Un byte no ASCII —una tilde de un nombre— no es
+/// uno de éstos, así que también cuenta como borde, que es lo correcto.
+fn is_address_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "@.!#$%&'*+-/=?^_`{|}~".contains(c)
+}
+
+/// Escapa `%`, `_` y `\` para que viajen como literales en un patrón `LIKE`
+/// (con `ESCAPE '\'`). Una dirección rara vez los trae, pero `_` es válido en la
+/// parte local y sin esto emparejaría cualquier carácter en el prefiltro.
+fn like_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn message_from_row(row: &Row) -> Result<MessageSummary, StoreError> {

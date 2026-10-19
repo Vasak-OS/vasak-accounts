@@ -125,6 +125,17 @@ pub const CALENDAR_RESOURCE: &str = "store.calendar";
 /// credencial.
 pub const EMAIL_RESOURCE: &str = "store.email";
 
+/// El recurso angosto para el **historial de correo con una dirección**: las
+/// fechas, los asuntos y las direcciones de los mensajes intercambiados con una
+/// persona, sin los cuerpos ni el resto de la casilla. Lo pide la libreta de
+/// direcciones para la ficha de un contacto.
+///
+/// Distinto de [`EMAIL_RESOURCE`] a propósito: concederlo no deja leer todo el
+/// correo guardado, sólo lo que se intercambió con quien se está mirando. El
+/// servicio de permisos lo reconoce desde su 0.19.0; contra un daemon viejo el
+/// chequeo falla cerrado, que es seguro.
+pub const EMAIL_INTERACTIONS_RESOURCE: &str = "store.email.interactions";
+
 /// Cuántos comandos de control deja pasar [`CallerLimits`] por cuenta y
 /// nombre único en cada ventana.
 pub const CONTROL_BURST: usize = 3;

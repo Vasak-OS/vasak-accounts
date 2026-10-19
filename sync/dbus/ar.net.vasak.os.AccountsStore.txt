@@ -18,6 +18,7 @@ interface ar.net.vasak.os.AccountsStore
   method ListMessages(in s account_id, in x mailbox_id, in s cursor, in u limit, out s)
   method ListOccurrences(in s from, in s to, in as calendar_ids, in s cursor, in u limit, out s)
   method ListTasks(in as calendar_ids, in b include_completed, in s cursor, in u limit, out s)
+  method MessagesWith(in s account_id, in s address, in u n, out s)
   method PutContact(in s account_id, in s address_book_id, in s payload, in s if_match, out s)
   method PutEvent(in s account_id, in s calendar_id, in s payload, in s if_match, out s)
   method PutTask(in s account_id, in s calendar_id, in s payload, in s if_match, out s)

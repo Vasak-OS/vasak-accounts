@@ -49,7 +49,8 @@ use zbus::object_server::SignalEmitter;
 use serde::Serialize;
 
 use crate::access::{
-    self, Access, ControlAction, Refusal, CALENDAR_RESOURCE, CONTACTS_RESOURCE, EMAIL_RESOURCE,
+    self, Access, ControlAction, Refusal, CALENDAR_RESOURCE, CONTACTS_RESOURCE,
+    EMAIL_INTERACTIONS_RESOURCE, EMAIL_RESOURCE,
 };
 use crate::broker::{self, BrokerError};
 use crate::calendar_sync::{CalendarScheduler, CalendarSync, CALENDAR_TICK};
@@ -833,6 +834,38 @@ impl<K: KeySource> StoreApi<K> {
             .map_err(read_error)
     }
 
+    /// El historial de correo con una dirección: los últimos `n` mensajes que se
+    /// intercambiaron con `address` —los que mandó y los que recibió—, de todas
+    /// las casillas de la cuenta, más nuevos primero. Lo pide la libreta de
+    /// direcciones para la ficha de un contacto.
+    ///
+    /// Devuelve metadatos acotados (fecha, asunto, remitente y UID), **nunca el
+    /// cuerpo**. `address` se compara entera, no como subcadena: el historial con
+    /// una persona no incluye el de otra de un dominio parecido.
+    ///
+    /// Pide **`store.email.interactions`**, no `store.email`: es un permiso más
+    /// angosto, y la libreta no llega a leer todo el correo guardado. Y **no
+    /// enciende** el correo de la cuenta —lee lo que ya haya—: sin correo
+    /// sincronizado contesta una lista vacía, nunca dispara la sincronización
+    /// completa. Un permiso angosto no es una puerta para bajar todo el correo.
+    async fn messages_with(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        account_id: String,
+        address: String,
+        n: u32,
+    ) -> zbus::fdo::Result<String> {
+        let limit = email_read::page_limit(n);
+        self.authorize_email_interactions(&header, &account_id)
+            .await?;
+        let items = self
+            .manager
+            .read_store(&account_id, move |s| s.messages_with(&address, limit))
+            .await
+            .map_err(read_error)?;
+        email_read::to_capped_json(&items, email_read::MAX_PAGE_REPLY_BYTES).map_err(read_error)
+    }
+
     /// Crea o edita un evento o una tarea de un calendario, **encolándolo** hacia
     /// el servidor (no espera a la red): escribe el crudo optimista, lo marca y
     /// suma la op (ver `store/queue.rs`). La señal `Changed` del área sale sola.
@@ -1470,6 +1503,29 @@ impl<K: KeySource> StoreApi<K> {
             .await?;
         self.activate_after_read(EMAIL_AREA, account_id, &account)
             .await;
+        Ok(())
+    }
+
+    /// Lo que va antes de leer el **historial de correo** con una dirección: la
+    /// cuenta existe y tiene correo, y quien llama tiene
+    /// `store.email.interactions`.
+    ///
+    /// A diferencia de [`Self::authorize_email`], **no enciende** el área ni
+    /// pide sincronizar (no hay `activate_after_read`): este permiso angosto
+    /// deja ver lo que ya se bajó, no es una orden de bajar el correo entero. Si
+    /// el correo nunca se sincronizó, la lectura devuelve una lista vacía.
+    async fn authorize_email_interactions(
+        &self,
+        header: &Header<'_>,
+        account_id: &str,
+    ) -> zbus::fdo::Result<()> {
+        let account = self
+            .manager
+            .area_account(EMAIL_AREA, account_id)
+            .await
+            .map_err(to_fdo)?;
+        self.authorize(header, EMAIL_INTERACTIONS_RESOURCE, &account.display_name)
+            .await?;
         Ok(())
     }
 
@@ -2868,6 +2924,7 @@ mod tests {
                 "ListMessages",
                 "ListOccurrences",
                 "ListTasks",
+                "MessagesWith",
                 "PutContact",
                 "PutEvent",
                 "PutTask",
