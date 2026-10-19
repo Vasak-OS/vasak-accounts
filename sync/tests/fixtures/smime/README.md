@@ -16,5 +16,14 @@ prueba, como los `.pem` de prueba de los propios crates de RustCrypto.
   `MalformedPkcs12` («no trae clave»).
 - `solo-clave.p12` — PBES2, **sólo la clave, sin certificados**. Tiene que dar
   `MalformedPkcs12` («no trae certificados»).
+- `sin-mac.p12` — PBES2 con clave y cert, **sin `MacData`** (`-nomac`). Tiene que dar
+  `MalformedPkcs12` («no trae MAC»).
+- `mac-sha1.p12` — PBES2 pero con el **MAC en SHA-1** (`-macalg sha1`). Tiene que dar
+  `UnsupportedPkcs12`.
+- `mac-sha512.p12` — PBES2 con MAC SHA-512 (`-macalg sha512`). Tiene que abrir.
+- `clave-heredada-sola.p12` — sólo la clave, en un keybag con
+  `pbeWithSHA1And3-KeyTripleDES-CBC` dentro de un safe en claro y MAC SHA-256
+  (`-nocerts -legacy -keypbe PBE-SHA1-3DES -macalg sha256`): la forma de los `.p12`
+  de CryptoAPI/keytool. Tiene que dar `UnsupportedPkcs12` con el hint «sin -legacy».
 
 Contraseña de todos: `vasak-test`.

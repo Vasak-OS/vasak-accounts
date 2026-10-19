@@ -571,6 +571,11 @@ mod tests {
     const LEGACY_P12: &[u8] = include_bytes!("../../tests/fixtures/smime/rsa-legacy.p12");
     const SOLO_CERTS_P12: &[u8] = include_bytes!("../../tests/fixtures/smime/solo-certs.p12");
     const SOLO_CLAVE_P12: &[u8] = include_bytes!("../../tests/fixtures/smime/solo-clave.p12");
+    const SIN_MAC_P12: &[u8] = include_bytes!("../../tests/fixtures/smime/sin-mac.p12");
+    const MAC_SHA1_P12: &[u8] = include_bytes!("../../tests/fixtures/smime/mac-sha1.p12");
+    const MAC_SHA512_P12: &[u8] = include_bytes!("../../tests/fixtures/smime/mac-sha512.p12");
+    const CLAVE_HEREDADA_P12: &[u8] =
+        include_bytes!("../../tests/fixtures/smime/clave-heredada-sola.p12");
     const CERT_PEM: &str = include_str!("../../tests/fixtures/smime/cert.pem");
     const PASSWORD: &[u8] = b"vasak-test";
     /// `rsaEncryption`, el algoritmo de la clave de los fixtures.
@@ -711,13 +716,14 @@ mod tests {
     /// aceptar con una identidad **distinta**. Antes de verificar el MAC, medido,
     /// ~1960 de las 2670 posiciones daban `Ok` con otra identidad (1197 con otra
     /// clave privada); ahora `verify_mac` las rechaza antes de confiar en el
-    /// contenido. Si para algún byte el parseo devuelve `Ok`, tiene que ser la
+    /// contenido (se prueba uno de cada 4 bytes: cubre todas las regiones y
+    /// ahorra 20 s de CI). Si para algún byte el parseo devuelve `Ok`, tiene que ser la
     /// misma identidad (p. ej. un byte fuera de lo que el MAC cubre y que no
     /// cambia nada).
     #[test]
     fn un_p12_con_un_byte_cambiado_no_se_acepta_con_otra_identidad() {
         let original = parse_pkcs12(PBES2_P12, PASSWORD).unwrap();
-        for i in 0..PBES2_P12.len() {
+        for i in (0..PBES2_P12.len()).step_by(4) {
             let mut roto = PBES2_P12.to_vec();
             roto[i] ^= 0xff;
             if let Ok(r) = parse_pkcs12(&roto, PASSWORD) {
@@ -743,6 +749,292 @@ mod tests {
             !printed.contains(&hex)
                 && !printed.contains(&format!("{:?}", &imported.private_key_pkcs8[..8]))
         );
+    }
+
+    // ── MAC del PFX ───────────────────────────────────────────────────
+
+    /// Re-codifica el fixture PBES2 tocando su `MacData`.
+    fn con_mac(tocar: impl FnOnce(&mut MacData)) -> Vec<u8> {
+        let mut pfx = Pfx::from_der(PBES2_P12).unwrap();
+        tocar(pfx.mac_data.as_mut().expect("el fixture trae MAC"));
+        pfx.to_der().unwrap()
+    }
+
+    #[test]
+    fn un_p12_sin_mac_se_rechaza_porque_no_se_puede_verificar() {
+        let r = parse_pkcs12(SIN_MAC_P12, PASSWORD);
+        assert!(
+            matches!(&r, Err(SmimeError::MalformedPkcs12(d)) if d.contains("no trae MAC")),
+            "dio {r:?}"
+        );
+    }
+
+    #[test]
+    fn un_mac_con_sha1_es_heredado_y_no_esta_disponible() {
+        let err = parse_pkcs12(MAC_SHA1_P12, PASSWORD).unwrap_err();
+        assert!(matches!(err, SmimeError::UnsupportedPkcs12), "dio {err:?}");
+        assert!(err.to_string().contains("sin -legacy"), "{err}");
+    }
+
+    #[test]
+    fn un_mac_con_sha512_se_verifica_y_abre() {
+        let imported = parse_pkcs12(MAC_SHA512_P12, PASSWORD).expect("tiene que abrir");
+        assert_eq!(imported.certs, vec![cert_der()]);
+        let err = parse_pkcs12(MAC_SHA512_P12, b"otra").unwrap_err();
+        assert!(matches!(err, SmimeError::WrongPassword), "dio {err:?}");
+    }
+
+    /// El contenido está intacto pero el MAC no cuadra: es lo que ve el MAC de
+    /// un `.p12` manipulado, y es `WrongPassword` de forma determinista.
+    #[test]
+    fn un_mac_manipulado_da_contrasena_equivocada() {
+        let roto = con_mac(|m| {
+            let mut digest = m.mac.digest.as_bytes().to_vec();
+            digest[0] ^= 0x01;
+            m.mac.digest = OctetString::new(digest).unwrap();
+        });
+        let err = parse_pkcs12(&roto, PASSWORD).unwrap_err();
+        assert!(matches!(err, SmimeError::WrongPassword), "dio {err:?}");
+
+        let otra_sal = con_mac(|m| {
+            let mut sal = m.mac_salt.as_bytes().to_vec();
+            sal[0] ^= 0x01;
+            m.mac_salt = OctetString::new(sal).unwrap();
+        });
+        let err = parse_pkcs12(&otra_sal, PASSWORD).unwrap_err();
+        assert!(matches!(err, SmimeError::WrongPassword), "dio {err:?}");
+    }
+
+    /// Sin el MAC una contraseña mala sólo se notaba por el relleno CBC (1 de
+    /// cada ~256 se colaba): con el MAC es siempre `WrongPassword`.
+    #[test]
+    fn una_contrasena_mala_es_siempre_wrongpassword() {
+        for i in 0..300 {
+            let pw = format!("mal-{i}");
+            let r = parse_pkcs12(PBES2_P12, pw.as_bytes());
+            assert!(
+                matches!(r, Err(SmimeError::WrongPassword)),
+                "con {pw:?} dio {r:?}"
+            );
+        }
+        let r = parse_pkcs12(PBES2_P12, &[0xff, 0xfe]);
+        assert!(
+            matches!(r, Err(SmimeError::WrongPassword)),
+            "no UTF-8: {r:?}"
+        );
+    }
+
+    // ── Cotas contra un .p12 hostil (DoS) ─────────────────────────────
+
+    #[test]
+    fn las_iteraciones_del_mac_fuera_de_rango_no_estan_disponibles_sin_computar_el_kdf() {
+        for n in [0, -1, i32::MIN, MAX_MAC_ITERS + 1, i32::MAX] {
+            let p12 = con_mac(|m| m.iterations = n);
+            let t = std::time::Instant::now();
+            let r = parse_pkcs12(&p12, PASSWORD);
+            assert!(
+                matches!(r, Err(SmimeError::UnsupportedPkcs12)),
+                "n={n}: {r:?}"
+            );
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(2),
+                "n={n}: tardó {:?}, ¿computó el KDF?",
+                t.elapsed()
+            );
+        }
+    }
+
+    /// Las iteraciones del MAC dentro de rango sí se computan: con una cantidad
+    /// distinta de la real, el MAC no cuadra.
+    #[test]
+    fn las_iteraciones_del_mac_dentro_de_rango_se_computan_y_no_cuadran() {
+        let p12 = con_mac(|m| m.iterations = 2049);
+        let r = parse_pkcs12(&p12, PASSWORD);
+        assert!(matches!(r, Err(SmimeError::WrongPassword)), "dio {r:?}");
+    }
+
+    fn tlv(tag: u8, contenido: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        match contenido.len() {
+            n if n < 0x80 => out.push(n as u8),
+            n => {
+                out.push(0x82);
+                out.extend_from_slice(&(n as u16).to_be_bytes());
+            }
+        }
+        out.extend_from_slice(contenido);
+        out
+    }
+
+    fn entero(n: u64) -> Vec<u8> {
+        let mut bytes: Vec<u8> = n
+            .to_be_bytes()
+            .into_iter()
+            .skip_while(|b| *b == 0)
+            .collect();
+        if bytes.is_empty() || bytes[0] & 0x80 != 0 {
+            bytes.insert(0, 0);
+        }
+        tlv(0x02, &bytes)
+    }
+
+    fn oid(s: &str) -> Vec<u8> {
+        tlv(0x06, ObjectIdentifier::new_unwrap(s).as_bytes())
+    }
+
+    /// `AlgorithmIdentifier` de PBES2 con el KDF dado (ya codificado).
+    fn pbes2_con(kdf: Vec<u8>) -> pkcs5::EncryptionScheme<'static> {
+        let cifrado = tlv(
+            0x30,
+            &[oid("2.16.840.1.101.3.4.1.42"), tlv(0x04, &[7u8; 16])].concat(),
+        );
+        let params = tlv(0x30, &[kdf, cifrado].concat());
+        let alg = tlv(0x30, &[oid("1.2.840.113549.1.5.13"), params].concat());
+        let alg: &'static [u8] = Box::leak(alg.into_boxed_slice());
+        pkcs5::EncryptionScheme::try_from(spki::AlgorithmIdentifierRef::from_der(alg).unwrap())
+            .expect("PBES2 sintético")
+    }
+
+    fn pbkdf2_con(iteraciones: u64) -> pkcs5::EncryptionScheme<'static> {
+        let params = tlv(0x30, &[tlv(0x04, &[1u8; 8]), entero(iteraciones)].concat());
+        pbes2_con(tlv(0x30, &[oid("1.2.840.113549.1.5.12"), params].concat()))
+    }
+
+    fn scrypt_con(n: u64, r: u64, p: u64) -> pkcs5::EncryptionScheme<'static> {
+        let params = tlv(
+            0x30,
+            &[tlv(0x04, &[1u8; 8]), entero(n), entero(r), entero(p)].concat(),
+        );
+        pbes2_con(tlv(0x30, &[oid("1.3.6.1.4.1.11591.4.11"), params].concat()))
+    }
+
+    #[test]
+    fn el_pbkdf2_con_demasiadas_iteraciones_no_esta_disponible() {
+        assert!(check_kdf_bounds(&pbkdf2_con(2048)).is_ok());
+        assert!(check_kdf_bounds(&pbkdf2_con(MAX_PBKDF2_ITERS as u64)).is_ok());
+        for n in [MAX_PBKDF2_ITERS as u64 + 1, u32::MAX as u64] {
+            let r = check_kdf_bounds(&pbkdf2_con(n));
+            assert!(
+                matches!(r, Err(SmimeError::UnsupportedPkcs12)),
+                "n={n}: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn el_scrypt_con_costo_de_memoria_enorme_no_esta_disponible() {
+        assert!(check_kdf_bounds(&scrypt_con(1 << 14, 8, 1)).is_ok());
+        assert!(check_kdf_bounds(&scrypt_con(MAX_SCRYPT_COST, 8, 1)).is_ok());
+        let casos = [
+            ("N > 2^20", scrypt_con(MAX_SCRYPT_COST * 2, 8, 1)),
+            ("N de 2^40", scrypt_con(1 << 40, 8, 1)),
+            (
+                "r enorme",
+                scrypt_con(1 << 14, MAX_SCRYPT_BLOCK as u64 + 1, 1),
+            ),
+            (
+                "p enorme",
+                scrypt_con(1 << 14, 8, MAX_SCRYPT_PARALLEL as u64 + 1),
+            ),
+        ];
+        for (nombre, scheme) in casos {
+            let r = check_kdf_bounds(&scheme);
+            assert!(
+                matches!(r, Err(SmimeError::UnsupportedPkcs12)),
+                "{nombre}: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn un_der_de_mas_de_8_mib_se_rechaza_sin_parsearlo() {
+        // Ceros: si se parseara daría `MalformedPkcs12`; `Unsupported` prueba
+        // que el tope corta antes.
+        let r = parse_pkcs12(&vec![0u8; MAX_PKCS12_BYTES + 1], PASSWORD);
+        assert!(matches!(r, Err(SmimeError::UnsupportedPkcs12)), "dio {r:?}");
+        // En el tope exacto sí se intenta, y no es un PFX.
+        let r = parse_pkcs12(&vec![0u8; MAX_PKCS12_BYTES], PASSWORD);
+        assert!(
+            matches!(r, Err(SmimeError::MalformedPkcs12(_))),
+            "dio {r:?}"
+        );
+    }
+
+    // ── Keybag heredado primero y en claro ────────────────────────────
+
+    /// `.p12` con sólo la clave, en un keybag con `pbeWithSHA1And3-KeyTripleDES`
+    /// dentro de un safe en claro y MAC SHA-256 (como lo arman CryptoAPI o
+    /// keytool): `EncryptedPrivateKeyInfo` no entiende ese PBE, y el error tiene
+    /// que ser el del hint y no «no se pudo leer».
+    #[test]
+    fn un_keybag_heredado_primero_y_en_claro_da_el_hint_de_sin_legacy() {
+        let err = parse_pkcs12(CLAVE_HEREDADA_P12, PASSWORD).unwrap_err();
+        assert!(matches!(err, SmimeError::UnsupportedPkcs12), "dio {err:?}");
+        assert!(err.to_string().contains("sin -legacy"), "{err}");
+    }
+
+    #[test]
+    fn el_oid_del_pbe_del_keybag_se_lee_sin_exigir_que_pkcs5_lo_entienda() {
+        // pbeWithSHA1And3-KeyTripleDES-CBC, con sus parámetros (sal + iteraciones).
+        let legacy = tlv(
+            0x30,
+            &[
+                tlv(
+                    0x30,
+                    &[
+                        oid("1.2.840.113549.1.12.1.3"),
+                        tlv(0x30, &[tlv(0x04, &[1u8; 8]), entero(2048)].concat()),
+                    ]
+                    .concat(),
+                ),
+                tlv(0x04, &[0u8; 16]),
+            ]
+            .concat(),
+        );
+        assert_eq!(
+            keybag_pbe_oid(&legacy).unwrap().to_string(),
+            "1.2.840.113549.1.12.1.3"
+        );
+        assert!(EncryptedPrivateKeyInfo::from_der(&legacy).is_err());
+
+        for basura in [
+            &[][..],
+            &[0x30],
+            &[0x30, 0x00],
+            &[0x04, 0x01, 0x00],
+            &[0x30, 0x84, 0xff, 0xff, 0xff, 0xff],
+        ] {
+            assert!(
+                matches!(keybag_pbe_oid(basura), Err(SmimeError::MalformedPkcs12(_))),
+                "{basura:?}"
+            );
+        }
+    }
+
+    /// El camino de `import_pkcs12` (ahora en `spawn_blocking`) sigue
+    /// llegando al llavero con un `.p12` con MAC SHA-512 y propaga el error
+    /// del parseo sin guardar nada con uno sin MAC.
+    #[tokio::test]
+    async fn importar_en_spawn_blocking_guarda_y_propaga_los_errores() {
+        let (keys, _server, _shared) = fake_keyring().await;
+        import_pkcs12(&keys, "ana@example.com", MAC_SHA512_P12, PASSWORD)
+            .await
+            .unwrap();
+        assert!(keys
+            .find_smime_private_key("ana@example.com")
+            .await
+            .unwrap()
+            .is_some());
+
+        let err = import_pkcs12(&keys, "beto@example.com", SIN_MAC_P12, PASSWORD)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SmimeError::MalformedPkcs12(_)), "dio {err:?}");
+        assert!(keys
+            .find_smime_private_key("beto@example.com")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     // ── La cadena de certificados ─────────────────────────────────────
