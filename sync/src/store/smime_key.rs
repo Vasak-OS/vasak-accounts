@@ -32,11 +32,15 @@ use cms::content_info::ContentInfo;
 use cms::encrypted_data::EncryptedData;
 use der::asn1::{ObjectIdentifier, OctetString};
 use der::{Any, Decode, Encode, Reader, SliceReader};
+use hmac::{Hmac, Mac};
 use pkcs12::bag_type::BagType;
 use pkcs12::cert_type::CertBag;
+use pkcs12::kdf::{derive_key_utf8, Pkcs12KeyType};
+use pkcs12::mac_data::MacData;
 use pkcs12::pfx::Pfx;
 use pkcs12::safe_bag::{SafeBag, SafeContents};
 use pkcs8::EncryptedPrivateKeyInfo;
+use sha2::{Digest, Sha256, Sha384, Sha512};
 use zbus::zvariant::{OwnedObjectPath, Value};
 use zeroize::Zeroizing;
 
@@ -61,6 +65,22 @@ const ID_ENCRYPTED_DATA: ObjectIdentifier = const_oid::db::rfc5911::ID_ENCRYPTED
 const ID_PBES2: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.5.13");
 /// `x509Certificate` dentro de un `CertBag`.
 const X509_CERTIFICATE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.22.1");
+
+const ID_SHA_256: ObjectIdentifier = const_oid::db::rfc5912::ID_SHA_256;
+const ID_SHA_384: ObjectIdentifier = const_oid::db::rfc5912::ID_SHA_384;
+const ID_SHA_512: ObjectIdentifier = const_oid::db::rfc5912::ID_SHA_512;
+
+/// Cotas de entrada contra un `.p12` hostil (DoS). Un `.p12` real pesa unos
+/// pocos KB y usa 2048 rondas; estos topes son holgados para lo legítimo y
+/// cierran el OOM/CPU de un archivo armado a propósito. Fuera de rango:
+/// [`SmimeError::UnsupportedPkcs12`].
+const MAX_PKCS12_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PBKDF2_ITERS: u32 = 10_000_000;
+const MAX_MAC_ITERS: i32 = 10_000_000;
+/// `N` de scrypt (memoria ≈ 128 · r · N): 2^20 con r=8 son ~1 GiB, el techo.
+const MAX_SCRYPT_COST: u64 = 1 << 20;
+const MAX_SCRYPT_BLOCK: u16 = 64;
+const MAX_SCRYPT_PARALLEL: u16 = 16;
 
 /// Lo que puede salir mal con una identidad S/MIME.
 #[derive(Debug)]
@@ -124,12 +144,31 @@ impl std::fmt::Debug for ImportedIdentity {
 /// y una contraseña equivocada [`SmimeError::WrongPassword`]. Todo lo demás que
 /// no cuadre es [`SmimeError::MalformedPkcs12`]; nunca entra en pánico.
 pub fn parse_pkcs12(der: &[u8], password: &[u8]) -> Result<ImportedIdentity, SmimeError> {
+    // Cota dura antes de parsear: un `.p12` legítimo pesa unos pocos KB.
+    if der.len() > MAX_PKCS12_BYTES {
+        return Err(SmimeError::UnsupportedPkcs12);
+    }
+
     let pfx = Pfx::from_der(der).map_err(|e| SmimeError::MalformedPkcs12(format!("PFX: {e}")))?;
 
     if pfx.auth_safe.content_type != ID_DATA {
         return Err(SmimeError::MalformedPkcs12("authSafe no es id-data".into()));
     }
     let authsafe_der = content_octets(&pfx.auth_safe)?;
+
+    // El MAC se verifica ANTES de confiar en el contenido: autentica el archivo
+    // con la contraseña, así una contraseña equivocada da `WrongPassword`
+    // determinista y un `.p12` corrompido o manipulado falla en vez de importar
+    // una identidad distinta en silencio (medido: sin esto, un byte cambiado
+    // daba otra clave o cert en ~1960 de 2670 posiciones). Un `.p12` sin MAC se
+    // rechaza: no se puede verificar su integridad.
+    let mac = pfx.mac_data.as_ref().ok_or_else(|| {
+        SmimeError::MalformedPkcs12(
+            "el .p12 no trae MAC; no se puede verificar su integridad".into(),
+        )
+    })?;
+    verify_mac(mac, &authsafe_der, password)?;
+
     let safes = Vec::<ContentInfo>::from_der(&authsafe_der)
         .map_err(|e| SmimeError::MalformedPkcs12(format!("AuthenticatedSafe: {e}")))?;
 
@@ -137,8 +176,10 @@ pub fn parse_pkcs12(der: &[u8], password: &[u8]) -> Result<ImportedIdentity, Smi
     let mut private_key: Option<Zeroizing<Vec<u8>>> = None;
 
     for safe in &safes {
-        let safe_contents_der: Vec<u8> = if safe.content_type == ID_DATA {
-            content_octets(safe)?
+        // El contenido descifrado —que puede traer la clave en claro— se borra
+        // al soltarlo.
+        let safe_contents_der: Zeroizing<Vec<u8>> = if safe.content_type == ID_DATA {
+            Zeroizing::new(content_octets(safe)?)
         } else if safe.content_type == ID_ENCRYPTED_DATA {
             decrypt_encrypted_data(safe, password)?
         } else {
@@ -178,7 +219,10 @@ fn content_octets(ci: &ContentInfo) -> Result<Vec<u8>, SmimeError> {
 }
 
 /// Descifra un `ContentInfo` `id-encryptedData` (los SafeContents cifrados).
-fn decrypt_encrypted_data(safe: &ContentInfo, password: &[u8]) -> Result<Vec<u8>, SmimeError> {
+fn decrypt_encrypted_data(
+    safe: &ContentInfo,
+    password: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, SmimeError> {
     let der = safe
         .content
         .to_der()
@@ -190,6 +234,21 @@ fn decrypt_encrypted_data(safe: &ContentInfo, password: &[u8]) -> Result<Vec<u8>
         .encrypted_content
         .ok_or_else(|| SmimeError::MalformedPkcs12("EncryptedData sin contenido".into()))?;
     decrypt_pbes2(&eci.content_enc_alg, ciphertext.as_bytes(), password)
+}
+
+/// El OID del esquema de cifrado de un keybag (`EncryptedPrivateKeyInfo`), leído
+/// del `AlgorithmIdentifier` crudo sin exigir que `pkcs5` lo entienda. Así un PBE
+/// heredado se clasifica como no soportado en vez de ilegible.
+fn keybag_pbe_oid(epki_der: &[u8]) -> Result<ObjectIdentifier, SmimeError> {
+    // EncryptedPrivateKeyInfo ::= SEQUENCE { encryptionAlgorithm AlgorithmIdentifier, ... }
+    let seq =
+        Any::from_der(epki_der).map_err(|e| SmimeError::MalformedPkcs12(format!("keybag: {e}")))?;
+    let mut reader = SliceReader::new(seq.value())
+        .map_err(|e| SmimeError::MalformedPkcs12(format!("keybag: {e}")))?;
+    let alg: spki::AlgorithmIdentifierRef = reader
+        .decode()
+        .map_err(|e| SmimeError::MalformedPkcs12(format!("keybag alg: {e}")))?;
+    Ok(alg.oid)
 }
 
 fn collect_bag(
@@ -205,16 +264,19 @@ fn collect_bag(
     match BagType::try_from(bag.bag_id) {
         Ok(BagType::Pkcs8) => {
             // Shrouded key bag: EncryptedPrivateKeyInfo → descifrar a PKCS#8.
-            // `encryption_algorithm` ya viene parseado como `EncryptionScheme`
-            // (PBES1/PBES2); el PBE heredado de PKCS#12 ni siquiera parsea acá y
-            // cae en `MalformedPkcs12`, pero en la práctica el `.p12` legacy se
-            // detecta antes, en el certbag (`decrypt_pbes2`). Igual exigimos
-            // PBES2 explícito para no intentar PBES1.
-            let epki = EncryptedPrivateKeyInfo::from_der(inner)
-                .map_err(|e| SmimeError::MalformedPkcs12(format!("keybag: {e}")))?;
-            if epki.encryption_algorithm.oid() != ID_PBES2 {
+            // El OID del PBE se mira **antes** de `from_der`: ése parsea
+            // `encryption_algorithm` como `EncryptionScheme`, que no entiende el
+            // PBE heredado de PKCS#12 (3DES/RC2) y daría `MalformedPkcs12`
+            // («no se pudo leer») en vez del hint «reexportá sin -legacy». Pasa
+            // con los `.p12` que ponen el safe de la clave primero y en claro
+            // (CryptoAPI de Windows, keytool de Java). Si no es PBES2, cortamos
+            // con el mensaje correcto; si lo es, seguimos.
+            if keybag_pbe_oid(inner)? != ID_PBES2 {
                 return Err(SmimeError::UnsupportedPkcs12);
             }
+            let epki = EncryptedPrivateKeyInfo::from_der(inner)
+                .map_err(|e| SmimeError::MalformedPkcs12(format!("keybag: {e}")))?;
+            check_kdf_bounds(&epki.encryption_algorithm)?;
             let doc = epki
                 .decrypt(password)
                 .map_err(|_| SmimeError::WrongPassword)?;
@@ -243,7 +305,7 @@ fn decrypt_pbes2(
     alg: &spki::AlgorithmIdentifierOwned,
     ciphertext: &[u8],
     password: &[u8],
-) -> Result<Vec<u8>, SmimeError> {
+) -> Result<Zeroizing<Vec<u8>>, SmimeError> {
     if alg.oid != ID_PBES2 {
         return Err(SmimeError::UnsupportedPkcs12);
     }
@@ -254,23 +316,91 @@ fn decrypt_pbes2(
         .map_err(|e| SmimeError::MalformedPkcs12(e.to_string()))?;
     let scheme =
         pkcs5::EncryptionScheme::try_from(alg_ref).map_err(|_| SmimeError::UnsupportedPkcs12)?;
+    check_kdf_bounds(&scheme)?;
     scheme
         .decrypt(password, ciphertext)
-        .map(|v| v.to_vec())
+        .map(|v| Zeroizing::new(v.to_vec()))
         .map_err(|_| SmimeError::WrongPassword)
+}
+
+/// Rechaza parámetros de KDF fuera de rango sano **antes** de computarlos, para
+/// que un `.p12` hostil no fuerce un OOM (scrypt con `N` enorme) ni una quema de
+/// CPU (iteraciones gigantes). Fuera de rango: [`SmimeError::UnsupportedPkcs12`].
+fn check_kdf_bounds(scheme: &pkcs5::EncryptionScheme) -> Result<(), SmimeError> {
+    if let pkcs5::EncryptionScheme::Pbes2(params) = scheme {
+        if let Some(pbkdf2) = params.kdf.pbkdf2() {
+            if pbkdf2.iteration_count > MAX_PBKDF2_ITERS {
+                return Err(SmimeError::UnsupportedPkcs12);
+            }
+        } else if let Some(scrypt) = params.kdf.scrypt() {
+            if scrypt.cost_parameter > MAX_SCRYPT_COST
+                || scrypt.block_size > MAX_SCRYPT_BLOCK
+                || scrypt.parallelization > MAX_SCRYPT_PARALLEL
+            {
+                return Err(SmimeError::UnsupportedPkcs12);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Verifica el MAC del PFX (HMAC con el KDF de PKCS#12) sobre el contenido del
+/// authSafe. Es lo que autentica el archivo con la contraseña: sin esto, un byte
+/// cambiado dentro del cifrado se aceptaba con otra identidad.
+///
+/// La contraseña del MAC va como BMPString (lo hace `derive_key_utf8`), que es
+/// otra codificación que la de PBES2 (bytes crudos); por eso se pasa como `&str`.
+/// Sólo SHA-256/384/512 (sha2); un MAC con SHA-1 es de un `.p12` heredado y se
+/// rechaza como no soportado, igual que su cifrado.
+fn verify_mac(mac: &MacData, authsafe: &[u8], password: &[u8]) -> Result<(), SmimeError> {
+    let password = std::str::from_utf8(password).map_err(|_| SmimeError::WrongPassword)?;
+    let rounds = mac.iterations;
+    if rounds < 1 || rounds > MAX_MAC_ITERS {
+        return Err(SmimeError::UnsupportedPkcs12);
+    }
+    let salt = mac.mac_salt.as_bytes();
+    let expected = mac.mac.digest.as_bytes();
+
+    macro_rules! verify_with {
+        ($hash:ty) => {{
+            let len = <$hash as Digest>::output_size();
+            let key = derive_key_utf8::<$hash>(password, salt, Pkcs12KeyType::Mac, rounds, len)
+                .map_err(|e| SmimeError::MalformedPkcs12(format!("KDF del MAC: {e}")))?;
+            let mut hmac = Hmac::<$hash>::new_from_slice(&key)
+                .map_err(|e| SmimeError::MalformedPkcs12(format!("clave del MAC: {e}")))?;
+            hmac.update(authsafe);
+            // `verify_slice` compara en tiempo constante.
+            hmac.verify_slice(expected)
+                .map_err(|_| SmimeError::WrongPassword)
+        }};
+    }
+
+    match mac.mac.algorithm.oid {
+        ID_SHA_256 => verify_with!(Sha256),
+        ID_SHA_384 => verify_with!(Sha384),
+        ID_SHA_512 => verify_with!(Sha512),
+        _ => Err(SmimeError::UnsupportedPkcs12),
+    }
 }
 
 // ── Guardado y lectura en el llavero ──────────────────────────────────
 
 /// Importa un `.p12` a la identidad `identity`: lo parsea y guarda la clave
 /// privada y la cadena de certificados en el llavero.
+///
+/// El parseo hace KDF (PBKDF2/HMAC del MAC), que es trabajo de CPU, así que corre
+/// en `spawn_blocking` para no frenar un worker de Tokio.
 pub async fn import_pkcs12(
     keys: &SecretServiceKeys,
     identity: &str,
     p12_der: &[u8],
     password: &[u8],
 ) -> Result<(), SmimeError> {
-    let imported = parse_pkcs12(p12_der, password)?;
+    let der = p12_der.to_vec();
+    let password = Zeroizing::new(password.to_vec());
+    let imported = tokio::task::spawn_blocking(move || parse_pkcs12(&der, &password))
+        .await
+        .map_err(|e| SmimeError::MalformedPkcs12(format!("el parseo del .p12 se cortó: {e}")))??;
     keys.store_smime_identity(identity, &imported).await?;
     Ok(())
 }
@@ -577,16 +707,14 @@ mod tests {
         }
     }
 
-    /// HUECO CONOCIDO, no se corre en el CI: `parse_pkcs12` no verifica el MAC
-    /// del PFX (HMAC con el KDF de PKCS#12, `pkcs12` con la característica
-    /// `kdf`), y el descifrado de PBES2 sólo comprueba el relleno CBC. Un `.p12`
-    /// con un byte cambiado dentro del cifrado se acepta con una clave o un
-    /// certificado **distintos** y se guarda en el llavero. Medido: cambiando
-    /// de a un byte, ~1960 de las 2670 posiciones dan `Ok` con otra identidad
-    /// (1197 con otra clave privada). Se corre con `--ignored`; pasa a ser una
-    /// prueba normal cuando se verifique el MAC.
+    /// El MAC del PFX cierra el hueco: un `.p12` con un byte cambiado no se puede
+    /// aceptar con una identidad **distinta**. Antes de verificar el MAC, medido,
+    /// ~1960 de las 2670 posiciones daban `Ok` con otra identidad (1197 con otra
+    /// clave privada); ahora `verify_mac` las rechaza antes de confiar en el
+    /// contenido. Si para algún byte el parseo devuelve `Ok`, tiene que ser la
+    /// misma identidad (p. ej. un byte fuera de lo que el MAC cubre y que no
+    /// cambia nada).
     #[test]
-    #[ignore = "falta verificar el MAC del PFX: un .p12 corrompido se acepta con otra identidad"]
     fn un_p12_con_un_byte_cambiado_no_se_acepta_con_otra_identidad() {
         let original = parse_pkcs12(PBES2_P12, PASSWORD).unwrap();
         for i in 0..PBES2_P12.len() {
