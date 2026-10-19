@@ -2679,6 +2679,194 @@ mod tests {
         );
     }
 
+    /// Dos mensajes de Ana (uno con cuerpo guardado) y uno de un vecino de
+    /// dominio, escritos como los escribe la sincronización de correo.
+    async fn with_mail(api: &Api, account_id: &str) {
+        use crate::store::email::{
+            MailboxListing, MailboxRole, MessageBodyRow, MessageOp, MessageRow,
+        };
+        let mail = |mailbox_id: i64, uid: u64, from: &str, to: &str, subject: &str, ts: i64| {
+            MessageOp::Upsert(Box::new(MessageRow {
+                mailbox_id,
+                uid,
+                message_id: Some(format!("<{uid}@x>")),
+                from_addr: from.into(),
+                to_addrs: to.into(),
+                cc_addrs: String::new(),
+                bcc_addrs: String::new(),
+                reply_to: None,
+                subject: subject.into(),
+                date_ts: ts,
+                sort_key: ts,
+                flags_seen: false,
+                flags_answered: false,
+                flags_flagged: false,
+                flags_draft: false,
+                flags_deleted: false,
+                has_attachments: false,
+                size: 10,
+            }))
+        };
+        api.manager
+            .with_store(account_id, move |store| {
+                store.upsert_mailboxes(&[MailboxListing {
+                    name: "INBOX".into(),
+                    display_name: "Bandeja".into(),
+                    role: MailboxRole::Inbox,
+                }])?;
+                let inbox = store.mailboxes()?[0].id;
+                store.apply_messages(
+                    vec![
+                        mail(inbox, 1, "Ana <ana@x.com>", "yo@x.com", "viejo", 100),
+                        mail(inbox, 2, "yo@x.com", "ana@x.com", "nuevo", 200),
+                        mail(inbox, 3, "ana@x.com.ar", "yo@x.com", "vecino", 300),
+                    ],
+                    inbox,
+                )?;
+                let id = store.list_messages(inbox, None, 10)?.items[0].id;
+                store.upsert_message_body(MessageBodyRow {
+                    message_id: id,
+                    text_body: Some("CUERPO-SECRETO".into()),
+                    html_body: None,
+                    truncated: false,
+                })?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    /// `MessagesWith` por el bus: con permiso devuelve el historial exacto, sin
+    /// cuerpo, y **no enciende** el correo ni pide una vuelta (a diferencia de
+    /// `ListMessages`).
+    #[tokio::test]
+    async fn el_historial_con_una_direccion_se_lee_por_el_bus_sin_encender_el_correo() {
+        let mut api = Api::new(
+            "api-historial",
+            vec![account("cuenta", false)],
+            Answer::Allow,
+        )
+        .await;
+        with_mail(&api, "cuenta").await;
+        let (client, _service) = api.client(":1.7").await;
+
+        let json = call(&client, "MessagesWith", &("cuenta", "ana@x.com", 10u32))
+            .await
+            .unwrap();
+        assert!(
+            !json.contains("CUERPO-SECRETO"),
+            "el historial filtró el cuerpo"
+        );
+        let items: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let subjects: Vec<&str> = items
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["subject"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            subjects,
+            vec!["nuevo", "viejo"],
+            "sin el vecino ana@x.com.ar"
+        );
+
+        // Un N chico recorta.
+        let one = call(&client, "MessagesWith", &("cuenta", "ana@x.com", 1u32))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&one)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Ni enciende el área ni pide sincronizar.
+        assert!(!api.settings().is_active("cuenta", EMAIL_AREA));
+        assert!(api.pending.try_recv().is_err());
+        // Y lo que se preguntó es el permiso angosto, no `store.email`.
+        let asked = api.access.permissions.0.lock().unwrap().asked.clone();
+        assert!(!asked.is_empty());
+        assert!(asked
+            .iter()
+            .all(|(_, _, resource, _)| resource == "store.email.interactions"));
+    }
+
+    /// **Falla cerrado**: sin `store.email.interactions` (negado o con el
+    /// servicio de permisos roto) no sale ni un dato, aunque quien llama tenga
+    /// `store.email` entero. Y al revés, el permiso angosto no depende del amplio.
+    /// Una sesión por caso: un «no» queda guardado para el proceso.
+    #[tokio::test]
+    async fn sin_el_permiso_angosto_el_historial_no_devuelve_nada() {
+        for (label, narrow, wide, expect_ok) in [
+            ("negado", Answer::Deny, Answer::Allow, false),
+            ("roto", Answer::Fail, Answer::Allow, false),
+            ("solo-angosto", Answer::Allow, Answer::Deny, true),
+        ] {
+            let mut api = Api::new(
+                &format!("api-historial-{label}"),
+                vec![account("cuenta", false)],
+                Answer::Allow,
+            )
+            .await;
+            with_mail(&api, "cuenta").await;
+            api.access
+                .permissions
+                .set_for(EMAIL_INTERACTIONS_RESOURCE, narrow);
+            api.access.permissions.set_for(EMAIL_RESOURCE, wide);
+            let (client, _service) = api.client(":1.7").await;
+
+            let result = call(&client, "MessagesWith", &("cuenta", "ana@x.com", 10u32)).await;
+            if expect_ok {
+                assert!(result.is_ok(), "{label}: {result:?}");
+            } else {
+                assert_eq!(error_name(&result), ACCESS_DENIED, "{label}");
+                // `store.email` concedido no abre el historial: esa lectura sí anda.
+                assert!(
+                    call(&client, "ListMailboxes", &("cuenta",)).await.is_ok(),
+                    "{label}"
+                );
+            }
+        }
+    }
+
+    /// Los bordes de la cuenta: sin área de correo, desconocida, y con correo
+    /// que nunca se sincronizó. Ninguno cae ni devuelve datos ajenos.
+    #[tokio::test]
+    async fn el_historial_de_una_cuenta_sin_correo_o_sin_sincronizar_no_cae() {
+        let mut only_calendar = account("agenda", false);
+        only_calendar.capabilities = vec!["calendar".into()];
+        let mut api = Api::new(
+            "api-historial-bordes",
+            vec![only_calendar, account("nueva", false)],
+            Answer::Allow,
+        )
+        .await;
+        let (client, _service) = api.client(":1.7").await;
+
+        // Sin área de correo y una cuenta que no existe: argumento inválido,
+        // y no se le pregunta nada a nadie.
+        for id in ["agenda", "desconocida", "../x"] {
+            assert_eq!(
+                error_name(&call(&client, "MessagesWith", &(id, "ana@x.com", 10u32)).await),
+                INVALID_ARGS,
+                "{id}"
+            );
+        }
+        assert_eq!(api.access.permissions.calls(), 0);
+
+        // Con correo pero nunca sincronizado (no hay base abierta): el
+        // documento de `messages_with` promete una lista vacía.
+        let result = call(&client, "MessagesWith", &("nueva", "ana@x.com", 10u32)).await;
+        assert_eq!(
+            result.as_deref().map(str::trim).ok(),
+            Some("[]"),
+            "correo sin sincronizar tenía que dar la lista vacía, dio {result:?}"
+        );
+    }
+
     /// La interfaz entera, con el llavero falso y un `vasak-permissions` falso,
     /// por conexiones punto a punto: cada cliente tiene su nombre único, como
     /// en el bus.
