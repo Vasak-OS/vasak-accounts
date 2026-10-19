@@ -1448,6 +1448,38 @@ pub(crate) mod tests {
             .unwrap()
     }
 
+    /// Las categorías van a la columna como un arreglo JSON y vuelven iguales,
+    /// con la coma y las comillas de adentro; lo que no es un arreglo de textos
+    /// (una base vieja, un valor roto) da una lista vacía y no un error.
+    #[test]
+    fn las_categorias_van_y_vuelven_de_la_columna_y_lo_roto_es_vacio() {
+        let categories = vec!["a".to_string(), "b,c".to_string(), "d\"e".to_string()];
+        let stored = categories_json(&categories);
+        assert_eq!(categories_from_json(&stored), categories);
+        assert_eq!(categories_json(&[]), "[]");
+        assert!(categories_from_json("[]").is_empty());
+        for broken in ["", "null", "a,b", "{\"a\":1}", "[1,2]", "[\"a\""] {
+            assert!(categories_from_json(broken).is_empty(), "{broken:?}");
+        }
+    }
+
+    /// Lo derivado del `VEVENT` de cabecera lleva categorías y color, y una
+    /// tarea también.
+    #[test]
+    fn lo_derivado_de_un_evento_y_de_una_tarea_lleva_categorias_y_color() {
+        let event = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:e\r\nDTSTART:20260926T120000Z\r\n\
+                     CATEGORIES:a,b\\,c\r\nCOLOR:tomato\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let index = derive_object(event, window(), &ExpansionLimits::DEFAULT);
+        assert_eq!(index.categories, vec!["a".to_string(), "b,c".to_string()]);
+        assert_eq!(index.color.as_deref(), Some("tomato"));
+
+        let task = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:t\r\nDUE:20260926T120000Z\r\n\
+                    CATEGORIES:casa\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let index = derive_object(task, window(), &ExpansionLimits::DEFAULT);
+        assert_eq!(index.categories, vec!["casa".to_string()]);
+        assert_eq!(index.color, None);
+    }
+
     #[test]
     fn la_ventana_va_de_doce_meses_atras_a_veinticuatro_adelante() {
         let w = window();

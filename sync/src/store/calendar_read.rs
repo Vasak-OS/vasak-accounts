@@ -1608,6 +1608,273 @@ mod tests {
         assert_eq!(read(&store).1, SyncState::Conflict);
     }
 
+    /// Un evento suelto con las líneas de más que se le pasen (`CATEGORIES`,
+    /// `COLOR`…), para las pruebas de categorías y color del DTO.
+    fn tagged(uid: &str, start: &str, extra: &str) -> String {
+        format!(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:{uid}\r\nSUMMARY:Evento {uid}\r\n\
+             DTSTART:{start}\r\nDURATION:PT1H\r\n{extra}END:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+    }
+
+    /// Lo que `ListOccurrences` dice de categorías y colores en un rango: por
+    /// cada vez, `(título, categorías, color propio, color del calendario)`.
+    /// Salen sólo estos campos de la lectura (ver la nota de
+    /// `las_ocurrencias_traen_etag_y_sync_state` sobre `cleartext-logging`).
+    type Tags = (String, Vec<String>, Option<String>, Option<String>);
+
+    fn listed_tags(store: &Store, from: &str, to: &str) -> Vec<Tags> {
+        let Ok(page) = account_occurrences(
+            store.connection(),
+            "cuenta",
+            range(from, to),
+            None,
+            None,
+            100,
+            &ExpansionLimits::DEFAULT,
+        ) else {
+            panic!("no se pudieron leer las ocurrencias");
+        };
+        page.rows
+            .into_iter()
+            .map(|(_, i)| (i.title, i.categories, i.event_color, i.color))
+            .collect()
+    }
+
+    /// Lo que `GetEvent` dice de categorías y color propio.
+    fn event_tags(
+        store: &Store,
+        id: i64,
+        occurrence: Option<i64>,
+    ) -> (Vec<String>, Option<String>) {
+        let Ok(Some(event)) = get_event(
+            store.connection(),
+            "cuenta",
+            id,
+            occurrence,
+            &ExpansionLimits::DEFAULT,
+        ) else {
+            panic!("no se pudo leer el evento");
+        };
+        (event.categories, event.event_color)
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// **DTO** (`vasak-calendar#6`, punto 2): `ListOccurrences` trae las
+    /// categorías y el color **propio** del evento, guardados con el objeto. La
+    /// coma escapada no parte la categoría, el color del evento no pisa el del
+    /// calendario (`color`, la marca al costado) y un evento sin nada trae
+    /// `[]` y `null`, no el color del calendario.
+    ///
+    /// Rojo-sin-cambio: sin las columnas ni los campos del DTO ni compila.
+    #[test]
+    fn las_ocurrencias_traen_categorias_y_color_del_evento() {
+        let temp = TempDir::new("occ-categorias");
+        let store = store_with(
+            &temp,
+            &[
+                (
+                    "https://x/c/a.ics",
+                    &tagged(
+                        "a",
+                        "20260926T120000Z",
+                        "CATEGORIES:Trabajo,Cliente\\, grande\r\nCOLOR:turquoise\r\n",
+                    ),
+                ),
+                ("https://x/c/b.ics", &tagged("b", "20260926T140000Z", "")),
+            ],
+        );
+        let rows = listed_tags(&store, "2026-09-26T00:00:00Z", "2026-09-27T00:00:00Z");
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "Evento a".to_string(),
+                    strings(&["Trabajo", "Cliente, grande"]),
+                    Some("turquoise".to_string()),
+                    Some("#FF0000".to_string()),
+                ),
+                (
+                    "Evento b".to_string(),
+                    Vec::new(),
+                    None,
+                    Some("#FF0000".to_string()),
+                ),
+            ]
+        );
+    }
+
+    /// **DTO**: `GetEvent` trae lo mismo, y el JSON que sale lleva las claves
+    /// `categories` y `event_color` (el contrato que lee `vasak-calendar`).
+    #[test]
+    fn un_evento_trae_categorias_y_color_propio() {
+        let temp = TempDir::new("evento-categorias");
+        let store = store_with(
+            &temp,
+            &[
+                (
+                    "https://x/c/a.ics",
+                    &tagged(
+                        "a",
+                        "20260926T120000Z",
+                        "CATEGORIES:Trabajo,Cliente\\, grande\r\nCOLOR:tomato\r\n",
+                    ),
+                ),
+                ("https://x/c/b.ics", &tagged("b", "20260926T140000Z", "")),
+            ],
+        );
+        assert_eq!(
+            event_tags(&store, 1, None),
+            (
+                strings(&["Trabajo", "Cliente, grande"]),
+                Some("tomato".to_string())
+            )
+        );
+        assert_eq!(event_tags(&store, 2, None), (Vec::new(), None));
+
+        let Ok(Some(event)) = get_event(
+            store.connection(),
+            "cuenta",
+            1,
+            None,
+            &ExpansionLimits::DEFAULT,
+        ) else {
+            panic!("no se pudo leer el evento");
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["categories"][1], "Cliente, grande");
+        assert_eq!(json["event_color"], "tomato");
+    }
+
+    /// **DTO**: lo que se **expande en el momento** (`series_batch`, fuera de la
+    /// ventana del almacén) también trae categorías y color propio de la serie:
+    /// ese camino lee las columnas por su cuenta y es el que se olvida.
+    ///
+    /// Rojo-sin-cambio: si `series_batch` no lee las columnas, las vistas de
+    /// 2030 salen con `[]`/`null` mientras las de hoy traen las etiquetas.
+    #[test]
+    fn lo_expandido_en_el_momento_trae_categorias_y_color() {
+        let temp = TempDir::new("occ-categorias-momento");
+        let raw = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:s\r\nSUMMARY:Semanal s\r\n\
+                   DTSTART:20260907T090000Z\r\nDURATION:PT1H\r\nRRULE:FREQ=WEEKLY\r\n\
+                   CATEGORIES:Clase,Fija\\,x\r\nCOLOR:purple\r\n\
+                   END:VEVENT\r\nEND:VCALENDAR\r\n";
+        let store = store_with(&temp, &[("https://x/c/s.ics", raw)]);
+        let expected: Tags = (
+            "Semanal s".to_string(),
+            strings(&["Clase", "Fija,x"]),
+            Some("purple".to_string()),
+            Some("#FF0000".to_string()),
+        );
+
+        // Dentro de la ventana: lo guardado.
+        let inside = listed_tags(&store, "2026-09-26T00:00:00Z", "2026-10-06T00:00:00Z");
+        assert_eq!(inside.len(), 2, "{inside:?}");
+        assert!(inside.iter().all(|t| *t == expected), "{inside:?}");
+
+        // Fuera: expandido desde `raw_ical`, con las mismas columnas.
+        let outside = listed_tags(&store, "2030-01-01T00:00:00Z", "2030-01-15T00:00:00Z");
+        assert_eq!(outside.len(), 2, "{outside:?}");
+        assert!(outside.iter().all(|t| *t == expected), "{outside:?}");
+    }
+
+    /// **Re-sync**: reescribir el objeto reemplaza las categorías y el color —el
+    /// `ON CONFLICT DO UPDATE` los incluye—, y quitarlos del evento los vacía.
+    #[test]
+    fn reescribir_el_objeto_reemplaza_categorias_y_color() {
+        let temp = TempDir::new("occ-categorias-resync");
+        let mut store = store_with(
+            &temp,
+            &[(
+                "https://x/c/a.ics",
+                &tagged("a", "20260926T120000Z", "CATEGORIES:viejo\r\nCOLOR:red\r\n"),
+            )],
+        );
+        assert_eq!(
+            event_tags(&store, 1, None),
+            (strings(&["viejo"]), Some("red".to_string()))
+        );
+
+        let cal = store.calendars().unwrap().remove(0);
+        let w = window();
+        let rewrite = |store: &mut Store, extra: &str| {
+            store
+                .apply_calendar_objects(
+                    &cal,
+                    &[ObjectOp::Upsert(object(
+                        "https://x/c/a.ics",
+                        &tagged("a", "20260926T120000Z", extra),
+                        w,
+                    ))],
+                    w,
+                    None,
+                    CalendarRoom::UNLIMITED,
+                )
+                .unwrap();
+        };
+        rewrite(&mut store, "CATEGORIES:nuevo,otro\r\nCOLOR:blue\r\n");
+        assert_eq!(
+            event_tags(&store, 1, None),
+            (strings(&["nuevo", "otro"]), Some("blue".to_string()))
+        );
+        let listed = listed_tags(&store, "2026-09-26T00:00:00Z", "2026-09-27T00:00:00Z");
+        assert_eq!(listed[0].1, strings(&["nuevo", "otro"]));
+        assert_eq!(listed[0].2.as_deref(), Some("blue"));
+
+        rewrite(&mut store, "");
+        assert_eq!(event_tags(&store, 1, None), (Vec::new(), None));
+        let listed = listed_tags(&store, "2026-09-26T00:00:00Z", "2026-09-27T00:00:00Z");
+        assert_eq!(listed[0].1, Vec::<String>::new());
+        assert_eq!(listed[0].2, None);
+    }
+
+    /// **Qué nivel es cada uno** (atajo declarado en el PR): `ListOccurrences`
+    /// trae las categorías y el color **de la serie** —se guardan por objeto, no
+    /// por ocurrencia—, mientras `GetEvent` lee **por instancia**: una excepción
+    /// con categorías y color propios las trae exactas, y una vez sin
+    /// excepción trae las de la serie. La prueba fija ese comportamiento para
+    /// que nadie lo cambie sin querer; si algún día la lista pasa a ser por
+    /// instancia, se cambia acá a conciencia.
+    #[test]
+    fn la_lista_muestra_lo_de_la_serie_y_el_evento_lo_de_la_instancia() {
+        let temp = TempDir::new("occ-categorias-excepcion");
+        let raw = "BEGIN:VCALENDAR\r\n\
+            BEGIN:VEVENT\r\nUID:s\r\nSUMMARY:Clase\r\n\
+            DTSTART:20260907T090000Z\r\nDURATION:PT1H\r\nRRULE:FREQ=WEEKLY;COUNT=4\r\n\
+            CATEGORIES:Serie\r\nCOLOR:green\r\nEND:VEVENT\r\n\
+            BEGIN:VEVENT\r\nUID:s\r\nSUMMARY:Clase movida\r\n\
+            RECURRENCE-ID:20260914T090000Z\r\n\
+            DTSTART:20260914T100000Z\r\nDURATION:PT1H\r\n\
+            CATEGORIES:Propia,Especial\r\nCOLOR:orange\r\nEND:VEVENT\r\n\
+            END:VCALENDAR\r\n";
+        let store = store_with(&temp, &[("https://x/c/s.ics", raw)]);
+
+        // La lista: las cuatro veces, la movida incluida, con lo de la serie.
+        let rows = listed_tags(&store, "2026-09-01T00:00:00Z", "2026-10-15T00:00:00Z");
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        for (_, categories, event_color, _) in &rows {
+            assert_eq!(categories, &strings(&["Serie"]));
+            assert_eq!(event_color.as_deref(), Some("green"));
+        }
+
+        // El evento: la serie, una vez común y la excepción, cada una lo suyo.
+        let serie = (strings(&["Serie"]), Some("green".to_string()));
+        assert_eq!(event_tags(&store, 1, None), serie);
+        assert_eq!(
+            event_tags(&store, 1, Some(at("2026-09-21T09:00:00Z"))),
+            serie,
+            "una vez sin excepción es la serie"
+        );
+        assert_eq!(
+            event_tags(&store, 1, Some(at("2026-09-14T09:00:00Z"))),
+            (strings(&["Propia", "Especial"]), Some("orange".to_string())),
+            "la excepción trae las suyas, exactas"
+        );
+    }
+
     /// Un VTODO para las pruebas del DTO de tareas.
     fn todo_task(uid: &str, due: &str) -> String {
         format!(
