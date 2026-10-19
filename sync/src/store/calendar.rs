@@ -179,6 +179,12 @@ pub struct ObjectIndex {
     /// Los títulos de sus excepciones que no son el suyo, por su lugar: lo
     /// que nombra `occurrences.title` ([`EventSeries::titles`]).
     pub titles: Vec<(u32, String)>,
+    /// Las categorías del evento (`CATEGORIES`), para agrupar y filtrar. En una
+    /// serie, las de la cabecera; se guardan por objeto, no por ocurrencia.
+    pub categories: Vec<String>,
+    /// El color propio del evento (`COLOR`, RFC 7986), distinto del del
+    /// calendario. `None` si no trae ninguno.
+    pub color: Option<String>,
 }
 
 /// Un objeto para guardar: el crudo, lo derivado y sus ocurrencias.
@@ -219,6 +225,18 @@ impl ObjectOp {
 /// Cuántas filas de `alarms` escriben unas ocurrencias.
 fn alarm_rows(occurrences: &[Occurrence]) -> usize {
     occurrences.iter().map(|o| o.alarms.len()).sum()
+}
+
+/// Las categorías para guardar en la columna: un arreglo JSON, que soporta una
+/// coma dentro de un valor sin perderla. Una lista vacía va como `[]`.
+pub fn categories_json(categories: &[String]) -> String {
+    serde_json::to_string(categories).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Las categorías leídas de la columna. Lo que no es un arreglo JSON de textos
+/// —una base vieja, un valor roto— queda en una lista vacía, nunca un error.
+pub fn categories_from_json(stored: &str) -> Vec<String> {
+    serde_json::from_str(stored).unwrap_or_default()
 }
 
 /// Lo que le queda a una cuenta: bytes de iCalendar crudo, ocurrencias y
@@ -331,6 +349,8 @@ fn empty_index() -> ObjectIndex {
         expansion: ExpansionState::Complete,
         expanded: None,
         titles: Vec::new(),
+        categories: Vec::new(),
+        color: None,
     }
 }
 
@@ -421,6 +441,8 @@ fn derive_event(
             .into_iter()
             .map(|(position, title)| (position, title.to_string()))
             .collect(),
+        categories: ical::categories_of(head),
+        color: ical::color_of(head),
     };
     (index, expansion.occurrences)
 }
@@ -463,6 +485,8 @@ fn derive_task(task: &Component, document: &ical::Document) -> ObjectIndex {
         expansion: ExpansionState::Complete,
         expanded: None,
         titles: Vec::new(),
+        categories: ical::categories_of(task),
+        color: ical::color_of(task),
     }
 }
 
@@ -1293,9 +1317,9 @@ fn upsert_object(
             "INSERT INTO calendar_objects
                (calendar_id, href, etag, uid, component, summary, starts_at, ends_at, all_day,
                 recurring, zone, status, priority, completed_at, done, sort_key, span,
-                expansion, expanded_from, expanded_to, raw_ical, updated_at)
+                expansion, expanded_from, expanded_to, categories, color, raw_ical, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                     ?17, ?18, ?19, ?20, ?21, ?22)
+                     ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
              ON CONFLICT (calendar_id, href) DO UPDATE SET
                etag = excluded.etag, uid = excluded.uid, component = excluded.component,
                summary = excluded.summary, starts_at = excluded.starts_at,
@@ -1304,7 +1328,8 @@ fn upsert_object(
                priority = excluded.priority, completed_at = excluded.completed_at,
                done = excluded.done, sort_key = excluded.sort_key, span = excluded.span,
                expansion = excluded.expansion, expanded_from = excluded.expanded_from,
-               expanded_to = excluded.expanded_to, raw_ical = excluded.raw_ical,
+               expanded_to = excluded.expanded_to, categories = excluded.categories,
+               color = excluded.color, raw_ical = excluded.raw_ical,
                updated_at = excluded.updated_at
              RETURNING id",
         )
@@ -1331,6 +1356,8 @@ fn upsert_object(
                     index.expansion.as_str(),
                     index.expanded.map(|w| w.start),
                     index.expanded.map(|w| w.end),
+                    categories_json(&index.categories),
+                    index.color,
                     row.raw_ical,
                     at
                 ],

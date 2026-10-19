@@ -602,6 +602,69 @@ pub fn event_of(component: &Component, zones: &Zones) -> Option<Event> {
     })
 }
 
+/// Cuántas categorías de un evento se leen, como mucho. Un evento con más de
+/// sesenta y cuatro etiquetas es un archivo armado para hacer crecer la fila,
+/// no una agenda de alguien.
+pub const MAX_CATEGORIES: usize = 64;
+
+/// Parte un valor de lista de iCalendar (`a,b\,c`) por las comas que **no**
+/// están escapadas. No deshace lo escapado —cada parte conserva sus barras para
+/// que [`unescape_text`] lo haga después—: así una coma dentro de un valor
+/// (`\,`) no lo corta en dos.
+fn split_escaped_list(value: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    for c in value.chars() {
+        if escaped {
+            current.push('\\');
+            current.push(c);
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == ',' {
+            parts.push(std::mem::take(&mut current));
+        } else {
+            current.push(c);
+        }
+    }
+    if escaped {
+        current.push('\\');
+    }
+    parts.push(current);
+    parts
+}
+
+/// Las categorías de un componente (RFC 5545 §3.8.1.2): una o más líneas
+/// `CATEGORIES`, cada una una lista separada por comas con escapes. Se parten
+/// por la coma sin escapar, se deshace lo escapado y se muestran sin controles,
+/// como cualquier otro texto, con tope de cantidad. Las vacías se descartan.
+pub fn categories_of(component: &Component) -> Vec<String> {
+    let mut out = Vec::new();
+    for property in component.all("CATEGORIES") {
+        for raw in split_escaped_list(&property.value) {
+            let text = visible(&unescape_text(&raw), MAX_TEXT);
+            if !text.is_empty() {
+                out.push(text);
+            }
+            if out.len() >= MAX_CATEGORIES {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+/// El color propio de un evento (RFC 7986 §5.9): un nombre de color CSS3, para
+/// mostrar. Vacío o ausente es `None`. No es un `TEXT` escapado —es un token—,
+/// así que sólo se le sacan los controles y se recorta.
+pub fn color_of(component: &Component) -> Option<String> {
+    component
+        .first("COLOR")
+        .map(|p| visible(p.value.trim(), 64))
+        .filter(|color| !color.is_empty())
+}
+
 /// Saca los eventos de un iCalendar.
 ///
 /// Sólo `VEVENT`: un calendario trae también tareas y notas, y mostrarlas como

@@ -42,6 +42,7 @@ use base64::Engine;
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
+use super::calendar::categories_from_json;
 use super::contacts_read::{InvalidArgument, MAX_CURSOR_BYTES};
 use super::queue::SyncState;
 use super::readers::Reader;
@@ -258,7 +259,13 @@ pub struct OccurrenceItem {
     /// Si la hora es la de quien mira: sin zona, o con una que no se pudo
     /// resolver.
     pub floating: bool,
+    /// El color del **calendario** al que pertenece: la marca al costado.
     pub color: Option<String>,
+    /// Las categorías del evento (`CATEGORIES`), para agrupar y filtrar.
+    pub categories: Vec<String>,
+    /// El color **propio** del evento (`COLOR`, RFC 7986), distinto del del
+    /// calendario; `null` si no trae ninguno.
+    pub event_color: Option<String>,
     /// Si es una vez de una serie. Es lo que pone el ícono de «se repite».
     pub recurring: bool,
     /// Si es una serie cuya regla no se entendió y se muestra sólo el día que
@@ -416,7 +423,8 @@ pub fn occurrences_sql(
     format!(
         "SELECT o.starts_at, o.object_id, o.recurrence_id, o.ends_at, o.all_day,
                 coalesce(t.summary, c.summary), o.calendar_id, k.color, c.zone,
-                c.recurring, c.expansion, c.etag, c.pending_op, pdo.state
+                c.recurring, c.expansion, c.etag, c.pending_op, pdo.state,
+                c.categories, c.color
            FROM occurrences o INDEXED BY {index}
            JOIN calendar_objects c ON c.id = o.object_id
            JOIN calendars k ON k.id = o.calendar_id
@@ -547,6 +555,8 @@ fn occurrence_item(
     title: String,
     calendar: i64,
     color: Option<String>,
+    categories: Vec<String>,
+    event_color: Option<String>,
     zone: &str,
     recurring: bool,
     shown_once: bool,
@@ -571,6 +581,8 @@ fn occurrence_item(
         all_day,
         floating: floating(zone),
         color,
+        categories,
+        event_color,
         recurring,
         shown_once,
         etag,
@@ -613,6 +625,8 @@ fn stored_occurrences(
             let etag: Option<String> = row.get(11).map_err(classify)?;
             let pending_op: Option<String> = row.get(12).map_err(classify)?;
             let op_state: Option<String> = row.get(13).map_err(classify)?;
+            let categories = categories_from_json(&row.get::<_, String>(14).map_err(classify)?);
+            let event_color: Option<String> = row.get(15).map_err(classify)?;
             let item = occurrence_item(
                 account_id,
                 start,
@@ -623,6 +637,8 @@ fn stored_occurrences(
                 row.get(5).map_err(classify)?,
                 row.get(6).map_err(classify)?,
                 row.get(7).map_err(classify)?,
+                categories,
+                event_color,
                 &zone,
                 row.get(9).map_err(classify)?,
                 row.get::<_, String>(10).map_err(classify)? == "invalid",
@@ -645,6 +661,8 @@ struct SeriesSource {
     summary: String,
     zone: String,
     color: Option<String>,
+    categories: Vec<String>,
+    event_color: Option<String>,
     /// El ETag guardado de la serie; vacío si todavía no confirmó.
     etag: String,
     /// La marca de la fila y el estado de su op, para derivar el `sync_state`.
@@ -664,7 +682,8 @@ fn series_batch(
     let mut statement = connection
         .prepare_cached(&format!(
             "SELECT c.id, c.calendar_id, c.raw_ical, c.expanded_from, c.expanded_to,
-                    c.summary, c.zone, k.color, c.etag, c.pending_op, pdo.state
+                    c.summary, c.zone, k.color, c.etag, c.pending_op, pdo.state,
+                    c.categories, c.color
                FROM calendar_objects c
                JOIN calendars k ON k.id = c.calendar_id
                LEFT JOIN pending_dav_ops pdo
@@ -714,6 +733,8 @@ fn series_batch(
                 .unwrap_or_default(),
             pending_op: row.get(9).map_err(classify)?,
             op_state: row.get(10).map_err(classify)?,
+            categories: categories_from_json(&row.get::<_, String>(11).map_err(classify)?),
+            event_color: row.get(12).map_err(classify)?,
         });
     }
     Ok((batch, false))
@@ -768,6 +789,8 @@ fn expand_into(
                 .map_or_else(|| source.summary.clone(), str::to_string),
             source.calendar,
             source.color.clone(),
+            source.categories.clone(),
+            source.event_color.clone(),
             &source.zone,
             // Lo que se expande en el momento es siempre de una serie, y una
             // que se pudo expandir no es «sólo una vez».
@@ -1130,6 +1153,10 @@ pub struct EventDetail {
     pub floating: bool,
     /// `confirmed`, `tentative`, `cancelled`, o vacío.
     pub status: String,
+    /// Las categorías del evento (`CATEGORIES`).
+    pub categories: Vec<String>,
+    /// El color propio del evento (`COLOR`, RFC 7986), o `null`.
+    pub event_color: Option<String>,
     pub recurrence: Option<Recurrence>,
     pub alarms: Vec<AlarmItem>,
     pub organizer: Option<Person>,
@@ -1368,6 +1395,8 @@ pub fn get_event(
             .value("STATUS")
             .map(|s| ical::visible(s, 32).to_ascii_lowercase())
             .unwrap_or_default(),
+        categories: ical::categories_of(component),
+        event_color: ical::color_of(component),
         recurrence: recurrence_of(master),
         alarms: alarms_of(component, limits),
         organizer: component.first("ORGANIZER").map(person),

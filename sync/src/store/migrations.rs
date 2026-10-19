@@ -581,6 +581,27 @@ ALTER TABLE contact_enrichment ADD COLUMN photo BLOB;
 ALTER TABLE contact_enrichment ADD COLUMN photo_media_type TEXT;
 ";
 
+/// v9 (`vasak-calendar#6`, punto 2): las categorías y el color propios de un
+/// evento, para agrupar y colorear por categoría en la ventana.
+///
+/// Las dos viven en `calendar_objects`, por objeto (no por ocurrencia): una
+/// serie las comparte entre todas sus veces, igual que el `summary`.
+///
+/// - **`categories`**: las etiquetas del evento (`CATEGORIES` de iCalendar),
+///   como un arreglo JSON de textos. JSON y no una lista separada por comas
+///   porque una categoría puede traer una coma adentro (`\,` en el crudo), que
+///   la separación por comas perdería. `[]` por omisión: una base de la v8 queda
+///   sin categorías, y la próxima bajada las llena al reescribir el objeto.
+/// - **`color`**: el color propio del evento (`COLOR`, RFC 7986 §5.9), distinto
+///   del color del calendario. Nulo cuando el evento no trae ninguno.
+///
+/// Las dos se derivan del `raw_ical`, que es la fuente de verdad: no hace falta
+/// volver a la red para llenarlas, las completa el re-sync normal.
+const V9: &str = "
+ALTER TABLE calendar_objects ADD COLUMN categories TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE calendar_objects ADD COLUMN color TEXT;
+";
+
 /// Todas las migraciones, en orden.
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
@@ -592,6 +613,7 @@ pub fn migrations() -> Migrations<'static> {
         M::up(V6),
         M::up(V7),
         M::up(V8),
+        M::up(V9),
     ])
 }
 
@@ -628,7 +650,7 @@ mod tests {
         let mut connection = Connection::open_in_memory().unwrap();
         apply(&mut connection).unwrap();
         let version = schema_version(&connection).unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
 
         let tables = |c: &Connection| -> Vec<String> {
             let mut statement = c
@@ -753,7 +775,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 8);
+        assert_eq!(schema_version(&connection).unwrap(), 9);
 
         // Lo que había sigue, y la marca nueva es NULL.
         let object_mark: Option<String> = connection
@@ -796,7 +818,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 8);
+        assert_eq!(schema_version(&connection).unwrap(), 9);
 
         // La op sigue, en conflicto, y las columnas nuevas son NULL.
         let (state, server_etag, server_raw): (String, Option<String>, Option<Vec<u8>>) =
@@ -855,7 +877,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 8);
+        assert_eq!(schema_version(&connection).unwrap(), 9);
 
         // El contacto sigue, y la tabla nueva arranca vacía.
         let contacts: i64 = connection
@@ -967,7 +989,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 8);
+        assert_eq!(schema_version(&connection).unwrap(), 9);
 
         // El enlace sigue, y las columnas nuevas arrancan nulas.
         let (resource, photo, media): (String, Option<Vec<u8>>, Option<String>) = connection
@@ -1031,7 +1053,7 @@ mod tests {
 
         apply(&mut connection).unwrap();
         assert_eq!(columns(&connection), before);
-        assert_eq!(schema_version(&connection).unwrap(), 8);
+        assert_eq!(schema_version(&connection).unwrap(), 9);
     }
 
     /// La marca `pending_op` sólo acepta los dos valores conocidos, o `NULL`.
@@ -1175,7 +1197,7 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .unwrap();
-        let all = [V1, V2, V3, V4, V5, V6, V7];
+        let all = [V1, V2, V3, V4, V5, V6, V7, V8, V9];
         Migrations::new(all[..version].iter().map(|sql| M::up(sql)).collect())
             .to_latest(&mut connection)
             .unwrap();
@@ -1202,7 +1224,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 8);
+        assert_eq!(schema_version(&connection).unwrap(), 9);
         let message: String = connection
             .query_row("SELECT message FROM sync_log", [], |row| row.get(0))
             .unwrap();
@@ -1503,7 +1525,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 8);
+        assert_eq!(schema_version(&connection).unwrap(), 9);
         assert_eq!(found(&connection, "jose"), vec![id]);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_emails"), 1);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_phones"), 1);
@@ -1674,7 +1696,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 8);
+        assert_eq!(schema_version(&connection).unwrap(), 9);
         assert_eq!(found(&connection, "jose"), vec![id]);
         assert_eq!(count(&connection, "SELECT count(*) FROM occurrences"), 2);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_emails"), 1);
