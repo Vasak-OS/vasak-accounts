@@ -330,7 +330,7 @@ impl SecretServiceKeys {
         }
     }
 
-    async fn call<B, R>(
+    pub(super) async fn call<B, R>(
         &self,
         path: &str,
         iface: &str,
@@ -366,7 +366,7 @@ impl SecretServiceKeys {
 
     /// La colección de las claves: la fijada, o si no hay ninguna, la del
     /// alias `default`.
-    async fn default_collection(&self) -> Result<OwnedObjectPath, KeyError> {
+    pub(super) async fn default_collection(&self) -> Result<OwnedObjectPath, KeyError> {
         let pinned = self
             .pinned
             .lock()
@@ -478,7 +478,7 @@ impl SecretServiceKeys {
     /// está borrado». Así que se lee `Locked` antes de buscar, y otra vez si la
     /// búsqueda volvió vacía, sobre **la misma** colección: un bloqueo que llega
     /// entre la primera lectura y la búsqueda también se ve.
-    async fn search(
+    pub(super) async fn search(
         &self,
         attributes: &HashMap<&str, &str>,
     ) -> Result<Vec<OwnedObjectPath>, KeyError> {
@@ -502,7 +502,7 @@ impl SecretServiceKeys {
         Ok(items)
     }
 
-    async fn open_session(&self) -> Result<OwnedObjectPath, KeyError> {
+    pub(super) async fn open_session(&self) -> Result<OwnedObjectPath, KeyError> {
         let (_output, session): (OwnedValue, OwnedObjectPath) = self
             .call(
                 SERVICE_PATH,
@@ -516,7 +516,7 @@ impl SecretServiceKeys {
 
     /// Cierra una sesión. Si falla no pasa nada: el llavero las cierra solo
     /// cuando se va la conexión.
-    async fn close_session(&self, session: &OwnedObjectPath) {
+    pub(super) async fn close_session(&self, session: &OwnedObjectPath) {
         let _: Result<(), _> = self
             .call(session.as_str(), SESSION_IFACE, "Close", &())
             .await;
