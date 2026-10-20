@@ -559,6 +559,42 @@ fn signed_attribute(attrs: &SetOfVec<Attribute>, oid: ObjectIdentifier) -> Optio
     value.to_der().ok()
 }
 
+/// Si un certificado (DER) declara `address` como uno de sus correos (SAN
+/// rfc822Name o `emailAddress` del subject), comparando sin distinguir mayúsculas.
+/// Con `address` vacío o cert ilegible, `false`. Se usa al importar: una
+/// identidad cuyo cert no liga la dirección de la cuenta no serviría para firmar
+/// (la firma no ligaría al `From`).
+pub fn certificate_matches_address(cert_der: &[u8], address: &str) -> bool {
+    let address = address.trim();
+    if address.is_empty() {
+        return false;
+    }
+    let Ok(cert) = Certificate::from_der(cert_der) else {
+        return false;
+    };
+    certificate_emails(&cert)
+        .iter()
+        .any(|email| !email.trim().is_empty() && email.trim().eq_ignore_ascii_case(address))
+}
+
+/// El correo y el vencimiento (`not_after`, RFC 3339) de un certificado, para
+/// mostrar el estado de la identidad **sin** tocar material de clave. `None` si el
+/// cert no se puede leer.
+pub fn certificate_summary(cert_der: &[u8]) -> Option<(Option<String>, String)> {
+    let cert = Certificate::from_der(cert_der).ok()?;
+    let email = certificate_emails(&cert).into_iter().next();
+    let secs = cert
+        .tbs_certificate
+        .validity
+        .not_after
+        .to_unix_duration()
+        .as_secs();
+    let not_after = chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_default();
+    Some((email, not_after))
+}
+
 /// Los correos que declara un certificado: del SubjectAltName (rfc822Name) y del
 /// `emailAddress` del subject.
 fn certificate_emails(cert: &Certificate) -> Vec<String> {

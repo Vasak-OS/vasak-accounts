@@ -109,6 +109,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use zbus::interface;
 use zbus::object_server::SignalEmitter;
+use zeroize::Zeroizing;
 
 use broker::{Broker, BrokerError};
 
@@ -578,6 +579,56 @@ impl Reader {
     }
 }
 
+/// Tope del `.p12` que entra por el bus: un certificado real pesa unos pocos KB.
+const MAX_SMIME_PKCS12_BYTES: usize = 8 * 1024 * 1024;
+
+/// Errores de la gestión de identidad S/MIME por IPC, con **nombres de error
+/// D-Bus estables** que la ventana traduce (no la prosa, que está en español y
+/// la escribe el servidor). El nombre es `ar.net.vasak.os.AccountsSync.<Variante>`.
+/// Ninguno lleva la contraseña ni el contenido del `.p12`.
+#[derive(Debug, zbus::DBusError)]
+#[zbus(prefix = "ar.net.vasak.os.AccountsSync")]
+enum SmimeIpcError {
+    /// Errores de infraestructura de zbus.
+    #[zbus(error)]
+    ZBus(zbus::Error),
+    /// La contraseña no abre el `.p12`.
+    WrongPassword,
+    /// El `.p12` usa cifrado heredado (RC2/3DES): reexportar sin `-legacy`.
+    UnsupportedLegacy,
+    /// El `.p12` no se pudo leer (no es un PFX, le falta la clave o el cert).
+    Malformed,
+    /// El correo del certificado no coincide con la dirección de la cuenta: no
+    /// serviría para firmar (la firma no ligaría al `From`).
+    AddressMismatch,
+    /// El llavero está bloqueado: hay que desbloquearlo e intentar de nuevo.
+    KeyringLocked,
+    /// El `.p12` supera el tope de tamaño.
+    TooBig,
+    /// Cualquier otro fallo (sin material sensible en el texto).
+    Failed(String),
+}
+
+/// `SmimeError` del parseo del `.p12` → el error IPC, sin filtrar la contraseña
+/// ni detalles del contenido (el `MalformedPkcs12(detalle)` se colapsa a `Malformed`).
+fn smime_ipc_from_parse(error: store::smime_key::SmimeError) -> SmimeIpcError {
+    use store::smime_key::SmimeError;
+    match error {
+        SmimeError::WrongPassword => SmimeIpcError::WrongPassword,
+        SmimeError::UnsupportedPkcs12 => SmimeIpcError::UnsupportedLegacy,
+        SmimeError::MalformedPkcs12(_) => SmimeIpcError::Malformed,
+        SmimeError::Keyring(e) => smime_ipc_from_keyring(e),
+    }
+}
+
+/// Un error del llavero → el error IPC.
+fn smime_ipc_from_keyring(error: store::key::KeyError) -> SmimeIpcError {
+    match error {
+        store::key::KeyError::Locked => SmimeIpcError::KeyringLocked,
+        other => SmimeIpcError::Failed(format!("el llavero falló: {other}")),
+    }
+}
+
 #[interface(name = "ar.net.vasak.os.AccountsSync")]
 impl Service {
     /// Cuánto correo sin leer hay, por cuenta.
@@ -999,6 +1050,25 @@ impl Service {
 
         compose::validate(&draft).map_err(zbus::fdo::Error::InvalidArgs)?;
 
+        // Si se pidió firmar, tiene que haber identidad S/MIME para el `From`
+        // **ahora**, al encolar: si no, la firma fallaría tarde en el despachador
+        // y el mensaje quedaría trabado sin que la ventana se entere. Se rechaza
+        // con `InvalidArgs`, como una dirección mal escrita.
+        if draft.sign {
+            let keys = store::key::SecretServiceKeys::on_session_bus(emitter.connection().clone());
+            let has_identity = keys
+                .find_smime_private_key(&draft.from)
+                .await
+                .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo leer el llavero: {e}")))?
+                .is_some();
+            if !has_identity {
+                return Err(zbus::fdo::Error::InvalidArgs(format!(
+                    "no hay certificado S/MIME para {}: importalo antes de firmar",
+                    draft.from
+                )));
+            }
+        }
+
         let now = chrono::Utc::now();
         let unique = next_unique();
         let outgoing = outbox::Outgoing {
@@ -1025,6 +1095,96 @@ impl Service {
         self.outbox_wakeup.notify_one();
         let _ = Service::outbox_changed(&emitter).await;
         Ok(outgoing.id)
+    }
+
+    /// Importa la identidad S/MIME de una cuenta desde un `.p12`/PFX.
+    ///
+    /// La dirección **no la elige la ventana**: se resuelve de la cuenta (como el
+    /// `From` al enviar). El correo del certificado tiene que coincidir con esa
+    /// dirección, o la firma saliente no ligaría al `From` → `AddressMismatch`.
+    /// La contraseña entra en memoria que se borra sola y no va a ningún lado.
+    ///
+    /// La contraseña y el `.p12` viajan por el bus de sesión como `ay`, igual que
+    /// los adjuntos; pasarlos por un descriptor de archivo es un endurecimiento
+    /// posterior. Y este método **no está tras `vasak-permissions`**: un proceso
+    /// del mismo usuario podría reemplazar la identidad de firma. Las dos cosas
+    /// van a la revisión de seguridad.
+    async fn import_smime_identity(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        account_id: String,
+        p12: Vec<u8>,
+        password: Vec<u8>,
+    ) -> Result<(), SmimeIpcError> {
+        // La contraseña a memoria que se borra, ni bien entra.
+        let password = Zeroizing::new(password);
+        if p12.len() > MAX_SMIME_PKCS12_BYTES {
+            return Err(SmimeIpcError::TooBig);
+        }
+
+        let address = self.account_address(&account_id).await?;
+
+        // El parseo hace KDF (CPU): fuera del worker de Tokio. `p12` y la
+        // contraseña se mueven al hilo (la contraseña se borra al terminar).
+        let imported =
+            tokio::task::spawn_blocking(move || store::smime_key::parse_pkcs12(&p12, &password))
+                .await
+                .map_err(|_| SmimeIpcError::Failed("el parseo del .p12 se cortó".into()))?
+                .map_err(smime_ipc_from_parse)?;
+
+        // El cert tiene que ser de esta dirección.
+        let leaf = imported.certs.first().ok_or(SmimeIpcError::Malformed)?;
+        if !smime_sign::certificate_matches_address(leaf, &address) {
+            return Err(SmimeIpcError::AddressMismatch);
+        }
+
+        let keys = store::key::SecretServiceKeys::on_session_bus(connection.clone());
+        keys.store_smime_identity(&address, &imported)
+            .await
+            .map_err(smime_ipc_from_keyring)?;
+        Ok(())
+    }
+
+    /// El estado de la identidad S/MIME de una cuenta, en JSON
+    /// `{present, email, not_after}`. **Nunca** devuelve material de clave. Sirve
+    /// para el formulario y para gatear el toggle de firma de la ventana.
+    async fn get_smime_identity(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        account_id: String,
+    ) -> Result<String, SmimeIpcError> {
+        let address = self.account_address(&account_id).await?;
+        let keys = store::key::SecretServiceKeys::on_session_bus(connection.clone());
+        let cert = keys
+            .find_smime_certs(&address)
+            .await
+            .map_err(smime_ipc_from_keyring)?
+            .and_then(|certs| certs.into_iter().next());
+
+        let value = match cert.as_deref().and_then(smime_sign::certificate_summary) {
+            Some((email, not_after)) => serde_json::json!({
+                "present": true,
+                "email": email,
+                "not_after": not_after,
+            }),
+            None => serde_json::json!({ "present": false, "email": null, "not_after": null }),
+        };
+        serde_json::to_string(&value)
+            .map_err(|e| SmimeIpcError::Failed(format!("no se pudo serializar: {e}")))
+    }
+
+    /// Borra la identidad S/MIME de una cuenta, para deshacer una importación
+    /// equivocada.
+    async fn remove_smime_identity(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        account_id: String,
+    ) -> Result<(), SmimeIpcError> {
+        let address = self.account_address(&account_id).await?;
+        let keys = store::key::SecretServiceKeys::on_session_bus(connection.clone());
+        keys.delete_smime_identity(&address)
+            .await
+            .map_err(smime_ipc_from_keyring)
     }
 
     /// Lo que está esperando salir, y lo que se trabó.
@@ -1130,6 +1290,27 @@ impl Service {
             .map(|c| (broker, c))
             .ok_or_else(|| {
                 zbus::fdo::Error::Failed(format!("la cuenta «{account_id}» ya no existe"))
+            })
+    }
+
+    /// La dirección de una cuenta, la misma que el `From` al enviar. Es la
+    /// identidad bajo la que vive su clave S/MIME; no la elige quien llama.
+    async fn account_address(&self, account_id: &str) -> Result<String, SmimeIpcError> {
+        let (broker, account) = self
+            .account(account_id)
+            .await
+            .map_err(|e| SmimeIpcError::Failed(e.to_string()))?;
+        let config = broker
+            .account_data(&account.id, "email")
+            .await
+            .map_err(|e| SmimeIpcError::Failed(format!("no se pudo leer la cuenta: {e}")))?;
+        let config = config.get("config").cloned().unwrap_or(config);
+        config
+            .get("username")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                SmimeIpcError::Failed("la cuenta no tiene una dirección guardada".into())
             })
     }
 }
