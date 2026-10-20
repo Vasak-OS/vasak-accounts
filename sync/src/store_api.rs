@@ -2729,6 +2729,8 @@ mod tests {
                     text_body: Some("CUERPO-SECRETO".into()),
                     html_body: None,
                     truncated: false,
+                    smime_status: None,
+                    smime_signer: None,
                 })?;
                 Ok(())
             })
@@ -5862,6 +5864,8 @@ mod tests {
                     text_body: Some(text.clone()),
                     html_body: Some(format!("<p>{text}</p>")),
                     truncated: false,
+                    smime_status: None,
+                    smime_signer: None,
                 })?;
                 Ok(id)
             })

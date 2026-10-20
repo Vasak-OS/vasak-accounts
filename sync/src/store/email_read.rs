@@ -168,6 +168,9 @@ pub struct MessageFull {
     pub text_body: Option<String>,
     pub html_body: Option<String>,
     pub truncated: bool,
+    /// El estado S/MIME: `None` si no venía firmado, si no «firmado» con si la
+    /// firma se verificó y quién firma. Ver `smime_sign`.
+    pub smime: Option<crate::smime_sign::SmimeStatus>,
     pub attachments: Vec<AttachmentSummary>,
     pub flags: Vec<String>,
 }
@@ -565,7 +568,8 @@ impl Store {
                         m.subject, m.date_ts, m.flags_seen, m.flags_answered,
                         m.flags_flagged, m.flags_draft, m.flags_deleted,
                         m.has_attachments, m.size,
-                        b.text_body, b.html_body, b.truncated
+                        b.text_body, b.html_body, b.truncated,
+                        b.smime_status, b.smime_signer
                  FROM messages m
                  JOIN mailboxes mb ON m.mailbox_id = mb.id
                  LEFT JOIN message_bodies b ON m.id = b.message_id
@@ -767,8 +771,25 @@ fn message_full_from_row(row: &Row) -> Result<MessageFull, StoreError> {
         text_body: row.get(19).map_err(classify)?,
         html_body: row.get(20).map_err(classify)?,
         truncated: row.get::<_, i64>(21).map_err(classify)? != 0,
+        smime: smime_from_row(
+            row.get::<_, Option<i64>>(22).map_err(classify)?,
+            row.get::<_, Option<String>>(23).map_err(classify)?,
+        ),
         attachments: Vec::new(),
         flags: Vec::new(),
+    })
+}
+
+/// Arma el estado S/MIME de las dos columnas: `None` si no venía firmado.
+fn smime_from_row(
+    status: Option<i64>,
+    signer: Option<String>,
+) -> Option<crate::smime_sign::SmimeStatus> {
+    status.map(|s| crate::smime_sign::SmimeStatus {
+        valid: s == 1,
+        // El firmante va tanto en «firmado, no verificado» (estado 0) como en el
+        // futuro «válido» (estado 1): sólo se guardó cuando la firma ligó el From.
+        signer,
     })
 }
 
@@ -1012,6 +1033,8 @@ mod tests {
                     text_body: Some(body.into()),
                     html_body: None,
                     truncated: false,
+                    smime_status: None,
+                    smime_signer: None,
                 })
                 .unwrap();
         }
@@ -1089,6 +1112,8 @@ mod tests {
                 text_body: Some("Texto plano".into()),
                 html_body: Some("<p>HTML</p>".into()),
                 truncated: false,
+                smime_status: None,
+                smime_signer: None,
             })
             .unwrap();
         store
@@ -1116,6 +1141,77 @@ mod tests {
         assert_eq!(msg.attachments.len(), 1);
         assert_eq!(msg.attachments[0].part_number, "2");
         assert_eq!(msg.flags, vec!["\\Flagged"]);
+    }
+
+    /// **De punta a punta, como lo ve la ventana**: el crudo entra por
+    /// `opened_rows`, se guarda, y `get_message` devuelve el estado S/MIME. Un
+    /// mensaje firmado se lee «firmado, no verificado» con su firmante y **nunca
+    /// `valid`**; uno manipulado o sin firma se lee sin estado; y volver a bajar el
+    /// mensaje pisa el estado anterior.
+    #[test]
+    fn el_estado_smime_llega_a_la_ventana_firmado_no_verificado_nunca_valido() {
+        use crate::smime_sign::test_support::*;
+        use crate::smime_sign::SmimeStatus;
+
+        let signed = sign(RSA_P12, &draft(RSA_ADDRESS, "hola firmado")).message;
+        let tampered = signed.replace("hola firmado", "hola cambiado");
+        let plain = "From: ana@x.com\r\nContent-Type: text/plain\r\n\r\nhola\r\n".to_string();
+
+        let (_temp, mut store, inbox, _sent) = store_with_inbox_and_sent();
+        let mut ids = Vec::new();
+        for uid in 1..=3u32 {
+            store
+                .apply_messages(
+                    vec![mail(inbox, uid, "ana@x.com", "yo@x.com", "", "s", 1000)],
+                    inbox,
+                )
+                .unwrap();
+            ids.push(
+                store
+                    .connection
+                    .query_row(
+                        "SELECT id FROM messages WHERE mailbox_id = ?1 AND uid = ?2",
+                        rusqlite::params![inbox, uid],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+            );
+        }
+        let ingest = |store: &mut Store, id: i64, raw: &str| {
+            let (body, _) = crate::email_sync::opened_rows(id, raw.as_bytes(), false);
+            store.upsert_message_body(body).unwrap();
+        };
+        let smime = |store: &Store, id: i64| store.get_message(id).unwrap().unwrap().smime;
+
+        ingest(&mut store, ids[0], &signed);
+        ingest(&mut store, ids[1], &tampered);
+        ingest(&mut store, ids[2], &plain);
+        assert_eq!(
+            smime(&store, ids[0]),
+            Some(SmimeStatus {
+                valid: false,
+                signer: Some(RSA_ADDRESS.into())
+            })
+        );
+        assert_eq!(smime(&store, ids[1]), None);
+        assert_eq!(smime(&store, ids[2]), None);
+
+        // Lo que sale por el bus: la clave `smime` con `valid` y `signer`.
+        let json = serde_json::to_value(store.get_message(ids[0]).unwrap().unwrap()).unwrap();
+        assert_eq!(json["smime"]["valid"], false);
+        assert_eq!(json["smime"]["signer"], RSA_ADDRESS);
+        let json = serde_json::to_value(store.get_message(ids[2]).unwrap().unwrap()).unwrap();
+        assert!(json["smime"].is_null());
+
+        // Volver a bajar el mensaje pisa el estado: de firmado a manipulado, y de
+        // sin firma a firmado.
+        ingest(&mut store, ids[0], &tampered);
+        ingest(&mut store, ids[2], &signed);
+        assert_eq!(smime(&store, ids[0]), None);
+        assert_eq!(
+            smime(&store, ids[2]).map(|s| (s.valid, s.signer)),
+            Some((false, Some(RSA_ADDRESS.into())))
+        );
     }
 
     #[test]
@@ -1201,6 +1297,8 @@ mod tests {
                     text_body: Some(format!("Cuerpo {i}")),
                     html_body: None,
                     truncated: false,
+                    smime_status: None,
+                    smime_signer: None,
                 })
                 .unwrap();
         }
@@ -1492,6 +1590,8 @@ mod tests {
                 text_body: Some("CUERPO-SECRETO".into()),
                 html_body: Some("<p>CUERPO-SECRETO</p>".into()),
                 truncated: false,
+                smime_status: None,
+                smime_signer: None,
             })
             .unwrap();
         let items = store.messages_with("ana@x.com", 10).unwrap();

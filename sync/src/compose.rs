@@ -106,6 +106,16 @@ pub struct Draft {
     /// lee el servicio. Quien eligió el archivo es quien lo abre.
     #[serde(default, rename = "adjuntos")]
     pub attachments: Vec<Attachment>,
+    /// Firmar el mensaje con S/MIME al enviarlo. El motor está acá; el toggle lo
+    /// prende la ventana (PR5). Por omisión no se firma, y cuando no se firma **no
+    /// se serializa**: así la cola vieja —sin este campo— se vuelve a escribir
+    /// idéntica y el campo sólo aparece cuando de verdad se pidió firmar.
+    #[serde(default, skip_serializing_if = "is_false", rename = "firmar")]
+    pub sign: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Un archivo para pegar a un mensaje.
@@ -407,6 +417,25 @@ fn encode_qp_line(line: &str) -> String {
 /// que el resultado se pueda probar entero: si leyera el reloj, el test tendría
 /// que buscar partes sueltas en vez de comparar el mensaje completo.
 pub fn build_message(draft: &Draft, message_id: &str, date: &str) -> Result<String, String> {
+    let headers = build_message_headers(draft, message_id, date)?;
+    let content = build_content_entity(draft);
+    // Los de dirección, después la entidad de contenido con sus propios headers.
+    // El `\r\n` de unión continúa la lista de cabeceras; la línea en blanco que
+    // separa cabeceras de cuerpo la pone `build_content_entity`.
+    Ok(format!("{}\r\n{}", headers.join("\r\n"), content))
+}
+
+/// Las cabeceras de dirección del mensaje: todo menos las de la entidad de
+/// contenido (`Content-Type`/`Content-Transfer-Encoding`).
+///
+/// Separadas de [`build_content_entity`] porque S/MIME las trata distinto: en un
+/// `multipart/signed` la firma cubre **sólo** la entidad de contenido, y estas
+/// cabeceras van en el mensaje de afuera, sin firmar. Ver `smime_sign`.
+pub fn build_message_headers(
+    draft: &Draft,
+    message_id: &str,
+    date: &str,
+) -> Result<Vec<String>, String> {
     validate(draft)?;
 
     let mut headers: Vec<String> = vec![
@@ -437,16 +466,23 @@ pub fn build_message(draft: &Draft, message_id: &str, date: &str) -> Result<Stri
     }
 
     headers.push("MIME-Version: 1.0".into());
+    Ok(headers)
+}
 
+/// La entidad MIME de contenido: sus cabeceras (`Content-Type`/
+/// `Content-Transfer-Encoding`), la línea en blanco y el cuerpo. Es lo que se
+/// firma en un `multipart/signed`, byte a byte como se transmite.
+pub fn build_content_entity(draft: &Draft) -> String {
     let text = quoted_printable(&draft.body);
 
     if draft.attachments.is_empty() {
         // Sin adjuntos, un mensaje de una sola parte. Envolverlo en un
         // `multipart` igual sería hacerle leer un árbol a quien recibe un
         // mensaje que es dos renglones de texto.
-        headers.push("Content-Type: text/plain; charset=utf-8".into());
-        headers.push("Content-Transfer-Encoding: quoted-printable".into());
-        return Ok(format!("{}\r\n\r\n{}", headers.join("\r\n"), text));
+        return format!(
+            "Content-Type: text/plain; charset=utf-8\r\n\
+             Content-Transfer-Encoding: quoted-printable\r\n\r\n{text}"
+        );
     }
 
     // La frontera se calcula sobre **todo** lo que va adentro, incluido cada
@@ -456,18 +492,14 @@ pub fn build_message(draft: &Draft, message_id: &str, date: &str) -> Result<Stri
     contents.extend(draft.attachments.iter().map(|a| a.content.as_str()));
     let boundary = boundary(&contents);
 
-    headers.push(format!(
-        "Content-Type: multipart/mixed; boundary=\"{boundary}\""
-    ));
-
-    let mut body = String::new();
+    let mut entity = format!("Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n");
     // El texto primero. Es lo que muestran los clientes que no bajan el árbol
     // entero, y lo que alguien espera ver al abrir el mensaje.
-    body.push_str(&format!("--{boundary}\r\n"));
-    body.push_str("Content-Type: text/plain; charset=utf-8\r\n");
-    body.push_str("Content-Transfer-Encoding: quoted-printable\r\n\r\n");
-    body.push_str(&text);
-    body.push_str("\r\n");
+    entity.push_str(&format!("--{boundary}\r\n"));
+    entity.push_str("Content-Type: text/plain; charset=utf-8\r\n");
+    entity.push_str("Content-Transfer-Encoding: quoted-printable\r\n\r\n");
+    entity.push_str(&text);
+    entity.push_str("\r\n");
 
     for attachment in &draft.attachments {
         let content_type = if attachment.content_type.trim().is_empty() {
@@ -475,26 +507,25 @@ pub fn build_message(draft: &Draft, message_id: &str, date: &str) -> Result<Stri
         } else {
             attachment.content_type.trim()
         };
-        body.push_str(&format!("--{boundary}\r\n"));
+        entity.push_str(&format!("--{boundary}\r\n"));
         // El nombre va en los dos lados: en el `Content-Type` para los clientes
         // viejos, y en el `Content-Disposition`, que es donde lo dice el
         // estándar. Es lo mismo que `attachments.rs` busca al leer.
-        body.push_str(&format!(
+        entity.push_str(&format!(
             "Content-Type: {content_type}; {}\r\n",
             filename_param(&attachment.name).replace("filename", "name")
         ));
-        body.push_str(&format!(
+        entity.push_str(&format!(
             "Content-Disposition: attachment; {}\r\n",
             filename_param(&attachment.name)
         ));
-        body.push_str("Content-Transfer-Encoding: base64\r\n\r\n");
-        body.push_str(&wrap_base64(&attachment.content));
-        body.push_str("\r\n");
+        entity.push_str("Content-Transfer-Encoding: base64\r\n\r\n");
+        entity.push_str(&wrap_base64(&attachment.content));
+        entity.push_str("\r\n");
     }
 
-    body.push_str(&format!("--{boundary}--\r\n"));
-
-    Ok(format!("{}\r\n\r\n{}", headers.join("\r\n"), body))
+    entity.push_str(&format!("--{boundary}--\r\n"));
+    entity
 }
 
 /// El tipo de un archivo, adivinado por su extensión.
@@ -1347,5 +1378,84 @@ mod tests {
             crate::test_support::json_keys(&json["adjuntos"][0]),
             ["contenido", "nombre", "tipo"]
         );
+    }
+    // ── Firmar con S/MIME ──────────────────────────────────────────────────
+
+    /// Lo que escribía la cola antes de que existiera `firmar`, byte por byte.
+    const LEGACY_DRAFT: &str = r#"{"de":"a@b.c","nombre":"","para":["d@e.f"],"cc":[],"asunto":"x","cuerpo":"y","en_respuesta_a":"","referencias":[],"adjuntos":[]}"#;
+
+    /// **La cola vieja no cambia de bytes.** Un borrador que no pide firma se
+    /// escribe sin el campo `firmar`, idéntico a como lo escribía la versión
+    /// anterior: un mensaje encolado antes de actualizar se relee y se reescribe
+    /// igual, y quien lea la cola desde afuera no ve una clave que no conoce.
+    #[test]
+    fn un_borrador_sin_firma_se_escribe_byte_a_byte_como_antes() {
+        let draft: Draft = serde_json::from_str(LEGACY_DRAFT).unwrap();
+        assert!(!draft.sign, "sin el campo, no se firma");
+        assert_eq!(serde_json::to_string(&draft).unwrap(), LEGACY_DRAFT);
+
+        let by_hand = Draft {
+            from: "a@b.c".into(),
+            to: vec!["d@e.f".into()],
+            subject: "x".into(),
+            body: "y".into(),
+            ..Default::default()
+        };
+        assert_eq!(serde_json::to_string(&by_hand).unwrap(), LEGACY_DRAFT);
+    }
+
+    #[test]
+    fn firmar_falso_explicito_tampoco_se_escribe() {
+        let wire = LEGACY_DRAFT.replace(r#""adjuntos":[]"#, r#""adjuntos":[],"firmar":false"#);
+        let draft: Draft = serde_json::from_str(&wire).unwrap();
+        assert!(!draft.sign);
+        assert_eq!(serde_json::to_string(&draft).unwrap(), LEGACY_DRAFT);
+    }
+
+    /// El campo sólo aparece cuando de verdad se pidió firmar, y vuelve.
+    #[test]
+    fn pedir_firma_se_escribe_y_se_lee() {
+        let wire = LEGACY_DRAFT.replace(r#""adjuntos":[]"#, r#""adjuntos":[],"firmar":true"#);
+        let draft: Draft = serde_json::from_str(&wire).unwrap();
+        assert!(draft.sign);
+        assert_eq!(serde_json::to_string(&draft).unwrap(), wire);
+    }
+
+    /// **Lo que se firma es sólo la entidad de contenido.** Las cabeceras de
+    /// dirección van afuera, sin firmar; si se colaran adentro, el mensaje
+    /// firmado las repetiría y el verificador firmaría de más.
+    #[test]
+    fn la_entidad_de_contenido_no_lleva_cabeceras_de_direccion() {
+        let mut with_files = draft();
+        with_files.attachments = vec![Attachment {
+            name: "x.pdf".into(),
+            content_type: String::new(),
+            content: "aG9sYQ==".into(),
+        }];
+        for draft in [draft(), with_files] {
+            let entity = build_content_entity(&draft);
+            let (head, _) = entity.split_once("\r\n\r\n").expect("cabeceras y cuerpo");
+            for line in head.split("\r\n") {
+                assert!(
+                    line.starts_with("Content-"),
+                    "una cabecera de dirección en la entidad firmada: {line}"
+                );
+            }
+
+            let headers =
+                build_message_headers(&draft, "<x@y>", "Thu, 10 Sep 2026 12:00:00 +0000").unwrap();
+            assert!(headers.iter().any(|h| h.starts_with("From: ")));
+            assert!(headers.iter().any(|h| h.starts_with("Subject: ")));
+            assert!(
+                headers.iter().all(|h| !h.starts_with("Content-")),
+                "{headers:?}"
+            );
+
+            // Y juntos son el mensaje de siempre.
+            assert_eq!(
+                build_message(&draft, "<x@y>", "Thu, 10 Sep 2026 12:00:00 +0000").unwrap(),
+                format!("{}\r\n{}", headers.join("\r\n"), entity)
+            );
+        }
     }
 }

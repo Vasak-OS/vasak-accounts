@@ -27,3 +27,19 @@ prueba, como los `.pem` de prueba de los propios crates de RustCrypto.
   de CryptoAPI/keytool. Tiene que dar `UnsupportedPkcs12` con el hint «sin -legacy».
 
 Contraseña de todos: `vasak-test`.
+
+## Para firmar y verificar (`smime_sign`)
+
+Generados con `openssl ecparam -name prime256v1 -genkey` + `openssl req -x509` +
+`openssl pkcs12 -export` (PBES2 por omisión). Contraseña: `vasak-test`.
+
+- `rsa-pbes2.p12` — RSA, SubjectAltName `prueba@vasak.test`.
+- `ec-p256.p12` — ECDSA P-256, SubjectAltName `ec@vasak.test` (cert suelto: `ec-cert.pem`).
+- `ec-email-en-subject.p12` — ECDSA P-256 **sin SubjectAltName**: el correo
+  `subject@vasak.test` sólo está en el `emailAddress` del subject. Prueba la otra
+  forma de ligar el firmante al `From`.
+- `ec-vencido.p12` — ECDSA P-256, SubjectAltName `vencido@vasak.test`, vigencia
+  2020-01-01 a 2021-01-01 (ya vencido).
+- `ec-correo-vacio.p12` — ECDSA P-256 cuyo SubjectAltName trae un `rfc822Name`
+  **vacío** (armado a mano con `cryptography`: `openssl` no lo emite). Prueba que
+  un `From` vacío no «liga» con un correo vacío del cert.

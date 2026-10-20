@@ -91,6 +91,9 @@ mod graph_write;
 // (`vasak-accounts#23`); por ahora lo ejercitan sus pruebas y la cola.
 #[allow(dead_code)]
 mod serialize;
+#[cfg(test)]
+mod smime_send_tests;
+mod smime_sign;
 mod smtp;
 mod store;
 mod store_api;
@@ -1154,8 +1157,10 @@ fn next_unique() -> u64 {
 /// que quedó esperando por un servidor caído tiene que salir solo cuando el
 /// servidor vuelva, sin que nadie apriete nada.
 async fn dispatch_outbox(service: Service, emitter: SignalEmitter<'static>) {
+    // La conexión de sesión, para llegar al llavero cuando un mensaje se firma.
+    let connection = emitter.connection().clone();
     loop {
-        let changed = flush_outbox(&service).await;
+        let changed = flush_outbox(&service, &connection).await;
         if changed {
             let _ = Service::outbox_changed(&emitter).await;
         }
@@ -1169,7 +1174,7 @@ async fn dispatch_outbox(service: Service, emitter: SignalEmitter<'static>) {
 }
 
 /// Intenta mandar lo que esté listo. Devuelve si cambió algo.
-async fn flush_outbox(service: &Service) -> bool {
+async fn flush_outbox(service: &Service, connection: &zbus::Connection) -> bool {
     let Ok(outbox) = outbox::Outbox::open(outbox::outbox_dir()) else {
         return false;
     };
@@ -1181,7 +1186,7 @@ async fn flush_outbox(service: &Service) -> bool {
     let mut changed = false;
 
     for mut outgoing in outbox::ready_to_send(queued, now) {
-        match send_one(service, &outgoing).await {
+        match send_one(service, &outgoing, connection).await {
             Ok(()) => {
                 tracing::info!("mensaje {} entregado", outgoing.id);
                 // **El error de sacarlo importa.** Un mensaje entregado que
@@ -1224,7 +1229,11 @@ async fn flush_outbox(service: &Service) -> bool {
 }
 
 /// Manda un mensaje, de principio a fin.
-async fn send_one(service: &Service, outgoing: &outbox::Outgoing) -> Result<(), smtp::SmtpError> {
+async fn send_one(
+    service: &Service,
+    outgoing: &outbox::Outgoing,
+    connection: &zbus::Connection,
+) -> Result<(), smtp::SmtpError> {
     let (broker, account) = service
         .account(&outgoing.account_id)
         .await
@@ -1250,8 +1259,9 @@ async fn send_one(service: &Service, outgoing: &outbox::Outgoing) -> Result<(), 
     let destination =
         broker::smtp_endpoint(&config, Some(token)).map_err(smtp::SmtpError::Permanent)?;
 
-    let message = compose::build_message(&outgoing.draft, &outgoing.message_id, &outgoing.date)
-        .map_err(smtp::SmtpError::Permanent)?;
+    let keys = store::key::SecretServiceKeys::on_session_bus(connection.clone());
+    let message =
+        compose_outgoing(&keys, &outgoing.draft, &outgoing.message_id, &outgoing.date).await?;
 
     let mut session = smtp::Session::open(&destination).await?;
     let result = session
@@ -1259,6 +1269,58 @@ async fn send_one(service: &Service, outgoing: &outbox::Outgoing) -> Result<(), 
         .await;
     session.close().await;
     result
+}
+
+/// El mensaje tal como sale: firmado si el borrador lo pidió, tal cual si no.
+/// Separado de `send_one` para poder probar que pedir firma y no poder firmar
+/// **falla** en vez de mandar sin firmar.
+async fn compose_outgoing(
+    keys: &store::key::SecretServiceKeys,
+    draft: &compose::Draft,
+    message_id: &str,
+    date: &str,
+) -> Result<String, smtp::SmtpError> {
+    if draft.sign {
+        sign_message(keys, draft, message_id, date).await
+    } else {
+        compose::build_message(draft, message_id, date).map_err(smtp::SmtpError::Permanent)
+    }
+}
+
+/// Arma el mensaje firmado con S/MIME. La clave y la cadena salen del llavero,
+/// por la dirección `From`. Si no hay certificado para esa dirección y se pidió
+/// firmar, el envío **falla** —no se manda sin firmar en silencio—.
+async fn sign_message(
+    keys: &store::key::SecretServiceKeys,
+    draft: &compose::Draft,
+    message_id: &str,
+    date: &str,
+) -> Result<String, smtp::SmtpError> {
+    let from = &draft.from;
+
+    let key = keys
+        .find_smime_private_key(from)
+        .await
+        .map_err(|e| smtp::SmtpError::Temporary(e.to_string()))?
+        .ok_or_else(|| {
+            smtp::SmtpError::Permanent(format!("no hay certificado S/MIME para {from}"))
+        })?;
+    let certs = keys
+        .find_smime_certs(from)
+        .await
+        .map_err(|e| smtp::SmtpError::Temporary(e.to_string()))?
+        .ok_or_else(|| {
+            smtp::SmtpError::Permanent(format!("no hay cadena de certificados S/MIME para {from}"))
+        })?;
+
+    let headers = compose::build_message_headers(draft, message_id, date)
+        .map_err(smtp::SmtpError::Permanent)?;
+    let content = compose::build_content_entity(draft);
+    let signature = smime_sign::detached_signature(content.as_bytes(), key.as_slice(), &certs)
+        .map_err(|e| smtp::SmtpError::Permanent(e.to_string()))?;
+    Ok(smime_sign::build_signed_message(
+        &headers, &content, &signature,
+    ))
 }
 
 /// Abre la sesión de una cuenta: token, configuración y conexión.

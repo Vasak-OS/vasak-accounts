@@ -373,6 +373,11 @@ pub struct ContentType {
     pub charset: String,
     /// El separador de las partes, si es un `multipart`.
     pub boundary: Option<String>,
+    /// El parámetro `protocol` (en minúsculas), que en un `multipart/signed`
+    /// dice qué firma lleva: S/MIME es `application/pkcs7-signature`, PGP es
+    /// `application/pgp-signature`. Distinguirlos evita tratar un correo PGP
+    /// como S/MIME. Ver `smime_sign::verify_message`.
+    pub protocol: Option<String>,
 }
 
 impl Default for ContentType {
@@ -384,6 +389,7 @@ impl Default for ContentType {
             media_type: "text/plain".into(),
             charset: "us-ascii".into(),
             boundary: None,
+            protocol: None,
         }
     }
 }
@@ -401,6 +407,7 @@ pub fn parse_content_type(value: &str) -> ContentType {
         },
         charset: "us-ascii".into(),
         boundary: None,
+        protocol: None,
     };
 
     for param in parts {
@@ -412,6 +419,9 @@ pub fn parse_content_type(value: &str) -> ContentType {
             "charset" => content_type.charset = value.to_string(),
             // Vacío no sirve de separador: partiría el mensaje en cada línea.
             "boundary" if !value.is_empty() => content_type.boundary = Some(value.to_string()),
+            "protocol" if !value.is_empty() => {
+                content_type.protocol = Some(value.to_ascii_lowercase())
+            }
             _ => {}
         }
     }

@@ -112,6 +112,11 @@ pub struct MessageBodyRow {
     pub text_body: Option<String>,
     pub html_body: Option<String>,
     pub truncated: bool,
+    /// Estado S/MIME: `None` si no venía firmado, `Some(0)` «firmado, no
+    /// verificado», `Some(1)` «firma válida». Se calcula al bajar el mensaje.
+    pub smime_status: Option<i64>,
+    /// El correo del firmante cuando la firma vale.
+    pub smime_signer: Option<String>,
 }
 
 /// Un adjunto de un mensaje.
@@ -189,18 +194,23 @@ pub enum Applied {
 fn write_body(transaction: &Transaction, body: MessageBodyRow) -> Result<(), StoreError> {
     transaction
         .execute(
-            "INSERT INTO message_bodies (message_id, text_body, html_body, truncated, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO message_bodies
+                 (message_id, text_body, html_body, truncated, smime_status, smime_signer, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT (message_id) DO UPDATE SET
                      text_body = excluded.text_body,
                      html_body = excluded.html_body,
                      truncated = excluded.truncated,
+                     smime_status = excluded.smime_status,
+                     smime_signer = excluded.smime_signer,
                      updated_at = excluded.updated_at",
             rusqlite::params![
                 body.message_id,
                 body.text_body,
                 body.html_body,
                 body.truncated as i64,
+                body.smime_status,
+                body.smime_signer,
                 now(),
             ],
         )
@@ -1032,6 +1042,8 @@ mod tests {
                 text_body: Some("Hola mundo".into()),
                 html_body: Some("<p>Hola mundo</p>".into()),
                 truncated: false,
+                smime_status: None,
+                smime_signer: None,
             })
             .unwrap();
 
@@ -1167,6 +1179,8 @@ mod tests {
                 text_body: Some("Cuerpo para búsqueda FTS".into()),
                 html_body: None,
                 truncated: false,
+                smime_status: None,
+                smime_signer: None,
             })
             .unwrap();
 
@@ -1382,6 +1396,8 @@ mod tests {
                 text_body: Some("cuerpo indexado".into()),
                 html_body: None,
                 truncated: false,
+                smime_status: None,
+                smime_signer: None,
             })
             .unwrap();
 
@@ -1548,6 +1564,8 @@ mod tests {
                 text_body: Some("ya está".into()),
                 html_body: None,
                 truncated: false,
+                smime_status: None,
+                smime_signer: None,
             })
             .unwrap();
 
@@ -1576,6 +1594,8 @@ mod tests {
                     text_body: Some(format!("cuerpo{uid}")),
                     html_body: Some("<p>hola</p>".into()),
                     truncated: false,
+                    smime_status: None,
+                    smime_signer: None,
                 },
                 vec![MessageAttachmentRow {
                     message_id: id,
