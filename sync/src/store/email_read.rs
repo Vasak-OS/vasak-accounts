@@ -1229,6 +1229,125 @@ mod tests {
         );
     }
 
+    /// El estado de cifrado, de punta a punta: `opened_rows_decrypting`, se guarda y
+    /// `get_message` lo devuelve como `smime.encryption` (`opened` / `unavailable`);
+    /// un correo no cifrado sigue sin estado, y volver a bajar el mensaje pisa el
+    /// anterior en las dos direcciones.
+    #[test]
+    fn el_estado_de_cifrado_llega_a_la_ventana_abierto_o_no_disponible_y_el_reupsert_lo_pisa() {
+        use crate::email_sync::{opened_rows_decrypting, SmimeMaterial};
+        use crate::smime_sign::test_support::*;
+        use crate::smime_sign::{Encryption, SmimeStatus};
+
+        let id = crate::store::smime_key::parse_pkcs12(RSA_P12, PASSWORD).unwrap();
+        let material = SmimeMaterial {
+            key: id.private_key_pkcs8,
+            cert: id.certs[0].clone(),
+        };
+        let encrypted = include_bytes!("../../tests/fixtures/smime/enc-rsa-aes256.eml").as_slice();
+        let ecc = include_bytes!("../../tests/fixtures/smime/enc-ecc-recipient.eml").as_slice();
+        let signed_and_encrypted =
+            include_bytes!("../../tests/fixtures/smime/enc-rsa-firmado.eml").as_slice();
+        let plain = b"From: ana@x.com\r\nContent-Type: text/plain\r\n\r\nhola\r\n".as_slice();
+
+        let (_temp, mut store, inbox, _sent) = store_with_inbox_and_sent();
+        let mut ids = Vec::new();
+        for uid in 1..=4u32 {
+            store
+                .apply_messages(
+                    vec![mail(inbox, uid, "ana@x.com", "yo@x.com", "", "s", 1000)],
+                    inbox,
+                )
+                .unwrap();
+            ids.push(
+                store
+                    .connection
+                    .query_row(
+                        "SELECT id FROM messages WHERE mailbox_id = ?1 AND uid = ?2",
+                        rusqlite::params![inbox, uid],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+            );
+        }
+        let ingest = |store: &mut Store, id: i64, raw: &[u8]| {
+            let (body, _) = opened_rows_decrypting(id, raw, false, Some(&material));
+            store.upsert_message_body(body).unwrap();
+        };
+        let message = |store: &Store, id: i64| store.get_message(id).unwrap().unwrap();
+        let smime = |store: &Store, id: i64| message(store, id).smime;
+
+        ingest(&mut store, ids[0], encrypted);
+        ingest(&mut store, ids[1], ecc);
+        ingest(&mut store, ids[2], plain);
+        ingest(&mut store, ids[3], signed_and_encrypted);
+
+        // Abierto: el cuerpo que se lee es el descifrado, y no es «firmado».
+        assert_eq!(
+            smime(&store, ids[0]),
+            Some(SmimeStatus {
+                valid: false,
+                signer: None,
+                encryption: Some(Encryption::Opened),
+            })
+        );
+        assert!(message(&store, ids[0])
+            .text_body
+            .unwrap_or_default()
+            .contains("mensaje secreto"));
+        // No se pudo abrir: marcado, y sin el blob del sobre como cuerpo.
+        assert_eq!(
+            smime(&store, ids[1]),
+            Some(SmimeStatus {
+                valid: false,
+                signer: None,
+                encryption: Some(Encryption::Unavailable),
+            })
+        );
+        let shown = message(&store, ids[1]).text_body.unwrap_or_default();
+        assert!(shown.trim().is_empty(), "{shown:?}");
+        // No cifrado: sin estado.
+        assert_eq!(smime(&store, ids[2]), None);
+        // Cifrado y firmado: las dos cosas, y la firma nunca `valid`.
+        assert_eq!(
+            smime(&store, ids[3]),
+            Some(SmimeStatus {
+                valid: false,
+                signer: Some(RSA_ADDRESS.into()),
+                encryption: Some(Encryption::Opened),
+            })
+        );
+
+        // Lo que sale por el bus: `smime.encryption` en snake_case, o nulo.
+        let json = |store: &Store, id: i64| {
+            serde_json::to_value(store.get_message(id).unwrap().unwrap()).unwrap()
+        };
+        assert_eq!(json(&store, ids[0])["smime"]["encryption"], "opened");
+        assert_eq!(json(&store, ids[1])["smime"]["encryption"], "unavailable");
+        assert!(json(&store, ids[2])["smime"].is_null());
+        assert_eq!(json(&store, ids[3])["smime"]["encryption"], "opened");
+        assert_eq!(json(&store, ids[3])["smime"]["signer"], RSA_ADDRESS);
+
+        // Volver a bajar pisa el estado: de abierto a no disponible (la clave ya no
+        // está), de no disponible a abierto (ya hay clave) y de abierto a no cifrado.
+        let (body, _) = opened_rows_decrypting(ids[0], encrypted, false, None);
+        store.upsert_message_body(body).unwrap();
+        assert_eq!(
+            smime(&store, ids[0]).and_then(|s| s.encryption),
+            Some(Encryption::Unavailable)
+        );
+        // El cuerpo descifrado de antes no quedó colgado.
+        let shown = message(&store, ids[0]).text_body.unwrap_or_default();
+        assert!(!shown.contains("mensaje secreto"), "{shown:?}");
+        ingest(&mut store, ids[1], encrypted);
+        assert_eq!(
+            smime(&store, ids[1]).and_then(|s| s.encryption),
+            Some(Encryption::Opened)
+        );
+        ingest(&mut store, ids[3], plain);
+        assert_eq!(smime(&store, ids[3]), None);
+    }
+
     #[test]
     fn cursor_encode_decode() {
         let c = Cursor {

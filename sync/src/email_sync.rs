@@ -890,4 +890,6 @@ impl<K: KeySource> AreaSync for EmailSync<K> {
 pub type EmailScheduler<K> = dav_sync::DavScheduler<EmailSync<K>>;
 
 #[cfg(test)]
+mod decrypt_tests;
+#[cfg(test)]
 mod tests;

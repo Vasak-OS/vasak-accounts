@@ -822,6 +822,8 @@ fn aes_cbc_decrypt(
 }
 
 #[cfg(test)]
+mod decrypt_tests;
+#[cfg(test)]
 mod edge_cases;
 #[cfg(test)]
 pub(crate) mod test_support;

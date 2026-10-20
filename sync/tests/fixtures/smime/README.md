@@ -43,3 +43,26 @@ Generados con `openssl ecparam -name prime256v1 -genkey` + `openssl req -x509` +
 - `ec-correo-vacio.p12` — ECDSA P-256 cuyo SubjectAltName trae un `rfc822Name`
   **vacío** (armado a mano con `cryptography`: `openssl` no lo emite). Prueba que
   un `From` vacío no «liga» con un correo vacío del cert.
+
+## Para descifrar (`smime_sign::decrypt_message`)
+
+Sobres reales de `openssl cms -encrypt`, cifrados a `rsa-pbes2.p12` (nuestro cert) con
+el cuerpo `mensaje secreto …` (`enc-rsa-html.eml`: HTML con un texto largo, para
+armar el ataque efail en las pruebas). Los de abajo se arman desde ellos en las
+pruebas (cambiando el CEK cifrado, el relleno CBC o recortando el DER).
+
+- `enc-rsa-aes128/192/256.eml` — RSAES-PKCS1-v1_5 + AES-CBC de 128/192/256 bits.
+- `enc-rsa-oaep.eml` — RSAES-OAEP con SHA-1 (el valor por omisión de openssl).
+- `enc-rsa-oaep-sha256.eml` — RSAES-OAEP con SHA-256 y MGF1-SHA-256 explícitos.
+- `enc-rsa-multi.eml` — tres destinatarios: `otro-cert.pem` (RSA, `CN=A`, serie 1),
+  nuestro cert y `ec-cert.pem` (ECC, `Kari`). En el orden en que el parser lo lee,
+  **nosotros no somos el primero**.
+- `enc-rsa-otro-destinatario.eml` — cifrado sólo a `otro-cert.pem`: bien formado,
+  pero no es para nosotros.
+- `enc-ecc-recipient.eml` — destinatario ECC (ECDH, `Kari`): no se abre.
+- `enc-rsa-3des.eml` — contenido en 3DES-CBC: cifrado no soportado.
+- `enc-rsa-gcm.eml` — AES-256-GCM (`AuthEnvelopedData`, `smime-type=authEnveloped-data`).
+- `enc-rsa-firmado.eml` — sign-then-encrypt: el contenido de adentro es un
+  `pkcs7-mime` firmado por `prueba@vasak.test`; el `From` sólo está en el sobre.
+- `enc-rsa-manipulado.eml` — el DER del sobre alterado: no parsea.
+- `otro-cert.pem` — certificado RSA de juguete; **la clave privada se descartó**.

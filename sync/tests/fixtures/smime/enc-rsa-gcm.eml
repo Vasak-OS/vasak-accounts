@@ -1,0 +1,21 @@
+From: remitente@otro.test
+To: yo@vasak.test
+Subject: cifrado
+Date: Thu, 10 Sep 2026 12:00:00 +0000
+MIME-Version: 1.0
+Content-Disposition: attachment; filename="smime.p7m"
+Content-Type: application/pkcs7-mime; smime-type=authEnveloped-data; name="smime.p7m"
+Content-Transfer-Encoding: base64
+
+MIIB4wYLKoZIhvcNAQkQARegggHSMIIBzgIBADGCAUAwggE8AgEAMCQwDDEKMAgG
+A1UEAwwBUwIUAsQIiSae/Oa0V5eqDM99E7rzdSIwDQYJKoZIhvcNAQEBBQAEggEA
+a/m8Oc5sZPZX99yfsmknDDs91rEM/v/ZdD5LU331gCHLqCiqmYOJFOH7hxaPEBwR
+m2JsVhajoMsp/UgNGjdyjUKbuACUE16ZQ/XFCSXs3nUSXnwPz7OIzjLArSShYpBN
+wS0fUkU39EY+AqqPH4OTc7rw8kZVAe5/HPKpJ4pZLjv0YLOalUmOpILJ4gAtbl/p
+J56K2WgnSas+bEhM2SwDaubx4+jVyTQYAJOv3gn83Ek+Asof7ursTVlHOqAeN6A2
+eNV5CWRStrtz1cDExUa6DIHTfXHggkmi0WFLssNp6KyujVu5ioP258tYLBQlVntJ
+poQ1Ds+K975ZF0R2Mv7z8zBzBgkqhkiG9w0BBwEwHgYJYIZIAWUDBAEuMBEEDBFw
+2UMOvcnEovvAJAIBEIBGwKxYt3hRtH195P3CSJg0EKQr46dYfYdbnVp4O2hiyzuS
+6iRcw+aBk5JFebJ2Fg/aR/I7dDlxKfygQIf+hLOpH9/LP7k8TgQQvv/slSpIiSOW
+ouiLXr+/HQ==
+
