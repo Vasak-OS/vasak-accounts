@@ -10,10 +10,18 @@
 //! `application/pkcs7-mime; smime-type=signed-data`. Chequea, como validó el POC:
 //! la firma (RSA PKCS#1 v1.5 o ECDSA P-256), los *signed attributes*
 //! (`messageDigest` = SHA-256 del contenido, `contentType`), y que el certificado
-//! del firmante **esté ligado al `From`**. **No** valida cadena contra una CA, ni
-//! vigencia, ni revocación (eso es un follow-up, «validación de confianza
-//! X.509»): un cert vencido o sin cadena se muestra «firmado, no verificado»,
-//! nunca «roto» (decisión #2).
+//! del firmante **esté ligado al `From`**.
+//!
+//! **Pero NO declara ninguna firma «válida» todavía.** No hay validación de
+//! confianza X.509 —cadena hasta una CA de confianza, ancla, vigencia,
+//! revocación, ESS `signingCertificate`—, y sin eso un certificado **autofirmado**
+//! con `SubjectAltName rfc822=ceo@víctima.com` y `From: ceo@víctima.com` pasaría
+//! las cuatro comprobaciones de arriba: decir «válido» ahí sería una mentira en
+//! un correo falsificado. Así que mientras falte la validación de confianza, lo
+//! más que se dice es **«firmado, no verificado — <firmante>»**
+//! ([`Verification::SignedUntrusted`]), nunca «válido» (decisión #2: lo no
+//! implementado se ve «no disponible», nunca una mentira). El estado «válido»
+//! queda reservado para el follow-up «validación de confianza X.509».
 
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use cms::builder::{SignedDataBuilder, SignerInfoBuilder};
