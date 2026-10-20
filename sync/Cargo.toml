@@ -94,12 +94,22 @@ ldap3 = { version = "0.12", default-features = false, features = ["tls-rustls-ri
 # `kdf` para derivar la clave del MAC del PFX (HMAC con el KDF de PKCS#12) y
 # verificarlo antes de confiar en el contenido del `.p12`. Ver `verify_mac`.
 pkcs12 = { version = "0.1", features = ["kdf"] }
-cms = "0.2"
+# `builder` para armar y verificar SignedData/PKCS#7 (firmar/verificar correo,
+# PR3). Ver `smime_sign.rs`.
+cms = { version = "0.2", features = ["builder"] }
 pkcs5 = { version = "0.7", features = ["pbes2", "alloc"] }
 pkcs8 = { version = "0.10", features = ["encryption", "alloc"] }
 der = { version = "0.7", features = ["alloc", "oid"] }
 const-oid = { version = "0.9", features = ["db"] }
 spki = { version = "0.7", features = ["alloc"] }
+# La firma: RSA (PKCS#1 v1.5) y ECDSA P-256, para firmar con la clave propia y
+# verificar las de terceros (las dos formas aparecen en el correo real). Rust
+# puro, misma generación der-0.7 (ecdsa 0.16 / p256 0.13), sin soname nuevo.
+rsa = { version = "0.9", features = ["sha2"] }
+ecdsa = { version = "0.16", features = ["der"] }
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+x509-cert = "0.2"
+signature = "2"
 # El HMAC del MAC del `.p12` y su hash. Ya estaban en el candado (los trae
 # `pbkdf2`/`pkcs5`): no suman crate nueva ni biblioteca compartida.
 hmac = "0.12"

@@ -168,6 +168,9 @@ pub struct MessageFull {
     pub text_body: Option<String>,
     pub html_body: Option<String>,
     pub truncated: bool,
+    /// El estado S/MIME: `None` si no venía firmado, si no «firmado» con si la
+    /// firma se verificó y quién firma. Ver `smime_sign`.
+    pub smime: Option<crate::smime_sign::SmimeStatus>,
     pub attachments: Vec<AttachmentSummary>,
     pub flags: Vec<String>,
 }
@@ -565,7 +568,8 @@ impl Store {
                         m.subject, m.date_ts, m.flags_seen, m.flags_answered,
                         m.flags_flagged, m.flags_draft, m.flags_deleted,
                         m.has_attachments, m.size,
-                        b.text_body, b.html_body, b.truncated
+                        b.text_body, b.html_body, b.truncated,
+                        b.smime_status, b.smime_signer
                  FROM messages m
                  JOIN mailboxes mb ON m.mailbox_id = mb.id
                  LEFT JOIN message_bodies b ON m.id = b.message_id
@@ -767,8 +771,23 @@ fn message_full_from_row(row: &Row) -> Result<MessageFull, StoreError> {
         text_body: row.get(19).map_err(classify)?,
         html_body: row.get(20).map_err(classify)?,
         truncated: row.get::<_, i64>(21).map_err(classify)? != 0,
+        smime: smime_from_row(
+            row.get::<_, Option<i64>>(22).map_err(classify)?,
+            row.get::<_, Option<String>>(23).map_err(classify)?,
+        ),
         attachments: Vec::new(),
         flags: Vec::new(),
+    })
+}
+
+/// Arma el estado S/MIME de las dos columnas: `None` si no venía firmado.
+fn smime_from_row(
+    status: Option<i64>,
+    signer: Option<String>,
+) -> Option<crate::smime_sign::SmimeStatus> {
+    status.map(|s| crate::smime_sign::SmimeStatus {
+        valid: s == 1,
+        signer: if s == 1 { signer } else { None },
     })
 }
 
@@ -1012,6 +1031,8 @@ mod tests {
                     text_body: Some(body.into()),
                     html_body: None,
                     truncated: false,
+                    smime_status: None,
+                    smime_signer: None,
                 })
                 .unwrap();
         }
@@ -1089,6 +1110,8 @@ mod tests {
                 text_body: Some("Texto plano".into()),
                 html_body: Some("<p>HTML</p>".into()),
                 truncated: false,
+                smime_status: None,
+                smime_signer: None,
             })
             .unwrap();
         store
@@ -1201,6 +1224,8 @@ mod tests {
                     text_body: Some(format!("Cuerpo {i}")),
                     html_body: None,
                     truncated: false,
+                    smime_status: None,
+                    smime_signer: None,
                 })
                 .unwrap();
         }
@@ -1492,6 +1517,8 @@ mod tests {
                 text_body: Some("CUERPO-SECRETO".into()),
                 html_body: Some("<p>CUERPO-SECRETO</p>".into()),
                 truncated: false,
+                smime_status: None,
+                smime_signer: None,
             })
             .unwrap();
         let items = store.messages_with("ana@x.com", 10).unwrap();

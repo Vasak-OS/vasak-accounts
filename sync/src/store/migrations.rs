@@ -602,6 +602,16 @@ ALTER TABLE calendar_objects ADD COLUMN categories TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE calendar_objects ADD COLUMN color TEXT;
 ";
 
+/// v10 (PR de vasak-mail#78, firmar/verificar S/MIME): el estado de la firma de
+/// un mensaje, calculado al bajarlo (cuando está el crudo) y guardado acá para
+/// responder desde la caché sin re-verificar ni guardar el RFC822 entero.
+/// `smime_status` es NULL si no venía firmado, 0 «firmado, no verificado», 1
+/// «firmado, firma válida»; `smime_signer` el correo del firmante cuando vale.
+const V10: &str = "
+ALTER TABLE message_bodies ADD COLUMN smime_status INTEGER;
+ALTER TABLE message_bodies ADD COLUMN smime_signer TEXT;
+";
+
 /// Todas las migraciones, en orden.
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
@@ -614,6 +624,7 @@ pub fn migrations() -> Migrations<'static> {
         M::up(V7),
         M::up(V8),
         M::up(V9),
+        M::up(V10),
     ])
 }
 
@@ -650,7 +661,7 @@ mod tests {
         let mut connection = Connection::open_in_memory().unwrap();
         apply(&mut connection).unwrap();
         let version = schema_version(&connection).unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
 
         let tables = |c: &Connection| -> Vec<String> {
             let mut statement = c
@@ -775,7 +786,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 9);
+        assert_eq!(schema_version(&connection).unwrap(), 10);
 
         // Lo que había sigue, y la marca nueva es NULL.
         let object_mark: Option<String> = connection
@@ -818,7 +829,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 9);
+        assert_eq!(schema_version(&connection).unwrap(), 10);
 
         // La op sigue, en conflicto, y las columnas nuevas son NULL.
         let (state, server_etag, server_raw): (String, Option<String>, Option<Vec<u8>>) =
@@ -877,7 +888,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 9);
+        assert_eq!(schema_version(&connection).unwrap(), 10);
 
         // El contacto sigue, y la tabla nueva arranca vacía.
         let contacts: i64 = connection
@@ -989,7 +1000,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 9);
+        assert_eq!(schema_version(&connection).unwrap(), 10);
 
         // El enlace sigue, y las columnas nuevas arrancan nulas.
         let (resource, photo, media): (String, Option<Vec<u8>>, Option<String>) = connection
@@ -1053,7 +1064,7 @@ mod tests {
 
         apply(&mut connection).unwrap();
         assert_eq!(columns(&connection), before);
-        assert_eq!(schema_version(&connection).unwrap(), 9);
+        assert_eq!(schema_version(&connection).unwrap(), 10);
     }
 
     /// **v8 → v9 no pierde nada**: un evento de una base de la v8 sigue con sus
@@ -1071,7 +1082,7 @@ mod tests {
         let object = insert_object(&connection, calendar, "https://x/c/1.ics");
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 9);
+        assert_eq!(schema_version(&connection).unwrap(), 10);
 
         // Lo que había sigue.
         assert_eq!(
@@ -1169,7 +1180,7 @@ mod tests {
 
         apply(&mut fresh).unwrap();
         assert_eq!(columns(&fresh), before);
-        assert_eq!(schema_version(&fresh).unwrap(), 9);
+        assert_eq!(schema_version(&fresh).unwrap(), 10);
 
         let mut from_v8 = at_version(8);
         apply(&mut from_v8).unwrap();
@@ -1344,7 +1355,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 9);
+        assert_eq!(schema_version(&connection).unwrap(), 10);
         let message: String = connection
             .query_row("SELECT message FROM sync_log", [], |row| row.get(0))
             .unwrap();
@@ -1645,7 +1656,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 9);
+        assert_eq!(schema_version(&connection).unwrap(), 10);
         assert_eq!(found(&connection, "jose"), vec![id]);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_emails"), 1);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_phones"), 1);
@@ -1816,7 +1827,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 9);
+        assert_eq!(schema_version(&connection).unwrap(), 10);
         assert_eq!(found(&connection, "jose"), vec![id]);
         assert_eq!(count(&connection, "SELECT count(*) FROM occurrences"), 2);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_emails"), 1);

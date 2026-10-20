@@ -394,6 +394,16 @@ pub fn opened_rows(
 ) -> (MessageBodyRow, Vec<MessageAttachmentRow>) {
     let text = crate::message::plain_text(raw);
     let html = crate::message::html_part(raw).map(|h| crate::html::sanitize(&h).html);
+    // S/MIME: se verifica acá, con el crudo en mano (al leer no está). Un mensaje
+    // truncado no se puede verificar y cae en «firmado, no verificado».
+    let (smime_status, smime_signer) = match crate::smime_sign::verify_message(raw) {
+        crate::smime_sign::Verification::NotSigned => (None, None),
+        crate::smime_sign::Verification::Valid(signer) => (Some(1), Some(signer)),
+        crate::smime_sign::Verification::Unverified(reason) => {
+            tracing::debug!(reason, "firma S/MIME no verificada");
+            (Some(0), None)
+        }
+    };
     let attachments = crate::attachments::list(raw)
         .into_iter()
         .map(|a| MessageAttachmentRow {
@@ -412,6 +422,8 @@ pub fn opened_rows(
             text_body: Some(text),
             html_body: html,
             truncated,
+            smime_status,
+            smime_signer,
         },
         attachments,
     )

@@ -106,6 +106,16 @@ pub struct Draft {
     /// lee el servicio. Quien eligió el archivo es quien lo abre.
     #[serde(default, rename = "adjuntos")]
     pub attachments: Vec<Attachment>,
+    /// Firmar el mensaje con S/MIME al enviarlo. El motor está acá; el toggle lo
+    /// prende la ventana (PR5). Por omisión no se firma, y cuando no se firma **no
+    /// se serializa**: así la cola vieja —sin este campo— se vuelve a escribir
+    /// idéntica y el campo sólo aparece cuando de verdad se pidió firmar.
+    #[serde(default, skip_serializing_if = "is_false", rename = "firmar")]
+    pub sign: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Un archivo para pegar a un mensaje.
@@ -407,6 +417,25 @@ fn encode_qp_line(line: &str) -> String {
 /// que el resultado se pueda probar entero: si leyera el reloj, el test tendría
 /// que buscar partes sueltas en vez de comparar el mensaje completo.
 pub fn build_message(draft: &Draft, message_id: &str, date: &str) -> Result<String, String> {
+    let headers = build_message_headers(draft, message_id, date)?;
+    let content = build_content_entity(draft);
+    // Los de dirección, después la entidad de contenido con sus propios headers.
+    // El `\r\n` de unión continúa la lista de cabeceras; la línea en blanco que
+    // separa cabeceras de cuerpo la pone `build_content_entity`.
+    Ok(format!("{}\r\n{}", headers.join("\r\n"), content))
+}
+
+/// Las cabeceras de dirección del mensaje: todo menos las de la entidad de
+/// contenido (`Content-Type`/`Content-Transfer-Encoding`).
+///
+/// Separadas de [`build_content_entity`] porque S/MIME las trata distinto: en un
+/// `multipart/signed` la firma cubre **sólo** la entidad de contenido, y estas
+/// cabeceras van en el mensaje de afuera, sin firmar. Ver `smime_sign`.
+pub fn build_message_headers(
+    draft: &Draft,
+    message_id: &str,
+    date: &str,
+) -> Result<Vec<String>, String> {
     validate(draft)?;
 
     let mut headers: Vec<String> = vec![
@@ -437,16 +466,23 @@ pub fn build_message(draft: &Draft, message_id: &str, date: &str) -> Result<Stri
     }
 
     headers.push("MIME-Version: 1.0".into());
+    Ok(headers)
+}
 
+/// La entidad MIME de contenido: sus cabeceras (`Content-Type`/
+/// `Content-Transfer-Encoding`), la línea en blanco y el cuerpo. Es lo que se
+/// firma en un `multipart/signed`, byte a byte como se transmite.
+pub fn build_content_entity(draft: &Draft) -> String {
     let text = quoted_printable(&draft.body);
 
     if draft.attachments.is_empty() {
         // Sin adjuntos, un mensaje de una sola parte. Envolverlo en un
         // `multipart` igual sería hacerle leer un árbol a quien recibe un
         // mensaje que es dos renglones de texto.
-        headers.push("Content-Type: text/plain; charset=utf-8".into());
-        headers.push("Content-Transfer-Encoding: quoted-printable".into());
-        return Ok(format!("{}\r\n\r\n{}", headers.join("\r\n"), text));
+        return format!(
+            "Content-Type: text/plain; charset=utf-8\r\n\
+             Content-Transfer-Encoding: quoted-printable\r\n\r\n{text}"
+        );
     }
 
     // La frontera se calcula sobre **todo** lo que va adentro, incluido cada
@@ -456,18 +492,14 @@ pub fn build_message(draft: &Draft, message_id: &str, date: &str) -> Result<Stri
     contents.extend(draft.attachments.iter().map(|a| a.content.as_str()));
     let boundary = boundary(&contents);
 
-    headers.push(format!(
-        "Content-Type: multipart/mixed; boundary=\"{boundary}\""
-    ));
-
-    let mut body = String::new();
+    let mut entity = format!("Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n");
     // El texto primero. Es lo que muestran los clientes que no bajan el árbol
     // entero, y lo que alguien espera ver al abrir el mensaje.
-    body.push_str(&format!("--{boundary}\r\n"));
-    body.push_str("Content-Type: text/plain; charset=utf-8\r\n");
-    body.push_str("Content-Transfer-Encoding: quoted-printable\r\n\r\n");
-    body.push_str(&text);
-    body.push_str("\r\n");
+    entity.push_str(&format!("--{boundary}\r\n"));
+    entity.push_str("Content-Type: text/plain; charset=utf-8\r\n");
+    entity.push_str("Content-Transfer-Encoding: quoted-printable\r\n\r\n");
+    entity.push_str(&text);
+    entity.push_str("\r\n");
 
     for attachment in &draft.attachments {
         let content_type = if attachment.content_type.trim().is_empty() {
@@ -475,26 +507,25 @@ pub fn build_message(draft: &Draft, message_id: &str, date: &str) -> Result<Stri
         } else {
             attachment.content_type.trim()
         };
-        body.push_str(&format!("--{boundary}\r\n"));
+        entity.push_str(&format!("--{boundary}\r\n"));
         // El nombre va en los dos lados: en el `Content-Type` para los clientes
         // viejos, y en el `Content-Disposition`, que es donde lo dice el
         // estándar. Es lo mismo que `attachments.rs` busca al leer.
-        body.push_str(&format!(
+        entity.push_str(&format!(
             "Content-Type: {content_type}; {}\r\n",
             filename_param(&attachment.name).replace("filename", "name")
         ));
-        body.push_str(&format!(
+        entity.push_str(&format!(
             "Content-Disposition: attachment; {}\r\n",
             filename_param(&attachment.name)
         ));
-        body.push_str("Content-Transfer-Encoding: base64\r\n\r\n");
-        body.push_str(&wrap_base64(&attachment.content));
-        body.push_str("\r\n");
+        entity.push_str("Content-Transfer-Encoding: base64\r\n\r\n");
+        entity.push_str(&wrap_base64(&attachment.content));
+        entity.push_str("\r\n");
     }
 
-    body.push_str(&format!("--{boundary}--\r\n"));
-
-    Ok(format!("{}\r\n\r\n{}", headers.join("\r\n"), body))
+    entity.push_str(&format!("--{boundary}--\r\n"));
+    entity
 }
 
 /// El tipo de un archivo, adivinado por su extensión.
