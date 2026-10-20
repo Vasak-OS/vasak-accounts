@@ -194,7 +194,7 @@ impl Fixture {
         let address = daemon().address.as_str();
         LOGS.lock().unwrap().clear();
         // La cola de salida de la prueba anterior no es de ésta.
-        let _ = std::fs::remove_dir_all(crate::outbox::outbox_dir());
+        let _ = tokio::fs::remove_dir_all(crate::outbox::outbox_dir()).await;
 
         use zbus::fdo::RequestNameFlags::{AllowReplacement, DoNotQueue, ReplaceExisting};
         let flags = AllowReplacement | DoNotQueue | ReplaceExisting;
