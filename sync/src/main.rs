@@ -92,11 +92,15 @@ mod graph_write;
 #[allow(dead_code)]
 mod serialize;
 #[cfg(test)]
+mod smime_ipc_tests;
+#[cfg(test)]
 mod smime_send_tests;
 mod smime_sign;
 mod smtp;
 mod store;
 mod store_api;
+#[cfg(test)]
+mod test_bus;
 mod tls;
 mod vcard;
 mod xdg;
