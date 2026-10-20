@@ -91,6 +91,8 @@ mod graph_write;
 // (`vasak-accounts#23`); por ahora lo ejercitan sus pruebas y la cola.
 #[allow(dead_code)]
 mod serialize;
+#[cfg(test)]
+mod smime_send_tests;
 mod smime_sign;
 mod smtp;
 mod store;
@@ -1257,18 +1259,9 @@ async fn send_one(
     let destination =
         broker::smtp_endpoint(&config, Some(token)).map_err(smtp::SmtpError::Permanent)?;
 
-    let message = if outgoing.draft.sign {
-        sign_message(
-            connection,
-            &outgoing.draft,
-            &outgoing.message_id,
-            &outgoing.date,
-        )
-        .await?
-    } else {
-        compose::build_message(&outgoing.draft, &outgoing.message_id, &outgoing.date)
-            .map_err(smtp::SmtpError::Permanent)?
-    };
+    let keys = store::key::SecretServiceKeys::on_session_bus(connection.clone());
+    let message =
+        compose_outgoing(&keys, &outgoing.draft, &outgoing.message_id, &outgoing.date).await?;
 
     let mut session = smtp::Session::open(&destination).await?;
     let result = session
@@ -1278,17 +1271,31 @@ async fn send_one(
     result
 }
 
-/// Arma el mensaje firmado con S/MIME. La clave y la cadena salen del llavero,
-/// por la dirección `From`. Si no hay certificado para esa dirección y se pidió
-/// firmar, el envío **falla** —no se manda sin firmar en silencio—.
-async fn sign_message(
-    connection: &zbus::Connection,
+/// El mensaje tal como sale: firmado si el borrador lo pidió, tal cual si no.
+/// Separado de `send_one` para poder probar que pedir firma y no poder firmar
+/// **falla** en vez de mandar sin firmar.
+async fn compose_outgoing(
+    keys: &store::key::SecretServiceKeys,
     draft: &compose::Draft,
     message_id: &str,
     date: &str,
 ) -> Result<String, smtp::SmtpError> {
-    use crate::store::key::SecretServiceKeys;
-    let keys = SecretServiceKeys::on_session_bus(connection.clone());
+    if draft.sign {
+        sign_message(keys, draft, message_id, date).await
+    } else {
+        compose::build_message(draft, message_id, date).map_err(smtp::SmtpError::Permanent)
+    }
+}
+
+/// Arma el mensaje firmado con S/MIME. La clave y la cadena salen del llavero,
+/// por la dirección `From`. Si no hay certificado para esa dirección y se pidió
+/// firmar, el envío **falla** —no se manda sin firmar en silencio—.
+async fn sign_message(
+    keys: &store::key::SecretServiceKeys,
+    draft: &compose::Draft,
+    message_id: &str,
+    date: &str,
+) -> Result<String, smtp::SmtpError> {
     let from = &draft.from;
 
     let key = keys

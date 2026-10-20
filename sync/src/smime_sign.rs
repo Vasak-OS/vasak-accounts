@@ -556,6 +556,11 @@ fn strip_whitespace(bytes: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(test)]
+mod edge_cases;
+#[cfg(test)]
+pub(crate) mod test_support;
+
+#[cfg(test)]
 mod round_trip {
     //! Prueba de ida y vuelta: se firma con este código y se verifica con este
     //! código. Es lo que ata la canonicalización —los bytes que se firman tienen

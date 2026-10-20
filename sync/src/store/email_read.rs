@@ -1143,6 +1143,77 @@ mod tests {
         assert_eq!(msg.flags, vec!["\\Flagged"]);
     }
 
+    /// **De punta a punta, como lo ve la ventana**: el crudo entra por
+    /// `opened_rows`, se guarda, y `get_message` devuelve el estado S/MIME. Un
+    /// mensaje firmado se lee «firmado, no verificado» con su firmante y **nunca
+    /// `valid`**; uno manipulado o sin firma se lee sin estado; y volver a bajar el
+    /// mensaje pisa el estado anterior.
+    #[test]
+    fn el_estado_smime_llega_a_la_ventana_firmado_no_verificado_nunca_valido() {
+        use crate::smime_sign::test_support::*;
+        use crate::smime_sign::SmimeStatus;
+
+        let signed = sign(RSA_P12, &draft(RSA_ADDRESS, "hola firmado")).message;
+        let tampered = signed.replace("hola firmado", "hola cambiado");
+        let plain = "From: ana@x.com\r\nContent-Type: text/plain\r\n\r\nhola\r\n".to_string();
+
+        let (_temp, mut store, inbox, _sent) = store_with_inbox_and_sent();
+        let mut ids = Vec::new();
+        for uid in 1..=3u32 {
+            store
+                .apply_messages(
+                    vec![mail(inbox, uid, "ana@x.com", "yo@x.com", "", "s", 1000)],
+                    inbox,
+                )
+                .unwrap();
+            ids.push(
+                store
+                    .connection
+                    .query_row(
+                        "SELECT id FROM messages WHERE mailbox_id = ?1 AND uid = ?2",
+                        rusqlite::params![inbox, uid],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+            );
+        }
+        let ingest = |store: &mut Store, id: i64, raw: &str| {
+            let (body, _) = crate::email_sync::opened_rows(id, raw.as_bytes(), false);
+            store.upsert_message_body(body).unwrap();
+        };
+        let smime = |store: &Store, id: i64| store.get_message(id).unwrap().unwrap().smime;
+
+        ingest(&mut store, ids[0], &signed);
+        ingest(&mut store, ids[1], &tampered);
+        ingest(&mut store, ids[2], &plain);
+        assert_eq!(
+            smime(&store, ids[0]),
+            Some(SmimeStatus {
+                valid: false,
+                signer: Some(RSA_ADDRESS.into())
+            })
+        );
+        assert_eq!(smime(&store, ids[1]), None);
+        assert_eq!(smime(&store, ids[2]), None);
+
+        // Lo que sale por el bus: la clave `smime` con `valid` y `signer`.
+        let json = serde_json::to_value(store.get_message(ids[0]).unwrap().unwrap()).unwrap();
+        assert_eq!(json["smime"]["valid"], false);
+        assert_eq!(json["smime"]["signer"], RSA_ADDRESS);
+        let json = serde_json::to_value(store.get_message(ids[2]).unwrap().unwrap()).unwrap();
+        assert!(json["smime"].is_null());
+
+        // Volver a bajar el mensaje pisa el estado: de firmado a manipulado, y de
+        // sin firma a firmado.
+        ingest(&mut store, ids[0], &tampered);
+        ingest(&mut store, ids[2], &signed);
+        assert_eq!(smime(&store, ids[0]), None);
+        assert_eq!(
+            smime(&store, ids[2]).map(|s| (s.valid, s.signer)),
+            Some((false, Some(RSA_ADDRESS.into())))
+        );
+    }
+
     #[test]
     fn cursor_encode_decode() {
         let c = Cursor {

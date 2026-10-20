@@ -1187,6 +1187,90 @@ mod tests {
         assert_eq!(columns(&from_v8), before);
     }
 
+    /// **v9 → v10 no pierde nada**: el cuerpo guardado de un mensaje de una base
+    /// de la v9 sigue entero, y las dos columnas S/MIME arrancan en `NULL`, que
+    /// quiere decir «no venía firmado». Y la base migrada es igual a la creada
+    /// de cero, y migrar otra vez no cambia nada.
+    #[test]
+    fn de_v9_a_v10_se_conserva_el_cuerpo_y_las_columnas_smime_arrancan_nulas() {
+        let columns = |c: &Connection| -> Vec<(String, String, i64, Option<String>)> {
+            let mut statement = c
+                .prepare(
+                    "SELECT name, type, \"notnull\", dflt_value
+                       FROM pragma_table_info('message_bodies') ORDER BY cid",
+                )
+                .unwrap();
+            statement
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+
+        let mut connection = at_version(9);
+        assert_eq!(schema_version(&connection).unwrap(), 9);
+        assert!(!columns(&connection)
+            .iter()
+            .any(|c| c.0.starts_with("smime")));
+        connection
+            .execute(
+                "INSERT INTO mailboxes (name, display_name, role, updated_at)
+                 VALUES ('INBOX', 'Bandeja', 'inbox', 'ayer')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages (mailbox_id, uid, from_addr, to_addrs, cc_addrs, bcc_addrs,
+                                       subject, date_ts, sort_key, size, updated_at)
+                 VALUES (1, 7, 'ana@x.com', 'yo@x.com', '', '', 'Hola', 100, 100, 10, 'ayer')",
+                [],
+            )
+            .unwrap();
+        let message = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO message_bodies (message_id, text_body, html_body, truncated, updated_at)
+                 VALUES (?1, 'cuerpo de antes', '<p>de antes</p>', 1, 'ayer')",
+                [message],
+            )
+            .unwrap();
+
+        apply(&mut connection).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 10);
+
+        // Lo que había sigue, y las columnas nuevas son NULL.
+        let row: (String, Option<String>, i64, Option<i64>, Option<String>) = connection
+            .query_row(
+                "SELECT text_body, html_body, truncated, smime_status, smime_signer
+                   FROM message_bodies WHERE message_id = ?1",
+                [message],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "cuerpo de antes".to_string(),
+                Some("<p>de antes</p>".to_string()),
+                1,
+                None,
+                None
+            )
+        );
+
+        // Igual que creada de cero, y repetir no cambia nada.
+        let mut fresh = Connection::open_in_memory().unwrap();
+        apply(&mut fresh).unwrap();
+        assert_eq!(columns(&connection), columns(&fresh));
+        assert!(columns(&fresh).iter().any(|c| c.0 == "smime_status"));
+        assert!(columns(&fresh).iter().any(|c| c.0 == "smime_signer"));
+        let before = columns(&connection);
+        apply(&mut connection).unwrap();
+        assert_eq!(columns(&connection), before);
+        assert_eq!(schema_version(&connection).unwrap(), 10);
+    }
+
     /// La marca `pending_op` sólo acepta los dos valores conocidos, o `NULL`.
     #[test]
     fn la_marca_pending_op_esta_acotada() {

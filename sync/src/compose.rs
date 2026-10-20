@@ -1379,4 +1379,83 @@ mod tests {
             ["contenido", "nombre", "tipo"]
         );
     }
+    // ── Firmar con S/MIME ──────────────────────────────────────────────────
+
+    /// Lo que escribía la cola antes de que existiera `firmar`, byte por byte.
+    const LEGACY_DRAFT: &str = r#"{"de":"a@b.c","nombre":"","para":["d@e.f"],"cc":[],"asunto":"x","cuerpo":"y","en_respuesta_a":"","referencias":[],"adjuntos":[]}"#;
+
+    /// **La cola vieja no cambia de bytes.** Un borrador que no pide firma se
+    /// escribe sin el campo `firmar`, idéntico a como lo escribía la versión
+    /// anterior: un mensaje encolado antes de actualizar se relee y se reescribe
+    /// igual, y quien lea la cola desde afuera no ve una clave que no conoce.
+    #[test]
+    fn un_borrador_sin_firma_se_escribe_byte_a_byte_como_antes() {
+        let draft: Draft = serde_json::from_str(LEGACY_DRAFT).unwrap();
+        assert!(!draft.sign, "sin el campo, no se firma");
+        assert_eq!(serde_json::to_string(&draft).unwrap(), LEGACY_DRAFT);
+
+        let by_hand = Draft {
+            from: "a@b.c".into(),
+            to: vec!["d@e.f".into()],
+            subject: "x".into(),
+            body: "y".into(),
+            ..Default::default()
+        };
+        assert_eq!(serde_json::to_string(&by_hand).unwrap(), LEGACY_DRAFT);
+    }
+
+    #[test]
+    fn firmar_falso_explicito_tampoco_se_escribe() {
+        let wire = LEGACY_DRAFT.replace(r#""adjuntos":[]"#, r#""adjuntos":[],"firmar":false"#);
+        let draft: Draft = serde_json::from_str(&wire).unwrap();
+        assert!(!draft.sign);
+        assert_eq!(serde_json::to_string(&draft).unwrap(), LEGACY_DRAFT);
+    }
+
+    /// El campo sólo aparece cuando de verdad se pidió firmar, y vuelve.
+    #[test]
+    fn pedir_firma_se_escribe_y_se_lee() {
+        let wire = LEGACY_DRAFT.replace(r#""adjuntos":[]"#, r#""adjuntos":[],"firmar":true"#);
+        let draft: Draft = serde_json::from_str(&wire).unwrap();
+        assert!(draft.sign);
+        assert_eq!(serde_json::to_string(&draft).unwrap(), wire);
+    }
+
+    /// **Lo que se firma es sólo la entidad de contenido.** Las cabeceras de
+    /// dirección van afuera, sin firmar; si se colaran adentro, el mensaje
+    /// firmado las repetiría y el verificador firmaría de más.
+    #[test]
+    fn la_entidad_de_contenido_no_lleva_cabeceras_de_direccion() {
+        let mut with_files = draft();
+        with_files.attachments = vec![Attachment {
+            name: "x.pdf".into(),
+            content_type: String::new(),
+            content: "aG9sYQ==".into(),
+        }];
+        for draft in [draft(), with_files] {
+            let entity = build_content_entity(&draft);
+            let (head, _) = entity.split_once("\r\n\r\n").expect("cabeceras y cuerpo");
+            for line in head.split("\r\n") {
+                assert!(
+                    line.starts_with("Content-"),
+                    "una cabecera de dirección en la entidad firmada: {line}"
+                );
+            }
+
+            let headers =
+                build_message_headers(&draft, "<x@y>", "Thu, 10 Sep 2026 12:00:00 +0000").unwrap();
+            assert!(headers.iter().any(|h| h.starts_with("From: ")));
+            assert!(headers.iter().any(|h| h.starts_with("Subject: ")));
+            assert!(
+                headers.iter().all(|h| !h.starts_with("Content-")),
+                "{headers:?}"
+            );
+
+            // Y juntos son el mensaje de siempre.
+            assert_eq!(
+                build_message(&draft, "<x@y>", "Thu, 10 Sep 2026 12:00:00 +0000").unwrap(),
+                format!("{}\r\n{}", headers.join("\r\n"), entity)
+            );
+        }
+    }
 }
