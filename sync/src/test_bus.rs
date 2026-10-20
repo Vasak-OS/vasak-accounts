@@ -41,6 +41,8 @@ struct Daemon {
 fn daemon() -> &'static Daemon {
     static DAEMON: OnceLock<Daemon> = OnceLock::new();
     DAEMON.get_or_init(|| {
+        // No se espera al `sh`: vive lo que dure el proceso de pruebas (ver `_keepalive`).
+        #[allow(clippy::zombie_processes)]
         let mut child = Command::new("sh")
             .arg("-c")
             .arg(
