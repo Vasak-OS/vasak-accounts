@@ -40,6 +40,12 @@ use crate::message::{
 
 const ID_DATA: ObjectIdentifier = const_oid::db::rfc5911::ID_DATA;
 const ID_SIGNED_DATA: ObjectIdentifier = const_oid::db::rfc5911::ID_SIGNED_DATA;
+const ID_ENVELOPED_DATA: ObjectIdentifier = const_oid::db::rfc5911::ID_ENVELOPED_DATA;
+/// Los `protocol` de un `multipart/signed` que son S/MIME (no PGP).
+const PKCS7_SIGNATURE_PROTOCOLS: [&str; 2] = [
+    "application/pkcs7-signature",
+    "application/x-pkcs7-signature",
+];
 const ID_SHA_256: ObjectIdentifier = const_oid::db::rfc5912::ID_SHA_256;
 const ID_MESSAGE_DIGEST: ObjectIdentifier = const_oid::db::rfc5911::ID_MESSAGE_DIGEST;
 const ID_CONTENT_TYPE: ObjectIdentifier = const_oid::db::rfc5911::ID_CONTENT_TYPE;
@@ -56,9 +62,13 @@ const SUBJECT_ALT_NAME: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.
 /// mensaje quiere decir que no venía firmado.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SmimeStatus {
-    /// La firma se verificó (cripto + signed-attrs + cert ligado al `From`).
+    /// La firma pasó la **validación de confianza X.509** (cadena hasta una CA,
+    /// vigencia, revocación). Hoy **siempre `false`**: esa validación es un
+    /// follow-up. Hasta entonces un correo firmado se ve «firmado, no verificado».
     pub valid: bool,
-    /// El firmante (el correo del certificado), presente cuando `valid`.
+    /// El firmante (el correo del certificado) cuando la firma criptográfica, el
+    /// digest y el binding al `From` cerraron, aunque todavía no se valide la
+    /// confianza. `None` si la firma no se pudo comprobar.
     pub signer: Option<String>,
 }
 
@@ -67,10 +77,12 @@ pub struct SmimeStatus {
 pub enum Verification {
     /// No venía firmado.
     NotSigned,
-    /// Firmado y verificado; trae el correo del firmante.
-    Valid(String),
-    /// Firmado pero no se pudo verificar; el motivo es para el diario, no para
-    /// la ventana (que muestra «firmado, no verificado» a secas).
+    /// Firmado, con la firma criptográfica + digest + binding al `From` en orden,
+    /// pero **sin** validar la confianza X.509 (follow-up). Trae el firmante. La
+    /// ventana muestra «firmado, no verificado — <firmante>», **nunca «válido»**.
+    SignedUntrusted(String),
+    /// Firmado pero la firma no se pudo comprobar (rota, digest que no coincide,
+    /// firmante que no liga al `From`). El motivo es para el diario.
     Unverified(String),
 }
 
@@ -266,12 +278,27 @@ pub fn verify_message(raw: &[u8]) -> Verification {
 
     match content_type.media_type.as_str() {
         "multipart/signed" => {
+            // El `protocol` tiene que ser el de S/MIME. Un `multipart/signed` de
+            // PGP (`application/pgp-signature`) no es nuestro: `NotSigned`, para
+            // no mostrarlo como «S/MIME firmado».
+            let is_pkcs7 = content_type
+                .protocol
+                .as_deref()
+                .is_some_and(|p| PKCS7_SIGNATURE_PROTOCOLS.contains(&p));
+            if !is_pkcs7 {
+                return Verification::NotSigned;
+            }
             let Some(boundary) = content_type.boundary.as_deref() else {
                 return Verification::Unverified("multipart/signed sin frontera".into());
             };
             let parts = split_parts(body, boundary);
-            if parts.len() < 2 {
-                return Verification::Unverified("multipart/signed sin las dos partes".into());
+            // RFC 1847: multipart/signed son **exactamente** dos partes (el
+            // contenido y la firma). Con más, la vista podría mostrar una parte
+            // que la firma no cubre, así que se rechaza.
+            if parts.len() != 2 {
+                return Verification::Unverified(
+                    "multipart/signed no tiene exactamente dos partes".into(),
+                );
             }
             // Parte 1: el contenido firmado, sin el CRLF que pertenece a la
             // frontera. Parte 2: la firma (`application/pkcs7-signature`, base64).
@@ -283,16 +310,54 @@ pub fn verify_message(raw: &[u8]) -> Verification {
             verify_signed_data(&signature_der, Some(&signed_content), &from)
         }
         "application/pkcs7-mime" | "application/x-pkcs7-mime" => {
-            // Opaque: el cuerpo base64 es el `ContentInfo` y el contenido va
-            // adentro del `SignedData`. (El enveloped —cifrado— es PR4.)
+            // Opaque: el cuerpo base64 es el `ContentInfo`. El tipo real lo dice
+            // el OID del CMS, no el parámetro del header: `signed-data` se
+            // verifica; `enveloped-data` (cifrado) es `NotSigned` hasta PR4.
             let der = match BASE64_STANDARD.decode(strip_whitespace(&from_latin1(body))) {
                 Ok(der) => der,
                 Err(_) => return Verification::Unverified("pkcs7-mime base64 ilegible".into()),
             };
-            verify_signed_data(&der, None, &from)
+            match ContentInfo::from_der(&der).map(|ci| ci.content_type) {
+                Ok(oid) if oid == ID_SIGNED_DATA => verify_signed_data(&der, None, &from),
+                Ok(oid) if oid == ID_ENVELOPED_DATA => Verification::NotSigned,
+                Ok(_) => Verification::NotSigned,
+                Err(e) => Verification::Unverified(format!("pkcs7-mime ilegible: {e}")),
+            }
         }
         _ => Verification::NotSigned,
     }
+}
+
+/// El contenido (eContent) de un `pkcs7-mime` opaque **firmado**, para poder
+/// mostrarlo: en el opaque el cuerpo real va dentro del PKCS#7, no en el crudo.
+/// `None` si no es opaque firmado (el `multipart/signed` ya trae el contenido
+/// como parte normal, y el `enveloped-data` es cifrado —PR4—).
+pub fn opaque_signed_content(raw: &[u8]) -> Option<Vec<u8>> {
+    let view = as_latin1(raw);
+    let (headers, body) = split_headers(&view);
+    let content_type = headers
+        .get("content-type")
+        .map(parse_content_type)
+        .unwrap_or_default();
+    if !matches!(
+        content_type.media_type.as_str(),
+        "application/pkcs7-mime" | "application/x-pkcs7-mime"
+    ) {
+        return None;
+    }
+    let der = BASE64_STANDARD
+        .decode(strip_whitespace(&from_latin1(body)))
+        .ok()?;
+    let ci = ContentInfo::from_der(&der).ok()?;
+    if ci.content_type != ID_SIGNED_DATA {
+        return None;
+    }
+    let sd = ci
+        .content
+        .to_der()
+        .ok()
+        .and_then(|d| SignedData::from_der(&d).ok())?;
+    Some(sd.encap_content_info.econtent?.value().to_vec())
 }
 
 /// El DER de la firma de la parte `application/pkcs7-signature` (su cuerpo base64
@@ -371,14 +436,23 @@ fn verify_signed_data(der: &[u8], external: Option<&[u8]>, from: &str) -> Verifi
         return Verification::Unverified("sin contentType".into());
     }
 
-    // 4) El cert del firmante tiene que estar ligado al `From`.
+    // 4) El cert del firmante tiene que estar ligado al `From`. Con los dos lados
+    // vacíos `"" == ""` ligaría cualquier cosa, así que se exige que el `From` y
+    // el correo del cert **no** estén vacíos.
+    let from = from.trim();
     let emails = certificate_emails(&cert);
-    let bound = emails.iter().any(|e| e.eq_ignore_ascii_case(from.trim()));
+    let bound = !from.is_empty()
+        && emails
+            .iter()
+            .any(|e| !e.trim().is_empty() && e.trim().eq_ignore_ascii_case(from));
     if !bound {
         return Verification::Unverified("el firmante no coincide con el From".into());
     }
 
-    Verification::Valid(from.trim().to_string())
+    // Todo lo criptográfico cerró, pero sin validación de confianza X.509 esto NO
+    // es «válido»: lo más que se afirma es «firmado, no verificado — <firmante>».
+    // Ver el doc del módulo y `Verification::SignedUntrusted`.
+    Verification::SignedUntrusted(from.to_string())
 }
 
 /// El cert embebido cuyo emisor+serie coincide con el `sid` del firmante.
@@ -520,22 +594,26 @@ mod round_trip {
         build_signed_message(&headers, &content, &sig)
     }
 
+    // Con un fixture **autofirmado** (sin cadena de confianza), lo máximo que se
+    // puede afirmar es `SignedUntrusted(firmante)`: nunca «válido». Eso prueba la
+    // canonicalización (los bytes firmados == los transmitidos) sin mentir sobre
+    // la confianza. El estado «válido» llega con la validación de confianza X.509.
     #[test]
-    fn rsa_firma_y_verifica_en_ida_y_vuelta() {
+    fn rsa_firma_y_verifica_en_ida_y_vuelta_pero_sin_confianza_no_es_valido() {
         let message = sign(RSA_P12, "prueba@vasak.test", "hola con RSA");
         assert!(message.contains("multipart/signed"), "{message}");
         assert_eq!(
             verify_message(message.as_bytes()),
-            Verification::Valid("prueba@vasak.test".into())
+            Verification::SignedUntrusted("prueba@vasak.test".into())
         );
     }
 
     #[test]
-    fn ecdsa_firma_y_verifica_en_ida_y_vuelta() {
+    fn ecdsa_firma_y_verifica_en_ida_y_vuelta_pero_sin_confianza_no_es_valido() {
         let message = sign(EC_P12, "ec@vasak.test", "hola con ECDSA");
         assert_eq!(
             verify_message(message.as_bytes()),
-            Verification::Valid("ec@vasak.test".into())
+            Verification::SignedUntrusted("ec@vasak.test".into())
         );
     }
 
@@ -549,9 +627,10 @@ mod round_trip {
             .position(|w| w == b"texto a proteger")
             .unwrap();
         bytes[pos] ^= 0xff;
+        // Ni «válido» ni «firmado»: una firma sobre contenido manipulado no liga.
         assert!(
-            !matches!(verify_message(&bytes), Verification::Valid(_)),
-            "una firma sobre contenido manipulado no puede dar Valid"
+            matches!(verify_message(&bytes), Verification::Unverified(_)),
+            "una firma sobre contenido manipulado no puede dar SignedUntrusted"
         );
     }
 

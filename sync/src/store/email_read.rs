@@ -787,7 +787,9 @@ fn smime_from_row(
 ) -> Option<crate::smime_sign::SmimeStatus> {
     status.map(|s| crate::smime_sign::SmimeStatus {
         valid: s == 1,
-        signer: if s == 1 { signer } else { None },
+        // El firmante va tanto en «firmado, no verificado» (estado 0) como en el
+        // futuro «válido» (estado 1): sólo se guardó cuando la firma ligó el From.
+        signer,
     })
 }
 

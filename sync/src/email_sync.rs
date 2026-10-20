@@ -392,19 +392,28 @@ pub fn opened_rows(
     raw: &[u8],
     truncated: bool,
 ) -> (MessageBodyRow, Vec<MessageAttachmentRow>) {
-    let text = crate::message::plain_text(raw);
-    let html = crate::message::html_part(raw).map(|h| crate::html::sanitize(&h).html);
-    // S/MIME: se verifica acá, con el crudo en mano (al leer no está). Un mensaje
-    // truncado no se puede verificar y cae en «firmado, no verificado».
+    // S/MIME opaque: el contenido real va dentro del PKCS#7, así que el crudo no
+    // tiene texto que mostrar. Si es opaque firmado, se muestra su eContent; si no,
+    // el crudo tal cual. (El `multipart/signed` ya tiene el contenido como parte
+    // normal, así que no hace falta desenvolverlo.)
+    let unwrapped = crate::smime_sign::opaque_signed_content(raw);
+    let display: &[u8] = unwrapped.as_deref().unwrap_or(raw);
+    let text = crate::message::plain_text(display);
+    let html = crate::message::html_part(display).map(|h| crate::html::sanitize(&h).html);
+    // S/MIME: se verifica acá, con el crudo en mano (al leer no está). Sólo se
+    // marca «firmado» (estado 0 + firmante) cuando la firma criptográfica, el
+    // digest y el binding al From cerraron —falta sólo la validación de confianza
+    // X.509—; cualquier otra cosa (firma rota, truncado, no firmado) queda sin
+    // estado, para no mostrar «firmado» algo cuya firma no verifica.
     let (smime_status, smime_signer) = match crate::smime_sign::verify_message(raw) {
-        crate::smime_sign::Verification::NotSigned => (None, None),
-        crate::smime_sign::Verification::Valid(signer) => (Some(1), Some(signer)),
+        crate::smime_sign::Verification::SignedUntrusted(signer) => (Some(0), Some(signer)),
         crate::smime_sign::Verification::Unverified(reason) => {
             tracing::debug!(reason, "firma S/MIME no verificada");
-            (Some(0), None)
+            (None, None)
         }
+        crate::smime_sign::Verification::NotSigned => (None, None),
     };
-    let attachments = crate::attachments::list(raw)
+    let attachments = crate::attachments::list(display)
         .into_iter()
         .map(|a| MessageAttachmentRow {
             message_id,
