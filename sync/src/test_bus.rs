@@ -102,15 +102,23 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
     }
 }
 
-/// Un suscriptor global que junta todo lo que se traza, de cualquier hilo (el
-/// parseo del `.p12` corre en `spawn_blocking`), a nivel `trace`. Si ya hay uno
-/// puesto, se queda el que estaba.
+/// Un suscriptor global que junta lo que traza **este servicio** (`trace` y para
+/// arriba), de cualquier hilo: el parseo del `.p12` corre en `spawn_blocking`.
+///
+/// Sólo el de este crate y sin el puente de `log`: las demás pruebas del proceso
+/// (las de tiempo, que miden con reloj de pared) no pagan el formato de los
+/// mensajes de `rrule` ni de `zbus`. Los mensajes de `zbus` a nivel `trace`
+/// llevan la forma del cuerpo de las llamadas y no sus valores. Si ya hay un
+/// suscriptor puesto, se queda el que estaba.
 fn install_log_capture() {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "vasak_accounts_sync=trace",
+        ))
         .with_ansi(false)
         .with_writer(Capture)
-        .try_init();
+        .finish();
+    let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
 /// Todo lo trazado desde el último [`Fixture::start`].
