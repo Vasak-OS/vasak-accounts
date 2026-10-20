@@ -856,6 +856,32 @@ impl SecretStore {
         })
     }
 
+    /// Guarda secretos de una cuenta **sólo si sigue existiendo**, con el
+    /// chequeo y la escritura bajo el mismo candado. `RemoveAccount` borra la
+    /// cuenta y después sus secretos: un refresco que terminaba en el medio
+    /// volvía a escribir el token de una cuenta borrada (`vasak-accounts#121`).
+    /// Devuelve si se guardó.
+    pub fn store_secrets_if_account_exists_in(
+        directory: &Path,
+        account_id: &str,
+        entries: &[(&str, &str)],
+    ) -> Result<bool, StorageError> {
+        with_write_lock(directory, || {
+            let mut db = AccountDatabase::in_directory(directory.to_path_buf())?;
+            db.load()?;
+            if db.get(account_id).is_none() {
+                return Ok(false);
+            }
+            let mut secrets = Self::load(directory)?;
+            let stored = secrets.entry(account_id.to_string()).or_default();
+            for (key, value) in entries {
+                stored.insert(key.to_string(), value.to_string());
+            }
+            Self::persist(directory, &secrets)?;
+            Ok(true)
+        })
+    }
+
     pub fn get_secret(uid: u32, account_id: &str, key: &str) -> Result<String, StorageError> {
         Self::get_secret_in(&AccountDatabase::directory_for(uid), account_id, key)
     }
@@ -2238,6 +2264,94 @@ pub(crate) mod tests {
             "the other account must be untouched"
         );
 
+        remove_test_database(&dir);
+    }
+
+    /// Una base en `dir` con las cuentas dadas, como la deja el demonio.
+    fn base_con_cuentas(dir: &Path, cuentas: &[Account]) -> AccountDatabase {
+        let mut db = AccountDatabase::in_directory(dir.to_path_buf()).unwrap();
+        for cuenta in cuentas {
+            db.add(cuenta.clone()).unwrap();
+        }
+        db
+    }
+
+    #[test]
+    fn los_tokens_de_una_cuenta_que_existe_se_guardan_juntos() {
+        let dir = temp_dir();
+        let cuenta = sample_account();
+        let _db = base_con_cuentas(&dir, &[cuenta.clone()]);
+
+        let guardado = SecretStore::store_secrets_if_account_exists_in(
+            &dir,
+            &cuenta.id,
+            &[("access", "token-abc"), ("refresh", "refresh-xyz")],
+        )
+        .unwrap();
+
+        assert!(guardado);
+        assert_eq!(
+            SecretStore::get_secret_in(&dir, &cuenta.id, "access").unwrap(),
+            "token-abc"
+        );
+        assert_eq!(
+            SecretStore::get_secret_in(&dir, &cuenta.id, "refresh").unwrap(),
+            "refresh-xyz"
+        );
+        remove_test_database(&dir);
+    }
+
+    /// `vasak-accounts#121`: `RemoveAccount` borra la cuenta y después sus
+    /// secretos; un refresco que terminaba en el medio reescribía el token de
+    /// la cuenta borrada. Con el chequeo bajo el candado no queda nada.
+    #[test]
+    fn un_refresco_que_termina_tras_borrar_la_cuenta_no_deja_tokens_huerfanos() {
+        let dir = temp_dir();
+        let borrada = sample_account();
+        let otra = Account::new("Otra", "google", HashMap::new());
+        let mut db = base_con_cuentas(&dir, &[borrada.clone(), otra.clone()]);
+        SecretStore::store_secret_in(&dir, &otra.id, "access", "de-otra").unwrap();
+
+        // El mismo orden que `RemoveAccount`.
+        db.remove(&borrada.id).unwrap();
+        SecretStore::forget_account_in(&dir, &borrada.id).unwrap();
+
+        let guardado = SecretStore::store_secrets_if_account_exists_in(
+            &dir,
+            &borrada.id,
+            &[("access", "nuevo"), ("refresh", "vivo")],
+        )
+        .unwrap();
+
+        assert!(!guardado);
+        let crudo = std::fs::read_to_string(dir.join("secrets.json")).unwrap();
+        assert!(!crudo.contains(&borrada.id), "quedó un huérfano: {crudo}");
+        assert!(!crudo.contains("vivo"), "quedó el refresh token: {crudo}");
+        assert_eq!(
+            SecretStore::get_secret_in(&dir, &otra.id, "access").unwrap(),
+            "de-otra",
+            "los secretos de las demás cuentas no se tocan"
+        );
+        remove_test_database(&dir);
+    }
+
+    /// El control de la prueba anterior: la secuencia vieja (guardar sin mirar
+    /// si la cuenta existe) sí deja el huérfano. Si esto dejara de pasar, la
+    /// prueba de arriba no probaría nada.
+    #[test]
+    fn la_secuencia_vieja_dejaba_el_token_de_una_cuenta_borrada() {
+        let dir = temp_dir();
+        let borrada = sample_account();
+        let mut db = base_con_cuentas(&dir, &[borrada.clone()]);
+        db.remove(&borrada.id).unwrap();
+        SecretStore::forget_account_in(&dir, &borrada.id).unwrap();
+
+        SecretStore::store_secret_in(&dir, &borrada.id, "refresh", "vivo").unwrap();
+
+        assert_eq!(
+            SecretStore::get_secret_in(&dir, &borrada.id, "refresh").unwrap(),
+            "vivo"
+        );
         remove_test_database(&dir);
     }
 
