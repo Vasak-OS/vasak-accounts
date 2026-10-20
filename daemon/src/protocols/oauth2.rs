@@ -647,12 +647,23 @@ fn persistir(
     plan: &ResourcePlan,
     frescos: &FreshTokens,
 ) -> Result<(), TokenError> {
-    SecretStore::store_secret(uid, &cuenta.id, &plan.access_key, &frescos.access)
-        .map_err(|e| TokenError::Failed(format!("no se pudo guardar el access_token: {e}")))?;
-
+    let mut entries = vec![(plan.access_key.as_str(), frescos.access.as_str())];
     if let Some(refresh) = &frescos.refresh {
-        SecretStore::store_secret(uid, &cuenta.id, "refresh", refresh)
-            .map_err(|e| TokenError::Failed(format!("no se pudo guardar el refresh_token: {e}")))?;
+        entries.push(("refresh", refresh.as_str()));
+    }
+    let stored = SecretStore::store_secrets_if_account_exists_in(
+        &AccountDatabase::directory_for(uid),
+        &cuenta.id,
+        &entries,
+    )
+    .map_err(|e| TokenError::Failed(format!("no se pudieron guardar los tokens: {e}")))?;
+    // La borraron mientras hablábamos con el proveedor: ni se guarda ni se le
+    // entrega a nadie un token de una cuenta que ya no existe.
+    if !stored {
+        return Err(TokenError::Failed(format!(
+            "la cuenta '{}' ya no existe",
+            cuenta.id
+        )));
     }
 
     let Some(expira) = frescos.expires_at else {
@@ -1520,6 +1531,45 @@ mod tests {
             pedidos,
             _handle: handle,
         }
+    }
+
+    /// `vasak-accounts#121`: un refresco que termina después de borrar la cuenta
+    /// no guarda nada **ni entrega** el token fresco: falla, y de la cuenta
+    /// borrada no queda ningún secreto.
+    #[tokio::test]
+    async fn persistir_tras_borrar_la_cuenta_falla_y_no_deja_secretos() {
+        let _guard = TOKEN_TEST_LOCK.lock().await;
+        let _root = set_test_root();
+        let uid = 900_077;
+
+        let mut caps = HashMap::new();
+        caps.insert(
+            CapabilityType::Email,
+            cap_config(1, &["offline_access"], None),
+        );
+        let id = seed(uid, Account::new("Borrada", "google", caps), "rt-0");
+        let (cuenta, _, plan) = cargar_plan(uid, &id, &CapabilityType::Email).unwrap();
+
+        // Como `RemoveAccount`: la cuenta y después sus secretos.
+        let mut db = AccountDatabase::for_user(uid).unwrap();
+        db.load().unwrap();
+        db.remove(&id).unwrap();
+        SecretStore::forget_account(uid, &id).unwrap();
+
+        let frescos = FreshTokens {
+            access: "acceso-fresco".into(),
+            refresh: Some("refresh-vivo".into()),
+            expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+        };
+        let error =
+            persistir(uid, &cuenta, &plan, &frescos).expect_err("no debía entregar el token");
+
+        assert!(
+            matches!(&error, TokenError::Failed(d) if d.contains("ya no existe")),
+            "{error}"
+        );
+        assert!(SecretStore::get_secret(uid, &id, "access").is_err());
+        assert!(SecretStore::get_secret(uid, &id, "refresh").is_err());
     }
 
     /// Pedir la capacidad de un recurso canjea y cachea un token de **ese**
