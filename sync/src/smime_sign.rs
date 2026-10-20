@@ -54,6 +54,10 @@ use crate::message::{
 const ID_DATA: ObjectIdentifier = const_oid::db::rfc5911::ID_DATA;
 const ID_SIGNED_DATA: ObjectIdentifier = const_oid::db::rfc5911::ID_SIGNED_DATA;
 const ID_ENVELOPED_DATA: ObjectIdentifier = const_oid::db::rfc5911::ID_ENVELOPED_DATA;
+/// AES-GCM viaja en `AuthEnvelopedData` (RFC 5083), otra estructura. No la
+/// soportamos, pero **es un sobre cifrado**: tiene que caer en «no se pudo abrir»
+/// (estado 2), nunca mostrarse crudo (decisión #2).
+const ID_AUTH_ENVELOPED_DATA: ObjectIdentifier = const_oid::db::rfc5911::ID_CT_AUTH_ENVELOPED_DATA;
 const ID_RSAES_OAEP: ObjectIdentifier = const_oid::db::rfc5912::ID_RSAES_OAEP;
 const ID_AES_128_CBC: ObjectIdentifier = const_oid::db::rfc5911::ID_AES_128_CBC;
 const ID_AES_192_CBC: ObjectIdentifier = const_oid::db::rfc5911::ID_AES_192_CBC;
@@ -640,7 +644,11 @@ pub fn decrypt_message(raw: &[u8], our_key_pkcs8: &[u8], our_cert_der: &[u8]) ->
     }
     // Si el header dice que es un sobre cifrado, un blob que no parsea (manipulado)
     // es «cifrado, no se pudo abrir», no «no cifrado»: no lo ignoramos en silencio.
-    let claims_enveloped = content_type.smime_type.as_deref() == Some("enveloped-data");
+    // Vale para EnvelopedData y para AuthEnvelopedData (AES-GCM), que es otro sobre.
+    let claims_enveloped = matches!(
+        content_type.smime_type.as_deref(),
+        Some("enveloped-data") | Some("authenveloped-data")
+    );
     let not_parseable = |reason: &str| {
         if claims_enveloped {
             Decryption::Unavailable(reason.to_string())
@@ -656,6 +664,10 @@ pub fn decrypt_message(raw: &[u8], our_key_pkcs8: &[u8], our_cert_der: &[u8]) ->
         Ok(ci) => ci,
         Err(_) => return not_parseable("pkcs7-mime ContentInfo ilegible"),
     };
+    // AuthEnvelopedData (AES-GCM) es un sobre cifrado que no abrimos: estado 2.
+    if ci.content_type == ID_AUTH_ENVELOPED_DATA {
+        return Decryption::Unavailable("AuthEnvelopedData (AES-GCM) no soportado".into());
+    }
     if ci.content_type != ID_ENVELOPED_DATA {
         // signed-data u otro: no es un sobre cifrado.
         return Decryption::NotEncrypted;
@@ -731,15 +743,21 @@ pub fn is_enveloped(raw: &[u8]) -> bool {
         return false;
     }
     // Por el OID del CMS; o, si no parsea (manipulado), por el `smime-type` del
-    // header: un sobre cifrado que no se puede leer igual es «cifrado».
-    if content_type.smime_type.as_deref() == Some("enveloped-data") {
+    // header: un sobre cifrado que no se puede leer igual es «cifrado». Incluye
+    // AuthEnvelopedData (AES-GCM), que es otro sobre que tampoco mostramos crudo.
+    if matches!(
+        content_type.smime_type.as_deref(),
+        Some("enveloped-data") | Some("authenveloped-data")
+    ) {
         return true;
     }
     BASE64_STANDARD
         .decode(strip_whitespace(&from_latin1(body)))
         .ok()
         .and_then(|der| ContentInfo::from_der(&der).ok())
-        .is_some_and(|ci| ci.content_type == ID_ENVELOPED_DATA)
+        .is_some_and(|ci| {
+            ci.content_type == ID_ENVELOPED_DATA || ci.content_type == ID_AUTH_ENVELOPED_DATA
+        })
 }
 
 /// El `RecipientIdentifier` (emisor+serie) de nuestro certificado, para encontrar

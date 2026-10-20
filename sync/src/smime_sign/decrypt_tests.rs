@@ -224,13 +224,12 @@ fn un_cifrado_que_no_soportamos_dentro_de_un_sobre_normal_no_se_abre() {
     assert_unavailable(TRIPLE_DES, "3DES-CBC");
 }
 
-/// **BUG conocido, sin arreglar** (ver el reporte de qa del PR): AES-GCM es
-/// `AuthEnvelopedData` (OID `id-ct-authEnvelopedData`, `smime-type=authEnveloped-data`),
-/// y `decrypt_message` lo toma por «no cifrado» porque sólo reconoce el OID de
-/// `EnvelopedData`. El correo queda sin marca de cifrado y se muestra el blob.
-/// Debe dar `Unavailable` (estado 2). Se saca el `ignore` al arreglarlo.
+/// AES-GCM es `AuthEnvelopedData` (OID `id-ct-authEnvelopedData`,
+/// `smime-type=authEnveloped-data`), otra estructura que no abrimos pero que
+/// **es un sobre cifrado**: tiene que dar `Unavailable` (estado 2), nunca
+/// mostrarse crudo (decisión #2). Lo reconocen `is_enveloped` y `decrypt_message`
+/// por ese OID (y por el `smime-type` del header si el blob no parsea).
 #[test]
-#[ignore = "BUG: AuthEnvelopedData (AES-GCM) se toma por no cifrado; debe ser Unavailable"]
 fn aes_gcm_se_marca_cifrado_no_se_pudo_abrir() {
     assert!(
         is_enveloped(GCM),
