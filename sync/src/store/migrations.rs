@@ -612,6 +612,17 @@ ALTER TABLE message_bodies ADD COLUMN smime_status INTEGER;
 ALTER TABLE message_bodies ADD COLUMN smime_signer TEXT;
 ";
 
+/// v11 (PR de vasak-mail#78, descifrar S/MIME): el estado de cifrado de un
+/// mensaje, calculado al bajarlo (con nuestra clave en mano; al leer no está).
+/// `smime_encrypted` es NULL si no venía cifrado, 1 «cifrado y abierto» (el cuerpo
+/// guardado es el descifrado), 2 «cifrado, no se pudo abrir» (destinatario ECC,
+/// sin nuestra clave, cifrado no soportado; el cuerpo queda vacío). El cuerpo
+/// descifrado se guarda descifrado, protegido en reposo por SQLCipher como el
+/// resto del correo (decisión #1): no se re-descifra en cada lectura.
+const V11: &str = "
+ALTER TABLE message_bodies ADD COLUMN smime_encrypted INTEGER;
+";
+
 /// Todas las migraciones, en orden.
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
@@ -625,6 +636,7 @@ pub fn migrations() -> Migrations<'static> {
         M::up(V8),
         M::up(V9),
         M::up(V10),
+        M::up(V11),
     ])
 }
 
@@ -661,7 +673,7 @@ mod tests {
         let mut connection = Connection::open_in_memory().unwrap();
         apply(&mut connection).unwrap();
         let version = schema_version(&connection).unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
 
         let tables = |c: &Connection| -> Vec<String> {
             let mut statement = c
@@ -786,7 +798,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 10);
+        assert_eq!(schema_version(&connection).unwrap(), 11);
 
         // Lo que había sigue, y la marca nueva es NULL.
         let object_mark: Option<String> = connection
@@ -829,7 +841,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 10);
+        assert_eq!(schema_version(&connection).unwrap(), 11);
 
         // La op sigue, en conflicto, y las columnas nuevas son NULL.
         let (state, server_etag, server_raw): (String, Option<String>, Option<Vec<u8>>) =
@@ -888,7 +900,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 10);
+        assert_eq!(schema_version(&connection).unwrap(), 11);
 
         // El contacto sigue, y la tabla nueva arranca vacía.
         let contacts: i64 = connection
@@ -1000,7 +1012,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 10);
+        assert_eq!(schema_version(&connection).unwrap(), 11);
 
         // El enlace sigue, y las columnas nuevas arrancan nulas.
         let (resource, photo, media): (String, Option<Vec<u8>>, Option<String>) = connection
@@ -1064,7 +1076,7 @@ mod tests {
 
         apply(&mut connection).unwrap();
         assert_eq!(columns(&connection), before);
-        assert_eq!(schema_version(&connection).unwrap(), 10);
+        assert_eq!(schema_version(&connection).unwrap(), 11);
     }
 
     /// **v8 → v9 no pierde nada**: un evento de una base de la v8 sigue con sus
@@ -1082,7 +1094,7 @@ mod tests {
         let object = insert_object(&connection, calendar, "https://x/c/1.ics");
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 10);
+        assert_eq!(schema_version(&connection).unwrap(), 11);
 
         // Lo que había sigue.
         assert_eq!(
@@ -1180,7 +1192,7 @@ mod tests {
 
         apply(&mut fresh).unwrap();
         assert_eq!(columns(&fresh), before);
-        assert_eq!(schema_version(&fresh).unwrap(), 10);
+        assert_eq!(schema_version(&fresh).unwrap(), 11);
 
         let mut from_v8 = at_version(8);
         apply(&mut from_v8).unwrap();
@@ -1237,7 +1249,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 10);
+        assert_eq!(schema_version(&connection).unwrap(), 11);
 
         // Lo que había sigue, y las columnas nuevas son NULL.
         let row: (String, Option<String>, i64, Option<i64>, Option<String>) = connection
@@ -1268,7 +1280,96 @@ mod tests {
         let before = columns(&connection);
         apply(&mut connection).unwrap();
         assert_eq!(columns(&connection), before);
+        assert_eq!(schema_version(&connection).unwrap(), 11);
+    }
+
+    /// **v10 → v11 no pierde nada**: el cuerpo, la firma y el firmante de una base de
+    /// la v10 siguen, `smime_encrypted` arranca en `NULL` (no cifrado), la base queda
+    /// igual que creada de cero, y migrar otra vez no cambia nada.
+    #[test]
+    fn de_v10_a_v11_se_conserva_el_cuerpo_y_el_estado_de_cifrado_arranca_nulo() {
+        let columns = |c: &Connection| -> Vec<(String, String, i64, Option<String>)> {
+            let mut statement = c
+                .prepare(
+                    "SELECT name, type, \"notnull\", dflt_value
+                       FROM pragma_table_info('message_bodies') ORDER BY cid",
+                )
+                .unwrap();
+            statement
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+
+        let mut connection = at_version(10);
         assert_eq!(schema_version(&connection).unwrap(), 10);
+        assert!(!columns(&connection)
+            .iter()
+            .any(|c| c.0 == "smime_encrypted"));
+        connection
+            .execute(
+                "INSERT INTO mailboxes (name, display_name, role, updated_at)
+                 VALUES ('INBOX', 'Bandeja', 'inbox', 'ayer')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages (mailbox_id, uid, from_addr, to_addrs, cc_addrs, bcc_addrs,
+                                       subject, date_ts, sort_key, size, updated_at)
+                 VALUES (1, 7, 'ana@x.com', 'yo@x.com', '', '', 'Hola', 100, 100, 10, 'ayer')",
+                [],
+            )
+            .unwrap();
+        let message = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO message_bodies
+                     (message_id, text_body, html_body, truncated, smime_status, smime_signer, updated_at)
+                 VALUES (?1, 'cuerpo de antes', '<p>de antes</p>', 1, 0, 'ana@x.com', 'ayer')",
+                [message],
+            )
+            .unwrap();
+
+        apply(&mut connection).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 11);
+
+        let row: (String, Option<String>, i64, Option<i64>, Option<String>, Option<i64>) =
+            connection
+                .query_row(
+                    "SELECT text_body, html_body, truncated, smime_status, smime_signer, smime_encrypted
+                       FROM message_bodies WHERE message_id = ?1",
+                    [message],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                )
+                .unwrap();
+        assert_eq!(
+            row,
+            (
+                "cuerpo de antes".to_string(),
+                Some("<p>de antes</p>".to_string()),
+                1,
+                Some(0),
+                Some("ana@x.com".to_string()),
+                None
+            )
+        );
+
+        // Igual que creada de cero (mismo tipo, sin NOT NULL ni valor por omisión), y
+        // repetir no cambia nada.
+        let mut fresh = Connection::open_in_memory().unwrap();
+        apply(&mut fresh).unwrap();
+        assert_eq!(columns(&connection), columns(&fresh));
+        let added = columns(&fresh)
+            .into_iter()
+            .find(|c| c.0 == "smime_encrypted")
+            .expect("la columna nueva");
+        assert_eq!(added, ("smime_encrypted".into(), "INTEGER".into(), 0, None));
+        let before = columns(&connection);
+        apply(&mut connection).unwrap();
+        assert_eq!(columns(&connection), before);
+        assert_eq!(schema_version(&connection).unwrap(), 11);
     }
 
     /// La marca `pending_op` sólo acepta los dos valores conocidos, o `NULL`.
@@ -1412,7 +1513,7 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .unwrap();
-        let all = [V1, V2, V3, V4, V5, V6, V7, V8, V9];
+        let all = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10];
         Migrations::new(all[..version].iter().map(|sql| M::up(sql)).collect())
             .to_latest(&mut connection)
             .unwrap();
@@ -1439,7 +1540,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 10);
+        assert_eq!(schema_version(&connection).unwrap(), 11);
         let message: String = connection
             .query_row("SELECT message FROM sync_log", [], |row| row.get(0))
             .unwrap();
@@ -1740,7 +1841,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 10);
+        assert_eq!(schema_version(&connection).unwrap(), 11);
         assert_eq!(found(&connection, "jose"), vec![id]);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_emails"), 1);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_phones"), 1);
@@ -1911,7 +2012,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 10);
+        assert_eq!(schema_version(&connection).unwrap(), 11);
         assert_eq!(found(&connection, "jose"), vec![id]);
         assert_eq!(count(&connection, "SELECT count(*) FROM occurrences"), 2);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_emails"), 1);

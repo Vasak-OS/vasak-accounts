@@ -378,6 +378,11 @@ pub struct ContentType {
     /// `application/pgp-signature`. Distinguirlos evita tratar un correo PGP
     /// como S/MIME. Ver `smime_sign::verify_message`.
     pub protocol: Option<String>,
+    /// El parámetro `smime-type` (en minúsculas) de un `application/pkcs7-mime`:
+    /// `signed-data` o `enveloped-data`. Sirve para clasificar un sobre que no se
+    /// pudo parsear (manipulado) como «cifrado, no se pudo abrir» en vez de
+    /// ignorarlo. Ver `smime_sign::decrypt_message`.
+    pub smime_type: Option<String>,
 }
 
 impl Default for ContentType {
@@ -390,6 +395,7 @@ impl Default for ContentType {
             charset: "us-ascii".into(),
             boundary: None,
             protocol: None,
+            smime_type: None,
         }
     }
 }
@@ -408,6 +414,7 @@ pub fn parse_content_type(value: &str) -> ContentType {
         charset: "us-ascii".into(),
         boundary: None,
         protocol: None,
+        smime_type: None,
     };
 
     for param in parts {
@@ -421,6 +428,9 @@ pub fn parse_content_type(value: &str) -> ContentType {
             "boundary" if !value.is_empty() => content_type.boundary = Some(value.to_string()),
             "protocol" if !value.is_empty() => {
                 content_type.protocol = Some(value.to_ascii_lowercase())
+            }
+            "smime-type" if !value.is_empty() => {
+                content_type.smime_type = Some(value.to_ascii_lowercase())
             }
             _ => {}
         }

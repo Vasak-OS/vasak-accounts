@@ -459,7 +459,7 @@ datos\r\n\
 /// ninguna aplicación que lea del almacén tenga que acordarse de hacerlo.
 #[test]
 fn un_mensaje_abierto_se_guarda_con_el_html_saneado_y_sus_adjuntos() {
-    let (body, attachments) = opened_rows(31, OPENED.as_bytes(), true);
+    let (body, attachments) = opened_rows_decrypting(31, OPENED.as_bytes(), true, None);
 
     assert_eq!(body.message_id, 31);
     assert!(body.truncated);
@@ -480,7 +480,7 @@ fn un_mensaje_abierto_se_guarda_con_el_html_saneado_y_sus_adjuntos() {
 #[test]
 fn un_mensaje_de_texto_solo_no_tiene_html_ni_adjuntos() {
     let raw = b"From: ana@x.com\r\nContent-Type: text/plain\r\n\r\nSolo texto\r\n";
-    let (body, attachments) = opened_rows(1, raw, false);
+    let (body, attachments) = opened_rows_decrypting(1, raw, false, None);
     assert!(!body.truncated);
     assert!(body.text_body.as_deref().unwrap().contains("Solo texto"));
     assert_eq!(body.html_body, None);
@@ -538,7 +538,7 @@ impl Fixture {
     ) -> (EmailReport, Vec<String>) {
         let (mut session, task) =
             with_server_caps("* OK listo", &["IMAP4REV1", "CONDSTORE"], script);
-        let report = sync_session(&self.manager, ACCOUNT, &mut session)
+        let report = sync_session(&self.manager, ACCOUNT, &mut session, None)
             .await
             .unwrap_or_else(|e| panic!("la vuelta no terminó: {e:?}"));
         drop(session);
@@ -907,7 +907,7 @@ async fn un_corte_a_mitad_de_la_vuelta_la_corta() {
             ("EXAMINE \"INBOX\" (CONDSTORE)", vec![]),
         ],
     );
-    let result = sync_session(&fixture.manager, ACCOUNT, &mut session).await;
+    let result = sync_session(&fixture.manager, ACCOUNT, &mut session, None).await;
     drop(session);
     let received = task.await.unwrap();
     assert!(

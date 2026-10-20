@@ -112,6 +112,13 @@ x509-cert = "0.2"
 signature = "2"
 # El HMAC del MAC del `.p12` y su hash. Ya estaban en el candado (los trae
 # `pbkdf2`/`pkcs5`): no suman crate nueva ni biblioteca compartida.
+# Descifrar S/MIME (EnvelopedData, PR4): AES-CBC del contenido y SHA-1 para OAEP
+# heredado. Rust puro, misma generación der-0.7, ya venían transitivas por
+# `cms`-builder (aes/cbc) y `rsa` (sha1 vía oaep) — no suman soname. `readelf` lo
+# confirma. Ver `smime_sign::decrypt_message`.
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc", "block-padding"] }
+sha1 = "0.10"
 hmac = "0.12"
 sha2 = "0.10"
 
