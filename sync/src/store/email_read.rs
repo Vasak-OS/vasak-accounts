@@ -569,7 +569,7 @@ impl Store {
                         m.flags_flagged, m.flags_draft, m.flags_deleted,
                         m.has_attachments, m.size,
                         b.text_body, b.html_body, b.truncated,
-                        b.smime_status, b.smime_signer
+                        b.smime_status, b.smime_signer, b.smime_encrypted
                  FROM messages m
                  JOIN mailboxes mb ON m.mailbox_id = mb.id
                  LEFT JOIN message_bodies b ON m.id = b.message_id
@@ -774,6 +774,7 @@ fn message_full_from_row(row: &Row) -> Result<MessageFull, StoreError> {
         smime: smime_from_row(
             row.get::<_, Option<i64>>(22).map_err(classify)?,
             row.get::<_, Option<String>>(23).map_err(classify)?,
+            row.get::<_, Option<i64>>(24).map_err(classify)?,
         ),
         attachments: Vec::new(),
         flags: Vec::new(),
@@ -784,12 +785,22 @@ fn message_full_from_row(row: &Row) -> Result<MessageFull, StoreError> {
 fn smime_from_row(
     status: Option<i64>,
     signer: Option<String>,
+    encrypted: Option<i64>,
 ) -> Option<crate::smime_sign::SmimeStatus> {
-    status.map(|s| crate::smime_sign::SmimeStatus {
-        valid: s == 1,
+    // `None` sólo si no venía ni firmado ni cifrado.
+    if status.is_none() && encrypted.is_none() {
+        return None;
+    }
+    let encryption = encrypted.map(|e| match e {
+        1 => crate::smime_sign::Encryption::Opened,
+        _ => crate::smime_sign::Encryption::Unavailable,
+    });
+    Some(crate::smime_sign::SmimeStatus {
+        valid: status == Some(1),
         // El firmante va tanto en «firmado, no verificado» (estado 0) como en el
         // futuro «válido» (estado 1): sólo se guardó cuando la firma ligó el From.
         signer,
+        encryption,
     })
 }
 
@@ -1035,6 +1046,7 @@ mod tests {
                     truncated: false,
                     smime_status: None,
                     smime_signer: None,
+                    smime_encrypted: None,
                 })
                 .unwrap();
         }
@@ -1114,6 +1126,7 @@ mod tests {
                 truncated: false,
                 smime_status: None,
                 smime_signer: None,
+                smime_encrypted: None,
             })
             .unwrap();
         store
@@ -1178,7 +1191,8 @@ mod tests {
             );
         }
         let ingest = |store: &mut Store, id: i64, raw: &str| {
-            let (body, _) = crate::email_sync::opened_rows(id, raw.as_bytes(), false);
+            let (body, _) =
+                crate::email_sync::opened_rows_decrypting(id, raw.as_bytes(), false, None);
             store.upsert_message_body(body).unwrap();
         };
         let smime = |store: &Store, id: i64| store.get_message(id).unwrap().unwrap().smime;
@@ -1190,7 +1204,8 @@ mod tests {
             smime(&store, ids[0]),
             Some(SmimeStatus {
                 valid: false,
-                signer: Some(RSA_ADDRESS.into())
+                signer: Some(RSA_ADDRESS.into()),
+                encryption: None,
             })
         );
         assert_eq!(smime(&store, ids[1]), None);
@@ -1299,6 +1314,7 @@ mod tests {
                     truncated: false,
                     smime_status: None,
                     smime_signer: None,
+                    smime_encrypted: None,
                 })
                 .unwrap();
         }
@@ -1592,6 +1608,7 @@ mod tests {
                 truncated: false,
                 smime_status: None,
                 smime_signer: None,
+                smime_encrypted: None,
             })
             .unwrap();
         let items = store.messages_with("ana@x.com", 10).unwrap();

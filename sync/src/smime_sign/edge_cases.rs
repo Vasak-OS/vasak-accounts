@@ -471,7 +471,7 @@ fn lo_que_no_es_smime_no_es_firmado() {
 
 /// Lo que `opened_rows` guarda de este crudo: (estado, firmante).
 fn stored(raw: &[u8], truncated: bool) -> (Option<i64>, Option<String>) {
-    let (body, _) = crate::email_sync::opened_rows(1, raw, truncated);
+    let (body, _) = crate::email_sync::opened_rows_decrypting(1, raw, truncated, None);
     (body.smime_status, body.smime_signer)
 }
 
@@ -618,7 +618,8 @@ fn el_opaque_firmado_se_muestra_con_su_texto_y_sus_adjuntos() {
     let signed = sign(RSA_P12, &draft_with_attachments(RSA_ADDRESS));
     let message = opaque(&signed, "application/pkcs7-mime");
 
-    let (body, attachments) = crate::email_sync::opened_rows(7, message.as_bytes(), false);
+    let (body, attachments) =
+        crate::email_sync::opened_rows_decrypting(7, message.as_bytes(), false, None);
     let text = body.text_body.unwrap_or_default();
     assert!(text.contains("Va el informe"), "{text:?}");
     let names: Vec<_> = attachments.iter().filter_map(|a| a.name.clone()).collect();

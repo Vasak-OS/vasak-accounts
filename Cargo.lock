@@ -2897,7 +2897,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vasak-accounts"
-version = "0.51.0"
+version = "0.52.0"
 dependencies = [
  "chrono",
  "dirs",
@@ -2918,7 +2918,7 @@ dependencies = [
 
 [[package]]
 name = "vasak-accounts-common"
-version = "0.51.0"
+version = "0.52.0"
 dependencies = [
  "roxmltree",
  "tokio",
@@ -2927,11 +2927,13 @@ dependencies = [
 
 [[package]]
 name = "vasak-accounts-sync"
-version = "0.51.0"
+version = "0.52.0"
 dependencies = [
+ "aes",
  "ammonia",
  "base64 0.23.1",
  "bytes",
+ "cbc",
  "chrono",
  "chrono-tz",
  "cms",
@@ -2961,6 +2963,7 @@ dependencies = [
  "rustls-native-certs",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
  "signature",
  "spki",

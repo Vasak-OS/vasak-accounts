@@ -24,16 +24,20 @@
 //! queda reservado para el follow-up «validación de confianza X.509».
 
 use base64::prelude::{Engine as _, BASE64_STANDARD};
+use cbc::cipher::block_padding::Pkcs7;
+use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 use cms::builder::{SignedDataBuilder, SignerInfoBuilder};
 use cms::cert::{CertificateChoices, IssuerAndSerialNumber};
 use cms::content_info::ContentInfo;
+use cms::enveloped_data::{EnvelopedData, RecipientIdentifier, RecipientInfo};
 use cms::signed_data::{EncapsulatedContentInfo, SignedData, SignerIdentifier};
 use der::asn1::{ObjectIdentifier, OctetString, SetOfVec};
 use der::{Decode, Encode};
 use rsa::pkcs1v15::{Signature as RsaSignature, SigningKey as RsaSigningKey};
 use rsa::pkcs8::DecodePrivateKey;
-use rsa::RsaPrivateKey;
+use rsa::{Oaep, Pkcs1v15Encrypt, RsaPrivateKey};
 use serde::Serialize;
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use signature::Verifier;
 use spki::{AlgorithmIdentifierOwned, SignatureBitStringEncoding};
@@ -41,6 +45,7 @@ use x509_cert::attr::Attribute;
 use x509_cert::ext::pkix::name::GeneralName;
 use x509_cert::ext::pkix::SubjectAltName;
 use x509_cert::Certificate;
+use zeroize::Zeroizing;
 
 use crate::message::{
     as_latin1, from_latin1, parse_content_type, parse_sender, split_headers, split_parts,
@@ -49,6 +54,10 @@ use crate::message::{
 const ID_DATA: ObjectIdentifier = const_oid::db::rfc5911::ID_DATA;
 const ID_SIGNED_DATA: ObjectIdentifier = const_oid::db::rfc5911::ID_SIGNED_DATA;
 const ID_ENVELOPED_DATA: ObjectIdentifier = const_oid::db::rfc5911::ID_ENVELOPED_DATA;
+const ID_RSAES_OAEP: ObjectIdentifier = const_oid::db::rfc5912::ID_RSAES_OAEP;
+const ID_AES_128_CBC: ObjectIdentifier = const_oid::db::rfc5911::ID_AES_128_CBC;
+const ID_AES_192_CBC: ObjectIdentifier = const_oid::db::rfc5911::ID_AES_192_CBC;
+const ID_AES_256_CBC: ObjectIdentifier = const_oid::db::rfc5911::ID_AES_256_CBC;
 /// Los `protocol` de un `multipart/signed` que son S/MIME (no PGP).
 const PKCS7_SIGNATURE_PROTOCOLS: [&str; 2] = [
     "application/pkcs7-signature",
@@ -66,8 +75,8 @@ const SUBJECT_ALT_NAME: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.
 
 // ── Estado expuesto a la ventana ──────────────────────────────────────
 
-/// El estado S/MIME de un mensaje firmado, como lo ve quien lo lee. `None` en el
-/// mensaje quiere decir que no venía firmado.
+/// El estado S/MIME de un mensaje, como lo ve quien lo lee. `None` quiere decir
+/// que no venía ni firmado ni cifrado.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SmimeStatus {
     /// La firma pasó la **validación de confianza X.509** (cadena hasta una CA,
@@ -78,6 +87,21 @@ pub struct SmimeStatus {
     /// digest y el binding al `From` cerraron, aunque todavía no se valide la
     /// confianza. `None` si la firma no se pudo comprobar.
     pub signer: Option<String>,
+    /// El estado de cifrado: `None` si no venía cifrado. La ventana distingue un
+    /// candado normal (`Opened`) de «cifrado, no se pudo abrir» (`Unavailable`,
+    /// p. ej. destinatario ECC o sin nuestra clave).
+    pub encryption: Option<Encryption>,
+}
+
+/// Cómo quedó un mensaje **cifrado** después de intentar abrirlo al bajarlo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Encryption {
+    /// Cifrado y abierto: el cuerpo que se muestra es el descifrado.
+    Opened,
+    /// Cifrado pero no se pudo abrir (ECC, sin nuestra clave, cifrado no
+    /// soportado). El cuerpo no está disponible; nunca «roto».
+    Unavailable,
 }
 
 /// El resultado de verificar un mensaje entrante.
@@ -269,19 +293,36 @@ pub fn build_signed_message(
 
 // ── Verificar ─────────────────────────────────────────────────────────
 
+/// El `From` de un mensaje (sólo la dirección), para ligar el firmante. En un
+/// sign-then-encrypt el `From` está en el **sobre de afuera**, no en el contenido
+/// firmado de adentro; por eso se puede pasar aparte a [`verify_message_with_from`].
+pub fn message_from(raw: &[u8]) -> String {
+    let view = as_latin1(raw);
+    let (headers, _) = split_headers(&view);
+    headers
+        .get("from")
+        .map(parse_sender)
+        .map(|(_, address)| address)
+        .unwrap_or_default()
+}
+
 /// Verifica un mensaje entrante. `raw` es el RFC822 crudo (lo que hace falta: la
-/// firma va sobre los bytes exactos, no sobre el cuerpo decodificado).
+/// firma va sobre los bytes exactos, no sobre el cuerpo decodificado). El `From`
+/// se toma del propio mensaje.
 pub fn verify_message(raw: &[u8]) -> Verification {
+    let from = message_from(raw);
+    verify_message_with_from(raw, &from)
+}
+
+/// Como [`verify_message`], pero el `From` para ligar el firmante se pasa aparte:
+/// al descifrar un sign-then-encrypt, el contenido firmado no trae `From` (está en
+/// el sobre de afuera), así que se liga contra ése.
+pub fn verify_message_with_from(raw: &[u8], from: &str) -> Verification {
     let view = as_latin1(raw);
     let (headers, body) = split_headers(&view);
     let content_type = headers
         .get("content-type")
         .map(parse_content_type)
-        .unwrap_or_default();
-    let from = headers
-        .get("from")
-        .map(parse_sender)
-        .map(|(_, address)| address)
         .unwrap_or_default();
 
     match content_type.media_type.as_str() {
@@ -315,7 +356,7 @@ pub fn verify_message(raw: &[u8]) -> Verification {
                 Some(der) => der,
                 None => return Verification::Unverified("firma pkcs7 ilegible".into()),
             };
-            verify_signed_data(&signature_der, Some(&signed_content), &from)
+            verify_signed_data(&signature_der, Some(&signed_content), from)
         }
         "application/pkcs7-mime" | "application/x-pkcs7-mime" => {
             // Opaque: el cuerpo base64 es el `ContentInfo`. El tipo real lo dice
@@ -326,7 +367,7 @@ pub fn verify_message(raw: &[u8]) -> Verification {
                 Err(_) => return Verification::Unverified("pkcs7-mime base64 ilegible".into()),
             };
             match ContentInfo::from_der(&der).map(|ci| ci.content_type) {
-                Ok(oid) if oid == ID_SIGNED_DATA => verify_signed_data(&der, None, &from),
+                Ok(oid) if oid == ID_SIGNED_DATA => verify_signed_data(&der, None, from),
                 Ok(oid) if oid == ID_ENVELOPED_DATA => Verification::NotSigned,
                 Ok(_) => Verification::NotSigned,
                 Err(e) => Verification::Unverified(format!("pkcs7-mime ilegible: {e}")),
@@ -563,6 +604,223 @@ fn strip_whitespace(bytes: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+// ── Descifrar (EnvelopedData) ──────────────────────────────────────────
+
+/// El resultado de intentar descifrar un mensaje entrante.
+#[derive(Debug)]
+pub enum Decryption {
+    /// No venía cifrado.
+    NotEncrypted,
+    /// Cifrado y abierto: el contenido descifrado (una entidad MIME, que puede
+    /// venir firmada adentro —sign-then-encrypt—). Se borra al soltarlo.
+    Opened(Zeroizing<Vec<u8>>),
+    /// Cifrado pero no se pudo abrir: destinatario por acuerdo de clave (ECC/ECDH),
+    /// cifrado no soportado (p. ej. AES-GCM / AuthEnvelopedData), falta nuestra
+    /// clave, o el descifrado falló. El motivo es para el diario; a la ventana se
+    /// le dice «cifrado, no se pudo abrir». **El resultado es uniforme** (todos
+    /// los fallos caen acá) para no darle un oráculo a quien manda ciphertexts.
+    Unavailable(String),
+}
+
+/// Descifra un `pkcs7-mime; smime-type=enveloped-data` con **nuestra** clave
+/// privada (`our_key_pkcs8`) y nuestro certificado (`our_cert_der`), los dos del
+/// llavero por nuestra dirección. Nunca entra en pánico sobre la entrada.
+pub fn decrypt_message(raw: &[u8], our_key_pkcs8: &[u8], our_cert_der: &[u8]) -> Decryption {
+    let view = as_latin1(raw);
+    let (headers, body) = split_headers(&view);
+    let content_type = headers
+        .get("content-type")
+        .map(parse_content_type)
+        .unwrap_or_default();
+    if !matches!(
+        content_type.media_type.as_str(),
+        "application/pkcs7-mime" | "application/x-pkcs7-mime"
+    ) {
+        return Decryption::NotEncrypted;
+    }
+    // Si el header dice que es un sobre cifrado, un blob que no parsea (manipulado)
+    // es «cifrado, no se pudo abrir», no «no cifrado»: no lo ignoramos en silencio.
+    let claims_enveloped = content_type.smime_type.as_deref() == Some("enveloped-data");
+    let not_parseable = |reason: &str| {
+        if claims_enveloped {
+            Decryption::Unavailable(reason.to_string())
+        } else {
+            Decryption::NotEncrypted
+        }
+    };
+    let der = match BASE64_STANDARD.decode(strip_whitespace(&from_latin1(body))) {
+        Ok(der) => der,
+        Err(_) => return not_parseable("pkcs7-mime base64 ilegible"),
+    };
+    let ci = match ContentInfo::from_der(&der) {
+        Ok(ci) => ci,
+        Err(_) => return not_parseable("pkcs7-mime ContentInfo ilegible"),
+    };
+    if ci.content_type != ID_ENVELOPED_DATA {
+        // signed-data u otro: no es un sobre cifrado.
+        return Decryption::NotEncrypted;
+    }
+    let ed = match ci
+        .content
+        .to_der()
+        .and_then(|d| EnvelopedData::from_der(&d))
+    {
+        Ok(ed) => ed,
+        Err(e) => return Decryption::Unavailable(format!("EnvelopedData: {e}")),
+    };
+
+    let key = match RsaPrivateKey::from_pkcs8_der(our_key_pkcs8) {
+        Ok(key) => key,
+        Err(_) => return Decryption::Unavailable("nuestra clave S/MIME no es RSA".into()),
+    };
+    let our_rid = match recipient_id(our_cert_der) {
+        Some(rid) => rid,
+        None => return Decryption::Unavailable("nuestro certificado no se pudo leer".into()),
+    };
+
+    // Buscamos el `RecipientInfo` de transporte de clave (RSA) que es para
+    // nosotros. Un destinatario por acuerdo de clave (ECC/ECDH, `Kari`) u otro
+    // esquema no lo soportamos → «no se pudo abrir».
+    let mut cek: Option<Zeroizing<Vec<u8>>> = None;
+    let mut saw_unsupported = false;
+    for recipient in ed.recip_infos.0.iter() {
+        match recipient {
+            RecipientInfo::Ktri(ktri) if ktri.rid == our_rid => {
+                cek = unwrap_cek(&key, &ktri.key_enc_alg, ktri.enc_key.as_bytes());
+                break;
+            }
+            _ => saw_unsupported = true,
+        }
+    }
+    let cek = match cek {
+        Some(cek) => cek,
+        None => {
+            return Decryption::Unavailable(if saw_unsupported {
+                "no somos destinatario por transporte de clave RSA (¿ECC?)".into()
+            } else {
+                "no se pudo recuperar la clave de contenido".into()
+            })
+        }
+    };
+
+    let eci = ed.encrypted_content;
+    let ciphertext = match eci.encrypted_content.as_ref() {
+        Some(octets) => octets,
+        None => return Decryption::Unavailable("el sobre no trae contenido cifrado".into()),
+    };
+    match aes_cbc_decrypt(&eci.content_enc_alg, &cek, ciphertext.as_bytes()) {
+        Some(plaintext) => Decryption::Opened(plaintext),
+        None => Decryption::Unavailable("no se pudo descifrar el contenido".into()),
+    }
+}
+
+/// Si un mensaje es un sobre cifrado S/MIME (`pkcs7-mime; enveloped-data`), sin
+/// intentar abrirlo. Para marcar «cifrado, no se pudo abrir» cuando no tenemos la
+/// clave (no hay con qué descifrar).
+pub fn is_enveloped(raw: &[u8]) -> bool {
+    let view = as_latin1(raw);
+    let (headers, body) = split_headers(&view);
+    let content_type = headers
+        .get("content-type")
+        .map(parse_content_type)
+        .unwrap_or_default();
+    if !matches!(
+        content_type.media_type.as_str(),
+        "application/pkcs7-mime" | "application/x-pkcs7-mime"
+    ) {
+        return false;
+    }
+    // Por el OID del CMS; o, si no parsea (manipulado), por el `smime-type` del
+    // header: un sobre cifrado que no se puede leer igual es «cifrado».
+    if content_type.smime_type.as_deref() == Some("enveloped-data") {
+        return true;
+    }
+    BASE64_STANDARD
+        .decode(strip_whitespace(&from_latin1(body)))
+        .ok()
+        .and_then(|der| ContentInfo::from_der(&der).ok())
+        .is_some_and(|ci| ci.content_type == ID_ENVELOPED_DATA)
+}
+
+/// El `RecipientIdentifier` (emisor+serie) de nuestro certificado, para encontrar
+/// el `RecipientInfo` que nos corresponde.
+fn recipient_id(cert_der: &[u8]) -> Option<RecipientIdentifier> {
+    let cert = Certificate::from_der(cert_der).ok()?;
+    Some(RecipientIdentifier::IssuerAndSerialNumber(
+        IssuerAndSerialNumber {
+            issuer: cert.tbs_certificate.issuer.clone(),
+            serial_number: cert.tbs_certificate.serial_number.clone(),
+        },
+    ))
+}
+
+/// Desenvuelve la clave de contenido (CEK) cifrada con nuestra clave RSA, según
+/// el esquema de transporte: RSAES-PKCS1-v1_5 o RSAES-OAEP (SHA-256 o SHA-1).
+///
+/// **Nota de seguridad (RUSTSEC-2023-0071, Marvin/Bleichenbacher).** El crate
+/// `rsa` no descifra PKCS#1 v1.5 en tiempo constante, y no hay alternativa en
+/// Rust puro. El modelo de amenaza acá es **descifrado local al abrir un correo,
+/// sin oráculo de auto-respuesta**: no respondemos ni rebotamos automáticamente,
+/// así que un atacante no puede medir el resultado de muchos ciphertexts
+/// elegidos. Y del lado nuestro el fallo es **uniforme**: unpad de RSA, unpad de
+/// CBC y destinatario equivocado terminan todos en `Decryption::Unavailable`
+/// («cifrado, no se pudo abrir»), sin distinguir el motivo hacia afuera. La
+/// revisión de seguridad firma esta aceptación. (OAEP no es vulnerable a
+/// Bleichenbacher; se prueban SHA-256 y SHA-1, que son los que emite el correo.)
+fn unwrap_cek(
+    key: &RsaPrivateKey,
+    key_enc_alg: &AlgorithmIdentifierOwned,
+    enc_key: &[u8],
+) -> Option<Zeroizing<Vec<u8>>> {
+    match key_enc_alg.oid {
+        RSA_ENCRYPTION => key
+            .decrypt(Pkcs1v15Encrypt, enc_key)
+            .ok()
+            .map(Zeroizing::new),
+        ID_RSAES_OAEP => key
+            .decrypt(Oaep::new::<Sha256>(), enc_key)
+            .ok()
+            .or_else(|| key.decrypt(Oaep::new::<Sha1>(), enc_key).ok())
+            .map(Zeroizing::new),
+        _ => None,
+    }
+}
+
+/// Descifra el contenido AES-CBC (128/192/256) con la CEK y el IV de los
+/// parámetros. El relleno PKCS#7 que no cierra es `None` (→ uniforme, arriba).
+fn aes_cbc_decrypt(
+    content_enc_alg: &AlgorithmIdentifierOwned,
+    cek: &[u8],
+    ciphertext: &[u8],
+) -> Option<Zeroizing<Vec<u8>>> {
+    let iv_der = content_enc_alg.parameters.as_ref()?.to_der().ok()?;
+    let iv = OctetString::from_der(&iv_der).ok()?;
+    let iv = iv.as_bytes();
+
+    let plaintext = match content_enc_alg.oid {
+        ID_AES_128_CBC if cek.len() == 16 => {
+            cbc::Decryptor::<aes::Aes128>::new_from_slices(cek, iv)
+                .ok()?
+                .decrypt_padded_vec_mut::<Pkcs7>(ciphertext)
+                .ok()?
+        }
+        ID_AES_192_CBC if cek.len() == 24 => {
+            cbc::Decryptor::<aes::Aes192>::new_from_slices(cek, iv)
+                .ok()?
+                .decrypt_padded_vec_mut::<Pkcs7>(ciphertext)
+                .ok()?
+        }
+        ID_AES_256_CBC if cek.len() == 32 => {
+            cbc::Decryptor::<aes::Aes256>::new_from_slices(cek, iv)
+                .ok()?
+                .decrypt_padded_vec_mut::<Pkcs7>(ciphertext)
+                .ok()?
+        }
+        _ => return None,
+    };
+    Some(Zeroizing::new(plaintext))
+}
+
 #[cfg(test)]
 mod edge_cases;
 #[cfg(test)]
@@ -654,5 +912,98 @@ mod round_trip {
             crate::compose::build_message(&draft, "<x@y>", "Thu, 10 Sep 2026 12:00:00 +0000")
                 .unwrap();
         assert_eq!(verify_message(plain.as_bytes()), Verification::NotSigned);
+    }
+}
+
+#[cfg(test)]
+mod decrypt_smoke {
+    //! Prueba de que el descifrado cierra contra sobres reales de openssl (los
+    //! ciframos a nuestro cert de prueba). qa suma los bordes (manipulado,
+    //! sign-then-encrypt, 192, más variantes). «Nuestra» clave sale del `.p12`.
+    use super::*;
+    use crate::store::smime_key::parse_pkcs12;
+
+    fn our_key_and_cert() -> (Zeroizing<Vec<u8>>, Vec<u8>) {
+        let id = parse_pkcs12(
+            include_bytes!("../tests/fixtures/smime/rsa-pbes2.p12"),
+            b"vasak-test",
+        )
+        .expect("el .p12 de prueba parsea");
+        (id.private_key_pkcs8, id.certs[0].clone())
+    }
+
+    fn opened(fixture: &[u8]) -> Vec<u8> {
+        let (key, cert) = our_key_and_cert();
+        match decrypt_message(fixture, &key, &cert) {
+            Decryption::Opened(pt) => pt.to_vec(),
+            other => panic!("se esperaba Opened, dio {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rsa_pkcs1v15_aes256_se_descifra() {
+        let pt = opened(include_bytes!("../tests/fixtures/smime/enc-rsa-aes256.eml"));
+        assert!(
+            String::from_utf8_lossy(&pt).contains("mensaje secreto"),
+            "{:?}",
+            String::from_utf8_lossy(&pt)
+        );
+    }
+
+    #[test]
+    fn rsa_pkcs1v15_aes128_se_descifra() {
+        let pt = opened(include_bytes!("../tests/fixtures/smime/enc-rsa-aes128.eml"));
+        assert!(String::from_utf8_lossy(&pt).contains("mensaje secreto"));
+    }
+
+    #[test]
+    fn rsa_oaep_se_descifra() {
+        let pt = opened(include_bytes!("../tests/fixtures/smime/enc-rsa-oaep.eml"));
+        assert!(String::from_utf8_lossy(&pt).contains("mensaje secreto"));
+    }
+
+    #[test]
+    fn destinatario_ecc_cae_a_no_disponible_sin_panico() {
+        let (key, cert) = our_key_and_cert();
+        let out = decrypt_message(
+            include_bytes!("../tests/fixtures/smime/enc-ecc-recipient.eml"),
+            &key,
+            &cert,
+        );
+        assert!(matches!(out, Decryption::Unavailable(_)), "dio {out:?}");
+    }
+
+    #[test]
+    fn un_sobre_firmado_adentro_se_descifra_y_la_firma_se_ve() {
+        // sign-then-encrypt: descifrar da el contenido firmado; verificarlo da el
+        // firmante (sin confianza, SignedUntrusted). Resuelve el orden solo.
+        let pt = opened(include_bytes!(
+            "../tests/fixtures/smime/enc-rsa-firmado.eml"
+        ));
+        // El From va del sobre de afuera (el contenido firmado no lo trae).
+        assert_eq!(
+            verify_message_with_from(&pt, "prueba@vasak.test"),
+            Verification::SignedUntrusted("prueba@vasak.test".into())
+        );
+    }
+
+    #[test]
+    fn un_sobre_manipulado_no_se_abre() {
+        let (key, cert) = our_key_and_cert();
+        let out = decrypt_message(
+            include_bytes!("../tests/fixtures/smime/enc-rsa-manipulado.eml"),
+            &key,
+            &cert,
+        );
+        assert!(matches!(out, Decryption::Unavailable(_)), "dio {out:?}");
+    }
+
+    #[test]
+    fn un_mensaje_en_claro_no_esta_cifrado() {
+        let (key, cert) = our_key_and_cert();
+        assert!(matches!(
+            decrypt_message(b"From: a@b.test\r\n\r\nhola", &key, &cert),
+            Decryption::NotEncrypted
+        ));
     }
 }

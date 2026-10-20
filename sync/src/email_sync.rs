@@ -385,27 +385,69 @@ fn join_sender(value: &str) -> String {
     }
 }
 
+/// Nuestra clave privada S/MIME y nuestro certificado, para descifrar el correo
+/// cifrado a nuestra dirección. Salen del llavero una vez por vuelta de cuenta.
+pub struct SmimeMaterial {
+    pub key: zeroize::Zeroizing<Vec<u8>>,
+    pub cert: Vec<u8>,
+}
+
 /// Lo que se guarda de un mensaje abierto: el texto, el HTML **saneado** y los
-/// adjuntos (sólo qué son, no su contenido).
-pub fn opened_rows(
+/// adjuntos. Si viene cifrado y tenemos la clave (`smime`), se descifra acá —con
+/// el crudo en mano; al leer no está— y se guarda el cuerpo **descifrado**
+/// (protegido en reposo por SQLCipher, decisión #1). Un cifrado que no se puede
+/// abrir queda marcado, nunca roto.
+pub fn opened_rows_decrypting(
     message_id: i64,
     raw: &[u8],
     truncated: bool,
+    smime: Option<&SmimeMaterial>,
 ) -> (MessageBodyRow, Vec<MessageAttachmentRow>) {
-    // S/MIME opaque: el contenido real va dentro del PKCS#7, así que el crudo no
-    // tiene texto que mostrar. Si es opaque firmado, se muestra su eContent; si no,
-    // el crudo tal cual. (El `multipart/signed` ya tiene el contenido como parte
-    // normal, así que no hace falta desenvolverlo.)
-    let unwrapped = crate::smime_sign::opaque_signed_content(raw);
-    let display: &[u8] = unwrapped.as_deref().unwrap_or(raw);
+    // 1) Descifrado. `decrypted` tiene el contenido interno si se abrió; el estado
+    //    de cifrado distingue abierto (1) de «no se pudo abrir» (2).
+    let (decrypted, smime_encrypted): (Option<zeroize::Zeroizing<Vec<u8>>>, Option<i64>) =
+        match smime {
+            Some(material) => {
+                match crate::smime_sign::decrypt_message(raw, &material.key, &material.cert) {
+                    crate::smime_sign::Decryption::Opened(content) => (Some(content), Some(1)),
+                    crate::smime_sign::Decryption::Unavailable(reason) => {
+                        tracing::debug!(reason, "cifrado S/MIME no se pudo abrir");
+                        (None, Some(2))
+                    }
+                    crate::smime_sign::Decryption::NotEncrypted => (None, None),
+                }
+            }
+            // Sin nuestra clave no hay con qué abrir un sobre: si está cifrado, es
+            // «cifrado, no se pudo abrir».
+            None if crate::smime_sign::is_enveloped(raw) => (None, Some(2)),
+            None => (None, None),
+        };
+    // El contenido sobre el que se muestra y se verifica: el descifrado si se
+    // abrió (sign-then-encrypt se resuelve solo: verificamos lo de adentro), si no
+    // el crudo.
+    let inner: &[u8] = decrypted.as_ref().map(|c| c.as_slice()).unwrap_or(raw);
+
+    // 2) S/MIME opaque firmado: el contenido real va dentro del PKCS#7; se muestra
+    //    su eContent. (El `multipart/signed` ya trae el contenido como parte normal.)
+    let unwrapped = crate::smime_sign::opaque_signed_content(inner);
+    let display: &[u8] = unwrapped.as_deref().unwrap_or(inner);
     let text = crate::message::plain_text(display);
     let html = crate::message::html_part(display).map(|h| crate::html::sanitize(&h).html);
-    // S/MIME: se verifica acá, con el crudo en mano (al leer no está). Sólo se
-    // marca «firmado» (estado 0 + firmante) cuando la firma criptográfica, el
-    // digest y el binding al From cerraron —falta sólo la validación de confianza
-    // X.509—; cualquier otra cosa (firma rota, truncado, no firmado) queda sin
-    // estado, para no mostrar «firmado» algo cuya firma no verifica.
-    let (smime_status, smime_signer) = match crate::smime_sign::verify_message(raw) {
+
+    // 3) Firma: sólo se marca «firmado» (estado 0 + firmante) cuando la firma
+    //    criptográfica, el digest y el binding al From cerraron —falta sólo la
+    //    validación de confianza X.509—; cualquier otra cosa queda sin estado, para
+    //    no mostrar «firmado» algo cuya firma no verifica.
+    // Si se descifró, el contenido firmado de adentro no trae `From` (está en el
+    // sobre de afuera, `raw`): se liga contra ése. Si no, el `From` es el del
+    // propio mensaje.
+    let verification = if decrypted.is_some() {
+        let from = crate::smime_sign::message_from(raw);
+        crate::smime_sign::verify_message_with_from(inner, &from)
+    } else {
+        crate::smime_sign::verify_message(inner)
+    };
+    let (smime_status, smime_signer) = match verification {
         crate::smime_sign::Verification::SignedUntrusted(signer) => (Some(0), Some(signer)),
         crate::smime_sign::Verification::Unverified(reason) => {
             tracing::debug!(reason, "firma S/MIME no verificada");
@@ -433,6 +475,7 @@ pub fn opened_rows(
             truncated,
             smime_status,
             smime_signer,
+            smime_encrypted,
         },
         attachments,
     )
@@ -503,11 +546,17 @@ impl<K: KeySource> EmailSync<K> {
             }
         };
 
+        // Nuestro material S/MIME (clave + cert), una vez por vuelta, para
+        // descifrar el correo cifrado a nuestra dirección. `None` si la cuenta no
+        // tiene identidad S/MIME o no hay llavero: los sobres quedan «cifrado, no
+        // se pudo abrir», nunca rotos.
+        let smime = smime_material(account_id).await;
+
         // Con plazo: la vuelta de las cuentas es una por vez, y un servidor que
         // contesta lento no puede dejar sin correo al resto.
         let outcome = match tokio::time::timeout(
             ROUND_DEADLINE,
-            sync_session(&self.manager, account_id, &mut session),
+            sync_session(&self.manager, account_id, &mut session, smime.as_ref()),
         )
         .await
         {
@@ -552,11 +601,42 @@ async fn open(account_id: &str) -> Result<Session, BrokerError> {
         .map_err(|e| BrokerError::Failed(e.to_string()))
 }
 
+/// Nuestra dirección de correo, de la config de la cuenta (lo mismo que usa el
+/// `From` al enviar). Es la identidad bajo la que vive nuestra clave S/MIME.
+async fn our_address(account_id: &str) -> Option<String> {
+    let broker = Broker::connect().await.ok()?;
+    let config = broker.account_data(account_id, "email").await.ok()?;
+    let config = config.get("config").cloned().unwrap_or(config);
+    config
+        .get("username")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// Nuestro material S/MIME (clave privada + certificado) del llavero, por nuestra
+/// dirección. `None` si no hay identidad S/MIME, no hay llavero, o no se pudo
+/// resolver la dirección: sin esto, el correo cifrado queda «no se pudo abrir».
+async fn smime_material(account_id: &str) -> Option<SmimeMaterial> {
+    let address = our_address(account_id).await?;
+    // Conexión al bus de sesión para el llavero, como `open` hace su `Broker`.
+    let connection = zbus::Connection::session().await.ok()?;
+    let keys = crate::store::key::SecretServiceKeys::on_session_bus(connection);
+    let key = keys.find_smime_private_key(&address).await.ok()??;
+    let cert = keys
+        .find_smime_certs(&address)
+        .await
+        .ok()??
+        .into_iter()
+        .next()?;
+    Some(SmimeMaterial { key, cert })
+}
+
 /// Todas las casillas de una sesión ya abierta.
 async fn sync_session<K, F>(
     manager: &StoreManager<K>,
     account_id: &str,
     session: &mut Session<F>,
+    smime: Option<&SmimeMaterial>,
 ) -> Result<EmailReport, RoundError>
 where
     K: KeySource,
@@ -598,7 +678,17 @@ where
 
     for (mailbox, listing) in boxes.iter().zip(listed.iter()) {
         let role = store_role(listing.role);
-        match sync_mailbox(manager, account_id, session, mailbox, role, &mut report).await {
+        match sync_mailbox(
+            manager,
+            account_id,
+            session,
+            mailbox,
+            role,
+            &mut report,
+            smime,
+        )
+        .await
+        {
             Ok(()) => {}
             // Una casilla que el servidor se niega a abrir —se borró recién,
             // permisos— no corta la vuelta de las demás. **Sólo eso**: un
@@ -626,6 +716,7 @@ async fn sync_mailbox<K, F>(
     mailbox: &StoredMailbox,
     role: MailboxRole,
     report: &mut EmailReport,
+    smime: Option<&SmimeMaterial>,
 ) -> Result<(), RoundError>
 where
     K: KeySource,
@@ -654,7 +745,7 @@ where
         MailboxAction::Skip => {
             report.unchanged += 1;
             if inbox {
-                prefetch_bodies(manager, account_id, session, id, report).await?;
+                prefetch_bodies(manager, account_id, session, id, report, smime).await?;
             }
             return Ok(());
         }
@@ -724,7 +815,7 @@ where
         .await?;
 
     if inbox {
-        prefetch_bodies(manager, account_id, session, id, report).await?;
+        prefetch_bodies(manager, account_id, session, id, report, smime).await?;
     }
     Ok(())
 }
@@ -737,6 +828,7 @@ async fn prefetch_bodies<K, F>(
     session: &mut Session<F>,
     mailbox_id: i64,
     report: &mut EmailReport,
+    smime: Option<&SmimeMaterial>,
 ) -> Result<(), RoundError>
 where
     K: KeySource,
@@ -756,7 +848,9 @@ where
             continue;
         };
         match session.fetch_body(uid).await {
-            Ok((raw, truncated)) => opened.push(opened_rows(message_id, &raw, truncated)),
+            Ok((raw, truncated)) => {
+                opened.push(opened_rows_decrypting(message_id, &raw, truncated, smime))
+            }
             // Uno que el servidor no da —se borró recién— no frena a los demás.
             Err(ImapError::Refused(e)) => {
                 tracing::debug!("'{account_id}': un cuerpo no se pudo traer: {e}")

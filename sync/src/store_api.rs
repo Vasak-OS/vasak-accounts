@@ -2731,6 +2731,7 @@ mod tests {
                     truncated: false,
                     smime_status: None,
                     smime_signer: None,
+                    smime_encrypted: None,
                 })?;
                 Ok(())
             })
@@ -5866,6 +5867,7 @@ mod tests {
                     truncated: false,
                     smime_status: None,
                     smime_signer: None,
+                    smime_encrypted: None,
                 })?;
                 Ok(id)
             })

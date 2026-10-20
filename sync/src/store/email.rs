@@ -112,11 +112,14 @@ pub struct MessageBodyRow {
     pub text_body: Option<String>,
     pub html_body: Option<String>,
     pub truncated: bool,
-    /// Estado S/MIME: `None` si no venía firmado, `Some(0)` «firmado, no
-    /// verificado», `Some(1)` «firma válida». Se calcula al bajar el mensaje.
+    /// Estado S/MIME de la firma: `None` si no venía firmado, `Some(0)` «firmado,
+    /// no verificado», `Some(1)` «firma válida» (follow-up). Se calcula al bajar.
     pub smime_status: Option<i64>,
-    /// El correo del firmante cuando la firma vale.
+    /// El correo del firmante cuando la firma ligó el From.
     pub smime_signer: Option<String>,
+    /// Estado de cifrado: `None` no cifrado, `Some(1)` cifrado y abierto (el
+    /// cuerpo guardado es el descifrado), `Some(2)` cifrado, no se pudo abrir.
+    pub smime_encrypted: Option<i64>,
 }
 
 /// Un adjunto de un mensaje.
@@ -195,14 +198,16 @@ fn write_body(transaction: &Transaction, body: MessageBodyRow) -> Result<(), Sto
     transaction
         .execute(
             "INSERT INTO message_bodies
-                 (message_id, text_body, html_body, truncated, smime_status, smime_signer, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 (message_id, text_body, html_body, truncated, smime_status, smime_signer,
+                  smime_encrypted, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT (message_id) DO UPDATE SET
                      text_body = excluded.text_body,
                      html_body = excluded.html_body,
                      truncated = excluded.truncated,
                      smime_status = excluded.smime_status,
                      smime_signer = excluded.smime_signer,
+                     smime_encrypted = excluded.smime_encrypted,
                      updated_at = excluded.updated_at",
             rusqlite::params![
                 body.message_id,
@@ -211,6 +216,7 @@ fn write_body(transaction: &Transaction, body: MessageBodyRow) -> Result<(), Sto
                 body.truncated as i64,
                 body.smime_status,
                 body.smime_signer,
+                body.smime_encrypted,
                 now(),
             ],
         )
@@ -1044,6 +1050,7 @@ mod tests {
                 truncated: false,
                 smime_status: None,
                 smime_signer: None,
+                smime_encrypted: None,
             })
             .unwrap();
 
@@ -1181,6 +1188,7 @@ mod tests {
                 truncated: false,
                 smime_status: None,
                 smime_signer: None,
+                smime_encrypted: None,
             })
             .unwrap();
 
@@ -1398,6 +1406,7 @@ mod tests {
                 truncated: false,
                 smime_status: None,
                 smime_signer: None,
+                smime_encrypted: None,
             })
             .unwrap();
 
@@ -1566,6 +1575,7 @@ mod tests {
                 truncated: false,
                 smime_status: None,
                 smime_signer: None,
+                smime_encrypted: None,
             })
             .unwrap();
 
@@ -1596,6 +1606,7 @@ mod tests {
                     truncated: false,
                     smime_status: None,
                     smime_signer: None,
+                    smime_encrypted: None,
                 },
                 vec![MessageAttachmentRow {
                     message_id: id,
