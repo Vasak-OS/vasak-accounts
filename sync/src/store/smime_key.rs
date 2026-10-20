@@ -41,6 +41,7 @@ use pkcs12::pfx::Pfx;
 use pkcs12::safe_bag::{SafeBag, SafeContents};
 use pkcs8::EncryptedPrivateKeyInfo;
 use sha2::{Digest, Sha256, Sha384, Sha512};
+use x509_cert::Certificate;
 use zbus::zvariant::{OwnedObjectPath, Value};
 use zeroize::Zeroizing;
 
@@ -200,10 +201,67 @@ pub fn parse_pkcs12(der: &[u8], password: &[u8]) -> Result<ImportedIdentity, Smi
             "el .p12 no trae certificados".into(),
         ));
     }
+
+    // PKCS#12 no garantiza el orden de los CertBag: el cert del end-entity puede
+    // no venir primero (p. ej. un `.p12` con la CA delante). Se adelanta el cert
+    // cuya clave pública es la de la clave privada, así `.first()`/`[0]` es
+    // siempre el leaf en el resto del pipeline.
+    if let Some(spki) = private_key_spki(&private_key_pkcs8) {
+        match certs
+            .iter()
+            .position(|c| cert_spki(c).as_deref() == Some(spki.as_slice()))
+        {
+            Some(0) => {}
+            Some(i) => {
+                let leaf = certs.remove(i);
+                certs.insert(0, leaf);
+            }
+            None => {
+                return Err(SmimeError::MalformedPkcs12(
+                    "ningún certificado del .p12 corresponde a la clave privada".into(),
+                ))
+            }
+        }
+    }
+
     Ok(ImportedIdentity {
         private_key_pkcs8,
         certs,
     })
+}
+
+/// El SPKI (DER) de la clave pública que corresponde a una clave privada PKCS#8.
+/// Sólo RSA y ECDSA P-256, que son las que el pipeline firma y descifra; otra
+/// clave devuelve `None` y el orden de los certs se deja como vino.
+fn private_key_spki(pkcs8_der: &[u8]) -> Option<Vec<u8>> {
+    use pkcs8::DecodePrivateKey;
+    use spki::EncodePublicKey;
+    if let Ok(key) = rsa::RsaPrivateKey::from_pkcs8_der(pkcs8_der) {
+        return key
+            .to_public_key()
+            .to_public_key_der()
+            .ok()
+            .map(|d| d.as_bytes().to_vec());
+    }
+    if let Ok(key) = p256::ecdsa::SigningKey::from_pkcs8_der(pkcs8_der) {
+        return key
+            .verifying_key()
+            .to_public_key_der()
+            .ok()
+            .map(|d| d.as_bytes().to_vec());
+    }
+    None
+}
+
+/// El SPKI (DER) de la clave pública de un certificado, para compararlo con el de
+/// la clave privada. `None` si el cert no se puede leer.
+fn cert_spki(cert_der: &[u8]) -> Option<Vec<u8>> {
+    Certificate::from_der(cert_der)
+        .ok()?
+        .tbs_certificate
+        .subject_public_key_info
+        .to_der()
+        .ok()
 }
 
 /// El valor del OCTET STRING que envuelve el contenido de un `ContentInfo`

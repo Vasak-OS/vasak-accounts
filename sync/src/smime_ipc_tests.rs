@@ -400,7 +400,9 @@ async fn consultar_nunca_devuelve_material_de_clave() {
 
     // Y la clave privada no está en el texto, ni en base64 ni en hexadecimal.
     let key = parse_pkcs12(RSA_P12, PASSWORD).unwrap().private_key_pkcs8;
-    let chunk = &key[key.len() / 2..key.len() / 2 + 24];
+    // Base64 de un trozo sólo aparece en el base64 del todo si empieza en un múltiplo de 3.
+    let start = key.len() / 2 / 3 * 3;
+    let chunk = &key[start..start + 24];
     assert!(!reply.contains(&BASE64_STANDARD.encode(chunk)));
     assert!(!reply.contains(&BASE64_URL_SAFE.encode(chunk)));
     let hex: String = chunk.iter().map(|b| format!("{b:02x}")).collect();

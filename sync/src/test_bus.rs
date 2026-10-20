@@ -47,7 +47,7 @@ fn daemon() -> &'static Daemon {
             .arg("-c")
             .arg(
                 "dbus-daemon --session --nofork --address=unix:tmpdir=/tmp --print-address=1 & \
-                 pid=$!; cat >/dev/null; kill $pid",
+                 pid=$!; exec >/dev/null; cat; kill $pid",
             )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
