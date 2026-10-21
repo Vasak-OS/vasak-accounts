@@ -17,16 +17,92 @@ const NAME_PREFIX: &str = "ar.net.vasak.os.AccountsSync.";
 /// nada que el servicio imprima por su cuenta: si aparece, se filtró.
 const WRONG_PASSWORD: &[u8] = b"contrasena-equivocada-9f3a-no-filtrar";
 const MAX_P12: usize = 8 * 1024 * 1024;
+const MAX_PASSWORD: usize = 4096;
 
 const LEGACY_P12: &[u8] = include_bytes!("../tests/fixtures/smime/rsa-legacy.p12");
 const ONLY_CERTS_P12: &[u8] = include_bytes!("../tests/fixtures/smime/solo-certs.p12");
 const ONLY_KEY_P12: &[u8] = include_bytes!("../tests/fixtures/smime/solo-clave.p12");
+
+/// Un memfd sellado con estos bytes, como lo manda el cliente: `.p12` y
+/// contraseña viajan por descriptor, no como `ay`. Sella contra escritura (y
+/// contra crecer/encoger) para que el servicio lo acepte.
+fn sealed_fd(bytes: &[u8]) -> zbus::zvariant::OwnedFd {
+    use rustix::fs::{fcntl_add_seals, memfd_create, MemfdFlags, SealFlags};
+    use std::io::Write;
+
+    let fd = memfd_create(
+        "smime-prueba",
+        MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
+    )
+    .unwrap();
+    let mut file = std::fs::File::from(fd);
+    file.write_all(bytes).unwrap();
+    fcntl_add_seals(
+        &file,
+        SealFlags::WRITE | SealFlags::SHRINK | SealFlags::GROW | SealFlags::SEAL,
+    )
+    .unwrap();
+    std::os::fd::OwnedFd::from(file).into()
+}
 
 async fn import(
     f: &Fixture,
     account: &str,
     p12: &[u8],
     password: &[u8],
+) -> zbus::Result<zbus::Message> {
+    f.call(
+        "ImportSmimeIdentity",
+        &(account, sealed_fd(p12), sealed_fd(password)),
+    )
+    .await
+}
+
+/// Un memfd con estos bytes pero **sin sellar**: el que manda un cliente que
+/// podría seguir escribiendo después de que el servicio validó (TOCTOU).
+fn unsealed_fd(bytes: &[u8]) -> zbus::zvariant::OwnedFd {
+    use rustix::fs::{memfd_create, MemfdFlags};
+    use std::io::Write;
+
+    let fd = memfd_create(
+        "smime-prueba-sin-sello",
+        MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
+    )
+    .unwrap();
+    let mut file = std::fs::File::from(fd);
+    file.write_all(bytes).unwrap();
+    std::os::fd::OwnedFd::from(file).into()
+}
+
+/// El extremo de lectura de un pipe con estos bytes ya escritos. El de escritura
+/// se cierra: si el servicio llegara a leerlo, termina en EOF en vez de colgarse.
+fn pipe_fd(bytes: &[u8]) -> zbus::zvariant::OwnedFd {
+    use std::io::Write;
+
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    writer.write_all(bytes).unwrap();
+    drop(writer);
+    std::os::fd::OwnedFd::from(reader).into()
+}
+
+/// Un archivo común en disco (no un memfd) con estos bytes: no admite sellos.
+fn regular_file_fd(bytes: &[u8]) -> zbus::zvariant::OwnedFd {
+    use std::io::Write;
+
+    // Sin crate de temporales: se crea, se abre y se borra el nombre al instante.
+    let path = std::env::temp_dir().join(format!("vasak-smime-prueba-{}", std::process::id()));
+    let mut file = std::fs::File::create_new(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    file.write_all(bytes).unwrap();
+    std::os::fd::OwnedFd::from(file).into()
+}
+
+/// `ImportSmimeIdentity` con los descriptores tal cual, sin sellar nada.
+async fn import_fds(
+    f: &Fixture,
+    account: &str,
+    p12: zbus::zvariant::OwnedFd,
+    password: zbus::zvariant::OwnedFd,
 ) -> zbus::Result<zbus::Message> {
     f.call("ImportSmimeIdentity", &(account, p12, password))
         .await
@@ -207,6 +283,97 @@ async fn el_tope_de_tamano_se_mira_antes_de_buscar_la_cuenta() {
         short_name(import(&f, "no-existe", &too_big, PASSWORD).await),
         "TooBig"
     );
+}
+
+// ── Los descriptores: sello, tipo y tope ────────────────────────────────
+
+#[tokio::test]
+async fn un_p12_sin_sellar_se_rechaza_aunque_sea_valido() {
+    let f = Fixture::start(&[(ACCOUNT, RSA_ADDRESS)]).await;
+
+    // Con un .p12 bueno y la contraseña buena: lo único que falla es el sello.
+    let name = short_name(import_fds(&f, ACCOUNT, unsealed_fd(RSA_P12), sealed_fd(PASSWORD)).await);
+
+    assert_eq!(name, "Malformed");
+    assert_nothing_stored(&f, RSA_ADDRESS).await;
+}
+
+#[tokio::test]
+async fn una_contrasena_sin_sellar_se_rechaza_aunque_sea_la_correcta() {
+    let f = Fixture::start(&[(ACCOUNT, RSA_ADDRESS)]).await;
+
+    let name = short_name(import_fds(&f, ACCOUNT, sealed_fd(RSA_P12), unsealed_fd(PASSWORD)).await);
+
+    assert_eq!(name, "Malformed");
+    assert_nothing_stored(&f, RSA_ADDRESS).await;
+}
+
+#[tokio::test]
+async fn un_p12_que_es_un_archivo_comun_no_se_acepta_aunque_sea_valido() {
+    let f = Fixture::start(&[(ACCOUNT, RSA_ADDRESS)]).await;
+
+    // Un archivo en disco no admite sellos: el cliente podría reescribirlo.
+    let name =
+        short_name(import_fds(&f, ACCOUNT, regular_file_fd(RSA_P12), sealed_fd(PASSWORD)).await);
+
+    assert_eq!(name, "Malformed");
+    assert_nothing_stored(&f, RSA_ADDRESS).await;
+}
+
+#[tokio::test]
+async fn un_pipe_como_p12_se_rechaza_sin_colgarse() {
+    let f = Fixture::start(&[(ACCOUNT, RSA_ADDRESS)]).await;
+
+    // Con un límite de tiempo: si el servicio leyera del pipe en lugar de
+    // rechazarlo, la prueba tiene que fallar y no colgar la suite.
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        import_fds(&f, ACCOUNT, pipe_fd(RSA_P12), sealed_fd(PASSWORD)),
+    )
+    .await
+    .expect("el servicio se colgó con un pipe");
+
+    assert_eq!(short_name(result), "Malformed");
+    assert_nothing_stored(&f, RSA_ADDRESS).await;
+}
+
+#[tokio::test]
+async fn una_contrasena_de_mas_de_4096_bytes_da_toobig_y_una_de_justo_4096_se_lee() {
+    let f = Fixture::start(&[(ACCOUNT, RSA_ADDRESS)]).await;
+
+    let too_long = vec![b'x'; MAX_PASSWORD + 1];
+    assert_eq!(
+        short_name(import(&f, ACCOUNT, RSA_P12, &too_long).await),
+        "TooBig"
+    );
+    // En el tope exacto se lee entera y falla después, por incorrecta: el
+    // límite es «más de», no «desde».
+    let at_the_limit = vec![b'x'; MAX_PASSWORD];
+    assert_eq!(
+        short_name(import(&f, ACCOUNT, RSA_P12, &at_the_limit).await),
+        "WrongPassword"
+    );
+    assert_nothing_stored(&f, RSA_ADDRESS).await;
+}
+
+#[tokio::test]
+async fn el_tope_de_la_contrasena_se_mira_antes_de_buscar_la_cuenta() {
+    // Sin ninguna cuenta: si se buscara primero daría `Failed`.
+    let f = Fixture::start(&[]).await;
+    let too_long = vec![b'x'; MAX_PASSWORD + 1];
+    assert_eq!(
+        short_name(import(&f, "no-existe", RSA_P12, &too_long).await),
+        "TooBig"
+    );
+}
+
+#[tokio::test]
+async fn un_fd_sin_sellar_se_rechaza_antes_de_buscar_la_cuenta() {
+    // Sin ninguna cuenta: el sello se mira en la lectura, que va primero.
+    let f = Fixture::start(&[]).await;
+    let name =
+        short_name(import_fds(&f, "no-existe", unsealed_fd(RSA_P12), sealed_fd(PASSWORD)).await);
+    assert_eq!(name, "Malformed");
 }
 
 #[tokio::test]

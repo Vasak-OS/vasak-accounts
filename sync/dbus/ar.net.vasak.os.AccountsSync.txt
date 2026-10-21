@@ -5,7 +5,7 @@ interface ar.net.vasak.os.AccountsSync
   method GetAttachment(in s account_id, in s mailbox, in u uid, in s part, out s)
   method GetMessage(in s account_id, in s mailbox, in u uid, out s)
   method GetSmimeIdentity(in s account_id, out s)
-  method ImportSmimeIdentity(in s account_id, in ay p12, in ay password)
+  method ImportSmimeIdentity(in s account_id, in h p12, in h password)
   method ListMailboxes(in s account_id, out s)
   method ListMessages(in s account_id, in s mailbox, out s)
   method ListOutbox(out s)

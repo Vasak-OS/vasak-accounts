@@ -586,6 +586,10 @@ impl Reader {
 /// Tope del `.p12` que entra por el bus: un certificado real pesa unos pocos KB.
 const MAX_SMIME_PKCS12_BYTES: usize = 8 * 1024 * 1024;
 
+/// Tope de la contraseña del `.p12`: una frase de paso, no un archivo. Capa la
+/// lectura del memfd de la contraseña igual que el del `.p12`.
+const MAX_SMIME_PASSWORD_BYTES: usize = 4096;
+
 /// Errores de la gestión de identidad S/MIME por IPC, con **nombres de error
 /// D-Bus estables** que la ventana traduce (no la prosa, que está en español y
 /// la escribe el servidor). El nombre es `ar.net.vasak.os.AccountsSync.<Variante>`.
@@ -631,6 +635,47 @@ fn smime_ipc_from_keyring(error: store::key::KeyError) -> SmimeIpcError {
         store::key::KeyError::Locked => SmimeIpcError::KeyringLocked,
         other => SmimeIpcError::Failed(format!("el llavero falló: {other}")),
     }
+}
+
+/// Lee el contenido de un memfd **sellado** que mandó el cliente, con un tope.
+///
+/// Exige el sello contra escritura (`F_SEAL_WRITE`): sin él, el proceso que
+/// mandó el descriptor podría cambiar los bytes **después** de que el servicio
+/// los validó (una carrera TOCTOU), así que un fd sin sellar se rechaza como
+/// `Malformed`. Un archivo en disco o un pipe no soportan sellos —`fcntl` falla
+/// con `EINVAL`— y caen por el mismo camino, sin colgarse: el `.take` capa la
+/// lectura a `max + 1`, de modo que ni un memfd mentiroso ni un pipe infinito
+/// agotan la memoria. El `seek` al inicio es imprescindible: el cliente deja el
+/// memfd con el offset al final tras escribir, y sin rebobinar se leerían cero
+/// bytes (el fallo más probable si algo se rompe).
+fn read_sealed_fd(fd: zbus::zvariant::OwnedFd, max: usize) -> Result<Vec<u8>, SmimeIpcError> {
+    use rustix::fs::{fcntl_get_seals, SealFlags};
+    use std::io::{Read, Seek, SeekFrom};
+
+    let fd: std::os::fd::OwnedFd = fd.into();
+    if !fcntl_get_seals(&fd)
+        .map_err(|_| SmimeIpcError::Malformed)?
+        .contains(SealFlags::WRITE)
+    {
+        return Err(SmimeIpcError::Malformed);
+    }
+
+    let mut file = std::fs::File::from(fd);
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| SmimeIpcError::Malformed)?;
+
+    // Capacidad `max + 1` de entrada: con el `.take` a `max + 1`, `read_to_end`
+    // no reasigna, así que el contenido (una contraseña, entre otros) no deja
+    // fragmentos en memoria liberada que nadie borró.
+    let mut buf = Vec::with_capacity(max + 1);
+    (&file)
+        .take((max + 1) as u64)
+        .read_to_end(&mut buf)
+        .map_err(|_| SmimeIpcError::Malformed)?;
+    if buf.len() > max {
+        return Err(SmimeIpcError::TooBig);
+    }
+    Ok(buf)
 }
 
 #[interface(name = "ar.net.vasak.os.AccountsSync")]
@@ -1108,23 +1153,35 @@ impl Service {
     /// dirección, o la firma saliente no ligaría al `From` → `AddressMismatch`.
     /// La contraseña entra en memoria que se borra sola y no va a ningún lado.
     ///
-    /// La contraseña y el `.p12` viajan por el bus de sesión como `ay`, igual que
-    /// los adjuntos; pasarlos por un descriptor de archivo es un endurecimiento
-    /// posterior. Y este método **no está tras `vasak-permissions`**: un proceso
-    /// del mismo usuario podría reemplazar la identidad de firma. Las dos cosas
-    /// van a la revisión de seguridad.
+    /// El `.p12` y la contraseña entran cada uno por un **memfd sellado**
+    /// (firma `h`, no `ay`): los bytes no transitan el `dbus-daemon` de sesión, y
+    /// el sello contra escritura evita que el cliente los cambie después de
+    /// validados (ver [`read_sealed_fd`]). La contraseña entra en memoria que se
+    /// borra sola y no va a ningún lado.
+    ///
+    /// Este método **todavía no está tras `vasak-permissions`**: un proceso del
+    /// mismo usuario podría reemplazar la identidad de firma. Ese gating se trata
+    /// aparte en `vasak-accounts#135`, no es este endurecimiento.
     async fn import_smime_identity(
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
         account_id: String,
-        p12: Vec<u8>,
-        password: Vec<u8>,
+        p12: zbus::zvariant::OwnedFd,
+        password: zbus::zvariant::OwnedFd,
     ) -> Result<(), SmimeIpcError> {
-        // La contraseña a memoria que se borra, ni bien entra.
-        let password = Zeroizing::new(password);
-        if p12.len() > MAX_SMIME_PKCS12_BYTES {
-            return Err(SmimeIpcError::TooBig);
-        }
+        // Leer y capar **ambos** fds antes de resolver la cuenta: el tope se mira
+        // antes de buscar la cuenta (lo fija `el_tope_de_tamano_se_mira_antes_de_
+        // buscar_la_cuenta`). El leído del memfd es trabajo de disco/syscalls, así
+        // que va en `spawn_blocking`. La contraseña y su buffer se borran solos.
+        let (p12, password) = tokio::task::spawn_blocking(move || {
+            let p12 = read_sealed_fd(p12, MAX_SMIME_PKCS12_BYTES)?;
+            // El buffer que leyó la contraseña **es** el `Zeroizing`: se mueve, no
+            // se copia, así que no queda ningún segundo buffer en claro que borrar.
+            let password = Zeroizing::new(read_sealed_fd(password, MAX_SMIME_PASSWORD_BYTES)?);
+            Ok::<_, SmimeIpcError>((p12, password))
+        })
+        .await
+        .map_err(|_| SmimeIpcError::Failed("la lectura de los descriptores se cortó".into()))??;
 
         let address = self.account_address(&account_id).await?;
 
