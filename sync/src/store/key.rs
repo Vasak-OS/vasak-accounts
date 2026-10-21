@@ -1386,6 +1386,33 @@ pub(crate) mod tests {
         )
     }
 
+    /// El mismo llavero falso, pero **en un bus** y con el nombre del estándar
+    /// (`org.freedesktop.secrets`), para las pruebas que ejercitan un método del
+    /// servicio de punta a punta: ahí `SecretServiceKeys::on_session_bus` le habla
+    /// por nombre, como al de verdad. Pide el nombre con reemplazo, así que el de
+    /// una prueba anterior que todavía no se soltó no lo traba.
+    pub(crate) async fn fake_keyring_on_bus(address: &str) -> (zbus::Connection, Shared) {
+        let shared = Shared::default();
+        let connection = zbus::connection::Builder::address(address)
+            .unwrap()
+            .serve_at(SERVICE_PATH, FakeService(shared.clone()))
+            .unwrap()
+            .serve_at(COLLECTION_PATH, FakeCollection(shared.clone()))
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        use zbus::fdo::RequestNameFlags::{AllowReplacement, DoNotQueue, ReplaceExisting};
+        connection
+            .request_name_with_flags(
+                SERVICE_NAME,
+                AllowReplacement | DoNotQueue | ReplaceExisting,
+            )
+            .await
+            .unwrap();
+        (connection, shared)
+    }
+
     /// Bloquea el llavero y **avisa**, en ese orden, como `vasak-keyring` al
     /// bloquear: primero cambia `Locked` y después manda el `PropertiesChanged`.
     ///

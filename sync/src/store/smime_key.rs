@@ -41,6 +41,7 @@ use pkcs12::pfx::Pfx;
 use pkcs12::safe_bag::{SafeBag, SafeContents};
 use pkcs8::EncryptedPrivateKeyInfo;
 use sha2::{Digest, Sha256, Sha384, Sha512};
+use x509_cert::Certificate;
 use zbus::zvariant::{OwnedObjectPath, Value};
 use zeroize::Zeroizing;
 
@@ -200,10 +201,74 @@ pub fn parse_pkcs12(der: &[u8], password: &[u8]) -> Result<ImportedIdentity, Smi
             "el .p12 no trae certificados".into(),
         ));
     }
+
+    // PKCS#12 no garantiza el orden de los CertBag: el cert del end-entity puede
+    // no venir primero (p. ej. un `.p12` con la CA delante). Se adelanta el cert
+    // cuya clave pública es la de la clave privada, así `.first()`/`[0]` es
+    // siempre el leaf en el resto del pipeline.
+    // Un tipo de clave no soportado (ni RSA ni ECDSA P-256) se rechaza acá en vez
+    // de devolver éxito en silencio: sin su SPKI no se puede verificar cuál cert
+    // es el leaf, y `detached_signature` tampoco podría firmar con esa clave, así
+    // que no es una identidad usable.
+    let spki = private_key_spki(&private_key_pkcs8).ok_or_else(|| {
+        SmimeError::MalformedPkcs12(
+            "tipo de clave del .p12 no soportado (sólo RSA y ECDSA P-256)".into(),
+        )
+    })?;
+    match certs
+        .iter()
+        .position(|c| cert_spki(c).as_deref() == Some(spki.as_slice()))
+    {
+        Some(0) => {}
+        Some(i) => {
+            let leaf = certs.remove(i);
+            certs.insert(0, leaf);
+        }
+        None => {
+            return Err(SmimeError::MalformedPkcs12(
+                "ningún certificado del .p12 corresponde a la clave privada".into(),
+            ))
+        }
+    }
+
     Ok(ImportedIdentity {
         private_key_pkcs8,
         certs,
     })
+}
+
+/// El SPKI (DER) de la clave pública que corresponde a una clave privada PKCS#8.
+/// Sólo RSA y ECDSA P-256, que son las que el pipeline firma y descifra; otra
+/// clave devuelve `None`, y el import la rechaza (no es una identidad usable).
+fn private_key_spki(pkcs8_der: &[u8]) -> Option<Vec<u8>> {
+    use pkcs8::DecodePrivateKey;
+    use spki::EncodePublicKey;
+    if let Ok(key) = rsa::RsaPrivateKey::from_pkcs8_der(pkcs8_der) {
+        return key
+            .to_public_key()
+            .to_public_key_der()
+            .ok()
+            .map(|d| d.as_bytes().to_vec());
+    }
+    if let Ok(key) = p256::ecdsa::SigningKey::from_pkcs8_der(pkcs8_der) {
+        return key
+            .verifying_key()
+            .to_public_key_der()
+            .ok()
+            .map(|d| d.as_bytes().to_vec());
+    }
+    None
+}
+
+/// El SPKI (DER) de la clave pública de un certificado, para compararlo con el de
+/// la clave privada. `None` si el cert no se puede leer.
+fn cert_spki(cert_der: &[u8]) -> Option<Vec<u8>> {
+    Certificate::from_der(cert_der)
+        .ok()?
+        .tbs_certificate
+        .subject_public_key_info
+        .to_der()
+        .ok()
 }
 
 /// El valor del OCTET STRING que envuelve el contenido de un `ContentInfo`
@@ -857,6 +922,8 @@ mod tests {
         let mut out = vec![tag];
         match contenido.len() {
             n if n < 0x80 => out.push(n as u8),
+            // DER exige la forma mínima: 0x81 hasta 255 bytes, 0x82 desde ahí.
+            n if n < 0x100 => out.extend_from_slice(&[0x81, n as u8]),
             n => {
                 out.push(0x82);
                 out.extend_from_slice(&(n as u16).to_be_bytes());
@@ -956,6 +1023,169 @@ mod tests {
         let r = parse_pkcs12(&vec![0u8; MAX_PKCS12_BYTES], PASSWORD);
         assert!(
             matches!(r, Err(SmimeError::MalformedPkcs12(_))),
+            "dio {r:?}"
+        );
+    }
+
+    // ── Orden de los certificados: el leaf siempre primero ────────────
+
+    const OTRO_CERT_PEM: &str = include_str!("../../tests/fixtures/smime/otro-cert.pem");
+    const EC_CERT_PEM: &str = include_str!("../../tests/fixtures/smime/ec-cert.pem");
+    const EC_P12: &[u8] = include_bytes!("../../tests/fixtures/smime/ec-p256.p12");
+
+    fn pem_a_der(pem: &str) -> Vec<u8> {
+        let b64: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+        base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .expect("el PEM es base64")
+    }
+
+    /// Arma en memoria un `.p12` PBES2-free (safes en claro, MAC SHA-256) con la
+    /// clave y los certificados **en el orden dado**. `openssl pkcs12 -export`
+    /// siempre pone el leaf primero, así que el orden «CA delante» —que PKCS#12
+    /// permite y otros exportadores usan— sólo se consigue armándolo a mano.
+    /// Un safe con la clave (keybag en claro) y otro con los CertBag.
+    fn p12_con_certs_en_orden(pkcs8: &[u8], certs: &[Vec<u8>]) -> Vec<u8> {
+        const ID_DATA_S: &str = "1.2.840.113549.1.7.1";
+        let safe_bag =
+            |bag_oid: &str, valor: &[u8]| tlv(0x30, &[oid(bag_oid), tlv(0xA0, valor)].concat());
+        let safe_contents = |bags: Vec<Vec<u8>>| tlv(0x30, &bags.concat());
+        let content_info = |contenido: &[u8]| {
+            tlv(
+                0x30,
+                &[oid(ID_DATA_S), tlv(0xA0, &tlv(0x04, contenido))].concat(),
+            )
+        };
+
+        let keybag = safe_bag("1.2.840.113549.1.12.10.1.1", pkcs8);
+        let certbags: Vec<Vec<u8>> = certs
+            .iter()
+            .map(|c| {
+                let cert_bag = tlv(
+                    0x30,
+                    &[oid(X509_CERTIFICATE_S), tlv(0xA0, &tlv(0x04, c))].concat(),
+                );
+                safe_bag("1.2.840.113549.1.12.10.1.3", &cert_bag)
+            })
+            .collect();
+        const X509_CERTIFICATE_S: &str = "1.2.840.113549.1.9.22.1";
+
+        let authsafe = tlv(
+            0x30,
+            &[
+                content_info(&safe_contents(vec![keybag])),
+                content_info(&safe_contents(certbags)),
+            ]
+            .concat(),
+        );
+
+        let salt = [7u8; 8];
+        let rounds = 2048;
+        let pw = std::str::from_utf8(PASSWORD).unwrap();
+        let key = derive_key_utf8::<Sha256>(pw, &salt, Pkcs12KeyType::Mac, rounds, 32).unwrap();
+        let mut hmac = Hmac::<Sha256>::new_from_slice(&key).unwrap();
+        hmac.update(&authsafe);
+        let digest = hmac.finalize().into_bytes();
+
+        let digest_info = tlv(
+            0x30,
+            &[
+                tlv(
+                    0x30,
+                    &[oid("2.16.840.1.101.3.4.2.1"), vec![0x05, 0x00]].concat(),
+                ),
+                tlv(0x04, &digest),
+            ]
+            .concat(),
+        );
+        let mac_data = tlv(
+            0x30,
+            &[digest_info, tlv(0x04, &salt), entero(rounds as u64)].concat(),
+        );
+        tlv(
+            0x30,
+            &[entero(3), content_info(&authsafe), mac_data].concat(),
+        )
+    }
+
+    fn assert_leaf_primero(p12: &[u8], leaf: &[u8], ca: &[u8]) {
+        let parsed = parse_pkcs12(p12, PASSWORD).expect("tiene que parsear");
+        assert_eq!(parsed.certs.len(), 2, "se conservan los dos certificados");
+        assert_eq!(
+            cert_spki(&parsed.certs[0]),
+            private_key_spki(&parsed.private_key_pkcs8),
+            "certs[0] tiene que ser el de la clave privada"
+        );
+        assert_eq!(parsed.certs[0], leaf, "primero el leaf");
+        assert_eq!(parsed.certs[1], ca, "después la CA");
+    }
+
+    /// El `.p12` trae la CA delante del leaf en los CertBag: sin reordenar,
+    /// `certs[0]` sería la CA y `import_smime_identity` validaría la dirección
+    /// contra el cert equivocado y `detached_signature` embebería ése como firmante.
+    #[test]
+    fn una_ca_delante_del_leaf_en_el_p12_no_le_gana_el_primer_lugar_rsa() {
+        let key = parse_pkcs12(PBES2_P12, PASSWORD).unwrap().private_key_pkcs8;
+        let (leaf, ca) = (cert_der(), pem_a_der(OTRO_CERT_PEM));
+        let p12 = p12_con_certs_en_orden(&key, &[ca.clone(), leaf.clone()]);
+        // Precondición: el orden del archivo es el malo, o la prueba no prueba nada.
+        assert_ne!(cert_spki(&ca), private_key_spki(&key));
+        assert_leaf_primero(&p12, &leaf, &ca);
+    }
+
+    /// Lo mismo con una clave ECDSA P-256 (la otra rama de `private_key_spki`).
+    #[test]
+    fn una_ca_delante_del_leaf_en_el_p12_no_le_gana_el_primer_lugar_ecdsa() {
+        let key = parse_pkcs12(EC_P12, PASSWORD).unwrap().private_key_pkcs8;
+        let (leaf, ca) = (pem_a_der(EC_CERT_PEM), pem_a_der(OTRO_CERT_PEM));
+        let p12 = p12_con_certs_en_orden(&key, &[ca.clone(), leaf.clone()]);
+        assert_leaf_primero(&p12, &leaf, &ca);
+    }
+
+    /// Si el leaf ya venía primero, el orden no se toca.
+    #[test]
+    fn un_p12_con_el_leaf_primero_conserva_el_orden() {
+        let key = parse_pkcs12(PBES2_P12, PASSWORD).unwrap().private_key_pkcs8;
+        let (leaf, ca) = (cert_der(), pem_a_der(OTRO_CERT_PEM));
+        let p12 = p12_con_certs_en_orden(&key, &[leaf.clone(), ca.clone()]);
+        assert_leaf_primero(&p12, &leaf, &ca);
+    }
+
+    /// Una clave que no corresponde a ningún certificado del `.p12` no es una
+    /// identidad: error, y no «el primer cert que haya».
+    #[test]
+    fn un_p12_cuya_clave_no_es_de_ningun_certificado_es_malformado() {
+        let key = parse_pkcs12(PBES2_P12, PASSWORD).unwrap().private_key_pkcs8;
+        let ajenos = [pem_a_der(OTRO_CERT_PEM), pem_a_der(EC_CERT_PEM)];
+        let p12 = p12_con_certs_en_orden(&key, &ajenos);
+        let r = parse_pkcs12(&p12, PASSWORD);
+        assert!(
+            matches!(&r, Err(SmimeError::MalformedPkcs12(d)) if d.contains("corresponde")),
+            "dio {r:?}"
+        );
+    }
+
+    /// Clave privada Ed25519 en PKCS#8 DER: el ejemplo de la RFC 8410 §10.3
+    /// (`OneAsymmetricKey` sin clave pública). No es de nadie.
+    const ED25519_PKCS8_RFC8410: [u8; 48] = [
+        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
+        0x20, 0xd4, 0xee, 0x72, 0xdb, 0xf9, 0x13, 0x58, 0x4a, 0xd5, 0xb6, 0xd8, 0xf1, 0xf7, 0x69,
+        0xf8, 0xad, 0x3a, 0xfe, 0x7c, 0x28, 0xcb, 0xf1, 0xd4, 0xfb, 0xe0, 0x97, 0xa8, 0x8f, 0x44,
+        0x75, 0x58, 0x42,
+    ];
+
+    /// Una clave que ni es RSA ni ECDSA P-256 no se puede firmar ni se puede
+    /// ligar a un cert: sin su SPKI, una CA delante con la dirección pasaría el
+    /// control de `import_smime_identity` (que sólo mira `certs[0]`) y se
+    /// guardaría una identidad que nunca firma. Se rechaza en el import.
+    #[test]
+    fn una_clave_de_tipo_no_soportado_se_rechaza_en_el_import() {
+        assert_eq!(private_key_spki(&ED25519_PKCS8_RFC8410), None);
+        let certs = [pem_a_der(OTRO_CERT_PEM), cert_der()];
+        let p12 = p12_con_certs_en_orden(&ED25519_PKCS8_RFC8410, &certs);
+        let r = parse_pkcs12(&p12, PASSWORD);
+        assert!(
+            matches!(&r, Err(SmimeError::MalformedPkcs12(d)) if d.contains("no soportado")),
             "dio {r:?}"
         );
     }
