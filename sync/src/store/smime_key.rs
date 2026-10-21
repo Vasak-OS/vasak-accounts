@@ -1165,6 +1165,31 @@ mod tests {
         );
     }
 
+    /// Clave privada Ed25519 en PKCS#8 DER: el ejemplo de la RFC 8410 §10.3
+    /// (`OneAsymmetricKey` sin clave pública). No es de nadie.
+    const ED25519_PKCS8_RFC8410: [u8; 48] = [
+        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
+        0x20, 0xd4, 0xee, 0x72, 0xdb, 0xf9, 0x13, 0x58, 0x4a, 0xd5, 0xb6, 0xd8, 0xf1, 0xf7, 0x69,
+        0xf8, 0xad, 0x3a, 0xfe, 0x7c, 0x28, 0xcb, 0xf1, 0xd4, 0xfb, 0xe0, 0x97, 0xa8, 0x8f, 0x44,
+        0x75, 0x58, 0x42,
+    ];
+
+    /// Una clave que ni es RSA ni ECDSA P-256 no se puede firmar ni se puede
+    /// ligar a un cert: sin su SPKI, una CA delante con la dirección pasaría el
+    /// control de `import_smime_identity` (que sólo mira `certs[0]`) y se
+    /// guardaría una identidad que nunca firma. Se rechaza en el import.
+    #[test]
+    fn una_clave_de_tipo_no_soportado_se_rechaza_en_el_import() {
+        assert_eq!(private_key_spki(&ED25519_PKCS8_RFC8410), None);
+        let certs = [pem_a_der(OTRO_CERT_PEM), cert_der()];
+        let p12 = p12_con_certs_en_orden(&ED25519_PKCS8_RFC8410, &certs);
+        let r = parse_pkcs12(&p12, PASSWORD);
+        assert!(
+            matches!(&r, Err(SmimeError::MalformedPkcs12(d)) if d.contains("no soportado")),
+            "dio {r:?}"
+        );
+    }
+
     // ── Keybag heredado primero y en claro ────────────────────────────
 
     /// `.p12` con sólo la clave, en un keybag con `pbeWithSHA1And3-KeyTripleDES`
