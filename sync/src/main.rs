@@ -1996,25 +1996,39 @@ async fn reconcile_tasks(
     Ok(accounts)
 }
 
-/// Que este proceso no deje volcados de memoria ni se deje leer con `ptrace`.
+/// Que este proceso no deje volcados de memoria.
 ///
 /// En la memoria del sync están la clave de cada base abierta —la tiene
 /// SQLCipher mientras la base está abierta— y los tokens de las cuentas. Un
 /// volcado por un cuelgue los escribiría sin cifrar en
 /// `/var/lib/systemd/coredump`; la unidad ya lo corta con `LimitCORE=0`, y esto
-/// lo corta también cuando el proceso se lanza a mano. `PR_SET_DUMPABLE` en cero
-/// hace además que otro proceso de la misma persona no pueda leerle la memoria
-/// con `ptrace` ni por `/proc/<pid>/mem`. No es una frontera —ese proceso le
-/// puede pedir la clave al llavero directamente, ver `store/mod.rs`—, pero la
-/// clave deja de estar a un `gdb -p` de distancia.
+/// lo corta también cuando el proceso se lanza a mano (`systemd-coredump`
+/// respeta el límite del proceso que se cayó).
 ///
-/// **Lo que sigue funcionando:** el servicio de cuentas y `vasak-permissions`
-/// corren como root con `CAP_SYS_PTRACE` y leen `/proc/<pid>/exe` y
-/// `/proc/<pid>/stat` de este proceso para identificarlo. Si alguna de las dos
-/// unidades suma un `CapabilityBoundingSet` sin esa capacidad, el sync deja de
-/// poder identificarse y se queda sin tokens.
+/// **No con `PR_SET_DUMPABLE`**, que era lo de antes: un proceso no volcable no
+/// deja leer su `/proc/<pid>/exe` a otro de la misma persona sin capacidades, y
+/// así es como la puerta de vasak-keyring reconoce al sync para darle la clave
+/// del almacén (`vasak-accounts#131`). Lo otro que daba —que otro proceso de la
+/// persona no le leyera la memoria con `ptrace`— lo da yama con
+/// `ptrace_scope=1` (el núcleo de Arch lo trae así y VasakOS lo fija en
+/// `vasak-desktop-settings`), salvo para los ancestros: el gestor de usuario o la
+/// terminal que lo lanzó. Y no era una frontera: la misma persona controla esos
+/// ancestros y puede arrancar el binario de verdad bajo un depurador.
+///
+/// **Lo que tiene que seguir así:** el servicio de cuentas y `vasak-permissions`
+/// corren como root y leen `/proc/<pid>/exe` y `/proc/<pid>/stat` de este
+/// proceso para identificarlo; vasak-keyring lo lee como la misma persona y sin
+/// capacidades. Si algo vuelve a marcarlo no volcable, el sync deja de poder
+/// identificarse ante el llavero y se queda sin la clave.
 fn forbid_memory_dumps() -> std::io::Result<()> {
-    rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)?;
+    use rustix::process::{setrlimit, Resource, Rlimit};
+    setrlimit(
+        Resource::Core,
+        Rlimit {
+            current: Some(0),
+            maximum: Some(0),
+        },
+    )?;
     Ok(())
 }
 
@@ -2361,15 +2375,87 @@ mod tests {
         assert_eq!(reply, "entero");
     }
 
-    /// Después de arrancar, el proceso no es volcable. (Deja así al proceso de
-    /// las pruebas, que no pierde nada: sólo sus propios volcados.)
+    /// Después de arrancar, el proceso no deja volcados (límite de core en cero)
+    /// y sigue siendo volcable: si no, la puerta de vasak-keyring no puede leer
+    /// su ejecutable y le niega la clave del almacén (`vasak-accounts#131`).
+    /// (Deja así al proceso de las pruebas, que no pierde nada: sólo sus propios
+    /// volcados.)
     #[test]
-    fn al_arrancar_el_proceso_deja_de_ser_volcable() {
+    fn al_arrancar_el_proceso_no_deja_volcados_y_se_deja_identificar() {
         forbid_memory_dumps().unwrap();
+        let limite = rustix::process::getrlimit(rustix::process::Resource::Core);
+        assert_eq!(limite.current, Some(0));
+        assert_eq!(limite.maximum, Some(0));
         assert_eq!(
             rustix::process::dumpable_behavior().unwrap(),
-            rustix::process::DumpableBehavior::NotDumpable
+            rustix::process::DumpableBehavior::Dumpable
         );
+    }
+
+    /// **El bug de `vasak-accounts#131`.** Otro proceso de la misma persona, sin
+    /// capacidades (como la unidad de usuario de vasak-keyring), tiene que poder
+    /// leer `/proc/<pid>/exe` del proceso que ya arrancó: así lo reconoce la
+    /// puerta del llavero. Con `PR_SET_DUMPABLE` en cero el kernel contesta
+    /// EACCES.
+    ///
+    /// El hijo es este mismo binario de pruebas relanzado sobre
+    /// `ayudante_proceso_arrancado`, que sólo hace algo si `VASAK_AYUDANTE_VOLCADOS`
+    /// está puesta. Con `CAP_SYS_PTRACE` (root, o un contenedor que la conserve)
+    /// el kernel deja leer igual y la prueba no puede fallar: se omite.
+    #[test]
+    fn el_proceso_arrancado_deja_leer_su_exe_a_otro_de_la_misma_persona() {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+
+        let cap_eff = std::fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("CapEff:"))
+            .map(|v| u64::from_str_radix(v.trim(), 16).unwrap())
+            .unwrap();
+        if cap_eff & (1 << 19) != 0 {
+            eprintln!("omitida: con CAP_SYS_PTRACE el kernel deja leer /proc/<pid>/exe igual");
+            return;
+        }
+
+        let mut hijo = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::ayudante_proceso_arrancado",
+                "--nocapture",
+            ])
+            .env("VASAK_AYUDANTE_VOLCADOS", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // El hijo avisa cuando ya corrió `forbid_memory_dumps`; recién ahí se mira.
+        let mut salida = BufReader::new(hijo.stdout.take().unwrap());
+        let mut linea = String::new();
+        while linea.trim() != "LISTO-VOLCADOS" {
+            linea.clear();
+            assert!(
+                salida.read_line(&mut linea).unwrap() > 0,
+                "el hijo terminó sin avisar"
+            );
+        }
+
+        let exe = std::fs::read_link(format!("/proc/{}/exe", hijo.id()));
+
+        drop(hijo.stdin.take()); // el EOF libera al hijo
+        hijo.wait().unwrap();
+        exe.expect("no se puede leer /proc/<pid>/exe del proceso ya arrancado");
+    }
+
+    /// Cuerpo del hijo de la prueba de arriba. Corrida normal: no hace nada.
+    #[test]
+    fn ayudante_proceso_arrancado() {
+        if std::env::var_os("VASAK_AYUDANTE_VOLCADOS").is_none() {
+            return;
+        }
+        forbid_memory_dumps().unwrap();
+        println!("LISTO-VOLCADOS");
+        let _ = std::io::stdin().read_line(&mut String::new());
     }
 
     fn account(id: &str) -> broker::Account {

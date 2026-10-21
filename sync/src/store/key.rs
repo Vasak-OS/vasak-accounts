@@ -18,8 +18,9 @@
 //! trajo del llavero (es de zbus, y vive lo que el mensaje), y la clave de
 //! páginas que SQLCipher tiene mientras la base está abierta. Por eso el
 //! proceso no deja volcados de memoria: `LimitCORE=0` en la unidad y
-//! `PR_SET_DUMPABLE` en cero al arrancar, que además le cierra `ptrace` a los
-//! demás procesos de la persona.
+//! `RLIMIT_CORE` en cero al arrancar. `ptrace` desde los demás procesos de la
+//! persona lo cierra yama (`ptrace_scope=1`), salvo para sus ancestros; ver
+//! `forbid_memory_dumps`.
 //!
 //! ── La regla que no se rompe ────────────────────────────────────────────────
 //!
