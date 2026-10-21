@@ -22,14 +22,39 @@ const LEGACY_P12: &[u8] = include_bytes!("../tests/fixtures/smime/rsa-legacy.p12
 const ONLY_CERTS_P12: &[u8] = include_bytes!("../tests/fixtures/smime/solo-certs.p12");
 const ONLY_KEY_P12: &[u8] = include_bytes!("../tests/fixtures/smime/solo-clave.p12");
 
+/// Un memfd sellado con estos bytes, como lo manda el cliente: `.p12` y
+/// contraseña viajan por descriptor, no como `ay`. Sella contra escritura (y
+/// contra crecer/encoger) para que el servicio lo acepte.
+fn sealed_fd(bytes: &[u8]) -> zbus::zvariant::OwnedFd {
+    use rustix::fs::{fcntl_add_seals, memfd_create, MemfdFlags, SealFlags};
+    use std::io::Write;
+
+    let fd = memfd_create(
+        "smime-prueba",
+        MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
+    )
+    .unwrap();
+    let mut file = std::fs::File::from(fd);
+    file.write_all(bytes).unwrap();
+    fcntl_add_seals(
+        &file,
+        SealFlags::WRITE | SealFlags::SHRINK | SealFlags::GROW | SealFlags::SEAL,
+    )
+    .unwrap();
+    std::os::fd::OwnedFd::from(file).into()
+}
+
 async fn import(
     f: &Fixture,
     account: &str,
     p12: &[u8],
     password: &[u8],
 ) -> zbus::Result<zbus::Message> {
-    f.call("ImportSmimeIdentity", &(account, p12, password))
-        .await
+    f.call(
+        "ImportSmimeIdentity",
+        &(account, sealed_fd(p12), sealed_fd(password)),
+    )
+    .await
 }
 
 /// El nombre corto del error (`WrongPassword`…), sin el prefijo del servicio.
