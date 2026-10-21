@@ -206,21 +206,28 @@ pub fn parse_pkcs12(der: &[u8], password: &[u8]) -> Result<ImportedIdentity, Smi
     // no venir primero (p. ej. un `.p12` con la CA delante). Se adelanta el cert
     // cuya clave pública es la de la clave privada, así `.first()`/`[0]` es
     // siempre el leaf en el resto del pipeline.
-    if let Some(spki) = private_key_spki(&private_key_pkcs8) {
-        match certs
-            .iter()
-            .position(|c| cert_spki(c).as_deref() == Some(spki.as_slice()))
-        {
-            Some(0) => {}
-            Some(i) => {
-                let leaf = certs.remove(i);
-                certs.insert(0, leaf);
-            }
-            None => {
-                return Err(SmimeError::MalformedPkcs12(
-                    "ningún certificado del .p12 corresponde a la clave privada".into(),
-                ))
-            }
+    // Un tipo de clave no soportado (ni RSA ni ECDSA P-256) se rechaza acá en vez
+    // de devolver éxito en silencio: sin su SPKI no se puede verificar cuál cert
+    // es el leaf, y `detached_signature` tampoco podría firmar con esa clave, así
+    // que no es una identidad usable.
+    let spki = private_key_spki(&private_key_pkcs8).ok_or_else(|| {
+        SmimeError::MalformedPkcs12(
+            "tipo de clave del .p12 no soportado (sólo RSA y ECDSA P-256)".into(),
+        )
+    })?;
+    match certs
+        .iter()
+        .position(|c| cert_spki(c).as_deref() == Some(spki.as_slice()))
+    {
+        Some(0) => {}
+        Some(i) => {
+            let leaf = certs.remove(i);
+            certs.insert(0, leaf);
+        }
+        None => {
+            return Err(SmimeError::MalformedPkcs12(
+                "ningún certificado del .p12 corresponde a la clave privada".into(),
+            ))
         }
     }
 
@@ -232,7 +239,7 @@ pub fn parse_pkcs12(der: &[u8], password: &[u8]) -> Result<ImportedIdentity, Smi
 
 /// El SPKI (DER) de la clave pública que corresponde a una clave privada PKCS#8.
 /// Sólo RSA y ECDSA P-256, que son las que el pipeline firma y descifra; otra
-/// clave devuelve `None` y el orden de los certs se deja como vino.
+/// clave devuelve `None`, y el import la rechaza (no es una identidad usable).
 fn private_key_spki(pkcs8_der: &[u8]) -> Option<Vec<u8>> {
     use pkcs8::DecodePrivateKey;
     use spki::EncodePublicKey;
