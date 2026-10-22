@@ -878,6 +878,10 @@ pub(crate) mod fake {
         /// Lo mismo, pero justo antes del próximo `store`: la clave nueva ya
         /// va a parar a la colección nueva.
         pub replace_before_store: Option<String>,
+        /// `(cuenta, hex)`: apenas el próximo `find` de esa cuenta contesta, su
+        /// clave pasa a ser `hex`. Simula que el propio llavero muta la clave de
+        /// la cuenta entre dos lecturas de una misma vuelta.
+        pub swap_key_after_find: Option<(String, String)>,
     }
 
     impl FakeState {
@@ -970,11 +974,22 @@ pub(crate) mod fake {
             if state.malformed.contains(account_id) {
                 return Err(KeyError::Malformed);
             }
-            state
+            let found = state
                 .keys
                 .get(account_id)
                 .map(|hex| StoreKey::from_secret(Zeroizing::new(hex.as_bytes().to_vec())))
-                .transpose()
+                .transpose();
+            // Esta búsqueda ya tomó la clave; si estaba pedida la mutación, la
+            // próxima lectura de la misma vuelta verá otra clave.
+            if state
+                .swap_key_after_find
+                .as_ref()
+                .is_some_and(|(acct, _)| acct == account_id)
+            {
+                let (acct, hex) = state.swap_key_after_find.take().unwrap();
+                state.keys.insert(acct, hex);
+            }
+            found
         }
 
         async fn store(&self, account_id: &str, key: &StoreKey) -> Result<(), KeyError> {
