@@ -1476,18 +1476,27 @@ impl<K: KeySource> StoreManager<K> {
         let recorded = settings.key_collections.get(account_id).map(String::as_str);
         let unrecorded = recorded.is_none();
         let awaiting = recorded == Some(PENDING_ADOPTION);
+        // La colección anotada es una identidad concreta que no es la de la
+        // vuelta: el llavero recreó la colección —otra identidad: ruta, `Created`
+        // y dueño— y puede haber conservado los ítems. Se intenta adoptar: si su
+        // clave sigue en la colección fijada y abre la base, `adopt_collection` la
+        // re-anota, sin rehacer ni perder datos. Si no, no anota nada y la base
+        // queda `moved`, intacta y no disponible, como antes (N5 del #55: una base
+        // `moved` no se rehace en silencio; su clave perdida se sale vaciando).
+        let moved_recorded = recorded.is_some_and(|r| r != PENDING_ADOPTION && r != collection);
         if inner.entry(account_id).store.is_some() {
-            if unrecorded || awaiting {
+            if unrecorded || awaiting || moved_recorded {
                 self.adopt_collection(locations, settings, collection, account_id)
                     .await;
             }
             return;
         }
-        if awaiting {
-            // Cerrada y a la espera de adoptar: se adopta antes de abrir si su
-            // clave está en la colección fijada y la abre. Si no, la marca
-            // hace que `moved` dé que sí, y la base no se toca: ni se busca la
-            // clave ni se rehace.
+        if awaiting || moved_recorded {
+            // Cerrada y a la espera de adoptar —por la marca `PENDING_ADOPTION`, o
+            // porque la colección se recreó con otra identidad—: se adopta antes
+            // de abrir si su clave está en la colección fijada y la abre. Si no,
+            // `moved` da que sí, y la base no se toca: ni se busca la clave ni se
+            // rehace.
             self.adopt_collection(locations, settings, collection, account_id)
                 .await;
         }
@@ -1568,13 +1577,15 @@ impl<K: KeySource> StoreManager<K> {
         }
     }
 
-    /// Una base sin colección anotada —una de antes de anotarlas, abierta— o
-    /// con la marca [`PENDING_ADOPTION`] —la colección cambió en la vuelta en
-    /// que se creó; abierta o cerrada— adopta la de esta vuelta, **si su clave
-    /// está ahí y es la que la abre**: la clave se busca en la colección fijada
-    /// y se prueba contra el archivo. Si no está, o es otra, no se anota nada y
-    /// la base sigue como estaba; nada se borra, y nada se genera: sólo `find`,
-    /// que con el llavero bloqueado es un error y sale.
+    /// Una base sin colección anotada —una de antes de anotarlas, abierta—, con
+    /// la marca [`PENDING_ADOPTION`] —la colección cambió en la vuelta en que se
+    /// creó; abierta o cerrada—, o con una colección anotada que ya no es la de
+    /// la vuelta —el llavero recreó la colección con otra identidad conservando
+    /// los ítems— adopta la de esta vuelta, **si su clave está ahí y es la que la
+    /// abre**: la clave se busca en la colección fijada y se prueba contra el
+    /// archivo. Si no está, o es otra, no se anota nada y la base sigue como
+    /// estaba; nada se borra, y nada se genera: sólo `find`, que con el llavero
+    /// bloqueado es un error y sale.
     async fn adopt_collection(
         &self,
         locations: &Locations,
@@ -2752,6 +2763,118 @@ mod tests {
                 .map(String::as_str),
             Some("coleccion-a")
         );
+    }
+
+    /// El llavero recreó la colección —otra identidad— y conservó los ítems: la
+    /// base, cerrada, tiene anotada una identidad concreta que ya no es la de la
+    /// vuelta, pero su clave está en la colección actual y abre el archivo.
+    /// Adopta la actual y abre, sin rehacer. Antes quedaba `Unavailable` para
+    /// siempre (#137).
+    #[tokio::test]
+    async fn una_base_cerrada_con_la_coleccion_recreada_adopta_la_actual_y_abre() {
+        let f = Fixture::new("coleccion-recreada-cerrada");
+        f.list(listing(&["cuenta"])).await;
+        let key = f.key("cuenta").unwrap();
+        let mut settings = f.settings();
+        settings
+            .key_collections
+            .insert("cuenta".into(), "coleccion-vieja".into());
+        settings.save(&f.locations().settings).unwrap();
+
+        f.keys.state().locked = true;
+        f.manager.refresh().await;
+        assert!(!f.manager.is_open("cuenta").await);
+        f.keys.state().locked = false;
+        f.manager.refresh().await;
+
+        assert_eq!(
+            f.state("cuenta").await,
+            StoreState::Open,
+            "la base con la colección recreada y su clave presente no se adoptó"
+        );
+        assert_eq!(
+            f.settings()
+                .key_collections
+                .get("cuenta")
+                .map(String::as_str),
+            Some("coleccion-a")
+        );
+        assert!(log_lines_with(&f, "cuenta", &key).is_empty(), "se rehízo");
+        assert_eq!(f.keys.state().stored.len(), 1, "se generó otra clave");
+        assert!(f.keys.state().deleted.is_empty(), "se borró una clave");
+    }
+
+    /// Lo mismo con la base abierta: la identidad anotada ya no es la de la
+    /// vuelta y la clave abre el archivo, así que se re-anota sin cerrarla.
+    #[tokio::test]
+    async fn una_base_abierta_con_la_coleccion_recreada_adopta_la_actual() {
+        let f = Fixture::new("coleccion-recreada-abierta");
+        f.list(listing(&["cuenta"])).await;
+        let mut settings = f.settings();
+        settings
+            .key_collections
+            .insert("cuenta".into(), "coleccion-vieja".into());
+        settings.save(&f.locations().settings).unwrap();
+
+        f.manager.refresh().await;
+
+        assert!(f.manager.is_open("cuenta").await, "la base sigue abierta");
+        assert_eq!(
+            f.settings()
+                .key_collections
+                .get("cuenta")
+                .map(String::as_str),
+            Some("coleccion-a")
+        );
+    }
+
+    /// **N5** con la adopción ampliada a las bases `moved`: si la clave no está
+    /// en la colección actual, no hay nada que adoptar y la base **no se rehace**
+    /// en silencio. Queda `Unavailable`, el archivo intacto, la identidad
+    /// anotada como estaba, y sin clave nueva ni borrada.
+    #[tokio::test]
+    async fn una_base_con_la_coleccion_recreada_y_sin_su_clave_no_se_rehace() {
+        let f = Fixture::new("coleccion-recreada-sin-clave");
+        f.list(listing(&["cuenta"])).await;
+        let key = f.key("cuenta").unwrap();
+        let mut settings = f.settings();
+        settings
+            .key_collections
+            .insert("cuenta".into(), "coleccion-vieja".into());
+        settings.save(&f.locations().settings).unwrap();
+
+        f.keys.state().locked = true;
+        f.manager.refresh().await;
+        let bytes_before = std::fs::read(&f.paths("cuenta").db).unwrap();
+        {
+            let mut state = f.keys.state();
+            state.locked = false;
+            state.keys.clear();
+        }
+        f.manager.refresh().await;
+
+        assert_eq!(f.state("cuenta").await, StoreState::Unavailable);
+        assert!(!f.manager.is_open("cuenta").await);
+        assert_eq!(
+            f.settings()
+                .key_collections
+                .get("cuenta")
+                .map(String::as_str),
+            Some("coleccion-vieja"),
+            "se anotó una colección donde la clave no está"
+        );
+        assert_eq!(
+            std::fs::read(&f.paths("cuenta").db).unwrap(),
+            bytes_before,
+            "se tocó el archivo de la base"
+        );
+        assert!(
+            Store::open(&f.paths("cuenta"), &key).is_ok(),
+            "la clave vieja ya no abre la base"
+        );
+        assert!(log_lines_with(&f, "cuenta", &key).is_empty(), "se rehízo");
+        assert_eq!(f.keys.state().stored.len(), 1, "se generó otra clave");
+        assert!(f.keys.state().deleted.is_empty(), "se borró una clave");
     }
 
     /// Si el llavero se bloquea entre la búsqueda y la creación, el vacío de la
