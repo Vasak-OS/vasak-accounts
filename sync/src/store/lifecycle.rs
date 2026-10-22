@@ -1491,22 +1491,24 @@ impl<K: KeySource> StoreManager<K> {
             }
             return;
         }
-        if awaiting || moved_recorded {
+        let adopted_key = if awaiting || moved_recorded {
             // Cerrada y a la espera de adoptar —por la marca `PENDING_ADOPTION`, o
             // porque la colección se recreó con otra identidad—: se adopta antes
             // de abrir si su clave está en la colección fijada y la abre. Si no,
             // `moved` da que sí, y la base no se toca: ni se busca la clave ni se
-            // rehace.
+            // rehace. La clave que adoptó se pasa a `bring_up` para abrir con ella.
             self.adopt_collection(locations, settings, collection, account_id)
-                .await;
-        }
+                .await
+        } else {
+            None
+        };
 
         let moved = settings
             .key_collections
             .get(account_id)
             .is_some_and(|recorded| recorded != collection);
         let result = self
-            .bring_up(&locations.stores, account_id, pending, moved)
+            .bring_up(&locations.stores, account_id, pending, moved, adopted_key)
             .await;
         if result.is_ok()
             && settings.key_collections.get(account_id).map(String::as_str) != Some(collection)
@@ -1586,24 +1588,37 @@ impl<K: KeySource> StoreManager<K> {
     /// archivo. Si no está, o es otra, no se anota nada y la base sigue como
     /// estaba; nada se borra, y nada se genera: sólo `find`, que con el llavero
     /// bloqueado es un error y sale.
+    ///
+    /// Devuelve la clave verificada cuando adopta, para que [`Self::bring_up`]
+    /// abra con **esa** y no vuelva a buscarla: si el llavero la cambia entre
+    /// esta verificación y la apertura, una clave distinta que falla arrastraría
+    /// la base al rehecho vacío (#139). `None` si no adopta.
     async fn adopt_collection(
         &self,
         locations: &Locations,
         settings: &mut StoreSettings,
         collection: &str,
         account_id: &str,
-    ) {
+    ) -> Option<StoreKey> {
         let Ok(Some(key)) = self.keys.find(account_id).await else {
-            return;
+            return None;
         };
         let Ok(paths) = StorePaths::new(&locations.stores, account_id) else {
-            return;
+            return None;
         };
-        let opens = blocking(move || Store::key_opens(&paths, &key))
-            .await
-            .unwrap_or(false);
+        // El `blocking` consume la clave; se la devuelve junto con el resultado
+        // para no volver a buscarla al abrir. Si la tarea del disco se cae, no
+        // hay clave ni adopción.
+        let Ok((key, opens)) = blocking(move || {
+            let opens = Store::key_opens(&paths, &key);
+            (key, opens)
+        })
+        .await
+        else {
+            return None;
+        };
         if !opens || !matches!(self.keys.pinned_is_unchanged().await, Ok(true)) {
-            return;
+            return None;
         }
         settings
             .key_collections
@@ -1611,6 +1626,7 @@ impl<K: KeySource> StoreManager<K> {
         if let Err(e) = settings.save(&locations.settings) {
             tracing::warn!("{e}");
         }
+        Some(key)
     }
 
     /// Las filas 2 a 5 de la tabla. Devuelve la base abierta y si se rehízo.
@@ -1624,16 +1640,36 @@ impl<K: KeySource> StoreManager<K> {
     /// colección que la de esta vuelta. Si hay base, **no se toca**: ni se
     /// busca la clave —lo que haya en esta colección no es la suya—, ni se
     /// rehace. Sin base no hay nada que perder, y se sigue como siempre.
+    ///
+    /// Con `adopted_key`, [`Self::adopt_collection`] ya verificó que esa clave
+    /// abre la base en esta misma vuelta: se abre con ella y **no se vuelve a
+    /// buscar**, para que un cambio de clave del llavero entre la adopción y la
+    /// apertura no empuje la base al rehecho vacío (#139). Si aun así no abre, es
+    /// esa misma ventana: no se rehace, queda no disponible y se reintenta en la
+    /// vuelta siguiente.
     async fn bring_up(
         &self,
         root: &Path,
         account_id: &str,
         discard_found_key: bool,
         collection_moved: bool,
+        adopted_key: Option<StoreKey>,
     ) -> Result<(Store, bool), StoreError> {
         let paths = StorePaths::new(root, account_id)?;
         if collection_moved && paths.db_exists()? {
             return Err(StoreError::CollectionChanged);
+        }
+
+        if let Some(key) = adopted_key {
+            let (_key, opened) = blocking({
+                let paths = paths.clone();
+                move || {
+                    let opened = Store::open(&paths, &key);
+                    (key, opened)
+                }
+            })
+            .await?;
+            return opened.map(|store| (store, false));
         }
 
         let key = if discard_found_key {
@@ -2875,6 +2911,65 @@ mod tests {
         assert!(log_lines_with(&f, "cuenta", &key).is_empty(), "se rehízo");
         assert_eq!(f.keys.state().stored.len(), 1, "se generó otra clave");
         assert!(f.keys.state().deleted.is_empty(), "se borró una clave");
+    }
+
+    /// #139: entre que `adopt_collection` verifica que la clave abre la base y
+    /// que `bring_up` la abre, el propio llavero muta la clave de la cuenta.
+    /// Antes `bring_up` volvía a buscar, recibía la clave nueva, fallaba
+    /// `WrongKey` y —ya `moved = false` por la adopción— rehacía la base vacía:
+    /// pérdida silenciosa de la caché. Con la clave verificada pasada a
+    /// `bring_up`, abre con ella y la base queda intacta.
+    #[tokio::test]
+    async fn una_clave_que_cambia_entre_adoptar_y_abrir_no_rehace_la_base() {
+        let f = Fixture::new("adoptar-clave-cambiada");
+        f.list(listing(&["cuenta"])).await;
+        let key = f.key("cuenta").unwrap();
+        // Anotada en otra identidad: la próxima vuelta la adopta.
+        let mut settings = f.settings();
+        settings
+            .key_collections
+            .insert("cuenta".into(), "coleccion-vieja".into());
+        settings.save(&f.locations().settings).unwrap();
+
+        // Se bloquea para cerrar la base; así la vuelta siguiente pasa por
+        // `adopt_collection` y `bring_up`, no por el camino de base ya abierta.
+        f.keys.state().locked = true;
+        f.manager.refresh().await;
+        let bytes_before = std::fs::read(&f.paths("cuenta").db).unwrap();
+
+        // Al desbloquear: la clave que abre la base sigue ahí para que la
+        // adopción la verifique, pero apenas esa búsqueda contesta, el llavero
+        // la cambia por otra que no abre.
+        {
+            let mut state = f.keys.state();
+            state.locked = false;
+            let other = fixed_key(b'b').hex().to_string();
+            state.swap_key_after_find = Some(("cuenta".into(), other));
+        }
+        f.manager.refresh().await;
+
+        assert_eq!(
+            f.state("cuenta").await,
+            StoreState::Open,
+            "se abrió con la clave ya verificada, no se rehízo"
+        );
+        assert_eq!(
+            std::fs::read(&f.paths("cuenta").db).unwrap(),
+            bytes_before,
+            "el archivo de la base no se tocó"
+        );
+        assert!(
+            Store::open(&f.paths("cuenta"), &key).is_ok(),
+            "la base sigue abriéndose con su clave original"
+        );
+        assert_eq!(
+            f.settings()
+                .key_collections
+                .get("cuenta")
+                .map(String::as_str),
+            Some("coleccion-a"),
+            "se adoptó la colección actual"
+        );
     }
 
     /// Si el llavero se bloquea entre la búsqueda y la creación, el vacío de la
