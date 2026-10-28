@@ -2181,4 +2181,165 @@ mod tests {
             server.pedidos.lock().unwrap()
         );
     }
+
+    fn cuenta_con(caps: &[(CapabilityType, &[&str])]) -> Account {
+        let capabilities = caps
+            .iter()
+            .map(|(cap, scopes)| (*cap, cap_config(1, scopes, None)))
+            .collect();
+        Account::new("Cuenta", "microsoft", capabilities)
+    }
+
+    const CORREO: &[&str] = &[
+        "offline_access",
+        "https://outlook.office.com/IMAP.AccessAsUser.All",
+    ];
+    const GRAPH: &[&str] = &[
+        "offline_access",
+        "https://graph.microsoft.com/Calendars.Read",
+    ];
+
+    /// `vasak-accounts#106`: el `access` del canje sólo es huérfano en una cuenta
+    /// multi-recurso donde ninguna capacidad resuelve a `None`.
+    #[test]
+    fn el_access_del_canje_es_huerfano_solo_en_multi_recurso_sin_none() {
+        // Dos recursos, todos con host: huérfano.
+        let multi = cuenta_con(&[
+            (CapabilityType::Email, CORREO),
+            (CapabilityType::Calendar, GRAPH),
+        ]);
+        assert!(resource_plan(&multi, &CapabilityType::Email).orphan_access_removable);
+        assert!(resource_plan(&multi, &CapabilityType::Calendar).orphan_access_removable);
+
+        // Dos recursos y una capacidad sin host (`offline_access` solo): su
+        // `access_key` es `access`, ese token se sirve y no se puede borrar.
+        let con_none = cuenta_con(&[
+            (CapabilityType::Email, CORREO),
+            (CapabilityType::Calendar, GRAPH),
+            (CapabilityType::Contacts, &["offline_access", "openid"]),
+        ]);
+        for cap in [
+            CapabilityType::Email,
+            CapabilityType::Calendar,
+            CapabilityType::Contacts,
+        ] {
+            assert!(
+                !resource_plan(&con_none, &cap).orphan_access_removable,
+                "borraría el access que sirve {cap:?}"
+            );
+        }
+
+        // Un solo recurso: el `access` es el token de la cuenta.
+        let single = cuenta_con(&[
+            (CapabilityType::Calendar, GRAPH),
+            (CapabilityType::Contacts, GRAPH),
+        ]);
+        assert!(!resource_plan(&single, &CapabilityType::Calendar).orphan_access_removable);
+
+        // Sin alcances (contraseña de aplicación): tampoco.
+        let sin_alcances = cuenta_con(&[(CapabilityType::Calendar, &[])]);
+        assert!(!resource_plan(&sin_alcances, &CapabilityType::Calendar).orphan_access_removable);
+    }
+
+    /// Persiste un token fresco para `capability` de una cuenta sembrada con
+    /// `access = canje`, y devuelve el id para mirar el almacén.
+    fn persistir_con_canje(
+        uid: u32,
+        caps: &[(CapabilityType, &[&str])],
+        capability: CapabilityType,
+    ) -> String {
+        let id = seed(uid, cuenta_con(caps), "rt-0");
+        SecretStore::store_secret(uid, &id, "access", "token-del-canje").unwrap();
+        let (cuenta, _, plan) = cargar_plan(uid, &id, &capability).unwrap();
+        let frescos = FreshTokens {
+            access: "token-fresco".into(),
+            refresh: Some("rt-1".into()),
+            expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+        };
+        persistir(uid, &cuenta, &plan, &frescos).unwrap();
+        id
+    }
+
+    /// `vasak-accounts#106`: tras guardar el token del recurso, el `access` de
+    /// alcance amplio del canje se borra; el del recurso y el refresh quedan.
+    #[tokio::test]
+    async fn persistir_en_multi_recurso_borra_el_access_huerfano_del_canje() {
+        let _guard = TOKEN_TEST_LOCK.lock().await;
+        let _root = set_test_root();
+        let uid = 900_101;
+
+        let id = persistir_con_canje(
+            uid,
+            &[
+                (CapabilityType::Email, CORREO),
+                (CapabilityType::Calendar, GRAPH),
+            ],
+            CapabilityType::Calendar,
+        );
+
+        assert!(
+            SecretStore::get_secret(uid, &id, "access").is_err(),
+            "el access del canje sigue en disco"
+        );
+        assert_eq!(
+            SecretStore::get_secret(uid, &id, "access:graph.microsoft.com").unwrap(),
+            "token-fresco"
+        );
+        assert_eq!(
+            SecretStore::get_secret(uid, &id, "refresh").unwrap(),
+            "rt-1"
+        );
+    }
+
+    /// Control: en una cuenta de un solo recurso el `access` **es** el token de
+    /// la cuenta y no se toca.
+    #[tokio::test]
+    async fn persistir_en_un_solo_recurso_conserva_el_access() {
+        let _guard = TOKEN_TEST_LOCK.lock().await;
+        let _root = set_test_root();
+        let uid = 900_102;
+
+        let id = persistir_con_canje(
+            uid,
+            &[
+                (CapabilityType::Calendar, GRAPH),
+                (CapabilityType::Contacts, GRAPH),
+            ],
+            CapabilityType::Calendar,
+        );
+
+        assert_eq!(
+            SecretStore::get_secret(uid, &id, "access").unwrap(),
+            "token-fresco"
+        );
+    }
+
+    /// Control: con una capacidad que resuelve a `None`, el `access` es el token
+    /// que se sirve para ella y borrarlo la dejaría sin token.
+    #[tokio::test]
+    async fn persistir_con_una_capacidad_sin_host_conserva_el_access() {
+        let _guard = TOKEN_TEST_LOCK.lock().await;
+        let _root = set_test_root();
+        let uid = 900_103;
+
+        let id = persistir_con_canje(
+            uid,
+            &[
+                (CapabilityType::Email, CORREO),
+                (CapabilityType::Calendar, GRAPH),
+                (CapabilityType::Contacts, &["offline_access"]),
+            ],
+            CapabilityType::Calendar,
+        );
+
+        assert_eq!(
+            SecretStore::get_secret(uid, &id, "access").unwrap(),
+            "token-del-canje",
+            "se borró el access que sirve a la capacidad sin host"
+        );
+        assert_eq!(
+            SecretStore::get_secret(uid, &id, "access:graph.microsoft.com").unwrap(),
+            "token-fresco"
+        );
+    }
 }

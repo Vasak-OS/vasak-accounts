@@ -2290,6 +2290,75 @@ pub(crate) mod tests {
         remove_test_database(&dir);
     }
 
+    /// `vasak-accounts#106`: borrar una clave puntual saca sólo esa y deja las
+    /// demás de la cuenta, y las de otras cuentas, intactas.
+    #[test]
+    fn borrar_una_clave_deja_las_demas_de_la_cuenta() {
+        let dir = temp_dir();
+        SecretStore::store_secret_in(&dir, "acct-1", "access", "canje").unwrap();
+        SecretStore::store_secret_in(&dir, "acct-1", "access:graph.microsoft.com", "graph")
+            .unwrap();
+        SecretStore::store_secret_in(&dir, "acct-1", "refresh", "rt").unwrap();
+        SecretStore::store_secret_in(&dir, "acct-2", "access", "ajeno").unwrap();
+
+        assert!(SecretStore::remove_secret_in(&dir, "acct-1", "access").unwrap());
+
+        assert!(SecretStore::get_secret_in(&dir, "acct-1", "access").is_err());
+        for (cuenta, clave, valor) in [
+            ("acct-1", "access:graph.microsoft.com", "graph"),
+            ("acct-1", "refresh", "rt"),
+            ("acct-2", "access", "ajeno"),
+        ] {
+            assert_eq!(
+                SecretStore::get_secret_in(&dir, cuenta, clave).unwrap(),
+                valor,
+                "se perdió {cuenta}/{clave}"
+            );
+        }
+
+        remove_test_database(&dir);
+    }
+
+    /// Una clave que no está devuelve `false` y no reescribe el archivo: los
+    /// bytes quedan como estaban (escritos a mano, con un formato que el
+    /// serializador del almacén no reproduciría).
+    #[test]
+    fn borrar_una_clave_inexistente_devuelve_false_sin_reescribir() {
+        let dir = temp_dir();
+        SecretStore::store_secret_in(&dir, "acct-1", "refresh", "rt").unwrap();
+        let ruta = dir.join("secrets.json");
+        let a_mano = "{ \"acct-1\" : { \"refresh\" : \"rt\" } }\n";
+        std::fs::write(&ruta, a_mano).unwrap();
+
+        assert!(!SecretStore::remove_secret_in(&dir, "acct-1", "access").unwrap());
+
+        assert_eq!(std::fs::read_to_string(&ruta).unwrap(), a_mano);
+        remove_test_database(&dir);
+    }
+
+    /// Sobre una cuenta que ya no existe es un no-op: no la resucita en el
+    /// archivo ni lo crea si no estaba.
+    #[test]
+    fn borrar_una_clave_de_una_cuenta_inexistente_no_la_crea() {
+        let dir = temp_dir();
+
+        // Sin secrets.json: no se crea.
+        assert!(!SecretStore::remove_secret_in(&dir, "fantasma", "access").unwrap());
+        assert!(!dir.join("secrets.json").exists());
+
+        // Con secrets.json de otra cuenta: la cuenta inexistente no aparece.
+        SecretStore::store_secret_in(&dir, "acct-1", "access", "uno").unwrap();
+        assert!(!SecretStore::remove_secret_in(&dir, "fantasma", "access").unwrap());
+        let crudo = std::fs::read_to_string(dir.join("secrets.json")).unwrap();
+        assert!(!crudo.contains("fantasma"), "{crudo}");
+        assert_eq!(
+            SecretStore::get_secret_in(&dir, "acct-1", "access").unwrap(),
+            "uno"
+        );
+
+        remove_test_database(&dir);
+    }
+
     /// Una base en `dir` con las cuentas dadas, como la deja el demonio.
     fn base_con_cuentas(dir: &Path, cuentas: &[Account]) -> AccountDatabase {
         let mut db = AccountDatabase::in_directory(dir.to_path_buf()).unwrap();
