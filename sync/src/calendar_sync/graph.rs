@@ -662,7 +662,7 @@ impl GraphApiBackend {
         }
 
         if let Some(rrule) = event.recurrence.as_ref().and_then(recurrence_to_rrule) {
-            out.push_str(&format!("RRULE:{rrule}\r\n"));
+            push_folded_line(&mut out, &format!("RRULE:{rrule}"));
         }
 
         if !event.categories.is_empty() {
