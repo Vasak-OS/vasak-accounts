@@ -675,39 +675,53 @@ impl Store {
 /// encabezado `From`, `To` o `Cc`, que puede traer nombres y varias
 /// direcciones, p. ej. `"Ana Pérez <ana@x.com>, Bob <bob@y.com>"`—.
 ///
-/// Compara la dirección entera, no una subcadena: exige que a cada lado del
-/// match haya un **borde** y no otro carácter de dirección, así `ana@x.com` no
-/// empareja con `ana@x.com.ar` (lo que sigue es `.`) ni con `bana@x.com` (lo que
-/// precede es `b`). Esa es la propiedad que cuida la privacidad acá: una
+/// Extrae la addr-spec real de cada entrada y la compara **entera**, no como
+/// subcadena: así `ana@x.com` no empareja con `ana@x.com.ar` ni con `bana@x.com`,
+/// y —lo que importa para la privacidad— un display-name que es una dirección
+/// literal (`"ana@x.com" <evil@z.com>`) no cuenta como esa dirección. Una
 /// aplicación que pide el historial con una persona no termina viendo el de otra
-/// de un dominio parecido.
+/// ni el de quien se disfrazó de ella en el nombre.
 fn header_has_address(field: &str, address: &str) -> bool {
     if address.is_empty() {
         return false;
     }
-    let haystack = field.to_ascii_lowercase();
-    let bytes = haystack.as_bytes();
-    let mut from = 0;
-    while let Some(offset) = haystack[from..].find(address) {
-        let start = from + offset;
-        let end = start + address.len();
-        let before_is_border = start == 0 || !is_address_char(bytes[start - 1] as char);
-        let after_is_border = end == bytes.len() || !is_address_char(bytes[end] as char);
-        if before_is_border && after_is_border {
-            return true;
+    // Los encabezados To/Cc traen varias direcciones separadas por coma (o por
+    // `;`, que algún cliente usa), y un display-name entrecomillado puede contener
+    // una coma (`"Doe, John" <j@x>`): se parte respetando las comillas. Por cada
+    // entrada la addr-spec real la saca `parse_sender` (lo de `<...>`, o el token
+    // pelado si no hay `<>`), que es justamente quien separa nombre de dirección
+    // sin dejarse engañar.
+    let mut start = 0;
+    let mut in_quotes = false;
+    // Una comilla escapada dentro de comillas (`\"`, quoted-pair de RFC 5322) no
+    // abre ni cierra: sin esto, `"a\", ana@x.com, b" <evil@z.com>` partiría el
+    // nombre en la coma y tomaría `ana@x.com` como dirección pelada.
+    let mut escaped = false;
+    for (i, c) in field.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
         }
-        // Un carácter entero, no un byte: `start + 1` caería dentro de uno multibyte.
-        from = start + haystack[start..].chars().next().map_or(1, char::len_utf8);
+        match c {
+            '\\' if in_quotes => escaped = true,
+            '"' => in_quotes = !in_quotes,
+            ',' | ';' if !in_quotes => {
+                if entry_has_address(&field[start..i], address) {
+                    return true;
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
     }
-    false
+    entry_has_address(&field[start..], address)
 }
 
-/// Los caracteres que pueden formar parte de una dirección (`atext` de RFC 5322
-/// más `@` y `.`). Un byte que no es uno de éstos separa una dirección de lo que
-/// la rodea en un encabezado. Un byte no ASCII —una tilde de un nombre— no es
-/// uno de éstos, así que también cuenta como borde, que es lo correcto.
-fn is_address_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || "@.!#$%&'*+-/=?^_`{|}~".contains(c)
+/// Si la única dirección de una entrada de encabezado (un mailbox: nombre
+/// opcional más addr-spec) es `address`, comparada entera e ignorando mayúsculas.
+fn entry_has_address(entry: &str, address: &str) -> bool {
+    let (_, addr) = crate::message::parse_sender(entry.trim());
+    addr.eq_ignore_ascii_case(address)
 }
 
 /// Escapa `%`, `_` y `\` para que viajen como literales en un patrón `LIKE`
@@ -1570,6 +1584,94 @@ mod tests {
         // carácter UTF-8: caería con un panic en el servicio.
         assert!(!header_has_address("xñandu@x.com", "ñandu@x.com"));
         assert!(header_has_address("Ñandú <ñandu@x.com>", "ñandu@x.com"));
+    }
+
+    #[test]
+    fn un_nombre_que_es_una_direccion_no_cuenta_como_esa_direccion() {
+        // El ataque de #127: el remitente se pone de nombre la dirección de otra
+        // persona y escribe desde la suya.
+        let field = "\"ana@x.com\" <evil@z.com>";
+        assert!(
+            !header_has_address(field, "ana@x.com"),
+            "el display-name entrecomillado no es la dirección"
+        );
+        assert!(
+            header_has_address(field, "evil@z.com"),
+            "la dirección real sí"
+        );
+        // Con comillas y sin ellas, y con una coma adentro del nombre.
+        assert!(!header_has_address("ana@x.com <evil@z.com>", "ana@x.com"));
+        assert!(!header_has_address(
+            "\"Doe, ana@x.com\" <evil@z.com>",
+            "ana@x.com"
+        ));
+    }
+
+    #[test]
+    fn una_comilla_escapada_en_el_nombre_no_parte_la_entrada() {
+        // El header trae `\"` literal (quoted-pair): no cierra el nombre, así que
+        // `ana@x.com` sigue siendo parte del display-name.
+        let field = r#""a\", ana@x.com, b" <evil@z.com>"#;
+        assert!(!header_has_address(field, "ana@x.com"));
+        assert!(header_has_address(field, "evil@z.com"));
+    }
+
+    #[test]
+    fn en_una_lista_solo_cuenta_la_direccion_real_de_cada_entrada() {
+        let field = "Ana <ana@x.com>, \"bob@y.com\" <bob@z.com>";
+        assert!(header_has_address(field, "ana@x.com"));
+        assert!(header_has_address(field, "bob@z.com"));
+        assert!(
+            !header_has_address(field, "bob@y.com"),
+            "bob@y.com sólo está en el nombre de la segunda entrada"
+        );
+    }
+
+    #[test]
+    fn el_historial_no_incluye_al_mensaje_que_se_disfraza_con_el_nombre() {
+        let (_t, mut store, inbox, _sent) = store_with_inbox_and_sent();
+        store
+            .apply_messages(
+                vec![
+                    mail(inbox, 1, "Ana <ana@x.com>", "yo@x.com", "", "de ana", 100),
+                    mail(
+                        inbox,
+                        2,
+                        "\"ana@x.com\" <evil@z.com>",
+                        "yo@x.com",
+                        "",
+                        "disfrazado",
+                        200,
+                    ),
+                    mail(
+                        inbox,
+                        3,
+                        "eva@z.com",
+                        "yo@x.com",
+                        "\"ana@x.com\" <evil@z.com>",
+                        "disfrazado en cc",
+                        300,
+                    ),
+                ],
+                inbox,
+            )
+            .unwrap();
+
+        let ana: Vec<String> = store
+            .messages_with("ana@x.com", 50)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.subject)
+            .collect();
+        assert_eq!(ana, vec!["de ana"]);
+
+        let evil: Vec<String> = store
+            .messages_with("evil@z.com", 50)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.subject)
+            .collect();
+        assert_eq!(evil, vec!["disfrazado en cc", "disfrazado"]);
     }
 
     #[test]
