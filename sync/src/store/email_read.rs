@@ -693,8 +693,17 @@ fn header_has_address(field: &str, address: &str) -> bool {
     // sin dejarse engañar.
     let mut start = 0;
     let mut in_quotes = false;
+    // Una comilla escapada dentro de comillas (`\"`, quoted-pair de RFC 5322) no
+    // abre ni cierra: sin esto, `"a\", ana@x.com, b" <evil@z.com>` partiría el
+    // nombre en la coma y tomaría `ana@x.com` como dirección pelada.
+    let mut escaped = false;
     for (i, c) in field.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
         match c {
+            '\\' if in_quotes => escaped = true,
             '"' => in_quotes = !in_quotes,
             ',' | ';' if !in_quotes => {
                 if entry_has_address(&field[start..i], address) {
