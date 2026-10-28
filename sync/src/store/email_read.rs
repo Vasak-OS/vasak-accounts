@@ -1578,6 +1578,85 @@ mod tests {
     }
 
     #[test]
+    fn un_nombre_que_es_una_direccion_no_cuenta_como_esa_direccion() {
+        // El ataque de #127: el remitente se pone de nombre la dirección de otra
+        // persona y escribe desde la suya.
+        let field = "\"ana@x.com\" <evil@z.com>";
+        assert!(
+            !header_has_address(field, "ana@x.com"),
+            "el display-name entrecomillado no es la dirección"
+        );
+        assert!(
+            header_has_address(field, "evil@z.com"),
+            "la dirección real sí"
+        );
+        // Con comillas y sin ellas, y con una coma adentro del nombre.
+        assert!(!header_has_address("ana@x.com <evil@z.com>", "ana@x.com"));
+        assert!(!header_has_address(
+            "\"Doe, ana@x.com\" <evil@z.com>",
+            "ana@x.com"
+        ));
+    }
+
+    #[test]
+    fn en_una_lista_solo_cuenta_la_direccion_real_de_cada_entrada() {
+        let field = "Ana <ana@x.com>, \"bob@y.com\" <bob@z.com>";
+        assert!(header_has_address(field, "ana@x.com"));
+        assert!(header_has_address(field, "bob@z.com"));
+        assert!(
+            !header_has_address(field, "bob@y.com"),
+            "bob@y.com sólo está en el nombre de la segunda entrada"
+        );
+    }
+
+    #[test]
+    fn el_historial_no_incluye_al_mensaje_que_se_disfraza_con_el_nombre() {
+        let (_t, mut store, inbox, _sent) = store_with_inbox_and_sent();
+        store
+            .apply_messages(
+                vec![
+                    mail(inbox, 1, "Ana <ana@x.com>", "yo@x.com", "", "de ana", 100),
+                    mail(
+                        inbox,
+                        2,
+                        "\"ana@x.com\" <evil@z.com>",
+                        "yo@x.com",
+                        "",
+                        "disfrazado",
+                        200,
+                    ),
+                    mail(
+                        inbox,
+                        3,
+                        "eva@z.com",
+                        "yo@x.com",
+                        "\"ana@x.com\" <evil@z.com>",
+                        "disfrazado en cc",
+                        300,
+                    ),
+                ],
+                inbox,
+            )
+            .unwrap();
+
+        let ana: Vec<String> = store
+            .messages_with("ana@x.com", 50)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.subject)
+            .collect();
+        assert_eq!(ana, vec!["de ana"]);
+
+        let evil: Vec<String> = store
+            .messages_with("evil@z.com", 50)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.subject)
+            .collect();
+        assert_eq!(evil, vec!["disfrazado en cc", "disfrazado"]);
+    }
+
+    #[test]
     fn el_historial_junta_recibidos_y_enviados_mas_nuevos_primero_y_sin_vecinos() {
         let (_t, mut store, inbox, sent) = store_with_inbox_and_sent();
         store
