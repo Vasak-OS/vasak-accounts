@@ -113,6 +113,71 @@ fn open_db(uid: u32) -> zbus::fdo::Result<AccountDatabase> {
 /// una cuenta se muriera en una hora.
 const SECRETOS_DE_OAUTH: [&str; 2] = ["refresh", "client_secret"];
 
+/// Las claves de secreto que no pueden aparecer dentro de la **configuración** de
+/// una capacidad.
+///
+/// Simétrico a [`SECRETOS_DE_OAUTH`], pero del otro lado: `GetAccountData`
+/// devuelve el config tal cual a cualquier aplicación con permiso de la
+/// capacidad, así que un secreto escrito ahí —una `ldap_password`, por ejemplo—
+/// quedaría a la vista. Las contraseñas viajan por `secrets_json` bajo la clave
+/// `access` y terminan cifradas en `vasak-keyring`, nunca en el config. Para LDAP
+/// pre-provisionado la contraseña la pone el catálogo de root, no el llamante.
+const SECRETOS_EN_CONFIG: [&str; 1] = ["ldap_password"];
+
+/// Rechaza un secreto escrito dentro de la configuración de una capacidad.
+///
+/// Simétrico al guard de [`SECRETOS_DE_OAUTH`]: un secreto no puede ir en la
+/// configuración, que `GetAccountData` devuelve a cualquier app con permiso. Las
+/// contraseñas viajan por `secrets_json` y se cifran en el llavero.
+fn reject_secrets_in_config(
+    capabilities: &HashMap<CapabilityType, serde_json::Value>,
+) -> zbus::fdo::Result<()> {
+    for config in capabilities.values() {
+        if let Some(obj) = config.as_object() {
+            for prohibida in &SECRETOS_EN_CONFIG {
+                if obj.contains_key(*prohibida) {
+                    return Err(FdoError::InvalidArgs(format!(
+                        "'{prohibida}' no puede ir en la configuración: \
+                         GetAccountData la devuelve a cualquier app con permiso. \
+                         La contraseña viaja en secrets_json bajo 'access' y \
+                         queda cifrada en el llavero"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// LDAP pre-provisionado: la contraseña del bind vive en el catálogo de root
+/// (`ldap_password`), que la pantalla no puede leer para mandarla en
+/// `secrets_json`. Si la cuenta es de un proveedor LDAP del catálogo con
+/// contraseña y el llamante no trajo una (`trajo_access`), se copia al llavero
+/// bajo la clave `access` —donde el sync la busca—, o la cuenta nunca
+/// sincronizaría («la contraseña guardada está vacía»). Devuelve si migró.
+fn migrate_ldap_secret(
+    directory: &std::path::Path,
+    account_id: &str,
+    provider: Option<&providers::Provider>,
+    trajo_access: bool,
+) -> Result<bool, storage::StorageError> {
+    if trajo_access {
+        return Ok(false);
+    }
+    let Some(proveedor) = provider.filter(|p| p.kind == providers::ProviderKind::Ldap) else {
+        return Ok(false);
+    };
+    let Some(clave) = proveedor
+        .ldap_password
+        .as_deref()
+        .filter(|c| !c.trim().is_empty())
+    else {
+        return Ok(false);
+    };
+    storage::SecretStore::store_secret_in(directory, account_id, "access", clave)?;
+    Ok(true)
+}
+
 // ---------------------------------------------------------------------------
 // Helper: extrae el PID del llamante desde la cabecera D-Bus
 // ---------------------------------------------------------------------------
@@ -822,6 +887,12 @@ impl AccountManager {
             }
         }
 
+        reject_secrets_in_config(&capabilities)?;
+
+        // Si el llamante ya trae la contraseña (alta manual, «otro servidor»), no
+        // hay nada que migrar del catálogo.
+        let trajo_access = secrets.contains_key("access");
+
         let account_id = self
             .con_candado(uid, || async {
                 let mut db = open_db(uid)?;
@@ -835,6 +906,21 @@ impl AccountManager {
                         |e| FdoError::Failed(format!("Error al guardar el secreto: {e}")),
                     )?;
                 }
+
+                let proveedor = if trajo_access {
+                    None
+                } else {
+                    providers::load_for(uid)
+                        .ok()
+                        .and_then(|c| c.get(&provider_type).cloned())
+                };
+                migrate_ldap_secret(
+                    &storage::AccountDatabase::directory_for(uid),
+                    &account_id,
+                    proveedor.as_ref(),
+                    trajo_access,
+                )
+                .map_err(|e| FdoError::Failed(format!("Error al guardar el secreto: {e}")))?;
                 Ok::<_, FdoError>(account_id)
             })
             .await?;
@@ -1870,6 +1956,138 @@ mod tests {
         assert_eq!(credenciales["google"].client_id, "id-1");
         assert_eq!(credenciales["microsoft"].client_id, "id-2");
 
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    // ---------------------------------------------------------------------------
+    // Endurecimiento de LDAP (#113): secretos en la configuración y migración
+    // ---------------------------------------------------------------------------
+
+    /// **F2.** `GetAccountData` devuelve el config tal cual a cualquier app con
+    /// permiso, así que una `ldap_password` ahí quedaría a la vista: el alta se
+    /// rechaza con `InvalidArgs`, y como el guard corre antes de abrir la base no
+    /// queda nada registrado ni nada que `GetAccountData` pueda devolver.
+    #[test]
+    fn una_ldap_password_en_la_configuracion_se_rechaza() {
+        let capabilities = HashMap::from([(
+            CapabilityType::Contacts,
+            serde_json::json!({"ldap_url": "ldaps://ad.ejemplo.com", "ldap_password": "x"}),
+        )]);
+
+        let error = reject_secrets_in_config(&capabilities).unwrap_err();
+
+        match error {
+            FdoError::InvalidArgs(mensaje) => {
+                assert!(mensaje.contains("ldap_password"), "{mensaje}");
+                assert!(mensaje.contains("secrets_json"), "{mensaje}");
+            }
+            otro => panic!("tenía que ser InvalidArgs, fue {otro:?}"),
+        }
+    }
+
+    /// El secreto se rechaza aunque venga en *otra* capacidad que la primera, y
+    /// una configuración sin secretos pasa: el guard no frena altas legítimas.
+    #[test]
+    fn el_guard_de_secretos_mira_todas_las_capacidades_y_deja_pasar_lo_limpio() {
+        let limpia = HashMap::from([
+            (
+                CapabilityType::Contacts,
+                serde_json::json!({"ldap_url": "ldaps://ad.ejemplo.com"}),
+            ),
+            (CapabilityType::Email, serde_json::json!({})),
+        ]);
+        assert!(reject_secrets_in_config(&limpia).is_ok());
+
+        let con_secreto = HashMap::from([
+            (CapabilityType::Email, serde_json::json!({})),
+            (
+                CapabilityType::Contacts,
+                serde_json::json!({"ldap_password": "x"}),
+            ),
+        ]);
+        assert!(matches!(
+            reject_secrets_in_config(&con_secreto),
+            Err(FdoError::InvalidArgs(_))
+        ));
+    }
+
+    fn proveedor_ldap(extra: &str) -> providers::Provider {
+        toml::from_str(&format!(
+            r#"
+                id = "ad-corp"
+                display_name = "AD corporativo"
+                kind = "ldap"
+                {extra}
+            "#
+        ))
+        .unwrap()
+    }
+
+    /// **Migración.** Un LDAP pre-provisionado (catálogo con `ldap_password`) y
+    /// un alta sin `access`: la contraseña del catálogo queda en el llavero bajo
+    /// `access`, que es donde el sync la busca. Sin la migración la cuenta nunca
+    /// sincronizaría («la contraseña guardada está vacía»).
+    #[test]
+    fn un_ldap_preprovisionado_sin_access_copia_la_clave_del_catalogo() {
+        let dir = dir_de_prueba();
+        let proveedor = proveedor_ldap(r#"ldap_password = "la-del-catalogo""#);
+
+        let migro = migrate_ldap_secret(&dir, "cuenta-1", Some(&proveedor), false).unwrap();
+
+        assert!(migro);
+        assert_eq!(
+            storage::SecretStore::get_secret_in(&dir, "cuenta-1", "access").unwrap(),
+            "la-del-catalogo"
+        );
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// Control: un alta manual que **sí** trae `access` no se pisa con la del
+    /// catálogo, aunque el proveedor la tenga.
+    #[test]
+    fn un_alta_con_access_no_se_pisa_con_la_clave_del_catalogo() {
+        let dir = dir_de_prueba();
+        let proveedor = proveedor_ldap(r#"ldap_password = "la-del-catalogo""#);
+        storage::SecretStore::store_secret_in(&dir, "cuenta-1", "access", "la-que-escribio")
+            .unwrap();
+
+        let migro = migrate_ldap_secret(&dir, "cuenta-1", Some(&proveedor), true).unwrap();
+
+        assert!(!migro);
+        assert_eq!(
+            storage::SecretStore::get_secret_in(&dir, "cuenta-1", "access").unwrap(),
+            "la-que-escribio"
+        );
+        std::fs::remove_dir_all(dir).unwrap_or_default();
+    }
+
+    /// Sin nada que migrar no se escribe nada: ni proveedor, ni clave en el
+    /// catálogo (ausente o en blanco), ni un proveedor que no es LDAP.
+    #[test]
+    fn sin_clave_ldap_en_el_catalogo_no_se_migra_nada() {
+        let dir = dir_de_prueba();
+        let casos = [
+            None,
+            Some(proveedor_ldap("")),
+            Some(proveedor_ldap(r#"ldap_password = "  ""#)),
+            Some(
+                toml::from_str(
+                    r#"
+                        id = "otro"
+                        display_name = "Otro"
+                        kind = "carddav"
+                        ldap_password = "no-es-ldap"
+                    "#,
+                )
+                .unwrap(),
+            ),
+        ];
+
+        for proveedor in &casos {
+            let migro = migrate_ldap_secret(&dir, "cuenta-1", proveedor.as_ref(), false).unwrap();
+            assert!(!migro, "{proveedor:?}");
+        }
+        assert!(storage::SecretStore::get_secret_in(&dir, "cuenta-1", "access").is_err());
         std::fs::remove_dir_all(dir).unwrap_or_default();
     }
 }

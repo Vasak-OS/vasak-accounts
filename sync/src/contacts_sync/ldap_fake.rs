@@ -65,6 +65,11 @@ pub struct FakeLdapConfig {
     /// El `resultCode` con que contesta el bind. `0` acepta; `49`
     /// (`invalidCredentials`) lo rechaza.
     pub bind_result: u8,
+    /// El `resultCode` con que cierra la búsqueda. `0` es éxito; `4`
+    /// (`sizeLimitExceeded`) es el resultado parcial de un servidor con límite
+    /// administrativo: llega **con** las entradas; `32` (`noSuchObject`) es un
+    /// fallo.
+    pub search_result: u8,
     /// Si `false`, el `extendedRequest` de StartTLS se contesta con un fallo
     /// (`unwillingToPerform`), como un servidor que no sabe StartTLS.
     pub starttls_supported: bool,
@@ -161,8 +166,11 @@ async fn serve(
                 for entry in &config.entries {
                     out.extend(message(message_id.clone(), search_result_entry(entry)));
                 }
-                // `searchResultDone` con éxito cierra la búsqueda.
-                out.extend(message(message_id, app(5, ldap_result(0))));
+                // `searchResultDone` cierra la búsqueda con el código configurado.
+                out.extend(message(
+                    message_id,
+                    app(5, ldap_result(config.search_result)),
+                ));
                 Some(out)
             }
             // `unbindRequest` no lleva respuesta: el cliente se va.

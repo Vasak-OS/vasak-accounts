@@ -267,6 +267,7 @@ mod ldap_tests {
                     "beto@ejemplo.com",
                 ),
             ],
+            ..Default::default()
         })
         .await;
 
