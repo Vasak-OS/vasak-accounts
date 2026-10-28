@@ -779,6 +779,7 @@ mod tests {
                     "beto@ejemplo.com",
                 ),
             ],
+            ..Default::default()
         })
         .await;
 
@@ -806,5 +807,79 @@ mod tests {
             server.saw_cleartext_bind(),
             "con allow_insecure el bind en claro es lo esperado"
         );
+    }
+
+    /// Un `bind_dn` vacío (con contraseña) es otro «unauthenticated bind»: se
+    /// rechaza al armar la credencial, también si son sólo espacios.
+    #[test]
+    fn un_bind_dn_vacio_se_rechaza() {
+        for vacio in ["", "   "] {
+            let mut config = account_config();
+            config["ldap_bind_dn"] = serde_json::json!(vacio);
+
+            let err = credential_from(&config, Zeroizing::new("la-clave".into())).unwrap_err();
+            match err {
+                CredentialError::Failed(mensaje) => assert!(
+                    mensaje.contains("bind DN") && mensaje.contains("vacío"),
+                    "el error no explica el motivo para {vacio:?}: {mensaje}"
+                ),
+                otro => panic!("tenía que ser Failed para {vacio:?}, fue {otro:?}"),
+            }
+        }
+    }
+
+    /// Un servidor con límite administrativo contesta `sizeLimitExceeded` (4)
+    /// **junto con** las entradas que sí entraron: es un resultado parcial. Se
+    /// usan esas entradas; antes (`.success()`) todo el sync fallaba y el
+    /// directorio grande no sincronizaba nunca.
+    #[tokio::test]
+    async fn un_limite_de_tamano_del_servidor_deja_usar_las_entradas_parciales() {
+        let server = FakeLdap::start(FakeLdapConfig {
+            search_result: 4, // sizeLimitExceeded
+            entries: vec![FakeEntry::person(
+                "cn=Ana Pérez,dc=ejemplo,dc=com",
+                "Ana Pérez",
+                "Pérez",
+                "Ana",
+                "ana@ejemplo.com",
+            )],
+            ..Default::default()
+        })
+        .await;
+
+        let cred = cleartext_credential(&server.url());
+        let mut ldap = LdapBackend::connect_ldap(&cred).await.unwrap();
+        let entries = LdapBackend::search_ldap(&mut ldap, &cred)
+            .await
+            .expect("un resultado parcial no es un fallo");
+
+        assert_eq!(entries.len(), 1, "tenía que devolver la entrada parcial");
+        assert_eq!(entries[0].dn, "cn=Ana Pérez,dc=ejemplo,dc=com");
+    }
+
+    /// Control: cualquier otro código distinto de cero sigue siendo un fallo, con
+    /// el código en el mensaje. Sólo el 4 es tolerado.
+    #[tokio::test]
+    async fn otro_codigo_de_error_en_la_busqueda_sigue_siendo_un_fallo() {
+        let server = FakeLdap::start(FakeLdapConfig {
+            search_result: 32, // noSuchObject
+            entries: vec![FakeEntry::person(
+                "cn=Ana Pérez,dc=ejemplo,dc=com",
+                "Ana Pérez",
+                "Pérez",
+                "Ana",
+                "ana@ejemplo.com",
+            )],
+            ..Default::default()
+        })
+        .await;
+
+        let cred = cleartext_credential(&server.url());
+        let mut ldap = LdapBackend::connect_ldap(&cred).await.unwrap();
+        let err = LdapBackend::search_ldap(&mut ldap, &cred)
+            .await
+            .expect_err("un noSuchObject tenía que fallar");
+
+        assert!(err.contains("rechazó la búsqueda"), "{err}");
     }
 }
