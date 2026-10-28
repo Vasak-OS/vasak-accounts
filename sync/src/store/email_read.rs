@@ -675,39 +675,44 @@ impl Store {
 /// encabezado `From`, `To` o `Cc`, que puede traer nombres y varias
 /// direcciones, p. ej. `"Ana Pérez <ana@x.com>, Bob <bob@y.com>"`—.
 ///
-/// Compara la dirección entera, no una subcadena: exige que a cada lado del
-/// match haya un **borde** y no otro carácter de dirección, así `ana@x.com` no
-/// empareja con `ana@x.com.ar` (lo que sigue es `.`) ni con `bana@x.com` (lo que
-/// precede es `b`). Esa es la propiedad que cuida la privacidad acá: una
+/// Extrae la addr-spec real de cada entrada y la compara **entera**, no como
+/// subcadena: así `ana@x.com` no empareja con `ana@x.com.ar` ni con `bana@x.com`,
+/// y —lo que importa para la privacidad— un display-name que es una dirección
+/// literal (`"ana@x.com" <evil@z.com>`) no cuenta como esa dirección. Una
 /// aplicación que pide el historial con una persona no termina viendo el de otra
-/// de un dominio parecido.
+/// ni el de quien se disfrazó de ella en el nombre.
 fn header_has_address(field: &str, address: &str) -> bool {
     if address.is_empty() {
         return false;
     }
-    let haystack = field.to_ascii_lowercase();
-    let bytes = haystack.as_bytes();
-    let mut from = 0;
-    while let Some(offset) = haystack[from..].find(address) {
-        let start = from + offset;
-        let end = start + address.len();
-        let before_is_border = start == 0 || !is_address_char(bytes[start - 1] as char);
-        let after_is_border = end == bytes.len() || !is_address_char(bytes[end] as char);
-        if before_is_border && after_is_border {
-            return true;
+    // Los encabezados To/Cc traen varias direcciones separadas por coma (o por
+    // `;`, que algún cliente usa), y un display-name entrecomillado puede contener
+    // una coma (`"Doe, John" <j@x>`): se parte respetando las comillas. Por cada
+    // entrada la addr-spec real la saca `parse_sender` (lo de `<...>`, o el token
+    // pelado si no hay `<>`), que es justamente quien separa nombre de dirección
+    // sin dejarse engañar.
+    let mut start = 0;
+    let mut in_quotes = false;
+    for (i, c) in field.char_indices() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            ',' | ';' if !in_quotes => {
+                if entry_has_address(&field[start..i], address) {
+                    return true;
+                }
+                start = i + 1;
+            }
+            _ => {}
         }
-        // Un carácter entero, no un byte: `start + 1` caería dentro de uno multibyte.
-        from = start + haystack[start..].chars().next().map_or(1, char::len_utf8);
     }
-    false
+    entry_has_address(&field[start..], address)
 }
 
-/// Los caracteres que pueden formar parte de una dirección (`atext` de RFC 5322
-/// más `@` y `.`). Un byte que no es uno de éstos separa una dirección de lo que
-/// la rodea en un encabezado. Un byte no ASCII —una tilde de un nombre— no es
-/// uno de éstos, así que también cuenta como borde, que es lo correcto.
-fn is_address_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || "@.!#$%&'*+-/=?^_`{|}~".contains(c)
+/// Si la única dirección de una entrada de encabezado (un mailbox: nombre
+/// opcional más addr-spec) es `address`, comparada entera e ignorando mayúsculas.
+fn entry_has_address(entry: &str, address: &str) -> bool {
+    let (_, addr) = crate::message::parse_sender(entry.trim());
+    addr.eq_ignore_ascii_case(address)
 }
 
 /// Escapa `%`, `_` y `\` para que viajen como literales en un patrón `LIKE`
