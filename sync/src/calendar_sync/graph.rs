@@ -1164,6 +1164,34 @@ mod tests {
         assert!(rrule.contains("UNTIL=20261231T235959Z"));
     }
 
+    /// Rojo-sin-arreglo: la línea `RRULE` se escribía directa, sin plegar; una
+    /// anual relativa con todos los días y `UNTIL` pasa de 75 octetos.
+    #[test]
+    fn una_rrule_larga_sale_plegada_y_entera() {
+        let event = event_from(
+            r#"{ "id": "x", "iCalUId": "u",
+                 "recurrence": {
+                    "pattern": { "type": "relativeYearly", "interval": 2, "month": 10,
+                        "index": "last",
+                        "daysOfWeek": ["monday", "tuesday", "wednesday", "thursday",
+                                       "friday", "saturday", "sunday"] },
+                    "range": { "type": "endDate", "endDate": "2030-12-31" } } }"#,
+        );
+        let rrule = recurrence_to_rrule(event.recurrence.as_ref().unwrap()).expect("hay RRULE");
+        assert!(
+            format!("RRULE:{rrule}").len() > 75,
+            "el caso tiene que pasar los 75 octetos: {rrule}"
+        );
+
+        let ical = GraphApiBackend::event_to_ical(&event);
+        assert!(ical.contains("\r\n "), "debe haber continuación: {ical:?}");
+        let desplegado = crate::serialize::assert_folded_and_unfold(&ical);
+        assert!(
+            desplegado.contains(&format!("\r\nRRULE:{rrule}\r\n")),
+            "RRULE desplegada no queda íntegra: {desplegado:?}"
+        );
+    }
+
     #[test]
     fn una_recurrencia_desconocida_no_da_rrule() {
         let recurrence: GraphRecurrence =
