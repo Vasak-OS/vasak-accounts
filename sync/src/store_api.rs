@@ -6045,4 +6045,141 @@ mod tests {
         store_forget("cuenta", "INBOX", 7).await;
         assert!(LIVE_STORE.get().is_none());
     }
+
+    // ── Direcciones postales: el cuerpo de PutContact ──────────────────────
+
+    fn addresses_of(payload: serde_json::Value) -> Result<Change<Vec<PostalAddress>>, StoreError> {
+        addresses_change(payload.as_object().unwrap(), "addresses")
+    }
+
+    /// Ausente no toca, `null` las saca todas, una lista las fija con cada
+    /// componente (los que faltan, vacíos) y la etiqueta en `label` o en `type`.
+    #[test]
+    fn las_direcciones_del_cuerpo_se_traducen_a_su_cambio() {
+        assert_eq!(addresses_of(serde_json::json!({})).unwrap(), Change::Leave);
+        assert_eq!(
+            addresses_of(serde_json::json!({ "addresses": null })).unwrap(),
+            Change::Clear
+        );
+        assert_eq!(
+            addresses_of(serde_json::json!({ "addresses": [] })).unwrap(),
+            Change::Set(vec![])
+        );
+        let set = addresses_of(serde_json::json!({ "addresses": [
+            { "label": "casa", "po_box": "CC 1", "extended": "Piso 2", "street": "Calle 3",
+              "city": "Rosario", "region": "Santa Fe", "postal_code": "2000", "country": "AR" },
+            { "type": "trabajo", "street": "Otra 4", "city": null },
+        ]}))
+        .unwrap();
+        assert_eq!(
+            set,
+            Change::Set(vec![
+                PostalAddress {
+                    label: "casa".into(),
+                    po_box: "CC 1".into(),
+                    extended: "Piso 2".into(),
+                    street: "Calle 3".into(),
+                    city: "Rosario".into(),
+                    region: "Santa Fe".into(),
+                    postal_code: "2000".into(),
+                    country: "AR".into(),
+                },
+                PostalAddress {
+                    label: "trabajo".into(),
+                    street: "Otra 4".into(),
+                    ..Default::default()
+                },
+            ])
+        );
+    }
+
+    /// Cualquier otra forma es un argumento inválido, y el mensaje no lleva nada
+    /// del cuerpo.
+    #[test]
+    fn una_direccion_con_un_tipo_invalido_es_un_argumento_invalido() {
+        for bad in [
+            serde_json::json!({ "addresses": "Calle 1" }),
+            serde_json::json!({ "addresses": 3 }),
+            serde_json::json!({ "addresses": ["Calle 1"] }),
+            serde_json::json!({ "addresses": [{ "street": 7 }] }),
+            serde_json::json!({ "addresses": [{ "city": ["x"] }] }),
+            serde_json::json!({ "addresses": [{ "label": 1 }] }),
+        ] {
+            match addresses_of(bad.clone()) {
+                Err(StoreError::InvalidArgument(message)) => {
+                    assert!(!message.contains("Calle 1"), "{message}");
+                }
+                other => panic!("{bad}: tenía que ser un argumento inválido, fue {other:?}"),
+            }
+        }
+    }
+
+    /// Por el bus: `PutContact` con `addresses` encola una vCard con la `ADR`, y
+    /// los componentes adversarios quedan escapados, sin una línea ni un
+    /// parámetro nuevos.
+    #[tokio::test]
+    async fn put_contact_con_direcciones_escribe_la_adr_escapada() {
+        let mut api = Api::new(
+            "api-write-adr",
+            vec![with_contacts("cuenta")],
+            Answer::Allow,
+        )
+        .await;
+        let book_id = api
+            .manager
+            .with_store("cuenta", |store| {
+                Ok(store
+                    .upsert_address_books(&[("https://x/b/".into(), "Personal".into())])?
+                    .remove(0)
+                    .id)
+            })
+            .await
+            .unwrap();
+        let (client, _service) = api.client(":1.7").await;
+
+        let payload = serde_json::json!({
+            "full_name": "Zeta",
+            "addresses": [{
+                "label": "casa;X-EVIL=1",
+                "street": "Calle 1; esq. 2",
+                "city": "Rosario\r\nX-EVIL:1",
+            }]
+        })
+        .to_string();
+        call(
+            &client,
+            "PutContact",
+            &("cuenta", book_id.to_string(), payload.as_str(), ""),
+        )
+        .await
+        .unwrap();
+        let ops = pending_ops_of(&api, "cuenta", CONTACTS_AREA).await;
+        let vcard = String::from_utf8(ops[0].payload.clone().unwrap()).unwrap();
+        assert!(
+            vcard.contains(r"ADR;TYPE=casaX-EVIL1:;;Calle 1\; esq. 2;Rosario\nX-EVIL:1;;;"),
+            "la dirección no quedó escapada:\n{vcard}"
+        );
+        assert!(
+            !vcard.lines().any(|l| l.starts_with("X-EVIL")),
+            "se inyectó una propiedad:\n{vcard}"
+        );
+        // Y un cuerpo con una dirección mal formada no encola nada.
+        let before = pending_ops_of(&api, "cuenta", CONTACTS_AREA).await.len();
+        let result = call(
+            &client,
+            "PutContact",
+            &(
+                "cuenta",
+                book_id.to_string(),
+                "{\"full_name\":\"Y\",\"addresses\":[{\"street\":7}]}",
+                "",
+            ),
+        )
+        .await;
+        assert!(result.is_err(), "una dirección inválida tenía que fallar");
+        assert_eq!(
+            pending_ops_of(&api, "cuenta", CONTACTS_AREA).await.len(),
+            before
+        );
+    }
 }

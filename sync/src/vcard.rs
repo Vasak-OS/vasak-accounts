@@ -1764,4 +1764,126 @@ mod tests {
         assert!(result.contains("\r\nPHOTO;ENCODING=b:aGVsbG8=\r\n"));
         assert!(!result.contains("TYPE="));
     }
+
+    // ── Direcciones postales (ADR) ─────────────────────────────────────────
+
+    fn address(label: &str, parts: [&str; 7]) -> Address {
+        Address {
+            label: label.into(),
+            po_box: parts[0].into(),
+            extended: parts[1].into(),
+            street: parts[2].into(),
+            city: parts[3].into(),
+            region: parts[4].into(),
+            postal_code: parts[5].into(),
+            country: parts[6].into(),
+        }
+    }
+
+    /// Los siete componentes del `ADR` 3.0, en orden, y la etiqueta del `TYPE`.
+    #[test]
+    fn se_lee_una_direccion_con_sus_siete_componentes_y_su_etiqueta() {
+        let card = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Ana\r\n\
+            ADR;TYPE=HOME:CC 12;Piso 3 Dto B;Av. Siempreviva 742;Springfield;Buenos Aires;B1900;Argentina\r\n\
+            END:VCARD";
+        let c = contact_from(card, "").unwrap();
+        assert_eq!(
+            c.addresses,
+            vec![address(
+                "home",
+                [
+                    "CC 12",
+                    "Piso 3 Dto B",
+                    "Av. Siempreviva 742",
+                    "Springfield",
+                    "Buenos Aires",
+                    "B1900",
+                    "Argentina"
+                ]
+            )]
+        );
+    }
+
+    /// La 2.1 manda los acentos en quoted-printable: se decodifica **antes** de
+    /// partir en componentes, igual que el `N`.
+    #[test]
+    fn se_lee_una_direccion_2_1_en_quoted_printable() {
+        let old = "BEGIN:VCARD\r\nVERSION:2.1\r\nFN:Ana\r\n\
+            ADR;HOME;ENCODING=QUOTED-PRINTABLE:;;Av. Rep=FAblica 1;C=F3rdoba;;5000;Argentina\r\n\
+            END:VCARD";
+        let c = contact_from(old, "").unwrap();
+        assert_eq!(
+            c.addresses,
+            vec![address(
+                "home",
+                [
+                    "",
+                    "",
+                    "Av. República 1",
+                    "Córdoba",
+                    "",
+                    "5000",
+                    "Argentina"
+                ]
+            )]
+        );
+    }
+
+    /// `\,`, `\;` y `\n` dentro de un componente se deshacen, y el `\;` no parte
+    /// el componente en dos (corría los campos de lugar).
+    #[test]
+    fn los_componentes_de_una_direccion_se_desescapan() {
+        let card = "BEGIN:VCARD\r\nFN:Ana\r\n\
+            ADR:;;Calle 1\\, esq. 2\\; piso\\n3;Ciudad;;1000;AR\r\nEND:VCARD";
+        let c = contact_from(card, "").unwrap();
+        assert_eq!(c.addresses.len(), 1);
+        // El salto de línea escapado es un espacio al mostrar (valor de una línea).
+        assert_eq!(c.addresses[0].street, "Calle 1, esq. 2; piso 3");
+        assert_eq!(c.addresses[0].city, "Ciudad");
+        assert_eq!(c.addresses[0].postal_code, "1000");
+        assert_eq!(c.addresses[0].country, "AR");
+    }
+
+    /// Una `ADR` que sólo trae los separadores no es una dirección: no se lista.
+    #[test]
+    fn una_direccion_de_solo_separadores_se_descarta() {
+        let card = "BEGIN:VCARD\r\nFN:Ana\r\nADR;TYPE=HOME:;;;;;;\r\n\
+            ADR:;;   ;;;;\r\nADR:;;Calle 1;;;;\r\nEND:VCARD";
+        let c = contact_from(card, "").unwrap();
+        assert_eq!(c.addresses.len(), 1);
+        assert_eq!(c.addresses[0].street, "Calle 1");
+    }
+
+    /// Cada componente pasa por `shown`: ni un control llega a lo que se muestra.
+    #[test]
+    fn los_componentes_de_una_direccion_no_llevan_controles() {
+        let card = "BEGIN:VCARD\r\nFN:Ana\r\nADR:;;Calle\u{7}1\\n2;;;;\r\nEND:VCARD";
+        let c = contact_from(card, "").unwrap();
+        assert_eq!(c.addresses[0].street, "Calle1 2");
+    }
+
+    /// Una tarjeta con miles de direcciones no llena el almacén: tope por tipo.
+    #[test]
+    fn las_direcciones_de_un_contacto_tienen_tope() {
+        let many = "BEGIN:VCARD\r\nFN:Ana\r\n".to_string()
+            + &(0..300)
+                .map(|i| format!("ADR:;;Calle {i};;;;\r\n"))
+                .collect::<String>()
+            + "END:VCARD";
+        let c = contact_from(&many, "").unwrap();
+        assert_eq!(c.addresses.len(), MAX_FIELDS_PER_KIND);
+        assert_eq!(c.addresses[0].street, "Calle 0", "se quedan las primeras");
+    }
+
+    /// Un componente desmedido se recorta como cualquier otro valor.
+    #[test]
+    fn un_componente_de_direccion_desmedido_se_recorta() {
+        let card = format!(
+            "BEGIN:VCARD\r\nFN:Ana\r\nADR:;;{};;;;\r\nEND:VCARD",
+            "ñ".repeat(MAX_VALUE)
+        );
+        let c = contact_from(&card, "").unwrap();
+        assert!(c.addresses[0].street.ends_with('…'));
+        assert!(c.addresses[0].street.len() <= MAX_VALUE + 4);
+    }
 }

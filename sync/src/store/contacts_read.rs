@@ -1391,6 +1391,64 @@ mod tests {
         assert!(kept_in_order, "se sacan del final");
     }
 
+    /// Con un contacto que no entra, **las direcciones son lo primero que se
+    /// recorta**: salen enteras y los correos, teléfonos y relaciones quedan.
+    #[test]
+    fn un_contacto_que_no_entra_pierde_primero_las_direcciones() {
+        let temp = TempDir::new("contacto-recortado-direcciones");
+        let mut store = open_store(&temp);
+        let b = book(&mut store, "https://x/a/", "A");
+        let quotes = "\"".repeat(4000);
+        let mut raw = String::from("BEGIN:VCARD\r\nFN:Ana\r\n");
+        for n in 0..50 {
+            // Tres componentes de 4000 comillas (el JSON las duplica): 50 de estas
+            // pasan del megabyte por sí solas.
+            raw.push_str(&format!(
+                "ADR;TYPE=home:;;{n}{quotes};{quotes};{quotes};;\r\n"
+            ));
+        }
+        for n in 0..5 {
+            raw.push_str(&format!(
+                "EMAIL:a{n}@x.com\r\nTEL:{n}\r\nRELATED:text:r{n}\r\n"
+            ));
+        }
+        raw.push_str("END:VCARD");
+        let id = add_raw(&mut store, &b, &raw);
+
+        let contact = get_contact(store.connection(), id).unwrap().unwrap();
+        assert!(contact.truncated);
+        assert!(contact.addresses.len() < 50, "se recortan las direcciones");
+        let kept_in_order = contact
+            .addresses
+            .iter()
+            .enumerate()
+            .all(|(n, a)| a.street.starts_with(&n.to_string()));
+        assert!(kept_in_order, "se sacan del final");
+        assert_eq!(contact.emails.len(), 5, "los correos no se tocan");
+        assert_eq!(contact.phones.len(), 5);
+        assert_eq!(contact.related.len(), 5);
+        assert!(to_capped_json(&contact, MAX_CONTACT_BYTES).is_ok());
+    }
+
+    /// Un contacto con direcciones que entra se lee entero, con sus componentes.
+    #[test]
+    fn un_contacto_con_direcciones_se_lee_entero() {
+        let temp = TempDir::new("contacto-direcciones");
+        let mut store = open_store(&temp);
+        let b = book(&mut store, "https://x/a/", "A");
+        let raw =
+            "BEGIN:VCARD\r\nFN:Ana\r\nADR;TYPE=HOME:;;Calle 1;Rosario;SF;2000;AR\r\nEND:VCARD";
+        let id = add_raw(&mut store, &b, raw);
+
+        let contact = get_contact(store.connection(), id).unwrap().unwrap();
+        assert!(!contact.truncated);
+        assert_eq!(contact.addresses.len(), 1);
+        assert_eq!(contact.addresses[0].label, "home");
+        assert_eq!(contact.addresses[0].city, "Rosario");
+        let json = serde_json::to_value(&contact).unwrap();
+        assert_eq!(json["addresses"][0]["postal_code"], "2000");
+    }
+
     #[test]
     fn una_respuesta_que_pasa_el_tope_no_sale() {
         let big = vec!["x".repeat(100); 20];
