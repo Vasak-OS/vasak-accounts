@@ -79,6 +79,24 @@ pub struct Field {
     pub value: String,
 }
 
+/// Una dirección postal (`ADR`), con su etiqueta y los siete componentes del
+/// RFC 6350 §6.3.1 / RFC 2426 §3.2.1, en orden. Cada uno va por separado: la UI
+/// los muestra como quiera, y escribir sabe cuál es cuál sin re-parsear.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Address {
+    /// «casa», «trabajo»… en minúsculas, igual que [`Field::label`].
+    pub label: String,
+    /// Casilla de correo.
+    pub po_box: String,
+    /// La parte extendida: piso, departamento.
+    pub extended: String,
+    pub street: String,
+    pub city: String,
+    pub region: String,
+    pub postal_code: String,
+    pub country: String,
+}
+
 /// Un contacto, listo para mostrar.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Contact {
@@ -94,6 +112,9 @@ pub struct Contact {
     pub sort_name: String,
     pub emails: Vec<Field>,
     pub phones: Vec<Field>,
+    /// Las direcciones postales (`ADR`), con sus componentes separados.
+    #[serde(default)]
+    pub addresses: Vec<Address>,
     #[serde(default)]
     pub organization: String,
     #[serde(default)]
@@ -519,6 +540,7 @@ pub fn contact_from(raw: &str, href: &str) -> Option<Contact> {
                 let value = strip_scheme(&value, "tel:").trim().to_string();
                 push_field(&mut contact.phones, &property, value);
             }
+            "ADR" => push_address(&mut contact.addresses, &property),
             "ORG" => {
                 // `ORG` trae la empresa y sus divisiones separadas por punto y
                 // coma. Se muestran juntas y no sólo la primera: «Vasak Group»
@@ -635,6 +657,45 @@ fn push_field(target: &mut Vec<Field>, property: &Property, value: String) {
         label: label_from(&property.params),
         value,
     });
+}
+
+/// Suma una dirección postal, hasta [`MAX_FIELDS_PER_KIND`]. El `ADR` se
+/// decodifica y se parte en sus siete componentes como el `N` —por el punto y
+/// coma sin escapar, deshaciendo lo escapado dentro de cada uno—, y cada
+/// componente pasa por [`shown`] para que ningún control llegue a lo que se
+/// muestra ni al JSON de la respuesta. Una tarjeta con sólo los separadores
+/// (`;;;;;;`) no es una dirección y se descarta.
+fn push_address(target: &mut Vec<Address>, property: &Property) {
+    if target.len() >= MAX_FIELDS_PER_KIND {
+        return;
+    }
+    let fields = split_fields(&decoded(property));
+    let component = |i: usize| shown(fields.get(i).map(String::as_str).unwrap_or(""));
+    let address = Address {
+        label: label_from(&property.params),
+        po_box: component(0),
+        extended: component(1),
+        street: component(2),
+        city: component(3),
+        region: component(4),
+        postal_code: component(5),
+        country: component(6),
+    };
+    let empty = [
+        &address.po_box,
+        &address.extended,
+        &address.street,
+        &address.city,
+        &address.region,
+        &address.postal_code,
+        &address.country,
+    ]
+    .iter()
+    .all(|c| c.trim().is_empty());
+    if empty {
+        return;
+    }
+    target.push(address);
 }
 
 /// Si un valor puede tener varias líneas: sólo la nota.

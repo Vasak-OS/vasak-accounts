@@ -49,7 +49,7 @@ use serde::Serialize;
 
 use super::queue::SyncState;
 use super::{classify, StoreError};
-use crate::vcard::{self, Field};
+use crate::vcard::{self, Address, Field};
 
 /// El tope de contactos por página.
 pub const MAX_PAGE: u32 = 1000;
@@ -242,6 +242,7 @@ pub struct ContactDetail {
     pub display_name: String,
     pub emails: Vec<Field>,
     pub phones: Vec<Field>,
+    pub addresses: Vec<Address>,
     pub organization: String,
     pub notes: String,
     pub related: Vec<Field>,
@@ -591,6 +592,7 @@ pub fn get_contact(connection: &Connection, id: i64) -> Result<Option<ContactDet
             display_name: contact.display_name,
             emails: contact.emails,
             phones: contact.phones,
+            addresses: contact.addresses,
             organization: contact.organization,
             notes: contact.notes,
             related: contact.related,
@@ -607,9 +609,9 @@ fn json_len<T: Serialize>(value: &T) -> usize {
     serde_json::to_string(value).map_or(usize::MAX, |json| json.len())
 }
 
-/// Un contacto que entra en `cap` bytes de JSON: entero si entra, y si no,
-/// sin sus últimas relaciones, después sin sus últimos teléfonos y después
-/// sin sus últimos correos, con `truncated`. Lo que queda —nombre,
+/// Un contacto que entra en `cap` bytes de JSON: entero si entra, y si no, sin
+/// sus últimas direcciones, después sin sus últimas relaciones, sus últimos
+/// teléfonos y sus últimos correos, con `truncated`. Lo que queda —nombre,
 /// organización, nota, de a 4096 bytes— entra siempre.
 fn fit_contact(mut contact: ContactDetail, cap: usize) -> ContactDetail {
     if json_len(&contact) <= cap {
@@ -617,6 +619,15 @@ fn fit_contact(mut contact: ContactDetail, cap: usize) -> ContactDetail {
     }
     contact.truncated = true;
     let mut size = json_len(&contact);
+    // Las direcciones primero: son las más pesadas (siete componentes cada una) y
+    // las menos urgentes para dar con alguien. Van en su propio bucle porque son
+    // de otro tipo que las listas de `{label, value}`.
+    while size > cap {
+        let Some(address) = contact.addresses.pop() else {
+            break;
+        };
+        size = size.saturating_sub(json_len(&address) + usize::from(!contact.addresses.is_empty()));
+    }
     for kind in 0..3 {
         let fields = match kind {
             0 => &mut contact.related,

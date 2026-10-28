@@ -43,6 +43,23 @@ pub struct LabeledValue {
     pub value: String,
 }
 
+/// Una dirección postal para escribir: su etiqueta («casa», «trabajo») como
+/// `TYPE`, y los siete componentes del `ADR` (RFC 6350 §6.3.1) en orden. Van por
+/// separado, no como un texto suelto, porque cada uno se escapa aparte al
+/// serializar: así ninguno puede partir la línea, inyectar un parámetro ni correr
+/// la estructura de los siete campos separados por `;`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PostalAddress {
+    pub label: String,
+    pub po_box: String,
+    pub extended: String,
+    pub street: String,
+    pub city: String,
+    pub region: String,
+    pub postal_code: String,
+    pub country: String,
+}
+
 /// Lo que cambia de una tarjeta.
 ///
 /// Cada campo es un [`Change`]: por omisión no se toca. Las listas —correos,
@@ -61,6 +78,8 @@ pub struct ContactPatch {
     pub emails: Change<Vec<LabeledValue>>,
     /// Los `TEL`, con su etiqueta en `TYPE`.
     pub phones: Change<Vec<LabeledValue>>,
+    /// Los `ADR`, con su etiqueta en `TYPE` y los siete componentes escapados.
+    pub addresses: Change<Vec<PostalAddress>>,
     /// `RELATED` o el par de Apple, según lo que la tarjeta ya traía.
     pub related: Change<Vec<Relation>>,
 }
@@ -73,6 +92,7 @@ impl ContactPatch {
             && self.note == Change::Leave
             && self.emails == Change::Leave
             && self.phones == Change::Leave
+            && self.addresses == Change::Leave
             && self.related == Change::Leave
     }
 }
@@ -145,6 +165,7 @@ pub fn apply_changes(raw_vcard: &str, patch: &ContactPatch) -> String {
 
     let editing_emails = !matches!(patch.emails, Change::Leave);
     let editing_phones = !matches!(patch.phones, Change::Leave);
+    let editing_addresses = !matches!(patch.addresses, Change::Leave);
     let editing_related = !matches!(patch.related, Change::Leave);
     // Una lista se fija entera: se sacan **todas** sus líneas del crudo y la lista
     // nueva se escribe en `flush`. Al reescribir las relaciones se sacan **las dos
@@ -168,6 +189,9 @@ pub fn apply_changes(raw_vcard: &str, patch: &ContactPatch) -> String {
     }
     if editing_phones {
         stripped_groups.extend(groups_of(&properties, "TEL"));
+    }
+    if editing_addresses {
+        stripped_groups.extend(groups_of(&properties, "ADR"));
     }
 
     let mut out: Vec<String> = Vec::new();
@@ -215,6 +239,7 @@ pub fn apply_changes(raw_vcard: &str, patch: &ContactPatch) -> String {
             // reescribe, la otra no.
             "EMAIL" if editing_emails => {}
             "TEL" if editing_phones => {}
+            "ADR" if editing_addresses => {}
             "RELATED" if editing_related => {}
             "X-ABRELATEDNAMES" if editing_related => {}
             // El `X-ABLabel` de un grupo cuya propiedad principal se sacó —un
@@ -261,6 +286,9 @@ pub fn new_contact(uid: &str, patch: &ContactPatch) -> String {
     }
     if let Change::Set(phones) = &patch.phones {
         push_labeled(&mut out, "TEL", phones);
+    }
+    if let Change::Set(addresses) = &patch.addresses {
+        push_addresses(&mut out, addresses);
     }
     if let Change::Set(relations) = &patch.related {
         push_related(&mut out, relations);
@@ -330,6 +358,9 @@ fn flush(out: &mut Vec<String>, patch: &ContactPatch, done: &Done, properties: &
     }
     if let Change::Set(phones) = &patch.phones {
         push_labeled(out, "TEL", phones);
+    }
+    if let Change::Set(addresses) = &patch.addresses {
+        push_addresses(out, addresses);
     }
     if let Change::Set(relations) = &patch.related {
         match related_form(properties) {
@@ -405,6 +436,37 @@ fn push_apple(out: &mut Vec<String>, relations: &[Relation], max_item: u32) {
             &[],
             &sanitize_label(&relation.label),
         )));
+    }
+}
+
+/// Escribe las direcciones como `ADR` (RFC 6350 §6.3.1): la etiqueta como `TYPE`
+/// **saneado** ([`sanitize_label`]) y los siete componentes **escapados cada uno
+/// por separado** ([`escape_text`]) y unidos por `;`. Como escapar protege el
+/// `;`, la coma y el salto de línea, ningún componente puede partir la línea,
+/// inyectar un parámetro ni correr la estructura de los siete campos; la lectura
+/// ([`crate::vcard`]) los parte por el `;` sin escapar y deshace el escape de cada
+/// uno, así vuelven en su lugar.
+fn push_addresses(out: &mut Vec<String>, addresses: &[PostalAddress]) {
+    for address in addresses {
+        let params = if address.label.trim().is_empty() {
+            Vec::new()
+        } else {
+            vec![format!("TYPE={}", sanitize_label(&address.label))]
+        };
+        let value = [
+            &address.po_box,
+            &address.extended,
+            &address.street,
+            &address.city,
+            &address.region,
+            &address.postal_code,
+            &address.country,
+        ]
+        .iter()
+        .map(|component| escape_text(component))
+        .collect::<Vec<_>>()
+        .join(";");
+        out.extend(fold(&render("ADR", &params, &value)));
     }
 }
 
