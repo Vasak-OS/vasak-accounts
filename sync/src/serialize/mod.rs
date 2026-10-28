@@ -174,6 +174,15 @@ pub fn fold(content: &str) -> Vec<String> {
     lines
 }
 
+/// Agrega a `out` una línea de contenido ya plegada a los 75 octetos, con
+/// `\r\n` entre las continuaciones y al final. Para los serializadores que
+/// arman el documento en un `String` (los de Graph), en vez de en un `Vec` de
+/// líneas como [`fold`].
+pub fn push_folded_line(out: &mut String, content: &str) {
+    out.push_str(&fold(content).join("\r\n"));
+    out.push_str("\r\n");
+}
+
 /// Arma una línea de contenido: `NOMBRE;PARAM=X;PARAM=Y:valor`.
 ///
 /// Los parámetros vienen ya en la forma `CLAVE=VALOR`, sin el punto y coma. El

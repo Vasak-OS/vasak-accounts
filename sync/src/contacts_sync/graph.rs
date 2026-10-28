@@ -13,6 +13,7 @@
 use crate::contacts_sync::backend::{SyncContext, SyncResult};
 use crate::contacts_sync::SyncReport;
 use crate::graph::{self, GraphCredential, GraphFetchError};
+use crate::serialize::push_folded_line;
 use crate::store::contacts::{ContactOp, ContactRow};
 use crate::store::key::{KeyError, KeySource};
 use crate::store::lifecycle::{AreaState, CONTACTS_AREA};
@@ -411,17 +412,17 @@ impl GraphApiBackend {
         vcard.push_str("VERSION:3.0\r\n");
         // El `id` también se escapa: era el único campo que iba crudo, y un `id`
         // con `\r\n` fabricaría propiedades o registros nuevos (inyección vCard).
-        vcard.push_str(&format!(
-            "UID:{}\r\n",
-            vcard::escape_vcard_public(&contact.id)
-        ));
+        push_folded_line(
+            &mut vcard,
+            &format!("UID:{}", vcard::escape_vcard_public(&contact.id)),
+        );
 
         let display_name = contact.display_name.as_deref().unwrap_or("");
         if !display_name.is_empty() {
-            vcard.push_str(&format!(
-                "FN:{}\r\n",
-                vcard::escape_vcard_public(display_name)
-            ));
+            push_folded_line(
+                &mut vcard,
+                &format!("FN:{}", vcard::escape_vcard_public(display_name)),
+            );
         }
 
         // N: apellido;nombre;segundo nombre;prefijo;sufijo
@@ -429,22 +430,25 @@ impl GraphApiBackend {
         let given = contact.given_name.as_deref().unwrap_or("");
         let middle = contact.middle_name.as_deref().unwrap_or("");
         if !surname.is_empty() || !given.is_empty() || !middle.is_empty() {
-            vcard.push_str(&format!(
-                "N:{};{};{};;\r\n",
-                vcard::escape_vcard_public(surname),
-                vcard::escape_vcard_public(given),
-                vcard::escape_vcard_public(middle)
-            ));
+            push_folded_line(
+                &mut vcard,
+                &format!(
+                    "N:{};{};{};;",
+                    vcard::escape_vcard_public(surname),
+                    vcard::escape_vcard_public(given),
+                    vcard::escape_vcard_public(middle)
+                ),
+            );
         }
 
         // Emails
         for email in &contact.email_addresses {
             if let Some(address) = email.address.as_deref() {
                 if !address.is_empty() {
-                    vcard.push_str(&format!(
-                        "EMAIL:{}\r\n",
-                        vcard::escape_vcard_public(address)
-                    ));
+                    push_folded_line(
+                        &mut vcard,
+                        &format!("EMAIL:{}", vcard::escape_vcard_public(address)),
+                    );
                 }
             }
         }
@@ -452,26 +456,26 @@ impl GraphApiBackend {
         // Teléfonos: cada lista con su tipo de vCard.
         for phone in &contact.business_phones {
             if !phone.is_empty() {
-                vcard.push_str(&format!(
-                    "TEL;TYPE=WORK:{}\r\n",
-                    vcard::escape_vcard_public(phone)
-                ));
+                push_folded_line(
+                    &mut vcard,
+                    &format!("TEL;TYPE=WORK:{}", vcard::escape_vcard_public(phone)),
+                );
             }
         }
         for phone in &contact.home_phones {
             if !phone.is_empty() {
-                vcard.push_str(&format!(
-                    "TEL;TYPE=HOME:{}\r\n",
-                    vcard::escape_vcard_public(phone)
-                ));
+                push_folded_line(
+                    &mut vcard,
+                    &format!("TEL;TYPE=HOME:{}", vcard::escape_vcard_public(phone)),
+                );
             }
         }
         if let Some(mobile) = contact.mobile_phone.as_deref() {
             if !mobile.is_empty() {
-                vcard.push_str(&format!(
-                    "TEL;TYPE=CELL:{}\r\n",
-                    vcard::escape_vcard_public(mobile)
-                ));
+                push_folded_line(
+                    &mut vcard,
+                    &format!("TEL;TYPE=CELL:{}", vcard::escape_vcard_public(mobile)),
+                );
             }
         }
 
@@ -483,12 +487,18 @@ impl GraphApiBackend {
         // Organización y puesto
         if let Some(company) = contact.company_name.as_deref() {
             if !company.is_empty() {
-                vcard.push_str(&format!("ORG:{}\r\n", vcard::escape_vcard_public(company)));
+                push_folded_line(
+                    &mut vcard,
+                    &format!("ORG:{}", vcard::escape_vcard_public(company)),
+                );
             }
         }
         if let Some(title) = contact.job_title.as_deref() {
             if !title.is_empty() {
-                vcard.push_str(&format!("TITLE:{}\r\n", vcard::escape_vcard_public(title)));
+                push_folded_line(
+                    &mut vcard,
+                    &format!("TITLE:{}", vcard::escape_vcard_public(title)),
+                );
             }
         }
 
@@ -496,14 +506,20 @@ impl GraphApiBackend {
         if let Some(birthday) = contact.birthday.as_deref() {
             let date = birthday.split('T').next().unwrap_or(birthday);
             if !date.is_empty() {
-                vcard.push_str(&format!("BDAY:{}\r\n", vcard::escape_vcard_public(date)));
+                push_folded_line(
+                    &mut vcard,
+                    &format!("BDAY:{}", vcard::escape_vcard_public(date)),
+                );
             }
         }
 
         // Notas
         if let Some(notes) = contact.personal_notes.as_deref() {
             if !notes.is_empty() {
-                vcard.push_str(&format!("NOTE:{}\r\n", vcard::escape_vcard_public(notes)));
+                push_folded_line(
+                    &mut vcard,
+                    &format!("NOTE:{}", vcard::escape_vcard_public(notes)),
+                );
             }
         }
 
@@ -528,9 +544,10 @@ impl GraphApiBackend {
         let postal = vcard::escape_vcard_public(address.postal_code.as_deref().unwrap_or(""));
         let country =
             vcard::escape_vcard_public(address.country_or_region.as_deref().unwrap_or(""));
-        vcard.push_str(&format!(
-            "ADR;TYPE={kind}:;;{street};{city};{state};{postal};{country}\r\n"
-        ));
+        push_folded_line(
+            vcard,
+            &format!("ADR;TYPE={kind}:;;{street};{city};{state};{postal};{country}"),
+        );
     }
 }
 

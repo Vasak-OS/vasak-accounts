@@ -350,10 +350,12 @@ pub async fn fetch_all_pages<T: DeserializeOwned>(
             Err(_) => return Err(GraphFetchError::Timeout),
         };
 
-        all.extend(data.value);
-        if all.len() > max_items {
+        // No materializamos más allá del tope: si esta página excedería
+        // `max_items`, cortamos antes de extender el `Vec`.
+        if all.len() + data.value.len() > max_items {
             return Err(GraphFetchError::TooManyItems);
         }
+        all.extend(data.value);
 
         let Some(next) = data.next_link else {
             return Ok(all);

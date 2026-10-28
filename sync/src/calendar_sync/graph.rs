@@ -24,7 +24,7 @@ use chrono::NaiveDateTime;
 use crate::calendar_sync::{CalendarOutcome, CalendarReport, CLOSED_DETAIL};
 use crate::graph::{self, GraphCredential, GraphFetchError};
 use crate::ical::recurrence::ExpansionLimits;
-use crate::serialize::escape_text;
+use crate::serialize::{escape_text, push_folded_line};
 use crate::store::calendar::{
     derive_with_occurrences, CalendarApplied, CalendarListing, CalendarProgress, CalendarRoom,
     ObjectOp, ObjectRow, Window, WRITE_BATCH_ROWS,
@@ -604,7 +604,7 @@ impl GraphApiBackend {
         } else {
             event.i_cal_uid.as_str()
         };
-        out.push_str(&format!("UID:{}\r\n", escape_text(uid)));
+        push_folded_line(&mut out, &format!("UID:{}", escape_text(uid)));
 
         // DTSTAMP: obligatorio. La última modificación si vino, o ahora.
         let dtstamp = event
@@ -627,17 +627,17 @@ impl GraphApiBackend {
         push_datetime(&mut out, "DTEND", event.end.as_ref(), event.is_all_day);
 
         if let Some(subject) = non_empty(&event.subject) {
-            out.push_str(&format!("SUMMARY:{}\r\n", escape_text(subject)));
+            push_folded_line(&mut out, &format!("SUMMARY:{}", escape_text(subject)));
         }
         if let Some(body) = non_empty(&event.body_preview) {
-            out.push_str(&format!("DESCRIPTION:{}\r\n", escape_text(body)));
+            push_folded_line(&mut out, &format!("DESCRIPTION:{}", escape_text(body)));
         }
         if let Some(location) = event
             .location
             .as_ref()
             .and_then(|l| non_empty(&l.display_name))
         {
-            out.push_str(&format!("LOCATION:{}\r\n", escape_text(location)));
+            push_folded_line(&mut out, &format!("LOCATION:{}", escape_text(location)));
         }
 
         if let Some(line) = event
@@ -674,7 +674,7 @@ impl GraphApiBackend {
                 .map(|c| escape_text(c))
                 .collect::<Vec<_>>()
                 .join(",");
-            out.push_str(&format!("CATEGORIES:{joined}\r\n"));
+            push_folded_line(&mut out, &format!("CATEGORIES:{joined}"));
         }
 
         if let Some(priority) = event.importance.as_deref().and_then(priority_of) {
@@ -702,9 +702,12 @@ fn non_empty(value: &Option<String>) -> Option<&str> {
 /// corresponde el escape de TEXT pero sí hay que impedir la inyección por salto
 /// de línea.
 fn clean_param_value(value: &str) -> String {
+    // Fuera todo carácter de control (CR/LF partirían la línea; el resto de los
+    // C0 dejaría un quoted-string técnicamente inválido) y la comilla doble que
+    // cierra un parámetro.
     value
         .chars()
-        .filter(|c| *c != '\r' && *c != '\n' && *c != '"')
+        .filter(|c| !c.is_control() && *c != '"')
         .collect()
 }
 
@@ -732,7 +735,9 @@ fn cal_address_line(
     if let Some(partstat) = partstat {
         params.push_str(&format!(";PARTSTAT={partstat}"));
     }
-    Some(format!("{property}{params}:mailto:{address}\r\n"))
+    let mut line = String::new();
+    push_folded_line(&mut line, &format!("{property}{params}:mailto:{address}"));
+    Some(line)
 }
 
 /// Mapea la respuesta de un asistente de Graph al `PARTSTAT` de iCalendar.
