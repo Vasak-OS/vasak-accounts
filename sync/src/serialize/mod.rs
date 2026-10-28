@@ -200,9 +200,44 @@ pub(crate) fn render(name: &str, params: &[String], value: &str) -> String {
     line
 }
 
+/// Ayuda de las pruebas de los serializadores de Graph: comprueba que el
+/// documento esté plegado como pide el estándar (ninguna línea física pasa de 75
+/// octetos, cada continuación abre con un espacio, todo termina en `\r\n`) y
+/// devuelve el documento **desplegado**, para comparar el valor entero.
+#[cfg(test)]
+pub fn assert_folded_and_unfold(doc: &str) -> String {
+    assert!(
+        doc.ends_with("\r\n"),
+        "el documento no termina en CRLF: {doc:?}"
+    );
+    for line in doc.split("\r\n").filter(|l| !l.is_empty()) {
+        assert!(
+            line.len() <= FOLD_OCTETS,
+            "línea física de {} octetos (máx. {FOLD_OCTETS}): {line:?}",
+            line.len()
+        );
+    }
+    doc.replace("\r\n ", "")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `push_folded_line` pliega a 75 octetos con `\r\n ` y termina en `\r\n`; una
+    /// línea corta sale tal cual, sin continuación.
+    #[test]
+    fn push_folded_line_pliega_y_termina_en_crlf() {
+        let mut out = String::new();
+        push_folded_line(&mut out, "UID:corto");
+        assert_eq!(out, "UID:corto\r\n");
+
+        let mut out = String::new();
+        let largo = format!("NOTE:{}", "é".repeat(100));
+        push_folded_line(&mut out, &largo);
+        assert!(out.contains("\r\n "), "debe haber continuación: {out:?}");
+        assert_eq!(assert_folded_and_unfold(&out), format!("{largo}\r\n"));
+    }
 
     #[test]
     fn el_fin_de_linea_sale_del_crudo() {

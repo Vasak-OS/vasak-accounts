@@ -601,6 +601,40 @@ mod tests {
         assert!(vcard.contains("NOTE:La primera programadora\r\n"));
     }
 
+    /// Rojo-sin-arreglo: sin `push_folded_line`, `NOTE`, `ADR`, `ORG` y `FN`
+    /// largos salían en una sola línea de más de 75 octetos. Con acentos justo
+    /// en el borde para comprobar que no se parte un carácter de varios bytes.
+    #[test]
+    fn los_campos_largos_de_un_contacto_salen_plegados_sin_partir_un_acento() {
+        // Con «NOTE:» (5 octetos), 69 «a» llegan al 74 y la «é» no entra.
+        let largo = format!("{}ééé{}", "a".repeat(69), "ü".repeat(60));
+        let contact: GraphContact = serde_json::from_value(serde_json::json!({
+            "id": "AAA",
+            "displayName": largo,
+            "companyName": largo,
+            "personalNotes": largo,
+            "homeAddress": { "street": largo, "city": "Rosario" },
+        }))
+        .expect("contacto válido");
+        let vcard = GraphApiBackend::contact_to_vcard(&contact);
+
+        assert!(
+            vcard.contains("\r\n "),
+            "debe haber continuaciones: {vcard:?}"
+        );
+        let desplegado = crate::serialize::assert_folded_and_unfold(&vcard);
+        for prop in ["FN", "ORG", "NOTE"] {
+            assert!(
+                desplegado.contains(&format!("\r\n{prop}:{largo}\r\n")),
+                "{prop} desplegado no da el valor entero: {desplegado:?}"
+            );
+        }
+        assert!(
+            desplegado.contains(&format!("\r\nADR;TYPE=HOME:;;{largo};Rosario;;;\r\n")),
+            "ADR desplegado no da el valor entero: {desplegado:?}"
+        );
+    }
+
     #[test]
     fn un_contacto_sin_campos_no_rompe_y_omite_lo_ausente() {
         let contact: GraphContact =

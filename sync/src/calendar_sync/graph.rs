@@ -1048,6 +1048,88 @@ mod tests {
         );
     }
 
+    /// Un valor largo con acentos justo en el borde de los 75 octetos.
+    fn texto_largo_con_acentos() -> String {
+        // «SUMMARY:» ocupa 8 octetos; 66 «a» llegan al 74 y la «é» (2 octetos)
+        // no entra en la línea: tiene que abrir la continuación entera.
+        format!("{}ééé{}", "a".repeat(66), "ü".repeat(60))
+    }
+
+    /// Rojo-sin-arreglo: sin `push_folded_line`, `SUMMARY`, `DESCRIPTION` y
+    /// `LOCATION` salen en una sola línea de más de 75 octetos.
+    #[test]
+    fn un_texto_largo_del_evento_sale_plegado_sin_partir_un_acento() {
+        let largo = texto_largo_con_acentos();
+        let json = serde_json::json!({
+            "id": "x", "iCalUId": "u",
+            "subject": largo, "bodyPreview": largo,
+            "location": { "displayName": largo },
+        })
+        .to_string();
+        let ical = GraphApiBackend::event_to_ical(&event_from(&json));
+
+        assert!(
+            ical.contains("\r\n "),
+            "debe haber continuaciones: {ical:?}"
+        );
+        let desplegado = crate::serialize::assert_folded_and_unfold(&ical);
+        for prop in ["SUMMARY", "DESCRIPTION", "LOCATION"] {
+            assert!(
+                desplegado.contains(&format!("\r\n{prop}:{largo}\r\n")),
+                "{prop} desplegado no da el valor entero: {desplegado:?}"
+            );
+        }
+    }
+
+    /// Rojo-sin-arreglo: el `ATTENDEE` con un nombre largo salía en una línea de
+    /// más de 75 octetos (`cal_address_line` no plegaba).
+    #[test]
+    fn un_asistente_con_nombre_largo_sale_plegado() {
+        let nombre = "Ñandú ".repeat(30);
+        let json = serde_json::json!({
+            "id": "x", "iCalUId": "u",
+            "attendees": [{ "emailAddress": { "name": nombre, "address": "n@example.com" } }],
+        })
+        .to_string();
+        let ical = GraphApiBackend::event_to_ical(&event_from(&json));
+
+        let desplegado = crate::serialize::assert_folded_and_unfold(&ical);
+        assert!(
+            desplegado.contains(&format!(
+                "\r\nATTENDEE;CN=\"{nombre}\":mailto:n@example.com\r\n"
+            )),
+            "{desplegado:?}"
+        );
+    }
+
+    /// Rojo-sin-arreglo: `clean_param_value` sólo sacaba CR, LF y la comilla; un
+    /// C0 (BEL, NUL, tab, DEL…) sobrevivía dentro del quoted-string del `CN`.
+    #[test]
+    fn clean_param_value_saca_los_caracteres_de_control_y_la_comilla() {
+        assert_eq!(clean_param_value("A\x07B"), "AB");
+        assert_eq!(clean_param_value("A\x00B"), "AB");
+        assert_eq!(clean_param_value("A\tB"), "AB");
+        assert_eq!(clean_param_value("A\x7fB"), "AB");
+        // Lo que ya se sacaba sigue sacándose.
+        assert_eq!(clean_param_value("A\r\nB\"C"), "ABC");
+        // Lo demás queda: espacios, acentos y signos.
+        assert_eq!(clean_param_value("Ñandú, Ana-María"), "Ñandú, Ana-María");
+    }
+
+    /// El control en el `CN` no llega al documento: ni cierra el quoted-string
+    /// ni queda crudo dentro.
+    #[test]
+    fn un_control_en_el_nombre_del_asistente_no_llega_al_ical() {
+        let json = r#"{ "id": "x", "iCalUId": "u",
+            "organizer": { "emailAddress": { "name": "Ma\u0007ría\u0000", "address": "m@e.com" } } }"#;
+        let ical = GraphApiBackend::event_to_ical(&event_from(json));
+        assert!(
+            ical.contains("ORGANIZER;CN=\"María\":mailto:m@e.com\r\n"),
+            "{ical:?}"
+        );
+        assert!(!ical.contains('\u{7}') && !ical.contains('\u{0}'));
+    }
+
     #[test]
     fn una_recurrencia_semanal_se_traduce_a_rrule() {
         let recurrence: GraphRecurrence = serde_json::from_str(
