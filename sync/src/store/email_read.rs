@@ -1608,6 +1608,15 @@ mod tests {
     }
 
     #[test]
+    fn una_comilla_escapada_en_el_nombre_no_parte_la_entrada() {
+        // El header trae `\"` literal (quoted-pair): no cierra el nombre, así que
+        // `ana@x.com` sigue siendo parte del display-name.
+        let field = r#""a\", ana@x.com, b" <evil@z.com>"#;
+        assert!(!header_has_address(field, "ana@x.com"));
+        assert!(header_has_address(field, "evil@z.com"));
+    }
+
+    #[test]
     fn en_una_lista_solo_cuenta_la_direccion_real_de_cada_entrada() {
         let field = "Ana <ana@x.com>, \"bob@y.com\" <bob@z.com>";
         assert!(header_has_address(field, "ana@x.com"));
