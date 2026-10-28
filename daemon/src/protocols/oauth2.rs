@@ -290,6 +290,12 @@ struct ResourcePlan {
     /// grupo. Mínimo privilegio —sólo los del recurso pedido— y, para Microsoft,
     /// lo que determina para qué recurso vale el token nuevo.
     scopes: Vec<String>,
+    /// Si el access_token de alcance amplio del canje inicial —guardado bajo la
+    /// clave `access`— quedó huérfano y conviene borrarlo. Cierto sólo cuando la
+    /// cuenta es multi-recurso **y** ninguna capacidad resuelve a recurso `None`:
+    /// si alguna lo hiciera, su `access_key` volvería a ser `access` y ese token
+    /// sí se serviría, así que no se puede borrar.
+    orphan_access_removable: bool,
 }
 
 /// Decide, para la capacidad pedida, bajo qué clave vive su token, con qué
@@ -313,6 +319,11 @@ fn resource_plan(account: &Account, capability: &CapabilityType) -> ResourcePlan
     let distintos: std::collections::BTreeSet<Option<String>> =
         account.capabilities.keys().map(&resource_de).collect();
     let multi = distintos.len() > 1;
+
+    // El `access` del canje es huérfano sólo si la cuenta es multi-recurso y
+    // ninguna capacidad resuelve a `None`: una que lo hiciera guardaría y serviría
+    // su token bajo `access`, el borde de los scopes sin host.
+    let orphan_access_removable = multi && !distintos.contains(&None);
 
     let resource = resource_de(capability);
 
@@ -341,6 +352,7 @@ fn resource_plan(account: &Account, capability: &CapabilityType) -> ResourcePlan
         access_key,
         group,
         scopes: scopes.into_iter().collect(),
+        orphan_access_removable,
     }
 }
 
@@ -664,6 +676,15 @@ fn persistir(
             "la cuenta '{}' ya no existe",
             cuenta.id
         )));
+    }
+
+    // Con el token ya guardado por recurso, el access_token de alcance amplio del
+    // canje inicial —bajo la clave `access`— quedó huérfano y sin uso: se borra.
+    // Sólo si ninguna capacidad resuelve a recurso `None` (ver
+    // `orphan_access_removable`), porque ese borde sí serviría `access`.
+    if plan.orphan_access_removable {
+        SecretStore::remove_secret_in(&AccountDatabase::directory_for(uid), &cuenta.id, "access")
+            .map_err(|e| TokenError::Failed(format!("no se pudo borrar el access huérfano: {e}")))?;
     }
 
     let Some(expira) = frescos.expires_at else {

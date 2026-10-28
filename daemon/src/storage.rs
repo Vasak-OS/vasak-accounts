@@ -882,6 +882,29 @@ impl SecretStore {
         })
     }
 
+    /// Borra **una sola** clave de secreto de una cuenta, si está. Devuelve si
+    /// borró algo. A diferencia de [`Self::forget_account_in`] —que borra todo al
+    /// eliminar la cuenta—, esto saca una clave puntual, p.ej. el `access` huérfano
+    /// del canje en una cuenta multi-recurso. Sobre una cuenta que ya no existe es
+    /// un no-op: no la resucita ni reescribe el archivo.
+    pub fn remove_secret_in(
+        directory: &Path,
+        account_id: &str,
+        key: &str,
+    ) -> Result<bool, StorageError> {
+        with_write_lock(directory, || {
+            let mut secrets = Self::load(directory)?;
+            let removed = secrets
+                .get_mut(account_id)
+                .map(|entry| entry.remove(key).is_some())
+                .unwrap_or(false);
+            if removed {
+                Self::persist(directory, &secrets)?;
+            }
+            Ok(removed)
+        })
+    }
+
     pub fn get_secret(uid: u32, account_id: &str, key: &str) -> Result<String, StorageError> {
         Self::get_secret_in(&AccountDatabase::directory_for(uid), account_id, key)
     }
