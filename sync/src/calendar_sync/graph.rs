@@ -24,7 +24,7 @@ use chrono::NaiveDateTime;
 use crate::calendar_sync::{CalendarOutcome, CalendarReport, CLOSED_DETAIL};
 use crate::graph::{self, GraphCredential, GraphFetchError};
 use crate::ical::recurrence::ExpansionLimits;
-use crate::serialize::escape_text;
+use crate::serialize::{escape_text, push_folded_line};
 use crate::store::calendar::{
     derive_with_occurrences, CalendarApplied, CalendarListing, CalendarProgress, CalendarRoom,
     ObjectOp, ObjectRow, Window, WRITE_BATCH_ROWS,
@@ -604,7 +604,7 @@ impl GraphApiBackend {
         } else {
             event.i_cal_uid.as_str()
         };
-        out.push_str(&format!("UID:{}\r\n", escape_text(uid)));
+        push_folded_line(&mut out, &format!("UID:{}", escape_text(uid)));
 
         // DTSTAMP: obligatorio. La última modificación si vino, o ahora.
         let dtstamp = event
@@ -627,17 +627,17 @@ impl GraphApiBackend {
         push_datetime(&mut out, "DTEND", event.end.as_ref(), event.is_all_day);
 
         if let Some(subject) = non_empty(&event.subject) {
-            out.push_str(&format!("SUMMARY:{}\r\n", escape_text(subject)));
+            push_folded_line(&mut out, &format!("SUMMARY:{}", escape_text(subject)));
         }
         if let Some(body) = non_empty(&event.body_preview) {
-            out.push_str(&format!("DESCRIPTION:{}\r\n", escape_text(body)));
+            push_folded_line(&mut out, &format!("DESCRIPTION:{}", escape_text(body)));
         }
         if let Some(location) = event
             .location
             .as_ref()
             .and_then(|l| non_empty(&l.display_name))
         {
-            out.push_str(&format!("LOCATION:{}\r\n", escape_text(location)));
+            push_folded_line(&mut out, &format!("LOCATION:{}", escape_text(location)));
         }
 
         if let Some(line) = event
@@ -662,7 +662,7 @@ impl GraphApiBackend {
         }
 
         if let Some(rrule) = event.recurrence.as_ref().and_then(recurrence_to_rrule) {
-            out.push_str(&format!("RRULE:{rrule}\r\n"));
+            push_folded_line(&mut out, &format!("RRULE:{rrule}"));
         }
 
         if !event.categories.is_empty() {
@@ -674,7 +674,7 @@ impl GraphApiBackend {
                 .map(|c| escape_text(c))
                 .collect::<Vec<_>>()
                 .join(",");
-            out.push_str(&format!("CATEGORIES:{joined}\r\n"));
+            push_folded_line(&mut out, &format!("CATEGORIES:{joined}"));
         }
 
         if let Some(priority) = event.importance.as_deref().and_then(priority_of) {
@@ -702,9 +702,12 @@ fn non_empty(value: &Option<String>) -> Option<&str> {
 /// corresponde el escape de TEXT pero sí hay que impedir la inyección por salto
 /// de línea.
 fn clean_param_value(value: &str) -> String {
+    // Fuera todo carácter de control (CR/LF partirían la línea; el resto de los
+    // C0 dejaría un quoted-string técnicamente inválido) y la comilla doble que
+    // cierra un parámetro.
     value
         .chars()
-        .filter(|c| *c != '\r' && *c != '\n' && *c != '"')
+        .filter(|c| !c.is_control() && *c != '"')
         .collect()
 }
 
@@ -732,7 +735,9 @@ fn cal_address_line(
     if let Some(partstat) = partstat {
         params.push_str(&format!(";PARTSTAT={partstat}"));
     }
-    Some(format!("{property}{params}:mailto:{address}\r\n"))
+    let mut line = String::new();
+    push_folded_line(&mut line, &format!("{property}{params}:mailto:{address}"));
+    Some(line)
 }
 
 /// Mapea la respuesta de un asistente de Graph al `PARTSTAT` de iCalendar.
@@ -1043,6 +1048,88 @@ mod tests {
         );
     }
 
+    /// Un valor largo con acentos justo en el borde de los 75 octetos.
+    fn texto_largo_con_acentos() -> String {
+        // «SUMMARY:» ocupa 8 octetos; 66 «a» llegan al 74 y la «é» (2 octetos)
+        // no entra en la línea: tiene que abrir la continuación entera.
+        format!("{}ééé{}", "a".repeat(66), "ü".repeat(60))
+    }
+
+    /// Rojo-sin-arreglo: sin `push_folded_line`, `SUMMARY`, `DESCRIPTION` y
+    /// `LOCATION` salen en una sola línea de más de 75 octetos.
+    #[test]
+    fn un_texto_largo_del_evento_sale_plegado_sin_partir_un_acento() {
+        let largo = texto_largo_con_acentos();
+        let json = serde_json::json!({
+            "id": "x", "iCalUId": "u",
+            "subject": largo, "bodyPreview": largo,
+            "location": { "displayName": largo },
+        })
+        .to_string();
+        let ical = GraphApiBackend::event_to_ical(&event_from(&json));
+
+        assert!(
+            ical.contains("\r\n "),
+            "debe haber continuaciones: {ical:?}"
+        );
+        let desplegado = crate::serialize::assert_folded_and_unfold(&ical);
+        for prop in ["SUMMARY", "DESCRIPTION", "LOCATION"] {
+            assert!(
+                desplegado.contains(&format!("\r\n{prop}:{largo}\r\n")),
+                "{prop} desplegado no da el valor entero: {desplegado:?}"
+            );
+        }
+    }
+
+    /// Rojo-sin-arreglo: el `ATTENDEE` con un nombre largo salía en una línea de
+    /// más de 75 octetos (`cal_address_line` no plegaba).
+    #[test]
+    fn un_asistente_con_nombre_largo_sale_plegado() {
+        let nombre = "Ñandú ".repeat(30);
+        let json = serde_json::json!({
+            "id": "x", "iCalUId": "u",
+            "attendees": [{ "emailAddress": { "name": nombre, "address": "n@example.com" } }],
+        })
+        .to_string();
+        let ical = GraphApiBackend::event_to_ical(&event_from(&json));
+
+        let desplegado = crate::serialize::assert_folded_and_unfold(&ical);
+        assert!(
+            desplegado.contains(&format!(
+                "\r\nATTENDEE;CN=\"{nombre}\":mailto:n@example.com\r\n"
+            )),
+            "{desplegado:?}"
+        );
+    }
+
+    /// Rojo-sin-arreglo: `clean_param_value` sólo sacaba CR, LF y la comilla; un
+    /// C0 (BEL, NUL, tab, DEL…) sobrevivía dentro del quoted-string del `CN`.
+    #[test]
+    fn clean_param_value_saca_los_caracteres_de_control_y_la_comilla() {
+        assert_eq!(clean_param_value("A\x07B"), "AB");
+        assert_eq!(clean_param_value("A\x00B"), "AB");
+        assert_eq!(clean_param_value("A\tB"), "AB");
+        assert_eq!(clean_param_value("A\x7fB"), "AB");
+        // Lo que ya se sacaba sigue sacándose.
+        assert_eq!(clean_param_value("A\r\nB\"C"), "ABC");
+        // Lo demás queda: espacios, acentos y signos.
+        assert_eq!(clean_param_value("Ñandú, Ana-María"), "Ñandú, Ana-María");
+    }
+
+    /// El control en el `CN` no llega al documento: ni cierra el quoted-string
+    /// ni queda crudo dentro.
+    #[test]
+    fn un_control_en_el_nombre_del_asistente_no_llega_al_ical() {
+        let json = r#"{ "id": "x", "iCalUId": "u",
+            "organizer": { "emailAddress": { "name": "Ma\u0007ría\u0000", "address": "m@e.com" } } }"#;
+        let ical = GraphApiBackend::event_to_ical(&event_from(json));
+        assert!(
+            ical.contains("ORGANIZER;CN=\"María\":mailto:m@e.com\r\n"),
+            "{ical:?}"
+        );
+        assert!(!ical.contains('\u{7}') && !ical.contains('\u{0}'));
+    }
+
     #[test]
     fn una_recurrencia_semanal_se_traduce_a_rrule() {
         let recurrence: GraphRecurrence = serde_json::from_str(
@@ -1075,6 +1162,34 @@ mod tests {
         assert!(rrule.contains("BYDAY=FR"));
         assert!(rrule.contains("BYSETPOS=-1"));
         assert!(rrule.contains("UNTIL=20261231T235959Z"));
+    }
+
+    /// Rojo-sin-arreglo: la línea `RRULE` se escribía directa, sin plegar; una
+    /// anual relativa con todos los días y `UNTIL` pasa de 75 octetos.
+    #[test]
+    fn una_rrule_larga_sale_plegada_y_entera() {
+        let event = event_from(
+            r#"{ "id": "x", "iCalUId": "u",
+                 "recurrence": {
+                    "pattern": { "type": "relativeYearly", "interval": 2, "month": 10,
+                        "index": "last",
+                        "daysOfWeek": ["monday", "tuesday", "wednesday", "thursday",
+                                       "friday", "saturday", "sunday"] },
+                    "range": { "type": "endDate", "endDate": "2030-12-31" } } }"#,
+        );
+        let rrule = recurrence_to_rrule(event.recurrence.as_ref().unwrap()).expect("hay RRULE");
+        assert!(
+            format!("RRULE:{rrule}").len() > 75,
+            "el caso tiene que pasar los 75 octetos: {rrule}"
+        );
+
+        let ical = GraphApiBackend::event_to_ical(&event);
+        assert!(ical.contains("\r\n "), "debe haber continuación: {ical:?}");
+        let desplegado = crate::serialize::assert_folded_and_unfold(&ical);
+        assert!(
+            desplegado.contains(&format!("\r\nRRULE:{rrule}\r\n")),
+            "RRULE desplegada no queda íntegra: {desplegado:?}"
+        );
     }
 
     #[test]

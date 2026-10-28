@@ -350,10 +350,12 @@ pub async fn fetch_all_pages<T: DeserializeOwned>(
             Err(_) => return Err(GraphFetchError::Timeout),
         };
 
-        all.extend(data.value);
-        if all.len() > max_items {
+        // No materializamos más allá del tope: si esta página excedería
+        // `max_items`, cortamos antes de extender el `Vec`.
+        if all.len() + data.value.len() > max_items {
             return Err(GraphFetchError::TooManyItems);
         }
+        all.extend(data.value);
 
         let Some(next) = data.next_link else {
             return Ok(all);
@@ -697,5 +699,71 @@ pub mod fake {
             user_id: "me".to_string(),
             base_url: server.base_url(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fake::{client, credential_for, FakeGraph};
+    use super::*;
+
+    /// Una página de `n` ítems enteros, con `nextLink` opcional.
+    fn page(n: usize, next: Option<&str>) -> String {
+        let items = (0..n).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        match next {
+            Some(link) => format!("{{\"value\":[{items}],\"@odata.nextLink\":\"{link}\"}}"),
+            None => format!("{{\"value\":[{items}]}}"),
+        }
+    }
+
+    async fn fetch(server: &FakeGraph, max_items: usize) -> Result<Vec<u32>, GraphFetchError> {
+        let url = Url::parse(&format!("{}/v1.0/me/items", server.origin())).unwrap();
+        fetch_all_pages(&client(), &credential_for(server), url, max_items, &[]).await
+    }
+
+    /// Una página que por sí sola pasa el tope corta con `TooManyItems`. Ojo: el
+    /// endurecimiento (comprobar antes de `extend`) no cambia lo que ve quien
+    /// llama, sólo evita materializar de más; esta prueba y las dos de abajo
+    /// guardan el **contrato** del tope (corte y borde `>`), no la asignación.
+    #[tokio::test]
+    async fn una_pagina_que_excede_el_tope_de_items_corta_con_too_many_items() {
+        let server = FakeGraph::start().await;
+        server.push(page(6, None));
+
+        let result = fetch(&server, 5).await;
+        assert!(
+            matches!(result, Err(GraphFetchError::TooManyItems)),
+            "6 ítems con tope 5 deben cortar con TooManyItems, dio {result:?}"
+        );
+    }
+
+    /// El tope cuenta lo acumulado: dos páginas que juntas pasan el tope cortan
+    /// en la segunda, y no se pide una tercera.
+    #[tokio::test]
+    async fn el_tope_de_items_cuenta_lo_acumulado_entre_paginas() {
+        let server = FakeGraph::start().await;
+        let next = format!("{}/v1.0/me/items?$skip=3", server.origin());
+        server.push(page(3, Some(&next)));
+        server.push(page(3, Some(&format!("{}/otra", server.origin()))));
+
+        let result = fetch(&server, 5).await;
+        assert!(
+            matches!(result, Err(GraphFetchError::TooManyItems)),
+            "3 + 3 con tope 5 deben cortar, dio {result:?}"
+        );
+        assert_eq!(server.requests().len(), 2, "no se pide una tercera página");
+    }
+
+    /// El borde: exactamente `max_items` ítems se aceptan (el corte es `>`, no
+    /// `>=`).
+    #[tokio::test]
+    async fn exactamente_el_tope_de_items_se_acepta() {
+        let server = FakeGraph::start().await;
+        let next = format!("{}/v1.0/me/items?$skip=3", server.origin());
+        server.push(page(3, Some(&next)));
+        server.push(page(2, None));
+
+        let items = fetch(&server, 5).await.expect("5 ítems con tope 5 pasan");
+        assert_eq!(items, vec![0, 1, 2, 0, 1]);
     }
 }
