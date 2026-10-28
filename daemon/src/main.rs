@@ -113,6 +113,17 @@ fn open_db(uid: u32) -> zbus::fdo::Result<AccountDatabase> {
 /// una cuenta se muriera en una hora.
 const SECRETOS_DE_OAUTH: [&str; 2] = ["refresh", "client_secret"];
 
+/// Las claves de secreto que no pueden aparecer dentro de la **configuración** de
+/// una capacidad.
+///
+/// Simétrico a [`SECRETOS_DE_OAUTH`], pero del otro lado: `GetAccountData`
+/// devuelve el config tal cual a cualquier aplicación con permiso de la
+/// capacidad, así que un secreto escrito ahí —una `ldap_password`, por ejemplo—
+/// quedaría a la vista. Las contraseñas viajan por `secrets_json` bajo la clave
+/// `access` y terminan cifradas en `vasak-keyring`, nunca en el config. Para LDAP
+/// pre-provisionado la contraseña la pone el catálogo de root, no el llamante.
+const SECRETOS_EN_CONFIG: [&str; 1] = ["ldap_password"];
+
 // ---------------------------------------------------------------------------
 // Helper: extrae el PID del llamante desde la cabecera D-Bus
 // ---------------------------------------------------------------------------
@@ -822,6 +833,29 @@ impl AccountManager {
             }
         }
 
+        // Simétrico al guard de arriba: un secreto no puede ir en la
+        // configuración, que `GetAccountData` devuelve a cualquier app con
+        // permiso. Las contraseñas viajan por `secrets_json` y se cifran en el
+        // llavero.
+        for config in capabilities.values() {
+            if let Some(obj) = config.as_object() {
+                for prohibida in &SECRETOS_EN_CONFIG {
+                    if obj.contains_key(*prohibida) {
+                        return Err(FdoError::InvalidArgs(format!(
+                            "'{prohibida}' no puede ir en la configuración: \
+                             GetAccountData la devuelve a cualquier app con permiso. \
+                             La contraseña viaja en secrets_json bajo 'access' y \
+                             queda cifrada en el llavero"
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Si el llamante ya trae la contraseña (alta manual, «otro servidor»), no
+        // hay nada que migrar del catálogo.
+        let trajo_access = secrets.contains_key("access");
+
         let account_id = self
             .con_candado(uid, || async {
                 let mut db = open_db(uid)?;
@@ -834,6 +868,37 @@ impl AccountManager {
                     storage::SecretStore::store_secret(uid, &account_id, &clave, &valor).map_err(
                         |e| FdoError::Failed(format!("Error al guardar el secreto: {e}")),
                     )?;
+                }
+
+                // LDAP pre-provisionado: la contraseña del bind vive en el catálogo
+                // de root (`ldap_password`), que la pantalla no puede leer para
+                // mandarla en `secrets_json`. Si la cuenta es de un proveedor LDAP
+                // del catálogo con contraseña y el llamante no trajo una, se copia
+                // al llavero bajo la clave `access` —donde el sync la busca—, o la
+                // cuenta nunca sincronizaría («la contraseña guardada está vacía»).
+                if !trajo_access {
+                    if let Some(proveedor) = providers::load_for(uid)
+                        .ok()
+                        .and_then(|c| c.get(&provider_type).cloned())
+                    {
+                        if proveedor.kind == providers::ProviderKind::Ldap {
+                            if let Some(clave) = proveedor
+                                .ldap_password
+                                .as_deref()
+                                .filter(|c| !c.trim().is_empty())
+                            {
+                                storage::SecretStore::store_secret(
+                                    uid,
+                                    &account_id,
+                                    "access",
+                                    clave,
+                                )
+                                .map_err(|e| {
+                                    FdoError::Failed(format!("Error al guardar el secreto: {e}"))
+                                })?;
+                            }
+                        }
+                    }
                 }
                 Ok::<_, FdoError>(account_id)
             })

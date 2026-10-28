@@ -158,6 +158,14 @@ pub(crate) fn credential_from(
         .and_then(|v| v.as_str())
         .ok_or_else(|| CredentialError::Failed("falta ldap_bind_dn".into()))?
         .to_string();
+    if bind_dn.trim().is_empty() {
+        // Un bind_dn vacío (con contraseña) es otra forma del «unauthenticated
+        // bind»: varios servidores lo tratan como anónimo. Se rechaza acá, igual
+        // que la contraseña vacía, en vez de dejar que lo atrape el `.success()`.
+        return Err(CredentialError::Failed(
+            "el bind DN guardado está vacío: la cuenta no está autenticada".into(),
+        ));
+    }
     let search_base = config
         .get("ldap_search_base")
         .and_then(|v| v.as_str())
@@ -334,7 +342,10 @@ impl LdapBackend {
         let parsed = url::Url::parse(&credential.url)
             .map_err(|e| format!("ldap_url no es una dirección: {e}"))?;
 
-        let mut settings = ldap3::LdapConnSettings::new();
+        // Timeout de conexión: un servidor que acepta el TCP y después se queda
+        // callado no puede dejar el sync colgado para siempre.
+        let mut settings =
+            ldap3::LdapConnSettings::new().set_conn_timeout(std::time::Duration::from_secs(15));
         match parsed.scheme() {
             // TLS implícito: `ldap3` lo aplica solo y valida el certificado.
             "ldaps" => {}
@@ -380,7 +391,14 @@ impl LdapBackend {
         ldap: &mut ldap3::Ldap,
         credential: &LdapCredential,
     ) -> Result<Vec<ldap3::SearchEntry>, String> {
+        // Cotas del lado del servidor: un directorio corporativo tiene miles de
+        // personas, no millones. El tope de tamaño acota una búsqueda demasiado
+        // amplia y el de tiempo una que el servidor tarda en resolver, sin cortar
+        // un directorio normal. `with_timeout` acota además el tiempo de red del
+        // lado del cliente, por si el servidor deja de contestar a mitad.
         let rs = ldap
+            .with_timeout(std::time::Duration::from_secs(30))
+            .with_search_options(ldap3::SearchOptions::new().sizelimit(10_000).timelimit(30))
             .search(
                 &credential.search_base,
                 ldap3::Scope::Subtree,
@@ -390,11 +408,22 @@ impl LdapBackend {
             .await
             .map_err(|e| format!("error en búsqueda LDAP: {e}"))?;
 
-        // Igual que en el bind: un código de resultado distinto de cero —base
-        // inexistente, filtro inválido— llega como `Ok` y hay que convertirlo.
-        let (entries, _result) = rs
-            .success()
-            .map_err(|e| format!("el servidor LDAP rechazó la búsqueda: {e}"))?;
+        // El código de resultado. 0 es éxito. 4 (`sizeLimitExceeded`) lo devuelve
+        // un servidor con un límite administrativo **junto con** las entradas que
+        // sí entraron: es un resultado parcial, no un fallo, así que se avisa y se
+        // usan las que vinieron. Cualquier otro código distinto de cero —base
+        // inexistente, filtro inválido— llega como `Ok` y sí es un fallo.
+        let ldap3::SearchResult(entries, result) = rs;
+        match result.rc {
+            0 => {}
+            4 => tracing::warn!(
+                "'{}': el servidor LDAP cortó la búsqueda por su límite de tamaño; \
+                 se usan las {} entradas que trajo",
+                credential.bind_dn,
+                entries.len()
+            ),
+            _ => return Err(format!("el servidor LDAP rechazó la búsqueda: {result}")),
+        }
 
         Ok(entries
             .into_iter()
