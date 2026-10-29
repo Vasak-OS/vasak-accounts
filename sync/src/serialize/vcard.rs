@@ -43,6 +43,23 @@ pub struct LabeledValue {
     pub value: String,
 }
 
+/// Una dirección postal para escribir: su etiqueta («casa», «trabajo») como
+/// `TYPE`, y los siete componentes del `ADR` (RFC 6350 §6.3.1) en orden. Van por
+/// separado, no como un texto suelto, porque cada uno se escapa aparte al
+/// serializar: así ninguno puede partir la línea, inyectar un parámetro ni correr
+/// la estructura de los siete campos separados por `;`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PostalAddress {
+    pub label: String,
+    pub po_box: String,
+    pub extended: String,
+    pub street: String,
+    pub city: String,
+    pub region: String,
+    pub postal_code: String,
+    pub country: String,
+}
+
 /// Lo que cambia de una tarjeta.
 ///
 /// Cada campo es un [`Change`]: por omisión no se toca. Las listas —correos,
@@ -61,6 +78,8 @@ pub struct ContactPatch {
     pub emails: Change<Vec<LabeledValue>>,
     /// Los `TEL`, con su etiqueta en `TYPE`.
     pub phones: Change<Vec<LabeledValue>>,
+    /// Los `ADR`, con su etiqueta en `TYPE` y los siete componentes escapados.
+    pub addresses: Change<Vec<PostalAddress>>,
     /// `RELATED` o el par de Apple, según lo que la tarjeta ya traía.
     pub related: Change<Vec<Relation>>,
 }
@@ -73,6 +92,7 @@ impl ContactPatch {
             && self.note == Change::Leave
             && self.emails == Change::Leave
             && self.phones == Change::Leave
+            && self.addresses == Change::Leave
             && self.related == Change::Leave
     }
 }
@@ -145,6 +165,7 @@ pub fn apply_changes(raw_vcard: &str, patch: &ContactPatch) -> String {
 
     let editing_emails = !matches!(patch.emails, Change::Leave);
     let editing_phones = !matches!(patch.phones, Change::Leave);
+    let editing_addresses = !matches!(patch.addresses, Change::Leave);
     let editing_related = !matches!(patch.related, Change::Leave);
     // Una lista se fija entera: se sacan **todas** sus líneas del crudo y la lista
     // nueva se escribe en `flush`. Al reescribir las relaciones se sacan **las dos
@@ -168,6 +189,9 @@ pub fn apply_changes(raw_vcard: &str, patch: &ContactPatch) -> String {
     }
     if editing_phones {
         stripped_groups.extend(groups_of(&properties, "TEL"));
+    }
+    if editing_addresses {
+        stripped_groups.extend(groups_of(&properties, "ADR"));
     }
 
     let mut out: Vec<String> = Vec::new();
@@ -215,6 +239,7 @@ pub fn apply_changes(raw_vcard: &str, patch: &ContactPatch) -> String {
             // reescribe, la otra no.
             "EMAIL" if editing_emails => {}
             "TEL" if editing_phones => {}
+            "ADR" if editing_addresses => {}
             "RELATED" if editing_related => {}
             "X-ABRELATEDNAMES" if editing_related => {}
             // El `X-ABLabel` de un grupo cuya propiedad principal se sacó —un
@@ -261,6 +286,9 @@ pub fn new_contact(uid: &str, patch: &ContactPatch) -> String {
     }
     if let Change::Set(phones) = &patch.phones {
         push_labeled(&mut out, "TEL", phones);
+    }
+    if let Change::Set(addresses) = &patch.addresses {
+        push_addresses(&mut out, addresses);
     }
     if let Change::Set(relations) = &patch.related {
         push_related(&mut out, relations);
@@ -330,6 +358,9 @@ fn flush(out: &mut Vec<String>, patch: &ContactPatch, done: &Done, properties: &
     }
     if let Change::Set(phones) = &patch.phones {
         push_labeled(out, "TEL", phones);
+    }
+    if let Change::Set(addresses) = &patch.addresses {
+        push_addresses(out, addresses);
     }
     if let Change::Set(relations) = &patch.related {
         match related_form(properties) {
@@ -405,6 +436,37 @@ fn push_apple(out: &mut Vec<String>, relations: &[Relation], max_item: u32) {
             &[],
             &sanitize_label(&relation.label),
         )));
+    }
+}
+
+/// Escribe las direcciones como `ADR` (RFC 6350 §6.3.1): la etiqueta como `TYPE`
+/// **saneado** ([`sanitize_label`]) y los siete componentes **escapados cada uno
+/// por separado** ([`escape_text`]) y unidos por `;`. Como escapar protege el
+/// `;`, la coma y el salto de línea, ningún componente puede partir la línea,
+/// inyectar un parámetro ni correr la estructura de los siete campos; la lectura
+/// ([`crate::vcard`]) los parte por el `;` sin escapar y deshace el escape de cada
+/// uno, así vuelven en su lugar.
+fn push_addresses(out: &mut Vec<String>, addresses: &[PostalAddress]) {
+    for address in addresses {
+        let params = if address.label.trim().is_empty() {
+            Vec::new()
+        } else {
+            vec![format!("TYPE={}", sanitize_label(&address.label))]
+        };
+        let value = [
+            &address.po_box,
+            &address.extended,
+            &address.street,
+            &address.city,
+            &address.region,
+            &address.postal_code,
+            &address.country,
+        ]
+        .iter()
+        .map(|component| escape_text(component))
+        .collect::<Vec<_>>()
+        .join(";");
+        out.extend(fold(&render("ADR", &params, &value)));
     }
 }
 
@@ -907,5 +969,244 @@ mod tests {
         let c = contact_from(&out, "").unwrap();
         assert_eq!(c.emails, vec![field("home", "juan@x.com")]);
         assert_eq!(c.phones, vec![field("cell", "+5491100000000")]);
+    }
+
+    // ── Direcciones postales (ADR) ─────────────────────────────────────────
+
+    fn postal(label: &str, street: &str, city: &str) -> PostalAddress {
+        PostalAddress {
+            label: label.to_string(),
+            street: street.to_string(),
+            city: city.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Lo que la lectura devuelve de una dirección, para comparar.
+    fn read_address(label: &str, street: &str, city: &str) -> crate::vcard::Address {
+        crate::vcard::Address {
+            label: label.to_string(),
+            street: street.to_string(),
+            city: city.to_string(),
+            ..Default::default()
+        }
+    }
+
+    const CARD_WITH_ADR: &str = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:abc\r\nFN:Ana Pérez\r\n\
+        N:Pérez;Ana;;;\r\nEMAIL;TYPE=WORK:ana@ejemplo.com\r\n\
+        ADR;TYPE=HOME:;;Vieja 1;Rosario;;2000;AR\r\n\
+        PHOTO;ENCODING=b:iVBORw0=\r\nX-CUSTOM:valor\r\nEND:VCARD\r\n";
+
+    /// Fijar las direcciones reemplaza las viejas, escribe las siete partes y
+    /// **deja el resto de la tarjeta cruda intacto** (una `PHOTO`, un `X-` propio).
+    #[test]
+    fn fijar_direcciones_reemplaza_las_viejas_y_deja_lo_demas_intacto() {
+        let out = apply_changes(
+            CARD_WITH_ADR,
+            &ContactPatch {
+                addresses: Change::Set(vec![PostalAddress {
+                    label: "work".into(),
+                    po_box: "CC 1".into(),
+                    extended: "Piso 2".into(),
+                    street: "Nueva 5".into(),
+                    city: "Córdoba".into(),
+                    region: "Córdoba".into(),
+                    postal_code: "5000".into(),
+                    country: "Argentina".into(),
+                }]),
+                ..Default::default()
+            },
+        );
+        assert!(!out.contains("Vieja 1"), "{out}");
+        assert!(
+            out.contains("ADR;TYPE=work:CC 1;Piso 2;Nueva 5;Córdoba;Córdoba;5000;Argentina"),
+            "{out}"
+        );
+        for kept in [
+            "UID:abc",
+            "FN:Ana Pérez",
+            "N:Pérez;Ana;;;",
+            "EMAIL;TYPE=WORK:ana@ejemplo.com",
+            "PHOTO;ENCODING=b:iVBORw0=",
+            "X-CUSTOM:valor",
+        ] {
+            assert!(out.contains(kept), "se perdió «{kept}»: {out}");
+        }
+        let c = contact_from(&out, "").unwrap();
+        assert_eq!(c.addresses.len(), 1);
+        assert_eq!(c.addresses[0].po_box, "CC 1");
+        assert_eq!(c.addresses[0].postal_code, "5000");
+    }
+
+    /// Sin tocar `addresses`, la `ADR` del crudo sobrevive tal cual: editar el
+    /// nombre no reescribe una dirección que la persona no editó.
+    #[test]
+    fn editar_otro_campo_no_toca_las_direcciones() {
+        let out = apply_changes(
+            CARD_WITH_ADR,
+            &ContactPatch {
+                full_name: set("Ana María"),
+                ..Default::default()
+            },
+        );
+        assert!(
+            out.contains("ADR;TYPE=HOME:;;Vieja 1;Rosario;;2000;AR"),
+            "{out}"
+        );
+    }
+
+    /// Sacar las direcciones (`Clear`) o fijar una lista vacía las borra todas,
+    /// con el `X-ABLabel` de su grupo de Apple —que quedaría huérfano—, sin tocar
+    /// el correo.
+    #[test]
+    fn sacar_las_direcciones_las_borra_con_su_etiqueta_de_apple() {
+        let apple = "BEGIN:VCARD\r\nFN:Ana\r\nEMAIL:ana@x.com\r\n\
+            item1.ADR:;;Vieja 1;Rosario;;;\r\nitem1.X-ABLabel:_$!<Home>!$_\r\n\
+            ADR;TYPE=WORK:;;Otra 2;Salta;;;\r\nEND:VCARD\r\n";
+        for change in [Change::Clear, Change::Set(vec![])] {
+            let out = apply_changes(
+                apple,
+                &ContactPatch {
+                    addresses: change,
+                    ..Default::default()
+                },
+            );
+            assert!(!out.contains("ADR"), "{out}");
+            assert!(!out.contains("Vieja 1") && !out.contains("Otra 2"), "{out}");
+            assert!(
+                !out.to_uppercase().contains("X-ABLABEL"),
+                "quedó una etiqueta huérfana: {out}"
+            );
+            let c = contact_from(&out, "").unwrap();
+            assert!(c.addresses.is_empty());
+            assert_eq!(c.emails, vec![field("", "ana@x.com")]);
+        }
+    }
+
+    /// Una tarjeta nueva escribe sus direcciones y se relee con ellas.
+    #[test]
+    fn una_tarjeta_nueva_con_direcciones_se_lee() {
+        let out = new_contact(
+            "nuevo-3",
+            &ContactPatch {
+                full_name: set("Juan"),
+                addresses: Change::Set(vec![
+                    postal("home", "Calle 1", "Rosario"),
+                    postal("", "Calle 2", "Salta"),
+                ]),
+                ..Default::default()
+            },
+        );
+        assert!(out.contains("ADR;TYPE=home:;;Calle 1;Rosario;;;"), "{out}");
+        assert!(out.contains("ADR:;;Calle 2;Salta;;;"), "{out}");
+        let c = contact_from(&out, "").unwrap();
+        assert_eq!(
+            c.addresses,
+            vec![
+                read_address("home", "Calle 1", "Rosario"),
+                read_address("", "Calle 2", "Salta"),
+            ]
+        );
+    }
+
+    /// Los separadores y escapes dentro de un componente viajan y vuelven:
+    /// `;` `,` `\` y el salto de línea no corren los siete campos.
+    #[test]
+    fn los_componentes_de_una_direccion_con_separadores_vuelven_en_su_lugar() {
+        let tricky = postal("home", "Calle 1; esq. 2, piso \\ 3", "Villa; Gesell");
+        let out = new_contact(
+            "u",
+            &ContactPatch {
+                full_name: set("Juan"),
+                addresses: Change::Set(vec![tricky]),
+                ..Default::default()
+            },
+        );
+        let c = contact_from(&out, "").unwrap();
+        assert_eq!(c.addresses.len(), 1);
+        assert_eq!(c.addresses[0].street, "Calle 1; esq. 2, piso \\ 3");
+        assert_eq!(c.addresses[0].city, "Villa; Gesell");
+        assert_eq!(c.addresses[0].region, "", "no se corrieron los campos");
+        assert_eq!(c.addresses[0].country, "");
+    }
+
+    /// **Seguridad (espejo de A0): una dirección adversaria no inyecta líneas ni
+    /// parámetros.** Un componente con `\r\nX-EVIL:1` y una etiqueta con `;`, `:`,
+    /// `"` y un salto de línea no pueden partir la línea `ADR`: ninguna propiedad
+    /// nueva, un solo `TYPE` saneado, y al releer vuelven exactamente los mismos
+    /// campos (sin la parte inyectada como línea).
+    #[test]
+    fn una_direccion_adversaria_no_inyecta_lineas_ni_parametros() {
+        let evil = PostalAddress {
+            label: "home;PREF=1:\"x\"\r\nX-EVIL:1".into(),
+            po_box: "caja\r\nX-EVIL:1".into(),
+            extended: "BEGIN:VCARD\r\nFN:Falsa".into(),
+            street: "calle\nEND:VCARD".into(),
+            city: "ciudad;X-EVIL=1".into(),
+            region: "re\\gión".into(),
+            postal_code: "1000,2000".into(),
+            country: "AR\r\nADR:;;;;;;".into(),
+        };
+        for out in [
+            apply_changes(
+                CARD,
+                &ContactPatch {
+                    addresses: Change::Set(vec![evil.clone()]),
+                    ..Default::default()
+                },
+            ),
+            new_contact(
+                "u",
+                &ContactPatch {
+                    full_name: set("Juan"),
+                    addresses: Change::Set(vec![evil.clone()]),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            // Se despliega antes de mirar: la línea larga se pliega en la salida.
+            let unfolded = out.replace("\r\n ", "");
+            let lines: Vec<&str> = unfolded.split("\r\n").filter(|l| !l.is_empty()).collect();
+            // Ninguna propiedad inyectada.
+            assert!(!lines.iter().any(|l| l.starts_with("X-EVIL")), "{out}");
+            assert!(!lines.iter().any(|l| l.starts_with("FN:Falsa")), "{out}");
+            assert_eq!(
+                lines.iter().filter(|l| l.starts_with("ADR")).count(),
+                1,
+                "{out}"
+            );
+            assert_eq!(
+                lines.iter().filter(|l| **l == "BEGIN:VCARD").count(),
+                1,
+                "{out}"
+            );
+            assert_eq!(
+                lines.iter().filter(|l| **l == "END:VCARD").count(),
+                1,
+                "{out}"
+            );
+            // Un solo parámetro `TYPE`, sin `;` extra ni comillas: la etiqueta
+            // quedó saneada en uno solo.
+            let adr = lines.iter().find(|l| l.starts_with("ADR")).unwrap();
+            let (head, _) = adr.split_once(':').unwrap();
+            assert_eq!(head.matches(';').count(), 1, "{out}");
+            assert!(
+                head.starts_with("ADR;TYPE=") && !head.contains('"'),
+                "{out}"
+            );
+
+            // Y se relee con la misma estructura: una dirección, siete campos.
+            let c = contact_from(&out, "").unwrap();
+            assert_eq!(c.addresses.len(), 1, "{out}");
+            let a = &c.addresses[0];
+            assert_eq!(a.label, "homepref1xx-evil1");
+            assert_eq!(a.po_box, "caja X-EVIL:1");
+            assert_eq!(a.extended, "BEGIN:VCARD FN:Falsa");
+            assert_eq!(a.street, "calle END:VCARD");
+            assert_eq!(a.city, "ciudad;X-EVIL=1");
+            assert_eq!(a.region, "re\\gión");
+            assert_eq!(a.postal_code, "1000,2000");
+            assert_eq!(a.country, "AR ADR:;;;;;;");
+        }
     }
 }

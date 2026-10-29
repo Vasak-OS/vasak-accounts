@@ -49,7 +49,7 @@ use serde::Serialize;
 
 use super::queue::SyncState;
 use super::{classify, StoreError};
-use crate::vcard::{self, Field};
+use crate::vcard::{self, Address, Field};
 
 /// El tope de contactos por página.
 pub const MAX_PAGE: u32 = 1000;
@@ -242,6 +242,7 @@ pub struct ContactDetail {
     pub display_name: String,
     pub emails: Vec<Field>,
     pub phones: Vec<Field>,
+    pub addresses: Vec<Address>,
     pub organization: String,
     pub notes: String,
     pub related: Vec<Field>,
@@ -591,6 +592,7 @@ pub fn get_contact(connection: &Connection, id: i64) -> Result<Option<ContactDet
             display_name: contact.display_name,
             emails: contact.emails,
             phones: contact.phones,
+            addresses: contact.addresses,
             organization: contact.organization,
             notes: contact.notes,
             related: contact.related,
@@ -607,9 +609,9 @@ fn json_len<T: Serialize>(value: &T) -> usize {
     serde_json::to_string(value).map_or(usize::MAX, |json| json.len())
 }
 
-/// Un contacto que entra en `cap` bytes de JSON: entero si entra, y si no,
-/// sin sus últimas relaciones, después sin sus últimos teléfonos y después
-/// sin sus últimos correos, con `truncated`. Lo que queda —nombre,
+/// Un contacto que entra en `cap` bytes de JSON: entero si entra, y si no, sin
+/// sus últimas direcciones, después sin sus últimas relaciones, sus últimos
+/// teléfonos y sus últimos correos, con `truncated`. Lo que queda —nombre,
 /// organización, nota, de a 4096 bytes— entra siempre.
 fn fit_contact(mut contact: ContactDetail, cap: usize) -> ContactDetail {
     if json_len(&contact) <= cap {
@@ -617,6 +619,15 @@ fn fit_contact(mut contact: ContactDetail, cap: usize) -> ContactDetail {
     }
     contact.truncated = true;
     let mut size = json_len(&contact);
+    // Las direcciones primero: son las más pesadas (siete componentes cada una) y
+    // las menos urgentes para dar con alguien. Van en su propio bucle porque son
+    // de otro tipo que las listas de `{label, value}`.
+    while size > cap {
+        let Some(address) = contact.addresses.pop() else {
+            break;
+        };
+        size = size.saturating_sub(json_len(&address) + usize::from(!contact.addresses.is_empty()));
+    }
     for kind in 0..3 {
         let fields = match kind {
             0 => &mut contact.related,
@@ -1378,6 +1389,64 @@ mod tests {
                 .starts_with(&format!("{n}\""))
         });
         assert!(kept_in_order, "se sacan del final");
+    }
+
+    /// Con un contacto que no entra, **las direcciones son lo primero que se
+    /// recorta**: salen enteras y los correos, teléfonos y relaciones quedan.
+    #[test]
+    fn un_contacto_que_no_entra_pierde_primero_las_direcciones() {
+        let temp = TempDir::new("contacto-recortado-direcciones");
+        let mut store = open_store(&temp);
+        let b = book(&mut store, "https://x/a/", "A");
+        let quotes = "\"".repeat(4000);
+        let mut raw = String::from("BEGIN:VCARD\r\nFN:Ana\r\n");
+        for n in 0..50 {
+            // Tres componentes de 4000 comillas (el JSON las duplica): 50 de estas
+            // pasan del megabyte por sí solas.
+            raw.push_str(&format!(
+                "ADR;TYPE=home:;;{n}{quotes};{quotes};{quotes};;\r\n"
+            ));
+        }
+        for n in 0..5 {
+            raw.push_str(&format!(
+                "EMAIL:a{n}@x.com\r\nTEL:{n}\r\nRELATED:text:r{n}\r\n"
+            ));
+        }
+        raw.push_str("END:VCARD");
+        let id = add_raw(&mut store, &b, &raw);
+
+        let contact = get_contact(store.connection(), id).unwrap().unwrap();
+        assert!(contact.truncated);
+        assert!(contact.addresses.len() < 50, "se recortan las direcciones");
+        let kept_in_order = contact
+            .addresses
+            .iter()
+            .enumerate()
+            .all(|(n, a)| a.street.starts_with(&n.to_string()));
+        assert!(kept_in_order, "se sacan del final");
+        assert_eq!(contact.emails.len(), 5, "los correos no se tocan");
+        assert_eq!(contact.phones.len(), 5);
+        assert_eq!(contact.related.len(), 5);
+        assert!(to_capped_json(&contact, MAX_CONTACT_BYTES).is_ok());
+    }
+
+    /// Un contacto con direcciones que entra se lee entero, con sus componentes.
+    #[test]
+    fn un_contacto_con_direcciones_se_lee_entero() {
+        let temp = TempDir::new("contacto-direcciones");
+        let mut store = open_store(&temp);
+        let b = book(&mut store, "https://x/a/", "A");
+        let raw =
+            "BEGIN:VCARD\r\nFN:Ana\r\nADR;TYPE=HOME:;;Calle 1;Rosario;SF;2000;AR\r\nEND:VCARD";
+        let id = add_raw(&mut store, &b, raw);
+
+        let contact = get_contact(store.connection(), id).unwrap().unwrap();
+        assert!(!contact.truncated);
+        assert_eq!(contact.addresses.len(), 1);
+        assert_eq!(contact.addresses[0].label, "home");
+        assert_eq!(contact.addresses[0].city, "Rosario");
+        let json = serde_json::to_value(&contact).unwrap();
+        assert_eq!(json["addresses"][0]["postal_code"], "2000");
     }
 
     #[test]

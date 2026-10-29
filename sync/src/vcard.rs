@@ -79,6 +79,24 @@ pub struct Field {
     pub value: String,
 }
 
+/// Una dirección postal (`ADR`), con su etiqueta y los siete componentes del
+/// RFC 6350 §6.3.1 / RFC 2426 §3.2.1, en orden. Cada uno va por separado: la UI
+/// los muestra como quiera, y escribir sabe cuál es cuál sin re-parsear.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Address {
+    /// «casa», «trabajo»… en minúsculas, igual que [`Field::label`].
+    pub label: String,
+    /// Casilla de correo.
+    pub po_box: String,
+    /// La parte extendida: piso, departamento.
+    pub extended: String,
+    pub street: String,
+    pub city: String,
+    pub region: String,
+    pub postal_code: String,
+    pub country: String,
+}
+
 /// Un contacto, listo para mostrar.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Contact {
@@ -94,6 +112,9 @@ pub struct Contact {
     pub sort_name: String,
     pub emails: Vec<Field>,
     pub phones: Vec<Field>,
+    /// Las direcciones postales (`ADR`), con sus componentes separados.
+    #[serde(default)]
+    pub addresses: Vec<Address>,
     #[serde(default)]
     pub organization: String,
     #[serde(default)]
@@ -342,9 +363,13 @@ pub fn label_from(params: &[String]) -> String {
     let meaningful = |p: &str| {
         let lower = p.to_ascii_lowercase();
         // Lo que no es una etiqueta para mostrar: cómo viene codificado, en qué
-        // juego de caracteres, y cuál es el preferido.
-        !matches!(lower.as_str(), "pref" | "internet" | "voice" | "x400")
-            && !lower.starts_with("encoding=")
+        // juego de caracteres, cuál es el preferido, y los tipos de entrega de
+        // `ADR` (`dom`/`intl`/`postal`/`parcel`), que una 3.0 legacy pone antes
+        // de `home`/`work` y no son una etiqueta.
+        !matches!(
+            lower.as_str(),
+            "pref" | "internet" | "voice" | "x400" | "dom" | "intl" | "postal" | "parcel"
+        ) && !lower.starts_with("encoding=")
             && !lower.starts_with("charset=")
             && !lower.starts_with("value=")
             && !lower.starts_with("pref=")
@@ -519,6 +544,7 @@ pub fn contact_from(raw: &str, href: &str) -> Option<Contact> {
                 let value = strip_scheme(&value, "tel:").trim().to_string();
                 push_field(&mut contact.phones, &property, value);
             }
+            "ADR" => push_address(&mut contact.addresses, &property),
             "ORG" => {
                 // `ORG` trae la empresa y sus divisiones separadas por punto y
                 // coma. Se muestran juntas y no sólo la primera: «Vasak Group»
@@ -635,6 +661,45 @@ fn push_field(target: &mut Vec<Field>, property: &Property, value: String) {
         label: label_from(&property.params),
         value,
     });
+}
+
+/// Suma una dirección postal, hasta [`MAX_FIELDS_PER_KIND`]. El `ADR` se
+/// decodifica y se parte en sus siete componentes como el `N` —por el punto y
+/// coma sin escapar, deshaciendo lo escapado dentro de cada uno—, y cada
+/// componente pasa por [`shown`] para que ningún control llegue a lo que se
+/// muestra ni al JSON de la respuesta. Una tarjeta con sólo los separadores
+/// (`;;;;;;`) no es una dirección y se descarta.
+fn push_address(target: &mut Vec<Address>, property: &Property) {
+    if target.len() >= MAX_FIELDS_PER_KIND {
+        return;
+    }
+    let fields = split_fields(&decoded(property));
+    let component = |i: usize| shown(fields.get(i).map(String::as_str).unwrap_or(""));
+    let address = Address {
+        label: label_from(&property.params),
+        po_box: component(0),
+        extended: component(1),
+        street: component(2),
+        city: component(3),
+        region: component(4),
+        postal_code: component(5),
+        country: component(6),
+    };
+    let empty = [
+        &address.po_box,
+        &address.extended,
+        &address.street,
+        &address.city,
+        &address.region,
+        &address.postal_code,
+        &address.country,
+    ]
+    .iter()
+    .all(|c| c.trim().is_empty());
+    if empty {
+        return;
+    }
+    target.push(address);
 }
 
 /// Si un valor puede tener varias líneas: sólo la nota.
@@ -1702,5 +1767,146 @@ mod tests {
         let result = embed_photo(raw, "aGVsbG8=", "image/;:\r\n");
         assert!(result.contains("\r\nPHOTO;ENCODING=b:aGVsbG8=\r\n"));
         assert!(!result.contains("TYPE="));
+    }
+
+    // ── Direcciones postales (ADR) ─────────────────────────────────────────
+
+    fn address(label: &str, parts: [&str; 7]) -> Address {
+        Address {
+            label: label.into(),
+            po_box: parts[0].into(),
+            extended: parts[1].into(),
+            street: parts[2].into(),
+            city: parts[3].into(),
+            region: parts[4].into(),
+            postal_code: parts[5].into(),
+            country: parts[6].into(),
+        }
+    }
+
+    /// Los siete componentes del `ADR` 3.0, en orden, y la etiqueta del `TYPE`.
+    #[test]
+    fn se_lee_una_direccion_con_sus_siete_componentes_y_su_etiqueta() {
+        let card = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Ana\r\n\
+            ADR;TYPE=HOME:CC 12;Piso 3 Dto B;Av. Siempreviva 742;Springfield;Buenos Aires;B1900;Argentina\r\n\
+            END:VCARD";
+        let c = contact_from(card, "").unwrap();
+        assert_eq!(
+            c.addresses,
+            vec![address(
+                "home",
+                [
+                    "CC 12",
+                    "Piso 3 Dto B",
+                    "Av. Siempreviva 742",
+                    "Springfield",
+                    "Buenos Aires",
+                    "B1900",
+                    "Argentina"
+                ]
+            )]
+        );
+    }
+
+    /// La 2.1 manda los acentos en quoted-printable: se decodifica **antes** de
+    /// partir en componentes, igual que el `N`.
+    #[test]
+    fn se_lee_una_direccion_2_1_en_quoted_printable() {
+        let old = "BEGIN:VCARD\r\nVERSION:2.1\r\nFN:Ana\r\n\
+            ADR;HOME;ENCODING=QUOTED-PRINTABLE:;;Av. Rep=FAblica 1;C=F3rdoba;;5000;Argentina\r\n\
+            END:VCARD";
+        let c = contact_from(old, "").unwrap();
+        assert_eq!(
+            c.addresses,
+            vec![address(
+                "home",
+                [
+                    "",
+                    "",
+                    "Av. República 1",
+                    "Córdoba",
+                    "",
+                    "5000",
+                    "Argentina"
+                ]
+            )]
+        );
+    }
+
+    /// `\,`, `\;` y `\n` dentro de un componente se deshacen, y el `\;` no parte
+    /// el componente en dos (corría los campos de lugar).
+    #[test]
+    fn los_componentes_de_una_direccion_se_desescapan() {
+        let card = "BEGIN:VCARD\r\nFN:Ana\r\n\
+            ADR:;;Calle 1\\, esq. 2\\; piso\\n3;Ciudad;;1000;AR\r\nEND:VCARD";
+        let c = contact_from(card, "").unwrap();
+        assert_eq!(c.addresses.len(), 1);
+        // El salto de línea escapado es un espacio al mostrar (valor de una línea).
+        assert_eq!(c.addresses[0].street, "Calle 1, esq. 2; piso 3");
+        assert_eq!(c.addresses[0].city, "Ciudad");
+        assert_eq!(c.addresses[0].postal_code, "1000");
+        assert_eq!(c.addresses[0].country, "AR");
+    }
+
+    /// Una `ADR` que sólo trae los separadores no es una dirección: no se lista.
+    #[test]
+    fn una_direccion_de_solo_separadores_se_descarta() {
+        let card = "BEGIN:VCARD\r\nFN:Ana\r\nADR;TYPE=HOME:;;;;;;\r\n\
+            ADR:;;   ;;;;\r\nADR:;;Calle 1;;;;\r\nEND:VCARD";
+        let c = contact_from(card, "").unwrap();
+        assert_eq!(c.addresses.len(), 1);
+        assert_eq!(c.addresses[0].street, "Calle 1");
+    }
+
+    /// Cada componente pasa por `shown`: ni un control llega a lo que se muestra.
+    #[test]
+    fn los_componentes_de_una_direccion_no_llevan_controles() {
+        let card = "BEGIN:VCARD\r\nFN:Ana\r\nADR:;;Calle\u{7}1\\n2;;;;\r\nEND:VCARD";
+        let c = contact_from(card, "").unwrap();
+        assert_eq!(c.addresses[0].street, "Calle1 2");
+    }
+
+    /// Una tarjeta con miles de direcciones no llena el almacén: tope por tipo.
+    #[test]
+    fn las_direcciones_de_un_contacto_tienen_tope() {
+        let many = "BEGIN:VCARD\r\nFN:Ana\r\n".to_string()
+            + &(0..300)
+                .map(|i| format!("ADR:;;Calle {i};;;;\r\n"))
+                .collect::<String>()
+            + "END:VCARD";
+        let c = contact_from(&many, "").unwrap();
+        assert_eq!(c.addresses.len(), MAX_FIELDS_PER_KIND);
+        assert_eq!(c.addresses[0].street, "Calle 0", "se quedan las primeras");
+    }
+
+    /// Un componente desmedido se recorta como cualquier otro valor.
+    #[test]
+    fn un_componente_de_direccion_desmedido_se_recorta() {
+        let card = format!(
+            "BEGIN:VCARD\r\nFN:Ana\r\nADR:;;{};;;;\r\nEND:VCARD",
+            "ñ".repeat(MAX_VALUE)
+        );
+        let c = contact_from(&card, "").unwrap();
+        assert!(c.addresses[0].street.ends_with('…'));
+        assert!(c.addresses[0].street.len() <= MAX_VALUE + 4);
+    }
+
+    /// `dom`, `intl`, `postal` y `parcel` son el tipo de **entrega** del `ADR`, no
+    /// su etiqueta: una 3.0 legacy con `TYPE=dom,home,postal,parcel` se muestra
+    /// como «home», no como «dom» (y al editar no se pierde el «home»).
+    #[test]
+    fn los_tipos_de_entrega_de_una_direccion_no_son_su_etiqueta() {
+        assert_eq!(label_from(&["TYPE=dom,home,postal,parcel".into()]), "home");
+        // La forma 2.1, con los parámetros sueltos.
+        assert_eq!(label_from(&["POSTAL".into(), "HOME".into()]), "home");
+        assert_eq!(label_from(&["INTL".into(), "WORK".into()]), "work");
+        // Sin nada más que el tipo de entrega, no hay etiqueta.
+        assert_eq!(label_from(&["TYPE=dom,parcel".into()]), "");
+
+        let card = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Ana\r\n\
+            ADR;TYPE=dom,home,postal,parcel:;;Calle 1;Rosario;;2000;AR\r\nEND:VCARD";
+        let c = contact_from(card, "").unwrap();
+        assert_eq!(c.addresses.len(), 1);
+        assert_eq!(c.addresses[0].label, "home");
     }
 }

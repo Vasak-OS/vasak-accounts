@@ -61,7 +61,7 @@ use crate::email_sync::{EmailScheduler, EmailSync, EMAIL_TICK};
 use crate::ical::recurrence::ExpansionLimits;
 use crate::reminders;
 use crate::serialize::ical::{DateSpec, EventPatch, SerializeError, TaskPatch, TodoStatus};
-use crate::serialize::vcard::{ContactPatch, LabeledValue, Relation};
+use crate::serialize::vcard::{ContactPatch, LabeledValue, PostalAddress, Relation};
 use crate::serialize::{ical as ical_write, vcard as vcard_write, Change};
 use crate::store::calendar::{derive_with_occurrences, ObjectRow, Window};
 use crate::store::calendar_read::{self, GlobalId, ListCursor, Range};
@@ -484,11 +484,13 @@ impl<K: KeySource> StoreApi<K> {
     }
 
     /// Un contacto entero, leído de su tarjeta en el momento: `{id,
-    /// address_book_id, uid, display_name, emails, phones, organization,
-    /// notes, related, truncated}`, cada correo, teléfono o relación como
-    /// `{label, value}`. `null` si ya no está. Nunca la tarjeta cruda. Uno que
-    /// no entra en 1 MiB llega recortado —sin sus últimas relaciones,
-    /// teléfonos y correos— y con `truncated: true`.
+    /// address_book_id, uid, display_name, emails, phones, addresses,
+    /// organization, notes, related, truncated}`, cada correo, teléfono o
+    /// relación como `{label, value}`, y cada dirección como `{label, po_box,
+    /// extended, street, city, region, postal_code, country}`. `null` si ya no
+    /// está. Nunca la tarjeta cruda. Uno que no entra en 1 MiB llega recortado
+    /// —sin sus últimas direcciones, relaciones, teléfonos y correos— y con
+    /// `truncated: true`.
     ///
     /// Pide `store.contacts`.
     async fn get_contact(
@@ -1000,11 +1002,14 @@ impl<K: KeySource> StoreApi<K> {
     ///
     /// `payload`: un objeto JSON. Los campos de texto `full_name`,
     /// `organization`, `note` (ausente no toca, `null` saca, un texto fija); las
-    /// listas `emails`, `phones` y `related` (ausente no toca, `null` las saca
-    /// todas, una lista fija el conjunto entero). Cada correo o teléfono es
-    /// `{"value": "...", "label": "..."}` —la etiqueta («casa», «trabajo») va en
-    /// `label` o, si no, en `type`, y es opcional—; cada relación,
-    /// `{"label": "...", "value": "..."}`. Al editar, `id` identifica el
+    /// listas `emails`, `phones`, `addresses` y `related` (ausente no toca,
+    /// `null` las saca todas, una lista fija el conjunto entero). Cada correo o
+    /// teléfono es `{"value": "...", "label": "..."}` —la etiqueta («casa»,
+    /// «trabajo») va en `label` o, si no, en `type`, y es opcional—; cada
+    /// relación, `{"label": "...", "value": "..."}`; cada dirección,
+    /// `{"label": "...", "po_box": "...", "extended": "...", "street": "...",
+    /// "city": "...", "region": "...", "postal_code": "...", "country": "..."}`,
+    /// con todos los componentes opcionales. Al editar, `id` identifica el
     /// contacto. Devuelve `{"contact_id": <id>}`, sin el `href` (la dirección en
     /// el servidor no sale del almacén; el `contact_id` ya alcanza).
     ///
@@ -1866,6 +1871,68 @@ fn labeled_change(
     }
 }
 
+/// Cómo cambian las direcciones postales —`ADR`—: ausente no se toca, `null` las
+/// saca todas, una lista las fija enteras. Cada elemento es un objeto con los
+/// siete componentes (`po_box`, `extended`, `street`, `city`, `region`,
+/// `postal_code`, `country`), todos de texto y opcionales (vacíos si no vienen), y
+/// la etiqueta en `label` o, si no, en `type` (opcional). Cualquier otra forma es
+/// un argumento inválido, con texto fijo que no lleva nada del cuerpo.
+fn addresses_change(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<Change<Vec<PostalAddress>>, StoreError> {
+    match obj.get(key) {
+        None => Ok(Change::Leave),
+        Some(serde_json::Value::Null) => Ok(Change::Clear),
+        Some(serde_json::Value::Array(items)) => {
+            let addresses = items
+                .iter()
+                .map(|item| {
+                    let map = item.as_object().ok_or_else(|| {
+                        StoreError::InvalidArgument(format!(
+                            "cada elemento de «{key}» es un objeto con los componentes de la dirección"
+                        ))
+                    })?;
+                    // Cada componente es texto opcional: ausente es vacío, pero un
+                    // valor que no es texto es un argumento inválido.
+                    let component = |name: &str| -> Result<String, StoreError> {
+                        match map.get(name) {
+                            None | Some(serde_json::Value::Null) => Ok(String::new()),
+                            Some(serde_json::Value::String(text)) => Ok(text.clone()),
+                            Some(_) => Err(StoreError::InvalidArgument(format!(
+                                "«{name}» de una dirección de «{key}» es texto"
+                            ))),
+                        }
+                    };
+                    let label = match map.get("label").or_else(|| map.get("type")) {
+                        None | Some(serde_json::Value::Null) => String::new(),
+                        Some(serde_json::Value::String(text)) => text.clone(),
+                        Some(_) => {
+                            return Err(StoreError::InvalidArgument(format!(
+                                "«label» de una dirección de «{key}» es texto"
+                            )))
+                        }
+                    };
+                    Ok(PostalAddress {
+                        label,
+                        po_box: component("po_box")?,
+                        extended: component("extended")?,
+                        street: component("street")?,
+                        city: component("city")?,
+                        region: component("region")?,
+                        postal_code: component("postal_code")?,
+                        country: component("country")?,
+                    })
+                })
+                .collect::<Result<Vec<_>, StoreError>>()?;
+            Ok(Change::Set(addresses))
+        }
+        Some(_) => Err(StoreError::InvalidArgument(format!(
+            "«{key}» es una lista de direcciones o null"
+        ))),
+    }
+}
+
 /// El `id` del objeto que se edita, del cuerpo: un número local positivo.
 fn require_edit_id(obj: &serde_json::Map<String, serde_json::Value>) -> Result<i64, StoreError> {
     let value = obj
@@ -1977,6 +2044,7 @@ fn contact_patch_from(
         note: text_change(obj, "note")?,
         emails: labeled_change(obj, "emails")?,
         phones: labeled_change(obj, "phones")?,
+        addresses: addresses_change(obj, "addresses")?,
         related: related_change(obj, "related")?,
     })
 }
@@ -5976,5 +6044,142 @@ mod tests {
         store_mark_seen("cuenta", "INBOX", 7).await;
         store_forget("cuenta", "INBOX", 7).await;
         assert!(LIVE_STORE.get().is_none());
+    }
+
+    // ── Direcciones postales: el cuerpo de PutContact ──────────────────────
+
+    fn addresses_of(payload: serde_json::Value) -> Result<Change<Vec<PostalAddress>>, StoreError> {
+        addresses_change(payload.as_object().unwrap(), "addresses")
+    }
+
+    /// Ausente no toca, `null` las saca todas, una lista las fija con cada
+    /// componente (los que faltan, vacíos) y la etiqueta en `label` o en `type`.
+    #[test]
+    fn las_direcciones_del_cuerpo_se_traducen_a_su_cambio() {
+        assert_eq!(addresses_of(serde_json::json!({})).unwrap(), Change::Leave);
+        assert_eq!(
+            addresses_of(serde_json::json!({ "addresses": null })).unwrap(),
+            Change::Clear
+        );
+        assert_eq!(
+            addresses_of(serde_json::json!({ "addresses": [] })).unwrap(),
+            Change::Set(vec![])
+        );
+        let set = addresses_of(serde_json::json!({ "addresses": [
+            { "label": "casa", "po_box": "CC 1", "extended": "Piso 2", "street": "Calle 3",
+              "city": "Rosario", "region": "Santa Fe", "postal_code": "2000", "country": "AR" },
+            { "type": "trabajo", "street": "Otra 4", "city": null },
+        ]}))
+        .unwrap();
+        assert_eq!(
+            set,
+            Change::Set(vec![
+                PostalAddress {
+                    label: "casa".into(),
+                    po_box: "CC 1".into(),
+                    extended: "Piso 2".into(),
+                    street: "Calle 3".into(),
+                    city: "Rosario".into(),
+                    region: "Santa Fe".into(),
+                    postal_code: "2000".into(),
+                    country: "AR".into(),
+                },
+                PostalAddress {
+                    label: "trabajo".into(),
+                    street: "Otra 4".into(),
+                    ..Default::default()
+                },
+            ])
+        );
+    }
+
+    /// Cualquier otra forma es un argumento inválido, y el mensaje no lleva nada
+    /// del cuerpo.
+    #[test]
+    fn una_direccion_con_un_tipo_invalido_es_un_argumento_invalido() {
+        for bad in [
+            serde_json::json!({ "addresses": "Calle 1" }),
+            serde_json::json!({ "addresses": 3 }),
+            serde_json::json!({ "addresses": ["Calle 1"] }),
+            serde_json::json!({ "addresses": [{ "street": 7 }] }),
+            serde_json::json!({ "addresses": [{ "city": ["x"] }] }),
+            serde_json::json!({ "addresses": [{ "label": 1 }] }),
+        ] {
+            match addresses_of(bad.clone()) {
+                Err(StoreError::InvalidArgument(message)) => {
+                    assert!(!message.contains("Calle 1"), "{message}");
+                }
+                other => panic!("{bad}: tenía que ser un argumento inválido, fue {other:?}"),
+            }
+        }
+    }
+
+    /// Por el bus: `PutContact` con `addresses` encola una vCard con la `ADR`, y
+    /// los componentes adversarios quedan escapados, sin una línea ni un
+    /// parámetro nuevos.
+    #[tokio::test]
+    async fn put_contact_con_direcciones_escribe_la_adr_escapada() {
+        let mut api = Api::new(
+            "api-write-adr",
+            vec![with_contacts("cuenta")],
+            Answer::Allow,
+        )
+        .await;
+        let book_id = api
+            .manager
+            .with_store("cuenta", |store| {
+                Ok(store
+                    .upsert_address_books(&[("https://x/b/".into(), "Personal".into())])?
+                    .remove(0)
+                    .id)
+            })
+            .await
+            .unwrap();
+        let (client, _service) = api.client(":1.7").await;
+
+        let payload = serde_json::json!({
+            "full_name": "Zeta",
+            "addresses": [{
+                "label": "casa;X-EVIL=1",
+                "street": "Calle 1; esq. 2",
+                "city": "Rosario\r\nX-EVIL:1",
+            }]
+        })
+        .to_string();
+        call(
+            &client,
+            "PutContact",
+            &("cuenta", book_id.to_string(), payload.as_str(), ""),
+        )
+        .await
+        .unwrap();
+        let ops = pending_ops_of(&api, "cuenta", CONTACTS_AREA).await;
+        let vcard = String::from_utf8(ops[0].payload.clone().unwrap()).unwrap();
+        assert!(
+            vcard.contains(r"ADR;TYPE=casaX-EVIL1:;;Calle 1\; esq. 2;Rosario\nX-EVIL:1;;;"),
+            "la dirección no quedó escapada:\n{vcard}"
+        );
+        assert!(
+            !vcard.lines().any(|l| l.starts_with("X-EVIL")),
+            "se inyectó una propiedad:\n{vcard}"
+        );
+        // Y un cuerpo con una dirección mal formada no encola nada.
+        let before = pending_ops_of(&api, "cuenta", CONTACTS_AREA).await.len();
+        let result = call(
+            &client,
+            "PutContact",
+            &(
+                "cuenta",
+                book_id.to_string(),
+                "{\"full_name\":\"Y\",\"addresses\":[{\"street\":7}]}",
+                "",
+            ),
+        )
+        .await;
+        assert!(result.is_err(), "una dirección inválida tenía que fallar");
+        assert_eq!(
+            pending_ops_of(&api, "cuenta", CONTACTS_AREA).await.len(),
+            before
+        );
     }
 }
