@@ -623,6 +623,34 @@ const V11: &str = "
 ALTER TABLE message_bodies ADD COLUMN smime_encrypted INTEGER;
 ";
 
+/// v12 (PR 3 de P5, `vasak-accounts#111`): los grupos/etiquetas y el «destacado»
+/// que la People API de Google trae y el CardDAV de Google no suele traer.
+///
+/// Como la foto de la V8, viven **fuera del `raw_vcard`** —el crudo es la fuente
+/// de la escritura conservadora (decisión 3 del taller) y lo pisa el replay de una
+/// edición local sin confirmar— y dentro de la base cifrada, en dos columnas
+/// nuevas de la misma fila del enlace de enriquecimiento. La lectura
+/// (`contacts_read::cards_page`) las inyecta al vCard de salida —los grupos como
+/// `CATEGORIES`, el destacado como `X-VASAK-STARRED`— sólo si el contacto no tiene
+/// op pendiente, igual que la foto.
+///
+/// - **`groups`**: los nombres de los grupos a los que pertenece el contacto, como
+///   un arreglo JSON de textos (el mismo formato que `calendar_objects.categories`
+///   de la V9). JSON y no una lista separada por comas porque un nombre de grupo
+///   puede traer una coma adentro, que la separación perdería. `[]` por omisión:
+///   una base de la V11 queda sin grupos, y la próxima pasada de enriquecimiento
+///   los llena. El grupo de sistema `contactGroups/starred` **no** entra acá: marca
+///   el destacado.
+/// - **`starred`**: `1` si el contacto está en el grupo de sistema
+///   `contactGroups/starred`, `0` si no. `0` por omisión.
+///
+/// Las dos se llenan por `Store::set_contact_groups`, aparte de los testigos del
+/// enlace, igual que la foto: la pasada de matching e incrementalidad no las carga.
+const V12: &str = "
+ALTER TABLE contact_enrichment ADD COLUMN groups TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE contact_enrichment ADD COLUMN starred INTEGER NOT NULL DEFAULT 0;
+";
+
 /// Todas las migraciones, en orden.
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
@@ -637,6 +665,7 @@ pub fn migrations() -> Migrations<'static> {
         M::up(V9),
         M::up(V10),
         M::up(V11),
+        M::up(V12),
     ])
 }
 
@@ -673,7 +702,7 @@ mod tests {
         let mut connection = Connection::open_in_memory().unwrap();
         apply(&mut connection).unwrap();
         let version = schema_version(&connection).unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
 
         let tables = |c: &Connection| -> Vec<String> {
             let mut statement = c
@@ -798,7 +827,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 11);
+        assert_eq!(schema_version(&connection).unwrap(), 12);
 
         // Lo que había sigue, y la marca nueva es NULL.
         let object_mark: Option<String> = connection
@@ -841,7 +870,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 11);
+        assert_eq!(schema_version(&connection).unwrap(), 12);
 
         // La op sigue, en conflicto, y las columnas nuevas son NULL.
         let (state, server_etag, server_raw): (String, Option<String>, Option<Vec<u8>>) =
@@ -900,7 +929,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 11);
+        assert_eq!(schema_version(&connection).unwrap(), 12);
 
         // El contacto sigue, y la tabla nueva arranca vacía.
         let contacts: i64 = connection
@@ -1012,7 +1041,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 11);
+        assert_eq!(schema_version(&connection).unwrap(), 12);
 
         // El enlace sigue, y las columnas nuevas arrancan nulas.
         let (resource, photo, media): (String, Option<Vec<u8>>, Option<String>) = connection
@@ -1076,7 +1105,83 @@ mod tests {
 
         apply(&mut connection).unwrap();
         assert_eq!(columns(&connection), before);
-        assert_eq!(schema_version(&connection).unwrap(), 11);
+        assert_eq!(schema_version(&connection).unwrap(), 12);
+    }
+
+    /// **v11 → v12 no pierde nada**: un enlace con su foto de una base de la v11
+    /// sigue intacto; los grupos arrancan en `[]` y el destacado en `0` (los
+    /// defaults, no `NULL`), y la pasada de enriquecimiento los puede llenar.
+    #[test]
+    fn de_v11_a_v12_suma_grupos_y_destacado_con_sus_defaults() {
+        let mut connection = at_version(11);
+        connection
+            .execute(
+                "INSERT INTO address_books (id, href, display_name, updated_at)
+                 VALUES (1, 'https://x/a/', 'A', 'ayer')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO contacts
+                   (id, address_book_id, href, etag, uid, display_name, sort_key, raw_vcard,
+                    updated_at)
+                 VALUES (1, 1, 'https://x/a/ana.vcf', '\"v1\"', 'u1', 'Ana', 'ana',
+                    'BEGIN:VCARD', 'ayer')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO contact_enrichment
+                   (contact_id, resource_name, etag, photo_etag, photo, photo_media_type)
+                 VALUES (1, 'people/c1', '\"e1\"', '\"p1\"', x'010203', 'image/jpeg')",
+                [],
+            )
+            .unwrap();
+
+        apply(&mut connection).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 12);
+
+        // Lo que había sigue, y las columnas nuevas traen sus defaults.
+        let row: (String, Option<Vec<u8>>, String, i64) = connection
+            .query_row(
+                "SELECT resource_name, photo, groups, starred
+                   FROM contact_enrichment WHERE contact_id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "people/c1");
+        assert_eq!(row.1.as_deref(), Some(&[1u8, 2u8, 3u8][..]));
+        assert_eq!(row.2, "[]");
+        assert_eq!(row.3, 0);
+
+        // Un enlace nuevo (sin nombrar las columnas) también arranca con defaults.
+        connection
+            .execute(
+                "INSERT INTO contacts
+                   (id, address_book_id, href, etag, uid, display_name, sort_key, raw_vcard,
+                    updated_at)
+                 VALUES (2, 1, 'https://x/a/b.vcf', NULL, 'u2', 'Beto', 'beto',
+                    'BEGIN:VCARD', 'ayer')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO contact_enrichment (contact_id, resource_name) VALUES (2, 'people/c2')",
+                [],
+            )
+            .unwrap();
+        let (groups, starred): (String, i64) = connection
+            .query_row(
+                "SELECT groups, starred FROM contact_enrichment WHERE contact_id = 2",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((groups.as_str(), starred), ("[]", 0));
     }
 
     /// **v8 → v9 no pierde nada**: un evento de una base de la v8 sigue con sus
@@ -1094,7 +1199,7 @@ mod tests {
         let object = insert_object(&connection, calendar, "https://x/c/1.ics");
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 11);
+        assert_eq!(schema_version(&connection).unwrap(), 12);
 
         // Lo que había sigue.
         assert_eq!(
@@ -1192,7 +1297,7 @@ mod tests {
 
         apply(&mut fresh).unwrap();
         assert_eq!(columns(&fresh), before);
-        assert_eq!(schema_version(&fresh).unwrap(), 11);
+        assert_eq!(schema_version(&fresh).unwrap(), 12);
 
         let mut from_v8 = at_version(8);
         apply(&mut from_v8).unwrap();
@@ -1249,7 +1354,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 11);
+        assert_eq!(schema_version(&connection).unwrap(), 12);
 
         // Lo que había sigue, y las columnas nuevas son NULL.
         let row: (String, Option<String>, i64, Option<i64>, Option<String>) = connection
@@ -1280,7 +1385,7 @@ mod tests {
         let before = columns(&connection);
         apply(&mut connection).unwrap();
         assert_eq!(columns(&connection), before);
-        assert_eq!(schema_version(&connection).unwrap(), 11);
+        assert_eq!(schema_version(&connection).unwrap(), 12);
     }
 
     /// **v10 → v11 no pierde nada**: el cuerpo, la firma y el firmante de una base de
@@ -1333,7 +1438,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 11);
+        assert_eq!(schema_version(&connection).unwrap(), 12);
 
         let row: (String, Option<String>, i64, Option<i64>, Option<String>, Option<i64>) =
             connection
@@ -1369,7 +1474,7 @@ mod tests {
         let before = columns(&connection);
         apply(&mut connection).unwrap();
         assert_eq!(columns(&connection), before);
-        assert_eq!(schema_version(&connection).unwrap(), 11);
+        assert_eq!(schema_version(&connection).unwrap(), 12);
     }
 
     /// La marca `pending_op` sólo acepta los dos valores conocidos, o `NULL`.
@@ -1513,7 +1618,7 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .unwrap();
-        let all = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10];
+        let all = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11];
         Migrations::new(all[..version].iter().map(|sql| M::up(sql)).collect())
             .to_latest(&mut connection)
             .unwrap();
@@ -1540,7 +1645,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 11);
+        assert_eq!(schema_version(&connection).unwrap(), 12);
         let message: String = connection
             .query_row("SELECT message FROM sync_log", [], |row| row.get(0))
             .unwrap();
@@ -1841,7 +1946,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 11);
+        assert_eq!(schema_version(&connection).unwrap(), 12);
         assert_eq!(found(&connection, "jose"), vec![id]);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_emails"), 1);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_phones"), 1);
@@ -2012,7 +2117,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 11);
+        assert_eq!(schema_version(&connection).unwrap(), 12);
         assert_eq!(found(&connection, "jose"), vec![id]);
         assert_eq!(count(&connection, "SELECT count(*) FROM occurrences"), 2);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_emails"), 1);

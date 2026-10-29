@@ -17,8 +17,9 @@ use std::time::Instant;
 use base64::Engine;
 
 use super::{
-    check_photo_size, enrich_photos, fetch_connections, fetch_photo, is_google_photo_host,
-    GoogleBackend, PeopleError, PeopleLimits, PHOTO_MAX_BYTES,
+    check_photo_size, enrich_photos, fetch_connections, fetch_contact_groups, fetch_photo,
+    is_google_photo_host, GoogleBackend, PeopleError, PeopleLimits, MAX_GROUPS_PER_CONTACT,
+    MAX_GROUP_NAME_CHARS, PHOTO_MAX_BYTES,
 };
 use crate::contacts_sync::backend::{SyncContext, SyncResult};
 use crate::dav::fake::{card, FakeDav};
@@ -938,4 +939,865 @@ async fn si_people_falla_la_vuelta_sigue_synced_y_sin_token_no_se_la_llama() {
         SyncResult::Synced(_)
     ));
     assert_eq!(people.requests().len(), 1, "sin token no se llama a People");
+}
+
+// ── Grupos/etiquetas y destacado (PR3 de #111) ───────────────────────────────
+
+/// La tarjeta de salida de la lectura (`list_cards`), la primera.
+async fn read_vcard(manager: &Arc<StoreManager<FakeKeys>>) -> String {
+    manager
+        .with_store(ACCOUNT, |s| {
+            Ok(crate::store::contacts_read::list_cards(s.connection(), None, None, 100).unwrap())
+        })
+        .await
+        .unwrap()
+        .items
+        .pop()
+        .expect("hay una tarjeta")
+        .vcard
+}
+
+async fn read_raw(manager: &Arc<StoreManager<FakeKeys>>, id: i64) -> String {
+    manager
+        .with_store(ACCOUNT, move |s| {
+            Ok(s.connection()
+                .query_row("SELECT raw_vcard FROM contacts WHERE id = ?1", [id], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap())
+        })
+        .await
+        .unwrap()
+}
+
+async fn generation(manager: &Arc<StoreManager<FakeKeys>>) -> u64 {
+    manager
+        .with_store(ACCOUNT, |s| {
+            crate::store::read_generation(s.connection(), CONTACTS_AREA)
+        })
+        .await
+        .unwrap()
+}
+
+/// Una pasada de enriquecimiento con el fetcher de fotos de mentira.
+async fn enrich(
+    manager: &Arc<StoreManager<FakeKeys>>,
+    server: &FakeGraph,
+) -> Result<(usize, usize), PeopleError> {
+    enrich_photos(
+        manager,
+        ACCOUNT,
+        TOKEN,
+        &server.base_url(),
+        PeopleLimits::DEFAULT,
+        stub_fetcher(Arc::new(AtomicUsize::new(0))),
+    )
+    .await
+}
+
+/// Un grupo de la respuesta de `contactGroups.list`.
+fn group_json(resource: &str, name: &str) -> String {
+    format!(r#"{{"resourceName":"{resource}","formattedName":"{name}"}}"#)
+}
+
+/// Casa por email, con los nombres del catálogo: los grupos entran a la lectura
+/// como `CATEGORIES` y la pertenencia a `contactGroups/starred` como
+/// `X-VASAK-STARRED:1`; el grupo de destacado **no** es una categoría; el crudo
+/// guardado no se toca; y se pidió `memberships` y el catálogo.
+#[tokio::test]
+async fn los_grupos_y_el_destacado_de_people_entran_en_la_lectura() {
+    let (_temp, manager) = store("google_grupos").await;
+    let id = seed(&manager, "Ana", "ana@x.com").await;
+    let raw_before = read_raw(&manager, id).await;
+
+    let server = FakeGraph::start().await;
+    server.push(
+        r#"{"connections":[{"resourceName":"people/c1",
+            "emailAddresses":[{"value":"ANA@x.com"}],
+            "memberships":[
+              {"contactGroupMembership":{"contactGroupResourceName":"contactGroups/starred"}},
+              {"contactGroupMembership":{"contactGroupResourceName":"contactGroups/g1"}},
+              {"contactGroupMembership":{"contactGroupResourceName":"contactGroups/g2"}},
+              {"contactGroupMembership":{"contactGroupResourceName":"contactGroups/g1"}},
+              {"contactGroupMembership":{"contactGroupResourceName":"contactGroups/borrado"}}]}]}"#,
+    );
+    server.push(format!(
+        r#"{{"contactGroups":[{},{},{},{}]}}"#,
+        group_json("contactGroups/starred", "Favoritos"),
+        group_json("contactGroups/g1", "Familia"),
+        group_json("contactGroups/g2", "Trabajo"),
+        group_json("contactGroups/g9", "Nadie lo usa"),
+    ));
+
+    enrich(&manager, &server).await.unwrap();
+
+    let vcard = read_vcard(&manager).await;
+    assert!(
+        vcard.contains("\r\nCATEGORIES:Familia,Trabajo\r\n"),
+        "los grupos entran como CATEGORIES, sin duplicados ni el destacado: {vcard}"
+    );
+    assert!(vcard.contains("\r\nX-VASAK-STARRED:1\r\n"), "{vcard}");
+    assert!(!vcard.contains("Favoritos"), "{vcard}");
+    assert!(vcard.find("CATEGORIES").unwrap() < vcard.find("END:VCARD").unwrap());
+    assert!(vcard.find("X-VASAK-STARRED").unwrap() < vcard.find("END:VCARD").unwrap());
+    assert_eq!(
+        read_raw(&manager, id).await,
+        raw_before,
+        "el crudo no se toca"
+    );
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[0].path.contains("memberships"),
+        "se piden las pertenencias: {}",
+        requests[0].path
+    );
+    assert!(requests[1].path.contains("/contactGroups"));
+    assert_eq!(requests[1].authorization, format!("Bearer {TOKEN}"));
+}
+
+/// Sólo el destacado, sin otro grupo: no hace falta el catálogo (un solo pedido),
+/// el contacto queda destacado y sin `CATEGORIES`. Una persona sin pertenencias no
+/// recibe nada.
+#[tokio::test]
+async fn el_destacado_solo_no_pide_el_catalogo_y_sin_membresias_no_se_inyecta_nada() {
+    let (_temp, manager) = store("google_destacado").await;
+    seed(&manager, "Ana", "ana@x.com").await;
+
+    let server = FakeGraph::start().await;
+    server.push(
+        r#"{"connections":[{"resourceName":"people/c1",
+            "emailAddresses":[{"value":"ana@x.com"}],
+            "memberships":[
+              {"contactGroupMembership":{"contactGroupResourceName":"contactGroups/starred"}},
+              {"domainMembership":{"inViewerDomain":true}}]}]}"#,
+    );
+    enrich(&manager, &server).await.unwrap();
+    assert_eq!(server.requests().len(), 1, "sin otro grupo no hay catálogo");
+    let vcard = read_vcard(&manager).await;
+    assert!(vcard.contains("\r\nX-VASAK-STARRED:1\r\n"), "{vcard}");
+    assert!(!vcard.contains("CATEGORIES"), "{vcard}");
+
+    // La misma persona sin pertenencias: ya no es destacada y no hay categorías.
+    server.push(
+        r#"{"connections":[{"resourceName":"people/c1",
+            "emailAddresses":[{"value":"ana@x.com"}]}]}"#,
+    );
+    enrich(&manager, &server).await.unwrap();
+    let vcard = read_vcard(&manager).await;
+    assert!(!vcard.contains("X-VASAK-STARRED"), "{vcard}");
+    assert!(!vcard.contains("CATEGORIES"), "{vcard}");
+}
+
+/// **Anti-inyección de punta a punta**: el nombre de un grupo viene de la red. Con
+/// coma, punto y coma, barra y un salto de línea que intenta cerrar la tarjeta y
+/// abrir otra, la lectura no gana ninguna propiedad, no se parte la categoría y,
+/// al releer, salen los mismos nombres.
+#[tokio::test]
+async fn un_nombre_de_grupo_hostil_de_la_red_no_inyecta_nada_en_la_lectura() {
+    let (_temp, manager) = store("google_grupos_hostiles").await;
+    seed(&manager, "Ana", "ana@x.com").await;
+    let plain = read_vcard(&manager).await;
+
+    let server = FakeGraph::start().await;
+    server.push(
+        r#"{"connections":[{"resourceName":"people/c1",
+            "emailAddresses":[{"value":"ana@x.com"}],
+            "memberships":[
+              {"contactGroupMembership":{"contactGroupResourceName":"contactGroups/a"}},
+              {"contactGroupMembership":{"contactGroupResourceName":"contactGroups/b"}},
+              {"contactGroupMembership":{"contactGroupResourceName":"contactGroups/c"}}]}]}"#,
+    );
+    server.push(
+        r#"{"contactGroups":[
+            {"resourceName":"contactGroups/a","formattedName":"Mal\r\nEND:VCARD\r\nBEGIN:VCARD\r\nFN:Evil"},
+            {"resourceName":"contactGroups/b","formattedName":"uno, dos;tres\\cuatro\nTEL:+000"},
+            {"resourceName":"contactGroups/c","formattedName":"termina en barra\\"}]}"#,
+    );
+    enrich(&manager, &server).await.unwrap();
+
+    let vcard = read_vcard(&manager).await;
+    let lines = crate::vcard::unfold_lines(&vcard);
+    let names = |text: &str| -> Vec<String> {
+        crate::vcard::unfold_lines(text)
+            .iter()
+            .filter_map(|l| crate::vcard::split_property(l))
+            .map(|p| p.name)
+            .collect()
+    };
+    // Una propiedad más (CATEGORIES) y nada fabricado.
+    let mut expected = names(&plain);
+    expected.insert(expected.len() - 1, "CATEGORIES".into());
+    assert_eq!(names(&vcard), expected, "{vcard:?}");
+    assert_eq!(lines.len(), crate::vcard::unfold_lines(&plain).len() + 1);
+    for marker in ["BEGIN:VCARD", "END:VCARD"] {
+        assert_eq!(lines.iter().filter(|l| l.trim() == marker).count(), 1);
+    }
+
+    // Y los nombres se releen tal cual (el `\r` se descarta; el `\n` queda).
+    let value =
+        crate::vcard::split_property(lines.iter().find(|l| l.starts_with("CATEGORIES")).unwrap())
+            .unwrap()
+            .value;
+    let mut got = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    for c in value.chars() {
+        match (escaped, c) {
+            (true, c) => {
+                current.push('\\');
+                current.push(c);
+                escaped = false;
+            }
+            (false, '\\') => escaped = true,
+            (false, ',') => got.push(std::mem::take(&mut current)),
+            (false, c) => current.push(c),
+        }
+    }
+    got.push(current);
+    let got: Vec<String> = got.iter().map(|v| crate::vcard::unescape_text(v)).collect();
+    assert_eq!(
+        got,
+        vec![
+            "Mal\nEND:VCARD\nBEGIN:VCARD\nFN:Evil".to_string(),
+            "uno, dos;tres\\cuatro\nTEL:+000".to_string(),
+            "termina en barra\\".to_string(),
+        ]
+    );
+}
+
+/// El largo de un nombre de grupo y la cantidad de grupos por contacto están
+/// acotados: son datos de red que van a parar a un vCard.
+#[tokio::test]
+async fn el_nombre_y_la_cantidad_de_grupos_por_contacto_estan_acotados() {
+    let (_temp, manager) = store("google_grupos_acotados").await;
+    seed(&manager, "Ana", "ana@x.com").await;
+
+    let total = MAX_GROUPS_PER_CONTACT + 10;
+    let memberships: Vec<String> = (0..total)
+        .map(|n| {
+            format!(r#"{{"contactGroupMembership":{{"contactGroupResourceName":"contactGroups/g{n}"}}}}"#)
+        })
+        .collect();
+    let groups: Vec<String> = (0..total)
+        .map(|n| group_json(&format!("contactGroups/g{n}"), &format!("G{n:03}")))
+        .collect();
+    let long = "ñ".repeat(MAX_GROUP_NAME_CHARS * 4);
+    let server = FakeGraph::start().await;
+    server.push(format!(
+        r#"{{"connections":[{{"resourceName":"people/c1",
+            "emailAddresses":[{{"value":"ana@x.com"}}],
+            "memberships":[{}]}}]}}"#,
+        memberships.join(",")
+    ));
+    server.push(format!(
+        r#"{{"contactGroups":[{},{}]}}"#,
+        groups.join(","),
+        group_json("contactGroups/largo", &long)
+    ));
+    enrich(&manager, &server).await.unwrap();
+
+    let vcard = read_vcard(&manager).await;
+    let unfolded = crate::vcard::unfold_lines(&vcard);
+    let line = unfolded
+        .iter()
+        .find(|l| l.starts_with("CATEGORIES:"))
+        .unwrap();
+    assert_eq!(
+        line.trim_start_matches("CATEGORIES:").split(',').count(),
+        MAX_GROUPS_PER_CONTACT,
+        "tope de grupos por contacto"
+    );
+
+    // El nombre largo se recorta al tope (en la persona que sí lo tiene).
+    let id: i64 = manager
+        .with_store(ACCOUNT, |s| {
+            Ok(s.connection()
+                .query_row("SELECT id FROM contacts", [], |r| r.get(0))
+                .unwrap())
+        })
+        .await
+        .unwrap();
+    let server = FakeGraph::start().await;
+    server.push(
+        r#"{"connections":[{"resourceName":"people/c1",
+            "emailAddresses":[{"value":"ana@x.com"}],
+            "memberships":[{"contactGroupMembership":{"contactGroupResourceName":"contactGroups/largo"}}]}]}"#,
+    );
+    server.push(format!(
+        r#"{{"contactGroups":[{}]}}"#,
+        group_json("contactGroups/largo", &long)
+    ));
+    enrich(&manager, &server).await.unwrap();
+    let stored: String = manager
+        .with_store(ACCOUNT, move |s| {
+            Ok(s.connection()
+                .query_row(
+                    "SELECT groups FROM contact_enrichment WHERE contact_id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap())
+        })
+        .await
+        .unwrap();
+    let stored: Vec<String> = serde_json::from_str(&stored).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].chars().count(), MAX_GROUP_NAME_CHARS);
+}
+
+/// Mejor esfuerzo: si el catálogo de grupos falla (500), la pasada **no** falla,
+/// y el destacado y la foto se aplican igual; sólo faltan los nombres de grupo.
+#[tokio::test]
+async fn si_el_catalogo_de_grupos_falla_se_aplican_el_destacado_y_la_foto() {
+    let (_temp, manager) = store("google_catalogo_falla").await;
+    let id = seed(&manager, "Ana", "ana@x.com").await;
+
+    let server = FakeGraph::start().await;
+    server.push(
+        r#"{"connections":[{"resourceName":"people/c1",
+            "emailAddresses":[{"value":"ana@x.com"}],
+            "photos":[{"url":"https://lh3.googleusercontent.com/p1"}],
+            "memberships":[
+              {"contactGroupMembership":{"contactGroupResourceName":"contactGroups/starred"}},
+              {"contactGroupMembership":{"contactGroupResourceName":"contactGroups/g1"}}]}]}"#,
+    );
+    server.push_status(500, "{}"); // el catálogo
+
+    let (fetched, _) = enrich(&manager, &server)
+        .await
+        .expect("el catálogo es mejor esfuerzo");
+    assert_eq!(fetched, 1, "la foto se bajó");
+    assert_eq!(server.requests().len(), 2, "se intentó el catálogo");
+
+    let photo = manager
+        .with_store(ACCOUNT, move |s| s.contact_photo(id))
+        .await
+        .unwrap();
+    assert!(photo.is_some(), "la foto se aplicó");
+    let vcard = read_vcard(&manager).await;
+    assert!(vcard.contains("X-VASAK-STARRED:1"), "{vcard}");
+    assert!(vcard.contains("PHOTO;ENCODING=b;TYPE=JPEG:"), "{vcard}");
+    assert!(!vcard.contains("CATEGORIES"), "sin catálogo no hay nombres");
+}
+
+/// El catálogo se mapea `resourceName → formattedName`, saltando los incompletos,
+/// pide sólo el nombre y manda el token sólo a nuestra url.
+#[tokio::test]
+async fn el_catalogo_de_grupos_mapea_el_recurso_a_su_nombre() {
+    let server = FakeGraph::start().await;
+    server.push(format!(
+        r#"{{"contactGroups":[{},{},
+            {{"resourceName":"contactGroups/sin-nombre"}},{{"formattedName":"sin recurso"}}],
+            "nextPageToken":"t2"}}"#,
+        group_json("contactGroups/g1", "Familia"),
+        group_json("contactGroups/g2", "Trabajo"),
+    ));
+    server.push(format!(
+        r#"{{"contactGroups":[{}]}}"#,
+        group_json("contactGroups/g3", "Amigos")
+    ));
+    let names = fetch_contact_groups(&client(), TOKEN, &server.base_url(), &PeopleLimits::DEFAULT)
+        .await
+        .unwrap();
+    assert_eq!(names.len(), 3);
+    assert_eq!(names["contactGroups/g1"], "Familia");
+    assert_eq!(names["contactGroups/g3"], "Amigos");
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].path.contains("/contactGroups"));
+    assert!(requests[0].path.contains("groupFields=name"));
+    assert!(requests[1].path.contains("pageToken=t2"));
+    assert!(requests
+        .iter()
+        .all(|r| r.authorization == format!("Bearer {TOKEN}")));
+}
+
+/// El paginador del catálogo acota igual que el de las personas: token repetido
+/// (cortando apenas se ve), tope de páginas, tope de grupos.
+#[tokio::test]
+async fn el_catalogo_de_grupos_corta_por_token_repetido_paginas_y_grupos() {
+    // Token repetido: termina en el segundo pedido aunque la cola siga.
+    let server = FakeGraph::start().await;
+    for _ in 0..50 {
+        server.push(r#"{"contactGroups":[],"nextPageToken":"t1"}"#);
+    }
+    let result =
+        fetch_contact_groups(&client(), TOKEN, &server.base_url(), &PeopleLimits::DEFAULT).await;
+    assert!(matches!(result, Err(PeopleError::PaginationLoop)));
+    assert_eq!(server.requests().len(), 2);
+
+    // Tokens siempre nuevos: exactamente el tope de páginas.
+    let server = FakeGraph::start().await;
+    for n in 0..50 {
+        server.push(format!(r#"{{"contactGroups":[],"nextPageToken":"n{n}"}}"#));
+    }
+    let limits = PeopleLimits {
+        max_pages: 3,
+        ..PeopleLimits::DEFAULT
+    };
+    let result = fetch_contact_groups(&client(), TOKEN, &server.base_url(), &limits).await;
+    assert!(matches!(result, Err(PeopleError::TooManyPages)));
+    assert_eq!(server.requests().len(), 3, "ni un pedido más que el tope");
+
+    // Tope de grupos acumulados.
+    let server = FakeGraph::start().await;
+    server.push(format!(
+        r#"{{"contactGroups":[{},{}]}}"#,
+        group_json("contactGroups/g1", "Uno"),
+        group_json("contactGroups/g2", "Dos")
+    ));
+    let limits = PeopleLimits {
+        max_groups: 1,
+        ..PeopleLimits::DEFAULT
+    };
+    let result = fetch_contact_groups(&client(), TOKEN, &server.base_url(), &limits).await;
+    assert!(matches!(result, Err(PeopleError::TooManyItems)));
+}
+
+/// El catálogo **nunca** sigue una url de la respuesta: un `nextPageToken` con
+/// forma de url se pega como parámetro a la nuestra, y el segundo pedido va al
+/// mismo endpoint con el mismo token de acceso.
+#[tokio::test]
+async fn el_catalogo_de_grupos_no_sigue_ninguna_url_de_la_respuesta() {
+    let server = FakeGraph::start().await;
+    server.push(r#"{"contactGroups":[],"nextPageToken":"http://evil.example/steal"}"#);
+    server.push(format!(
+        r#"{{"contactGroups":[{}]}}"#,
+        group_json("contactGroups/g1", "Familia")
+    ));
+    let names = fetch_contact_groups(&client(), TOKEN, &server.base_url(), &PeopleLimits::DEFAULT)
+        .await
+        .unwrap();
+    assert_eq!(names.len(), 1);
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1].path.starts_with("/v1.0/contactGroups?"),
+        "{}",
+        requests[1].path
+    );
+    assert!(requests[1].path.contains("pageToken=http"));
+    assert_eq!(requests[1].authorization, format!("Bearer {TOKEN}"));
+}
+
+/// Un error HTTP, un cuerpo que pasa el tope de tamaño y uno que no es JSON del
+/// catálogo se devuelven como error (la pasada los traga como mejor esfuerzo).
+#[tokio::test]
+async fn el_catalogo_de_grupos_rechaza_error_http_cuerpo_enorme_y_basura() {
+    let server = FakeGraph::start().await; // cola vacía: 500
+    assert!(matches!(
+        fetch_contact_groups(&client(), TOKEN, &server.base_url(), &PeopleLimits::DEFAULT).await,
+        Err(PeopleError::Http(_))
+    ));
+
+    let server = FakeGraph::start().await;
+    server.push(format!(
+        r#"{{"contactGroups":[{}]}}"#,
+        group_json("contactGroups/g1", &"x".repeat(1000))
+    ));
+    let limits = PeopleLimits {
+        max_response_bytes: 100,
+        ..PeopleLimits::DEFAULT
+    };
+    assert!(matches!(
+        fetch_contact_groups(&client(), TOKEN, &server.base_url(), &limits).await,
+        Err(PeopleError::TooLarge)
+    ));
+
+    let server = FakeGraph::start().await;
+    server.push("no es json");
+    assert!(matches!(
+        fetch_contact_groups(&client(), TOKEN, &server.base_url(), &PeopleLimits::DEFAULT).await,
+        Err(PeopleError::Parse)
+    ));
+
+    assert!(matches!(
+        fetch_contact_groups(&client(), TOKEN, "no es una url", &PeopleLimits::DEFAULT).await,
+        Err(PeopleError::MalformedUrl)
+    ));
+}
+
+/// El plazo por pedido del catálogo: un servidor que recibe y no contesta corta
+/// con `Timeout` (el reloj va pausado: no se esperan los 60 s de verdad).
+#[tokio::test(start_paused = true)]
+async fn el_catalogo_de_grupos_corta_por_plazo_si_el_servidor_no_contesta() {
+    let server = FakeGraph::start().await;
+    server.push_status(0, "");
+    let result =
+        fetch_contact_groups(&client(), TOKEN, &server.base_url(), &PeopleLimits::DEFAULT).await;
+    assert!(matches!(result, Err(PeopleError::Timeout)), "{result:?}");
+}
+
+/// `set_contact_groups` escribe sólo si algo cambió: la misma lista y el mismo
+/// destacado no suben la generación; un grupo de más, uno de menos o el destacado
+/// sí; sin fila de enlace no toca nada. Los nombres con coma sobreviven (JSON).
+#[tokio::test]
+async fn guardar_los_mismos_grupos_no_sube_la_generacion_y_un_cambio_si() {
+    let (_temp, manager) = store("google_grupos_generacion").await;
+    let id = seed(&manager, "Ana", "ana@x.com").await;
+    let set = |groups: Vec<String>, starred: bool| {
+        let manager = manager.clone();
+        async move {
+            manager
+                .with_store(ACCOUNT, move |s| {
+                    s.set_contact_groups(id, Some(&groups), starred)
+                })
+                .await
+                .unwrap();
+        }
+    };
+    let stored = || {
+        let manager = manager.clone();
+        async move {
+            manager
+                .with_store(ACCOUNT, move |s| {
+                    Ok(s.connection()
+                        .query_row(
+                            "SELECT groups, starred FROM contact_enrichment WHERE contact_id = ?1",
+                            [id],
+                            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+                        )
+                        .unwrap())
+                })
+                .await
+                .unwrap()
+        }
+    };
+
+    // Sin fila de enlace: nada que guardar, la generación no se mueve.
+    let before = generation(&manager).await;
+    set(vec!["Familia".into()], true).await;
+    assert_eq!(generation(&manager).await, before);
+
+    manager
+        .with_store(ACCOUNT, move |s| {
+            s.upsert_contact_enrichment(&ContactEnrichment {
+                contact_id: id,
+                resource_name: "people/c1".into(),
+                etag: None,
+                photo_etag: None,
+            })
+        })
+        .await
+        .unwrap();
+    // Una fila nueva trae los defaults: guardar vacío y no destacado es no-op.
+    assert_eq!(stored().await, ("[]".to_string(), 0));
+    let before = generation(&manager).await;
+    set(vec![], false).await;
+    assert_eq!(generation(&manager).await, before, "vacío sobre vacío");
+
+    // Un cambio sube; repetirlo no.
+    let names = vec!["Familia, cercana".to_string(), "Trabajo".to_string()];
+    set(names.clone(), true).await;
+    let after = generation(&manager).await;
+    assert!(after > before, "un cambio sube la generación");
+    assert_eq!(
+        stored().await,
+        (r#"["Familia, cercana","Trabajo"]"#.to_string(), 1)
+    );
+    set(names.clone(), true).await;
+    assert_eq!(generation(&manager).await, after, "lo mismo no sube");
+
+    // Cambiar sólo el destacado, o sólo los grupos, sí sube.
+    set(names.clone(), false).await;
+    let unstarred = generation(&manager).await;
+    assert!(unstarred > after);
+    set(vec!["Trabajo".into()], false).await;
+    assert!(generation(&manager).await > unstarred);
+}
+
+/// Una segunda pasada con lo mismo no sube la generación (no dispara relecturas
+/// en las apps); y si People saca un grupo y el destacado, se reflejan.
+#[tokio::test]
+async fn la_segunda_pasada_con_los_mismos_grupos_no_sube_la_generacion() {
+    let (_temp, manager) = store("google_grupos_incremental").await;
+    seed(&manager, "Ana", "ana@x.com").await;
+
+    let page = r#"{"connections":[{"resourceName":"people/c1",
+        "emailAddresses":[{"value":"ana@x.com"}],
+        "photos":[{"url":"https://lh3.googleusercontent.com/p1"}],
+        "memberships":[
+          {"contactGroupMembership":{"contactGroupResourceName":"contactGroups/starred"}},
+          {"contactGroupMembership":{"contactGroupResourceName":"contactGroups/g1"}}]}]}"#;
+    let catalog = format!(
+        r#"{{"contactGroups":[{}]}}"#,
+        group_json("contactGroups/g1", "Familia")
+    );
+    let server = FakeGraph::start().await;
+    server.push(page);
+    server.push(catalog.clone());
+    enrich(&manager, &server).await.unwrap();
+    let first = generation(&manager).await;
+
+    server.push(page);
+    server.push(catalog);
+    enrich(&manager, &server).await.unwrap();
+    assert_eq!(generation(&manager).await, first, "nada cambió: no sube");
+
+    // People saca el grupo y el destacado.
+    server.push(
+        r#"{"connections":[{"resourceName":"people/c1",
+            "emailAddresses":[{"value":"ana@x.com"}],
+            "photos":[{"url":"https://lh3.googleusercontent.com/p1"}]}]}"#,
+    );
+    enrich(&manager, &server).await.unwrap();
+    assert!(generation(&manager).await > first);
+    let vcard = read_vcard(&manager).await;
+    assert!(!vcard.contains("CATEGORIES"), "{vcard}");
+    assert!(!vcard.contains("X-VASAK-STARRED"), "{vcard}");
+}
+
+/// Una op pendiente no se pisa: el contacto con una edición local sin confirmar
+/// queda fuera del casamiento (no recibe grupos ni destacado), y si el
+/// enriquecimiento ya estaba guardado, la lectura sirve el crudo sin inyectar
+/// `CATEGORIES` ni `X-VASAK-STARRED`; al irse la op, vuelven solos.
+#[tokio::test]
+async fn con_op_pendiente_no_se_enriquecen_los_grupos_y_la_lectura_sirve_el_crudo() {
+    let (_temp, manager) = store("google_grupos_pendiente").await;
+    let id = seed(&manager, "Ana", "ana@x.com").await;
+    let set_pending = |value: &'static str| {
+        let manager = manager.clone();
+        async move {
+            manager
+                .with_store(ACCOUNT, move |s| {
+                    s.connection()
+                        .execute(
+                            &format!("UPDATE contacts SET pending_op = {value} WHERE id = ?1"),
+                            [id],
+                        )
+                        .unwrap();
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+    };
+    let page = r#"{"connections":[{"resourceName":"people/c1",
+        "emailAddresses":[{"value":"ana@x.com"}],
+        "memberships":[
+          {"contactGroupMembership":{"contactGroupResourceName":"contactGroups/starred"}},
+          {"contactGroupMembership":{"contactGroupResourceName":"contactGroups/g1"}}]}]}"#;
+    let catalog = format!(
+        r#"{{"contactGroups":[{}]}}"#,
+        group_json("contactGroups/g1", "Familia")
+    );
+
+    // 1. Con la op pendiente de antemano: la pasada no escribe nada.
+    set_pending("'put'").await;
+    let server = FakeGraph::start().await;
+    server.push(page);
+    server.push(catalog.clone());
+    enrich(&manager, &server).await.unwrap();
+    let rows: i64 = manager
+        .with_store(ACCOUNT, |s| {
+            Ok(s.connection()
+                .query_row("SELECT COUNT(*) FROM contact_enrichment", [], |r| r.get(0))
+                .unwrap())
+        })
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "un contacto pendiente no se enriquece");
+
+    // 2. Sin op pendiente se enriquece; con una op nueva, la lectura es el crudo.
+    set_pending("NULL").await;
+    server.push(page);
+    server.push(catalog);
+    enrich(&manager, &server).await.unwrap();
+    let raw = read_raw(&manager, id).await;
+    let vcard = read_vcard(&manager).await;
+    assert!(vcard.contains("CATEGORIES:Familia"), "{vcard}");
+    assert!(vcard.contains("X-VASAK-STARRED:1"), "{vcard}");
+
+    set_pending("'put'").await;
+    assert_eq!(
+        read_vcard(&manager).await,
+        raw,
+        "con op pendiente, el crudo"
+    );
+
+    set_pending("NULL").await;
+    assert_eq!(read_vcard(&manager).await, vcard, "al irse la op, vuelven");
+}
+
+/// Los grupos guardados de un contacto, tal como quedaron en la columna.
+async fn stored_groups(manager: &Arc<StoreManager<FakeKeys>>, id: i64) -> Vec<String> {
+    let json: String = manager
+        .with_store(ACCOUNT, move |s| {
+            Ok(s.connection()
+                .query_row(
+                    "SELECT groups FROM contact_enrichment WHERE contact_id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap())
+        })
+        .await
+        .unwrap();
+    serde_json::from_str(&json).unwrap()
+}
+
+/// **Regresión**: un catálogo de grupos que falla (5xx, o una respuesta que no es
+/// JSON) es «no disponible», no «sin grupos». La pasada no puede reescribir los
+/// grupos con una lista vacía: los `CATEGORIES` ya guardados se conservan y el
+/// destacado, que sale de las pertenencias de la persona, se actualiza igual.
+#[tokio::test]
+async fn un_catalogo_que_falla_no_borra_los_grupos_guardados_pero_actualiza_el_destacado() {
+    let (_temp, manager) = store("google_catalogo_preserva").await;
+    let id = seed(&manager, "Ana", "ana@x.com").await;
+
+    // Primera pasada, catálogo bueno: queda en el grupo «Familia», sin destacar.
+    let server = FakeGraph::start().await;
+    server.push(
+        r#"{"connections":[{"resourceName":"people/c1",
+            "emailAddresses":[{"value":"ana@x.com"}],
+            "memberships":[
+              {"contactGroupMembership":{"contactGroupResourceName":"contactGroups/g1"}}]}]}"#,
+    );
+    server.push(format!(
+        r#"{{"contactGroups":[{}]}}"#,
+        group_json("contactGroups/g1", "Familia")
+    ));
+    enrich(&manager, &server).await.unwrap();
+    assert_eq!(stored_groups(&manager, id).await, vec!["Familia"]);
+    assert!(!read_vcard(&manager).await.contains("X-VASAK-STARRED"));
+
+    // Segunda pasada: People ahora la destaca, pero el catálogo falla de dos
+    // maneras distintas (cada una en su pasada).
+    for failure in [(500u16, "{}"), (200, "esto no es json")] {
+        server.push(
+            r#"{"connections":[{"resourceName":"people/c1",
+                "emailAddresses":[{"value":"ana@x.com"}],
+                "memberships":[
+                  {"contactGroupMembership":{"contactGroupResourceName":"contactGroups/starred"}},
+                  {"contactGroupMembership":{"contactGroupResourceName":"contactGroups/g1"}}]}]}"#,
+        );
+        server.push_status(failure.0, failure.1);
+        enrich(&manager, &server)
+            .await
+            .expect("el catálogo es mejor esfuerzo");
+
+        assert_eq!(
+            stored_groups(&manager, id).await,
+            vec!["Familia"],
+            "un catálogo caído no borra los grupos ({failure:?})"
+        );
+        let vcard = read_vcard(&manager).await;
+        assert!(vcard.contains("\r\nCATEGORIES:Familia\r\n"), "{vcard}");
+        assert!(
+            vcard.contains("\r\nX-VASAK-STARRED:1\r\n"),
+            "el destacado se actualiza igual: {vcard}"
+        );
+
+        // Se vuelve a dejar sin destacar para la vuelta siguiente.
+        manager
+            .with_store(ACCOUNT, move |s| s.set_contact_groups(id, None, false))
+            .await
+            .unwrap();
+    }
+}
+
+/// Control: con el catálogo **disponible**, un contacto que ya no pertenece a
+/// ningún grupo sí queda sin grupos (la limpieza legítima sigue funcionando), ya
+/// sea porque ninguna persona tiene grupos (no se pide el catálogo) o porque el
+/// catálogo vino y no trae el grupo que la persona nombra.
+#[tokio::test]
+async fn con_el_catalogo_disponible_un_contacto_sin_grupos_queda_sin_grupos() {
+    let (_temp, manager) = store("google_catalogo_limpia").await;
+    let id = seed(&manager, "Ana", "ana@x.com").await;
+    let with_group = r#"{"connections":[{"resourceName":"people/c1",
+        "emailAddresses":[{"value":"ana@x.com"}],
+        "memberships":[
+          {"contactGroupMembership":{"contactGroupResourceName":"contactGroups/g1"}}]}]}"#;
+    let catalog = format!(
+        r#"{{"contactGroups":[{}]}}"#,
+        group_json("contactGroups/g1", "Familia")
+    );
+
+    let server = FakeGraph::start().await;
+    server.push(with_group);
+    server.push(catalog.clone());
+    enrich(&manager, &server).await.unwrap();
+    assert_eq!(stored_groups(&manager, id).await, vec!["Familia"]);
+
+    // Sin ninguna pertenencia a grupo: no hay catálogo que pedir y se limpia.
+    server.push(
+        r#"{"connections":[{"resourceName":"people/c1",
+            "emailAddresses":[{"value":"ana@x.com"}]}]}"#,
+    );
+    enrich(&manager, &server).await.unwrap();
+    assert!(stored_groups(&manager, id).await.is_empty());
+
+    // Con el catálogo bueno pero sin el grupo que la persona nombra: también `[]`.
+    server.push(with_group);
+    server.push(catalog.clone());
+    enrich(&manager, &server).await.unwrap();
+    assert_eq!(stored_groups(&manager, id).await, vec!["Familia"]);
+    server.push(with_group);
+    server.push(format!(
+        r#"{{"contactGroups":[{}]}}"#,
+        group_json("contactGroups/otro", "Otro")
+    ));
+    enrich(&manager, &server).await.unwrap();
+    assert!(stored_groups(&manager, id).await.is_empty());
+    assert!(!read_vcard(&manager).await.contains("CATEGORIES"));
+}
+
+/// `set_contact_groups(id, None, starred)` no toca los grupos pero sí cambia el
+/// destacado, y sólo sube la generación cuando el destacado cambia.
+#[tokio::test]
+async fn guardar_sin_grupos_conserva_los_grupos_y_cambia_solo_el_destacado() {
+    let (_temp, manager) = store("google_grupos_none").await;
+    let id = seed(&manager, "Ana", "ana@x.com").await;
+    manager
+        .with_store(ACCOUNT, move |s| {
+            s.upsert_contact_enrichment(&ContactEnrichment {
+                contact_id: id,
+                resource_name: "people/c1".into(),
+                etag: None,
+                photo_etag: None,
+            })?;
+            s.set_contact_groups(id, Some(&["Familia".to_string()]), false)
+        })
+        .await
+        .unwrap();
+    let starred = |manager: Arc<StoreManager<FakeKeys>>| async move {
+        manager
+            .with_store(ACCOUNT, move |s| {
+                Ok(s.connection()
+                    .query_row(
+                        "SELECT starred FROM contact_enrichment WHERE contact_id = ?1",
+                        [id],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .unwrap())
+            })
+            .await
+            .unwrap()
+    };
+    let set = |starred: bool| {
+        let manager = manager.clone();
+        async move {
+            manager
+                .with_store(ACCOUNT, move |s| s.set_contact_groups(id, None, starred))
+                .await
+                .unwrap();
+        }
+    };
+
+    let before = generation(&manager).await;
+    set(false).await;
+    assert_eq!(generation(&manager).await, before, "nada cambió: no sube");
+
+    set(true).await;
+    assert_eq!(starred(manager.clone()).await, 1);
+    assert_eq!(stored_groups(&manager, id).await, vec!["Familia"]);
+    let after = generation(&manager).await;
+    assert!(after > before, "el destacado cambió: sube");
+
+    set(false).await;
+    assert_eq!(starred(manager.clone()).await, 0);
+    assert_eq!(stored_groups(&manager, id).await, vec!["Familia"]);
 }

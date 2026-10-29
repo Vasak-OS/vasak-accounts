@@ -630,6 +630,61 @@ impl Store {
         Ok(())
     }
 
+    /// Guarda los nombres de los grupos/etiquetas de un contacto y si está
+    /// «destacado», en la fila de enriquecimiento que ya tiene que existir (la crea
+    /// [`Self::upsert_contact_enrichment`]). Los grupos van serializados como un
+    /// arreglo JSON de textos (el mismo formato que `calendar_objects.categories`);
+    /// el destacado como `0`/`1`.
+    ///
+    /// `groups` es `None` cuando el catálogo de grupos **no estaba disponible** (su
+    /// fetch falló): en ese caso se actualiza sólo `starred` —que sale de las
+    /// memberships de la persona, no del catálogo— y se **preserva** la columna
+    /// `groups`, así un fallo transitorio del catálogo no borra los grupos ya
+    /// guardados. Con `Some(groups)` se reescriben los grupos resueltos (un contacto
+    /// que ya no pertenece a ninguno queda con `[]`).
+    ///
+    /// Como [`Self::set_contact_photo`], sube la generación de los contactos **sólo
+    /// si algo cambió** —así una pasada incremental que trae los mismos grupos no
+    /// dispara una relectura— y no toca nada si no hay fila para ese contacto. El
+    /// `WHERE` incluye la comparación: la columna no cambia y la generación no sube
+    /// cuando los grupos y el destacado ya coinciden.
+    pub fn set_contact_groups(
+        &mut self,
+        contact_id: i64,
+        groups: Option<&[String]>,
+        starred: bool,
+    ) -> Result<(), StoreError> {
+        let starred = i64::from(starred);
+        let transaction = self.connection.transaction().map_err(classify)?;
+        let changed = match groups {
+            Some(groups) => {
+                let groups_json =
+                    serde_json::to_string(groups).unwrap_or_else(|_| "[]".to_string());
+                transaction.execute(
+                    "UPDATE contact_enrichment SET groups = ?2, starred = ?3
+                      WHERE contact_id = ?1 AND (groups != ?2 OR starred != ?3)",
+                    rusqlite::params![contact_id, groups_json, starred],
+                )
+            }
+            None => transaction.execute(
+                "UPDATE contact_enrichment SET starred = ?2
+                  WHERE contact_id = ?1 AND starred != ?2",
+                rusqlite::params![contact_id, starred],
+            ),
+        }
+        .map_err(classify)?;
+        let generation = if changed > 0 {
+            Some(bump_generation(&transaction, CONTACTS_AREA)?)
+        } else {
+            None
+        };
+        transaction.commit().map_err(classify)?;
+        if let Some(generation) = generation {
+            self.note_change(CONTACTS_AREA, generation);
+        }
+        Ok(())
+    }
+
     /// Un mapa de correo (en minúsculas) al `id` del contacto local que lo lleva,
     /// para casar por email a las personas de la People API.
     ///

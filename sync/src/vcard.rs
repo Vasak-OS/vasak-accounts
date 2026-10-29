@@ -949,6 +949,56 @@ fn fold_line(line: &str) -> String {
     out
 }
 
+/// Inserta una línea de propiedad ya plegada antes del `END:VCARD` de `raw`, como
+/// hace [`embed_photo`]. Si `raw` no tiene `END:VCARD`, se devuelve tal cual: sin
+/// dónde insertar, no se inventa una tarjeta.
+fn insert_before_end(raw: &str, folded_line: &str) -> String {
+    let upper = raw.to_ascii_uppercase();
+    let Some(pos) = upper.rfind("END:VCARD") else {
+        return raw.to_string();
+    };
+    format!("{}{}\r\n{}", &raw[..pos], folded_line, &raw[pos..])
+}
+
+/// Devuelve `raw` con una propiedad `CATEGORIES` (RFC 6350 §6.7.1) agregada antes
+/// de su `END:VCARD`, con los nombres de los grupos/etiquetas que la People API de
+/// Google trae (`vasak-accounts#111`) y el CardDAV de Google no suele traer.
+///
+/// Es el camino de lectura del enriquecimiento, como [`embed_photo`]: los grupos
+/// viven **fuera del crudo guardado**, en la tabla `contact_enrichment`, y acá se
+/// suman al vCard de salida sin tocar lo que se guardó. **Cada nombre pasa por
+/// [`escape_vcard_public`]** —que escapa la barra primero, la coma, el punto y
+/// coma y descarta el `\r`— antes de unirlos con la coma que separa los valores de
+/// `CATEGORIES`: así un nombre con una coma, un punto y coma o un salto de línea no
+/// puede fabricar un valor de más ni una propiedad nueva. La línea se pliega a 75
+/// octetos sin partir un carácter de varios bytes ([`crate::serialize::fold`]).
+///
+/// Con `names` vacío no se agrega nada.
+pub fn embed_categories(raw: &str, names: &[String]) -> String {
+    if names.is_empty() {
+        return raw.to_string();
+    }
+    let joined = names
+        .iter()
+        .map(|name| escape_vcard_public(name))
+        .collect::<Vec<_>>()
+        .join(",");
+    let line = crate::serialize::fold(&format!("CATEGORIES:{joined}")).join("\r\n");
+    insert_before_end(raw, &line)
+}
+
+/// Devuelve `raw` con la propiedad `X-VASAK-STARRED:1` agregada antes de su
+/// `END:VCARD`, que marca el contacto como «destacado» (el grupo de sistema
+/// `contactGroups/starred` de la People API de Google, `vasak-accounts#111`).
+///
+/// vCard no tiene una propiedad estándar para el destacado y el modelo de lectura
+/// no traía ningún campo de «favorito», así que se usa una propiedad `X-` propia y
+/// estable, fuera del crudo guardado, como el resto del enriquecimiento. El valor
+/// es fijo (`1`), así que no hay nada de la red que escapar.
+pub fn embed_starred(raw: &str) -> String {
+    insert_before_end(raw, "X-VASAK-STARRED:1")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1908,5 +1958,128 @@ mod tests {
         let c = contact_from(card, "").unwrap();
         assert_eq!(c.addresses.len(), 1);
         assert_eq!(c.addresses[0].label, "home");
+    }
+
+    // ── El enriquecimiento de la lectura: CATEGORIES y X-VASAK-STARRED ─────
+
+    /// Los nombres de las propiedades de una tarjeta, en orden, tal como las ve la
+    /// lectura (con las líneas plegadas ya juntas).
+    fn property_names(vcard: &str) -> Vec<String> {
+        unfold_lines(vcard)
+            .iter()
+            .filter_map(|line| split_property(line))
+            .map(|p| p.name)
+            .collect()
+    }
+
+    /// Los valores de `CATEGORIES` tal como los lee un cliente: se parte por la
+    /// coma **sin escapar** y se deshace el escape de cada uno.
+    fn categories_of(vcard: &str) -> Vec<String> {
+        let lines: Vec<_> = unfold_lines(vcard)
+            .iter()
+            .filter_map(|line| split_property(line))
+            .filter(|p| p.name == "CATEGORIES")
+            .collect();
+        assert_eq!(lines.len(), 1, "una sola propiedad CATEGORIES: {vcard:?}");
+        let mut values = Vec::new();
+        let mut current = String::new();
+        let mut escaped = false;
+        for c in lines[0].value.chars() {
+            if escaped {
+                current.push('\\');
+                current.push(c);
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == ',' {
+                values.push(std::mem::take(&mut current));
+            } else {
+                current.push(c);
+            }
+        }
+        values.push(current);
+        values.iter().map(|v| unescape_text(v)).collect()
+    }
+
+    #[test]
+    fn las_categorias_se_insertan_antes_del_cierre_sin_tocar_el_resto() {
+        let names = vec!["Familia".to_string(), "Trabajo".to_string()];
+        let out = embed_categories(ANA, &names);
+
+        assert!(out.contains("\r\nCATEGORIES:Familia,Trabajo\r\nEND:VCARD"));
+        assert_eq!(categories_of(&out), names);
+        // Todo lo que había sigue, en el mismo orden, con una propiedad de más.
+        let mut expected = property_names(ANA);
+        expected.insert(expected.len() - 1, "CATEGORIES".into());
+        assert_eq!(property_names(&out), expected);
+        // Sin nombres no se agrega nada; sin `END:VCARD` no se inventa una tarjeta.
+        assert_eq!(embed_categories(ANA, &[]), ANA);
+        assert_eq!(embed_categories("FN:x", &names), "FN:x");
+    }
+
+    /// El nombre de un grupo es dato de red. Con una coma, un punto y coma, una
+    /// barra o un salto de línea **no** puede fabricar un valor de más, un campo de
+    /// más ni una propiedad nueva: la lectura devuelve exactamente los mismos
+    /// nombres (sin el `\r`, que el escape descarta) y ninguna línea de más.
+    #[test]
+    fn un_nombre_de_grupo_hostil_no_inyecta_propiedades_ni_parte_la_categoria() {
+        let names: Vec<String> = [
+            "Familia, amigos",
+            "A;B",
+            "Mal\r\nEND:VCARD\r\nBEGIN:VCARD\r\nFN:Evil",
+            "Con\nsalto\rde linea\nTEL:+000",
+            "barra\\final\\",
+            "trampa\\,x",
+            "dos\\\\,y",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let out = embed_categories(ANA, &names);
+
+        // Estructura: las mismas propiedades que antes más una CATEGORIES, y un
+        // solo BEGIN/END (nada de tarjetas ni propiedades fabricadas).
+        let mut expected = property_names(ANA);
+        expected.insert(expected.len() - 1, "CATEGORIES".into());
+        assert_eq!(property_names(&out), expected, "{out:?}");
+        let lines = unfold_lines(&out);
+        for marker in ["BEGIN:VCARD", "END:VCARD"] {
+            let count = lines.iter().filter(|l| l.trim() == marker).count();
+            assert_eq!(count, 1, "{marker} una sola vez como línea: {out:?}");
+        }
+        assert_eq!(unfold_lines(&out).len(), unfold_lines(ANA).len() + 1);
+
+        // Y los mismos nombres al releer (el `\r` se descarta, el `\n` sobrevive
+        // escapado).
+        let round_trip: Vec<String> = names.iter().map(|n| n.replace('\r', "")).collect();
+        assert_eq!(categories_of(&out), round_trip);
+    }
+
+    /// La línea larga se pliega a 75 octetos sin partir un carácter de varios
+    /// bytes, y al des-plegar vuelve el mismo valor.
+    #[test]
+    fn las_categorias_largas_se_pliegan_a_75_octetos_sin_partir_un_caracter() {
+        let names = vec!["ñandú".repeat(40), "日本語".repeat(30), "x".to_string()];
+        let out = embed_categories(ANA, &names);
+        for line in out.split("\r\n") {
+            assert!(
+                line.len() <= 75,
+                "línea de {} octetos: {line:?}",
+                line.len()
+            );
+        }
+        assert!(out.contains("\r\n "), "la línea larga se plegó: {out:?}");
+        assert_eq!(categories_of(&out), names);
+    }
+
+    #[test]
+    fn el_destacado_se_inserta_antes_del_cierre_y_solo_una_vez() {
+        let out = embed_starred(ANA);
+        assert!(out.contains("\r\nX-VASAK-STARRED:1\r\nEND:VCARD"));
+        let mut expected = property_names(ANA);
+        expected.insert(expected.len() - 1, "X-VASAK-STARRED".into());
+        assert_eq!(property_names(&out), expected);
+        assert_eq!(embed_starred("FN:x"), "FN:x");
     }
 }
