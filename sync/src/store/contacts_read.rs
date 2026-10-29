@@ -332,7 +332,8 @@ fn cards_page(
 ) -> Result<Page<ContactCard>, StoreError> {
     let mut sql = String::from(
         "SELECT c.id, c.address_book_id, c.sort_key, c.href, c.raw_vcard,
-                c.etag, c.pending_op, pdo.state, ce.photo, ce.photo_media_type
+                c.etag, c.pending_op, pdo.state, ce.photo, ce.photo_media_type,
+                ce.groups, ce.starred
            FROM contacts c
            JOIN address_books ab ON ab.id = c.address_book_id
            LEFT JOIN pending_dav_ops pdo
@@ -365,17 +366,39 @@ fn cards_page(
         let pending_op: Option<String> = row.get(6).map_err(classify)?;
         let op_state: Option<String> = row.get(7).map_err(classify)?;
         let raw_vcard: String = row.get(4).map_err(classify)?;
-        // La foto del enriquecimiento (People API de Google) se inyecta al vCard
-        // de salida, nunca al crudo guardado, y **sólo si no hay op pendiente**:
-        // una tarjeta con una edición local sin confirmar se sirve tal cual.
+        // El enriquecimiento (People API de Google) se inyecta al vCard de salida,
+        // nunca al crudo guardado, y **sólo si no hay op pendiente**: una tarjeta
+        // con una edición local sin confirmar se sirve tal cual. La foto, los
+        // grupos (`CATEGORIES`) y el destacado (`X-VASAK-STARRED`) viven en
+        // `contact_enrichment`; con el `LEFT JOIN`, un contacto sin enlace trae
+        // todo en `NULL`, que equivale a «sin enriquecimiento».
         let photo: Option<Vec<u8>> = row.get(8).map_err(classify)?;
         let photo_media_type: Option<String> = row.get(9).map_err(classify)?;
-        let vcard = match (pending_op.as_deref(), photo, photo_media_type) {
-            (None, Some(bytes), Some(media_type)) => {
-                let base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                vcard::embed_photo(&raw_vcard, &base64, &media_type)
+        let groups_json: Option<String> = row.get(10).map_err(classify)?;
+        let starred: Option<i64> = row.get(11).map_err(classify)?;
+        let vcard = if pending_op.is_none() {
+            let mut vcard = match (photo, photo_media_type) {
+                (Some(bytes), Some(media_type)) => {
+                    let base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    vcard::embed_photo(&raw_vcard, &base64, &media_type)
+                }
+                _ => raw_vcard,
+            };
+            // Los nombres de grupo se guardaron como arreglo JSON de textos; se
+            // escapan de a uno al armar `CATEGORIES` (ver `vcard::embed_categories`).
+            let groups: Vec<String> = groups_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str(json).ok())
+                .unwrap_or_default();
+            if !groups.is_empty() {
+                vcard = vcard::embed_categories(&vcard, &groups);
             }
-            _ => raw_vcard,
+            if starred.unwrap_or(0) != 0 {
+                vcard = vcard::embed_starred(&vcard);
+            }
+            vcard
+        } else {
+            raw_vcard
         };
         let card = ContactCard {
             id: id.to_string(),

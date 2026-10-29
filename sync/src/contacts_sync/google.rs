@@ -3,9 +3,13 @@
 //!
 //! Google sincroniza la agenda por **CardDAV** genérico (como cualquier cuenta
 //! `oauth2` con CardDAV); la People API (`people.googleapis.com`) la **enriquece**,
-//! no la reemplaza. El alcance de este PR es **sólo la foto**: el CardDAV de
-//! Google no suele traer la `PHOTO` embebida y la People API sí. Grupos,
-//! etiquetas y «destacado» quedan fuera (los difiere el usuario).
+//! no la reemplaza. Lo que enriquece y el CardDAV de Google no suele traer: la
+//! `PHOTO` embebida (PR2), y los **grupos/etiquetas** y el **destacado** (PR3).
+//! Los grupos salen de `memberships` de cada persona, con los nombres del catálogo
+//! `contactGroups.list` ([`fetch_contact_groups`]); el grupo de sistema
+//! [`STARRED_GROUP`] marca el destacado. Todo vive en `contact_enrichment`, fuera
+//! del `raw_vcard`, y la lectura lo inyecta al vCard de salida (foto como `PHOTO`,
+//! grupos como `CATEGORIES`, destacado como `X-VASAK-STARRED`).
 //!
 //! ── Dónde vive la foto ───────────────────────────────────────────────────────
 //!
@@ -43,10 +47,19 @@
 //!   un allowlist del host de Google como defensa en profundidad y un tope duro de
 //!   tamaño antes de guardar. El token OAuth **no** viaja a googleusercontent: las
 //!   fotos de People son públicas, así que la descarga va pelada.
-//! - Todo lo que entra al vCard (la foto en base64) pasa por
-//!   `vcard::escape_vcard_public` en [`crate::vcard::embed_photo`].
+//! - Todo lo que entra al vCard pasa por `vcard::escape_vcard_public`: la foto en
+//!   base64 en [`crate::vcard::embed_photo`], y **cada nombre de grupo** en
+//!   [`crate::vcard::embed_categories`] antes de unirlos con coma, así un nombre
+//!   con coma, punto y coma o salto de línea no fabrica un valor de más ni una
+//!   propiedad nueva. El destacado es una línea `X-` de valor fijo, sin nada de la
+//!   red.
+//! - **El catálogo de grupos es otro paginador propio y acotado**
+//!   ([`fetch_contact_groups`]): mismos topes y criterios que el de personas, y
+//!   nunca sigue una url de la respuesta. Sólo se trae si alguien pertenece a algún
+//!   grupo que no sea el de destacado, y es mejor esfuerzo (si falla, se siguen
+//!   aplicando el destacado y la foto).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use base64::Engine;
@@ -71,6 +84,17 @@ const PEOPLE_BASE_URL: &str = "https://people.googleapis.com/v1";
 /// guardar.)
 const PHOTO_MAX_BYTES: usize = 2 * 1024 * 1024;
 
+/// El grupo de sistema de la People API que marca el «destacado»: una persona que
+/// pertenece a él se guarda con `starred = 1`, y su nombre **no** entra como
+/// categoría (lo representa el destacado, no una etiqueta).
+const STARRED_GROUP: &str = "contactGroups/starred";
+
+/// Tope de grupos por contacto que entran al vCard, y largo máximo de un nombre de
+/// grupo. Son datos de red: mejor acotarlos que dejar un `CATEGORIES` gigantesco o
+/// un nombre sin límite.
+const MAX_GROUPS_PER_CONTACT: usize = 64;
+const MAX_GROUP_NAME_CHARS: usize = 256;
+
 /// Las cotas de la paginación de People. Parametrizadas para que las pruebas las
 /// pongan chicas y lleguen al tope sin miles de páginas, al estilo de
 /// `dav::webdav::Limits`.
@@ -81,7 +105,10 @@ pub(crate) struct PeopleLimits {
     pub max_pages: usize,
     /// Tope de personas acumuladas, cota de memoria independiente del de páginas.
     pub max_people: usize,
-    /// Cuántas personas se piden por página (`pageSize`).
+    /// Tope de grupos acumulados en el catálogo (`contactGroups.list`): una agenda
+    /// personal tiene unas pocas etiquetas, no decenas de miles.
+    pub max_groups: usize,
+    /// Cuántas personas (o grupos) se piden por página (`pageSize`).
     pub page_size: usize,
     /// Tope del cuerpo de una respuesta, contado mientras llega.
     pub max_response_bytes: usize,
@@ -91,6 +118,7 @@ impl PeopleLimits {
     pub const DEFAULT: Self = Self {
         max_pages: 1_000,
         max_people: 50_000,
+        max_groups: 10_000,
         page_size: 200,
         max_response_bytes: 16 * 1024 * 1024,
     };
@@ -117,6 +145,53 @@ struct Person {
     etag: Option<String>,
     email_addresses: Vec<PersonEmail>,
     photos: Vec<PersonPhoto>,
+    /// La pertenencia a grupos/etiquetas. El grupo de sistema
+    /// [`STARRED_GROUP`] marca el destacado; los demás, los nombres que se
+    /// resuelven con el catálogo (ver [`fetch_contact_groups`]).
+    memberships: Vec<Membership>,
+}
+
+/// Una pertenencia a un grupo de una persona de People.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct Membership {
+    contact_group_membership: Option<ContactGroupMembership>,
+}
+
+impl Membership {
+    /// El `contactGroups/<id>` al que pertenece, o `""` si la pertenencia no es de
+    /// grupo (la People API tiene otros tipos que no usamos).
+    fn group_resource_name(&self) -> &str {
+        self.contact_group_membership
+            .as_ref()
+            .map(|m| m.contact_group_resource_name.as_str())
+            .unwrap_or_default()
+    }
+}
+
+/// La parte de grupo de una pertenencia.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct ContactGroupMembership {
+    contact_group_resource_name: String,
+}
+
+/// Una página de `contactGroups.list`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct ContactGroups {
+    contact_groups: Vec<ContactGroup>,
+    next_page_token: Option<String>,
+}
+
+/// Un grupo/etiqueta del catálogo, con su nombre ya formateado.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct ContactGroup {
+    resource_name: String,
+    /// El nombre traducido y formateado para mostrar (los grupos de sistema
+    /// traen acá «Favoritos», «Mis contactos», etc.).
+    formatted_name: String,
 }
 
 /// Un correo de una persona de People.
@@ -281,6 +356,31 @@ where
     let client = graph::http_client().map_err(|e| PeopleError::Network(e.to_string()))?;
     let people = fetch_connections(&client, token, base_url, &limits).await?;
 
+    // El catálogo de nombres de grupo (`resourceName → formattedName`): sólo se
+    // trae si alguien pertenece a algún grupo que no sea el de destacado (ése no
+    // necesita nombre). Es **mejor esfuerzo**: si el fetch acotado falla, se siguen
+    // aplicando el destacado y la foto, sin los nombres de grupo (decisión 2 del
+    // taller: lo que no está disponible se ve no disponible, nunca roto).
+    let needs_groups = people.iter().any(|person| {
+        person.memberships.iter().any(|m| {
+            let name = m.group_resource_name();
+            !name.is_empty() && name != STARRED_GROUP
+        })
+    });
+    let group_names = if needs_groups {
+        match fetch_contact_groups(&client, token, base_url, &limits).await {
+            Ok(names) => names,
+            Err(e) => {
+                tracing::warn!(
+                    "'{account_id}': no se pudo traer el catálogo de grupos de People: {e}"
+                );
+                HashMap::new()
+            }
+        }
+    } else {
+        HashMap::new()
+    };
+
     // El mapa de email → contacto, sólo contactos sin op pendiente: así una
     // edición local sin confirmar no se enriquece (se respeta `pending_op` igual
     // que `apply_contacts`).
@@ -307,61 +407,181 @@ where
             continue; // sin email que case: el trade-off aceptado en #111.
         };
 
-        // La primera foto de verdad (no el monograma generado).
-        let Some(photo_url) = person
+        // Destacado y grupos de esta persona. El destacado sale de la pertenencia
+        // misma (no necesita el catálogo); los nombres de grupo se resuelven contra
+        // el catálogo, se deduplican y se acotan.
+        let starred = person
+            .memberships
+            .iter()
+            .any(|m| m.group_resource_name() == STARRED_GROUP);
+        let mut groups: Vec<String> = Vec::new();
+        for membership in &person.memberships {
+            let name = membership.group_resource_name();
+            if name.is_empty() || name == STARRED_GROUP {
+                continue;
+            }
+            if let Some(formatted) = group_names.get(name) {
+                if !formatted.is_empty() && !groups.contains(formatted) {
+                    groups.push(formatted.clone());
+                    if groups.len() >= MAX_GROUPS_PER_CONTACT {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // La primera foto de verdad (no el monograma generado), si hay.
+        let photo_url = person
             .photos
             .iter()
             .filter(|p| !p.is_default)
             .filter_map(|p| p.url.as_deref())
             .find(|u| !u.is_empty())
-        else {
-            continue;
-        };
-        let photo_url = photo_url.to_string();
+            .map(str::to_string);
 
-        // Incrementalidad: misma persona y misma foto que la corrida anterior → no
-        // se re-baja.
         let existing = manager
             .with_store(account_id, move |s| s.contact_enrichment(contact_id))
             .await
             .map_err(PeopleError::Store)?;
-        if let Some(link) = &existing {
+
+        // Incrementalidad de la foto: misma persona y misma url → no se re-baja.
+        let photo_unchanged = matches!((&existing, &photo_url), (Some(link), Some(url))
             if link.resource_name == person.resource_name
-                && link.photo_etag.as_deref() == Some(photo_url.as_str())
-            {
+                && link.photo_etag.as_deref() == Some(url.as_str()));
+
+        // Qué foto queda guardada y qué `photo_etag` va al enlace: la url nueva si
+        // se bajó o no cambió; el que ya estaba si esta corrida no trae foto o la
+        // descarga falló (así un fallo transitorio no borra la foto anterior).
+        let mut photo_bytes: Option<(Vec<u8>, String)> = None;
+        let photo_etag = match &photo_url {
+            Some(url) if photo_unchanged => {
                 unchanged += 1;
-                continue;
+                Some(url.clone())
             }
+            Some(url) => match fetch_photo(url.clone()).await {
+                Ok((bytes, media_type)) => {
+                    photo_bytes = Some((bytes, media_type));
+                    fetched += 1;
+                    Some(url.clone())
+                }
+                Err(detail) => {
+                    tracing::warn!(
+                        "'{account_id}': no se bajó la foto de {}: {detail}",
+                        person.resource_name
+                    );
+                    existing.as_ref().and_then(|l| l.photo_etag.clone())
+                }
+            },
+            None => existing.as_ref().and_then(|l| l.photo_etag.clone()),
+        };
+
+        let link = ContactEnrichment {
+            contact_id,
+            resource_name: person.resource_name.clone(),
+            etag: person.etag.clone(),
+            photo_etag,
+        };
+        manager
+            .with_store(account_id, move |s| {
+                // El enlace (resourceName/etag/photo_etag) primero, que crea la
+                // fila; después la foto (si se bajó) y los grupos/destacado, que la
+                // actualizan. Cada uno sube la generación sólo si cambió algo.
+                s.upsert_contact_enrichment(&link)?;
+                if let Some((bytes, media_type)) = &photo_bytes {
+                    s.set_contact_photo(contact_id, bytes, media_type)?;
+                }
+                s.set_contact_groups(contact_id, &groups, starred)
+            })
+            .await
+            .map_err(PeopleError::Store)?;
+    }
+    Ok((fetched, unchanged))
+}
+
+/// Trae el catálogo de grupos/etiquetas (`contactGroups.list`) como un mapa
+/// `resourceName → formattedName`, con los mismos criterios de seguridad que
+/// [`fetch_connections`]: el `pageToken` es opaco y se pega a **nuestra** url base
+/// (`people.googleapis.com/v1/contactGroups`), nunca una url que venga en la
+/// respuesta; se acota por tope de páginas, tope de grupos, deduplicado del token,
+/// plazo por pedido y tope de tamaño del cuerpo; y reusa el mismo `http_client`.
+async fn fetch_contact_groups(
+    client: &reqwest::Client,
+    token: &str,
+    base_url: &str,
+    limits: &PeopleLimits,
+) -> Result<HashMap<String, String>, PeopleError> {
+    let base = url::Url::parse(base_url).map_err(|_| PeopleError::MalformedUrl)?;
+    let mut names: HashMap<String, String> = HashMap::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut page_token: Option<String> = None;
+
+    for _page in 0..limits.max_pages {
+        let mut url = base.clone();
+        {
+            let mut seg = url
+                .path_segments_mut()
+                .map_err(|_| PeopleError::MalformedUrl)?;
+            seg.pop_if_empty();
+            seg.push("contactGroups");
+        }
+        url.query_pairs_mut()
+            .append_pair("groupFields", "name")
+            .append_pair("pageSize", &limits.page_size.to_string());
+        if let Some(token) = &page_token {
+            url.query_pairs_mut().append_pair("pageToken", token);
         }
 
-        match fetch_photo(photo_url.clone()).await {
-            Ok((bytes, media_type)) => {
-                let link = ContactEnrichment {
-                    contact_id,
-                    resource_name: person.resource_name.clone(),
-                    etag: person.etag.clone(),
-                    photo_etag: Some(photo_url),
-                };
-                manager
-                    .with_store(account_id, move |s| {
-                        // El enlace (resourceName/etag/photo_etag) primero, que crea
-                        // la fila; después los bytes, que la actualizan.
-                        s.upsert_contact_enrichment(&link)?;
-                        s.set_contact_photo(contact_id, &bytes, &media_type)
-                    })
-                    .await
-                    .map_err(PeopleError::Store)?;
-                fetched += 1;
+        let deadline = tokio::time::Instant::now() + graph::REQUEST_TIMEOUT;
+        let request = client
+            .get(url.as_str())
+            .bearer_auth(token)
+            .header("Accept", "application/json");
+        let max_bytes = limits.max_response_bytes;
+        let fetch = async move {
+            let response = request
+                .send()
+                .await
+                .map_err(|e| PeopleError::Network(e.to_string()))?;
+            if !response.status().is_success() {
+                return Err(PeopleError::Http(response.status()));
             }
-            Err(detail) => {
-                tracing::warn!(
-                    "'{account_id}': no se bajó la foto de {}: {detail}",
-                    person.resource_name
-                );
+            let body = read_capped(response, max_bytes).await?;
+            serde_json::from_slice::<ContactGroups>(&body).map_err(|_| PeopleError::Parse)
+        };
+        let data = match tokio::time::timeout_at(deadline, fetch).await {
+            Ok(result) => result?,
+            Err(_) => return Err(PeopleError::Timeout),
+        };
+
+        for group in data.contact_groups {
+            if group.resource_name.is_empty() || group.formatted_name.is_empty() {
+                continue;
+            }
+            if names.len() >= limits.max_groups {
+                return Err(PeopleError::TooManyItems);
+            }
+            // Acotar el largo del nombre: es dato de red y va a parar a un vCard.
+            let name: String = group
+                .formatted_name
+                .chars()
+                .take(MAX_GROUP_NAME_CHARS)
+                .collect();
+            names.insert(group.resource_name, name);
+        }
+
+        match data.next_page_token {
+            None => return Ok(names),
+            Some(token) if token.is_empty() => return Ok(names),
+            Some(token) => {
+                if !seen.insert(token.clone()) {
+                    return Err(PeopleError::PaginationLoop);
+                }
+                page_token = Some(token);
             }
         }
     }
-    Ok((fetched, unchanged))
+
+    Err(PeopleError::TooManyPages)
 }
 
 /// Trae todas las personas de `people/me/connections` paginando por
@@ -395,7 +615,7 @@ async fn fetch_connections(
             }
         }
         url.query_pairs_mut()
-            .append_pair("personFields", "emailAddresses,photos")
+            .append_pair("personFields", "emailAddresses,photos,memberships")
             .append_pair("pageSize", &limits.page_size.to_string());
         if let Some(token) = &page_token {
             url.query_pairs_mut().append_pair("pageToken", token);

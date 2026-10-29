@@ -949,6 +949,56 @@ fn fold_line(line: &str) -> String {
     out
 }
 
+/// Inserta una línea de propiedad ya plegada antes del `END:VCARD` de `raw`, como
+/// hace [`embed_photo`]. Si `raw` no tiene `END:VCARD`, se devuelve tal cual: sin
+/// dónde insertar, no se inventa una tarjeta.
+fn insert_before_end(raw: &str, folded_line: &str) -> String {
+    let upper = raw.to_ascii_uppercase();
+    let Some(pos) = upper.rfind("END:VCARD") else {
+        return raw.to_string();
+    };
+    format!("{}{}\r\n{}", &raw[..pos], folded_line, &raw[pos..])
+}
+
+/// Devuelve `raw` con una propiedad `CATEGORIES` (RFC 6350 §6.7.1) agregada antes
+/// de su `END:VCARD`, con los nombres de los grupos/etiquetas que la People API de
+/// Google trae (`vasak-accounts#111`) y el CardDAV de Google no suele traer.
+///
+/// Es el camino de lectura del enriquecimiento, como [`embed_photo`]: los grupos
+/// viven **fuera del crudo guardado**, en la tabla `contact_enrichment`, y acá se
+/// suman al vCard de salida sin tocar lo que se guardó. **Cada nombre pasa por
+/// [`escape_vcard_public`]** —que escapa la barra primero, la coma, el punto y
+/// coma y descarta el `\r`— antes de unirlos con la coma que separa los valores de
+/// `CATEGORIES`: así un nombre con una coma, un punto y coma o un salto de línea no
+/// puede fabricar un valor de más ni una propiedad nueva. La línea se pliega a 75
+/// octetos sin partir un carácter de varios bytes ([`crate::serialize::fold`]).
+///
+/// Con `names` vacío no se agrega nada.
+pub fn embed_categories(raw: &str, names: &[String]) -> String {
+    if names.is_empty() {
+        return raw.to_string();
+    }
+    let joined = names
+        .iter()
+        .map(|name| escape_vcard_public(name))
+        .collect::<Vec<_>>()
+        .join(",");
+    let line = crate::serialize::fold(&format!("CATEGORIES:{joined}")).join("\r\n");
+    insert_before_end(raw, &line)
+}
+
+/// Devuelve `raw` con la propiedad `X-VASAK-STARRED:1` agregada antes de su
+/// `END:VCARD`, que marca el contacto como «destacado» (el grupo de sistema
+/// `contactGroups/starred` de la People API de Google, `vasak-accounts#111`).
+///
+/// vCard no tiene una propiedad estándar para el destacado y el modelo de lectura
+/// no traía ningún campo de «favorito», así que se usa una propiedad `X-` propia y
+/// estable, fuera del crudo guardado, como el resto del enriquecimiento. El valor
+/// es fijo (`1`), así que no hay nada de la red que escapar.
+pub fn embed_starred(raw: &str) -> String {
+    insert_before_end(raw, "X-VASAK-STARRED:1")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
