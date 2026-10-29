@@ -1108,6 +1108,82 @@ mod tests {
         assert_eq!(schema_version(&connection).unwrap(), 12);
     }
 
+    /// **v11 → v12 no pierde nada**: un enlace con su foto de una base de la v11
+    /// sigue intacto; los grupos arrancan en `[]` y el destacado en `0` (los
+    /// defaults, no `NULL`), y la pasada de enriquecimiento los puede llenar.
+    #[test]
+    fn de_v11_a_v12_suma_grupos_y_destacado_con_sus_defaults() {
+        let mut connection = at_version(11);
+        connection
+            .execute(
+                "INSERT INTO address_books (id, href, display_name, updated_at)
+                 VALUES (1, 'https://x/a/', 'A', 'ayer')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO contacts
+                   (id, address_book_id, href, etag, uid, display_name, sort_key, raw_vcard,
+                    updated_at)
+                 VALUES (1, 1, 'https://x/a/ana.vcf', '\"v1\"', 'u1', 'Ana', 'ana',
+                    'BEGIN:VCARD', 'ayer')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO contact_enrichment
+                   (contact_id, resource_name, etag, photo_etag, photo, photo_media_type)
+                 VALUES (1, 'people/c1', '\"e1\"', '\"p1\"', x'010203', 'image/jpeg')",
+                [],
+            )
+            .unwrap();
+
+        apply(&mut connection).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 12);
+
+        // Lo que había sigue, y las columnas nuevas traen sus defaults.
+        let row: (String, Option<Vec<u8>>, String, i64) = connection
+            .query_row(
+                "SELECT resource_name, photo, groups, starred
+                   FROM contact_enrichment WHERE contact_id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "people/c1");
+        assert_eq!(row.1.as_deref(), Some(&[1u8, 2u8, 3u8][..]));
+        assert_eq!(row.2, "[]");
+        assert_eq!(row.3, 0);
+
+        // Un enlace nuevo (sin nombrar las columnas) también arranca con defaults.
+        connection
+            .execute(
+                "INSERT INTO contacts
+                   (id, address_book_id, href, etag, uid, display_name, sort_key, raw_vcard,
+                    updated_at)
+                 VALUES (2, 1, 'https://x/a/b.vcf', NULL, 'u2', 'Beto', 'beto',
+                    'BEGIN:VCARD', 'ayer')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO contact_enrichment (contact_id, resource_name) VALUES (2, 'people/c2')",
+                [],
+            )
+            .unwrap();
+        let (groups, starred): (String, i64) = connection
+            .query_row(
+                "SELECT groups, starred FROM contact_enrichment WHERE contact_id = 2",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((groups.as_str(), starred), ("[]", 0));
+    }
+
     /// **v8 → v9 no pierde nada**: un evento de una base de la v8 sigue con sus
     /// ocurrencias, recordatorios y títulos; `categories` arranca en `[]` (el
     /// `NOT NULL DEFAULT` llena las filas viejas) y `color` en `NULL`; y las
