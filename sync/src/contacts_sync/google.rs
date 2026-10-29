@@ -358,9 +358,12 @@ where
 
     // El catálogo de nombres de grupo (`resourceName → formattedName`): sólo se
     // trae si alguien pertenece a algún grupo que no sea el de destacado (ése no
-    // necesita nombre). Es **mejor esfuerzo**: si el fetch acotado falla, se siguen
-    // aplicando el destacado y la foto, sin los nombres de grupo (decisión 2 del
-    // taller: lo que no está disponible se ve no disponible, nunca roto).
+    // necesita nombre). Es **mejor esfuerzo**: si el fetch acotado falla, queda
+    // `None` = «catálogo no disponible» y el bucle preserva los grupos ya guardados
+    // (sólo actualiza el destacado), para no perderlos por un fallo transitorio del
+    // catálogo (decisión 2 del taller: lo que no está disponible se ve no
+    // disponible, nunca roto). Si no hace falta traerlo, es `Some` vacío: catálogo
+    // disponible, nadie tiene grupos que resolver.
     let needs_groups = people.iter().any(|person| {
         person.memberships.iter().any(|m| {
             let name = m.group_resource_name();
@@ -369,16 +372,16 @@ where
     });
     let group_names = if needs_groups {
         match fetch_contact_groups(&client, token, base_url, &limits).await {
-            Ok(names) => names,
+            Ok(names) => Some(names),
             Err(e) => {
                 tracing::warn!(
                     "'{account_id}': no se pudo traer el catálogo de grupos de People: {e}"
                 );
-                HashMap::new()
+                None
             }
         }
     } else {
-        HashMap::new()
+        Some(HashMap::new())
     };
 
     // El mapa de email → contacto, sólo contactos sin op pendiente: así una
@@ -414,21 +417,26 @@ where
             .memberships
             .iter()
             .any(|m| m.group_resource_name() == STARRED_GROUP);
-        let mut groups: Vec<String> = Vec::new();
-        for membership in &person.memberships {
-            let name = membership.group_resource_name();
-            if name.is_empty() || name == STARRED_GROUP {
-                continue;
-            }
-            if let Some(formatted) = group_names.get(name) {
-                if !formatted.is_empty() && !groups.contains(formatted) {
-                    groups.push(formatted.clone());
-                    if groups.len() >= MAX_GROUPS_PER_CONTACT {
-                        break;
+        // Con el catálogo disponible se resuelven los nombres de grupo; sin él
+        // (`None`) se dejan en `None` para preservar los grupos ya guardados.
+        let groups: Option<Vec<String>> = group_names.as_ref().map(|names| {
+            let mut groups: Vec<String> = Vec::new();
+            for membership in &person.memberships {
+                let name = membership.group_resource_name();
+                if name.is_empty() || name == STARRED_GROUP {
+                    continue;
+                }
+                if let Some(formatted) = names.get(name) {
+                    if !formatted.is_empty() && !groups.contains(formatted) {
+                        groups.push(formatted.clone());
+                        if groups.len() >= MAX_GROUPS_PER_CONTACT {
+                            break;
+                        }
                     }
                 }
             }
-        }
+            groups
+        });
 
         // La primera foto de verdad (no el monograma generado), si hay.
         let photo_url = person
@@ -490,7 +498,7 @@ where
                 if let Some((bytes, media_type)) = &photo_bytes {
                     s.set_contact_photo(contact_id, bytes, media_type)?;
                 }
-                s.set_contact_groups(contact_id, &groups, starred)
+                s.set_contact_groups(contact_id, groups.as_deref(), starred)
             })
             .await
             .map_err(PeopleError::Store)?;

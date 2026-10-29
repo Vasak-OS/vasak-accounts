@@ -1442,7 +1442,9 @@ async fn guardar_los_mismos_grupos_no_sube_la_generacion_y_un_cambio_si() {
         let manager = manager.clone();
         async move {
             manager
-                .with_store(ACCOUNT, move |s| s.set_contact_groups(id, &groups, starred))
+                .with_store(ACCOUNT, move |s| {
+                    s.set_contact_groups(id, Some(&groups), starred)
+                })
                 .await
                 .unwrap();
         }
