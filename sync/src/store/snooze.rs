@@ -244,3 +244,282 @@ fn row_to_followup(row: &rusqlite::Row) -> rusqlite::Result<Followup> {
         created_at: row.get(4)?,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::contacts::tests::open_store;
+    use super::super::paths::tests::TempDir;
+    use super::*;
+
+    const NOW: i64 = 1_000;
+
+    fn snooze(c: &Connection, id: &str, return_at: i64) {
+        upsert_snooze(c, id, "INBOX", Some(7), Some(3), return_at, 1).unwrap();
+    }
+
+    fn followup(c: &Connection, id: &str, remind_at: i64) {
+        upsert_followup(c, id, "ana@x.com", remind_at, 1).unwrap();
+    }
+
+    fn ids_of_snoozed(rows: &[SnoozedMessage]) -> Vec<&str> {
+        rows.iter().map(|r| r.message_id.as_str()).collect()
+    }
+
+    fn ids_of_followups(rows: &[Followup]) -> Vec<&str> {
+        rows.iter().map(|r| r.message_id.as_str()).collect()
+    }
+
+    #[test]
+    fn posponer_guarda_el_mensaje_y_la_lista_lo_devuelve() {
+        let temp = TempDir::new("snooze-lista");
+        let store = open_store(&temp);
+        let c = store.connection();
+        assert!(list_snoozed(c).unwrap().is_empty());
+
+        upsert_snooze(c, "<a@x>", "INBOX", Some(7), Some(3), 2_000, 500).unwrap();
+
+        let rows = list_snoozed(c).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.message_id, "<a@x>");
+        assert_eq!(row.origin_mailbox, "INBOX");
+        assert_eq!(row.new_uid, Some(7));
+        assert_eq!(row.uidvalidity, Some(3));
+        assert_eq!(row.return_at, 2_000);
+        assert_eq!(row.created_at, 500);
+    }
+
+    #[test]
+    fn reponer_un_posponer_actualiza_la_hora_y_el_ruteo_sin_duplicar() {
+        let temp = TempDir::new("snooze-upsert");
+        let store = open_store(&temp);
+        let c = store.connection();
+        upsert_snooze(c, "<a@x>", "INBOX", Some(7), Some(3), 2_000, 500).unwrap();
+        upsert_snooze(c, "<a@x>", "Trabajo", Some(9), Some(4), 5_000, 600).unwrap();
+
+        let rows = list_snoozed(c).unwrap();
+        assert_eq!(rows.len(), 1, "no debe duplicar por message_id");
+        assert_eq!(rows[0].origin_mailbox, "Trabajo");
+        assert_eq!(rows[0].new_uid, Some(9));
+        assert_eq!(rows[0].uidvalidity, Some(4));
+        assert_eq!(rows[0].return_at, 5_000);
+        assert_eq!(rows[0].created_at, 600);
+    }
+
+    #[test]
+    fn el_seguimiento_se_guarda_y_la_lista_lo_devuelve() {
+        let temp = TempDir::new("followup-lista");
+        let store = open_store(&temp);
+        let c = store.connection();
+        assert!(list_followups(c).unwrap().is_empty());
+
+        upsert_followup(c, "<f@x>", "ana@x.com, beto@x.com", 2_000, 500).unwrap();
+
+        let rows = list_followups(c).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message_id, "<f@x>");
+        assert_eq!(rows[0].recipients, "ana@x.com, beto@x.com");
+        assert_eq!(rows[0].remind_at, 2_000);
+        assert_eq!(rows[0].created_at, 500);
+    }
+
+    #[test]
+    fn reponer_un_seguimiento_actualiza_la_hora_sin_duplicar() {
+        let temp = TempDir::new("followup-upsert");
+        let store = open_store(&temp);
+        let c = store.connection();
+        upsert_followup(c, "<f@x>", "ana@x.com", 2_000, 500).unwrap();
+        upsert_followup(c, "<f@x>", "beto@x.com", 7_000, 600).unwrap();
+
+        let rows = list_followups(c).unwrap();
+        assert_eq!(rows.len(), 1, "no debe duplicar por message_id");
+        assert_eq!(rows[0].recipients, "beto@x.com");
+        assert_eq!(rows[0].remind_at, 7_000);
+        assert_eq!(rows[0].created_at, 600);
+    }
+
+    #[test]
+    fn las_listas_van_ordenadas_por_hora() {
+        let temp = TempDir::new("orden");
+        let store = open_store(&temp);
+        let c = store.connection();
+        snooze(c, "<tarde>", 3_000);
+        snooze(c, "<temprano>", 2_000);
+        followup(c, "<tarde>", 3_000);
+        followup(c, "<temprano>", 2_000);
+
+        assert_eq!(
+            ids_of_snoozed(&list_snoozed(c).unwrap()),
+            ["<temprano>", "<tarde>"]
+        );
+        assert_eq!(
+            ids_of_followups(&list_followups(c).unwrap()),
+            ["<temprano>", "<tarde>"]
+        );
+    }
+
+    #[test]
+    fn los_pospuestos_vencidos_incluyen_el_borde_y_excluyen_el_futuro() {
+        let temp = TempDir::new("snooze-vencidos");
+        let store = open_store(&temp);
+        let c = store.connection();
+        snooze(c, "<pasado>", NOW - 100);
+        snooze(c, "<justo>", NOW);
+        snooze(c, "<futuro>", NOW + 1);
+
+        let due = due_snoozed(c, NOW).unwrap();
+        assert_eq!(ids_of_snoozed(&due), ["<pasado>", "<justo>"]);
+        // Lo que se devuelve es la fila entera, lista para mover.
+        assert_eq!(due[1].origin_mailbox, "INBOX");
+        assert_eq!(due[1].new_uid, Some(7));
+        assert!(due_snoozed(c, NOW - 101).unwrap().is_empty());
+    }
+
+    #[test]
+    fn los_seguimientos_vencidos_incluyen_el_borde_y_excluyen_el_futuro() {
+        let temp = TempDir::new("followup-vencidos");
+        let store = open_store(&temp);
+        let c = store.connection();
+        followup(c, "<pasado>", NOW - 100);
+        followup(c, "<justo>", NOW);
+        followup(c, "<futuro>", NOW + 1);
+
+        let due = due_followups(c, NOW).unwrap();
+        assert_eq!(ids_of_followups(&due), ["<pasado>", "<justo>"]);
+        assert_eq!(due[1].recipients, "ana@x.com");
+        assert!(due_followups(c, NOW - 101).unwrap().is_empty());
+    }
+
+    /// Contrato: `next_*` mira **estrictamente después** de `now` (`> now`). Lo
+    /// que vence en `now` ya lo devuelve `due_*`; si `next_*` también lo diera, el
+    /// bucle dormiría cero segundos sobre algo que ya atendió.
+    #[test]
+    fn la_proxima_vuelta_es_la_menor_estrictamente_futura() {
+        let temp = TempDir::new("snooze-proximo");
+        let store = open_store(&temp);
+        let c = store.connection();
+        assert_eq!(next_snooze_at(c, NOW).unwrap(), None, "tabla vacía");
+
+        snooze(c, "<viejo>", NOW - 500);
+        snooze(c, "<justo>", NOW);
+        snooze(c, "<lejos>", NOW + 900);
+        snooze(c, "<cerca>", NOW + 10);
+
+        // El menor absoluto (NOW - 500) y el `== now` no cuentan: el próximo es el
+        // menor de los futuros.
+        assert_eq!(next_snooze_at(c, NOW).unwrap(), Some(NOW + 10));
+        assert_eq!(next_snooze_at(c, NOW + 10).unwrap(), Some(NOW + 900));
+        assert_eq!(
+            next_snooze_at(c, NOW + 900).unwrap(),
+            None,
+            "no queda ninguna"
+        );
+    }
+
+    #[test]
+    fn el_proximo_aviso_es_el_menor_estrictamente_futuro() {
+        let temp = TempDir::new("followup-proximo");
+        let store = open_store(&temp);
+        let c = store.connection();
+        assert_eq!(next_followup_at(c, NOW).unwrap(), None, "tabla vacía");
+
+        followup(c, "<viejo>", NOW - 500);
+        followup(c, "<justo>", NOW);
+        followup(c, "<lejos>", NOW + 900);
+        followup(c, "<cerca>", NOW + 10);
+
+        assert_eq!(next_followup_at(c, NOW).unwrap(), Some(NOW + 10));
+        assert_eq!(next_followup_at(c, NOW + 10).unwrap(), Some(NOW + 900));
+        assert_eq!(
+            next_followup_at(c, NOW + 900).unwrap(),
+            None,
+            "no queda ninguna"
+        );
+    }
+
+    #[test]
+    fn cancelar_un_posponer_dice_si_habia_y_es_idempotente() {
+        let temp = TempDir::new("snooze-borrar");
+        let store = open_store(&temp);
+        let c = store.connection();
+        snooze(c, "<a@x>", 2_000);
+        snooze(c, "<b@x>", 3_000);
+
+        assert!(delete_snooze(c, "<a@x>").unwrap());
+        assert_eq!(ids_of_snoozed(&list_snoozed(c).unwrap()), ["<b@x>"]);
+        // Otra vez, o uno que nunca existió: `false`, sin error y sin tocar el resto.
+        assert!(!delete_snooze(c, "<a@x>").unwrap());
+        assert!(!delete_snooze(c, "<nunca@x>").unwrap());
+        assert_eq!(list_snoozed(c).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cancelar_un_seguimiento_dice_si_habia_y_es_idempotente() {
+        let temp = TempDir::new("followup-borrar");
+        let store = open_store(&temp);
+        let c = store.connection();
+        followup(c, "<a@x>", 2_000);
+        followup(c, "<b@x>", 3_000);
+
+        assert!(delete_followup(c, "<a@x>").unwrap());
+        assert_eq!(ids_of_followups(&list_followups(c).unwrap()), ["<b@x>"]);
+        assert!(!delete_followup(c, "<a@x>").unwrap());
+        assert!(!delete_followup(c, "<nunca@x>").unwrap());
+        assert_eq!(list_followups(c).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn atender_un_vencido_lo_borra_y_no_se_repite() {
+        let temp = TempDir::new("snooze-atender");
+        let store = open_store(&temp);
+        let c = store.connection();
+        snooze(c, "<a@x>", NOW - 1);
+        followup(c, "<f@x>", NOW - 1);
+
+        assert_eq!(due_snoozed(c, NOW).unwrap().len(), 1);
+        assert!(delete_snooze(c, "<a@x>").unwrap());
+        assert!(due_snoozed(c, NOW).unwrap().is_empty());
+
+        assert_eq!(due_followups(c, NOW).unwrap().len(), 1);
+        assert!(delete_followup(c, "<f@x>").unwrap());
+        assert!(due_followups(c, NOW).unwrap().is_empty());
+    }
+
+    /// Sin `COPYUID` (servidor sin `UIDPLUS`) no hay UID nuevo: se guarda y se lee
+    /// como `None` —no como `0`—, y el retorno re-ubica por `Message-ID`.
+    #[test]
+    fn sin_uid_nuevo_se_guarda_y_se_lee_como_nada() {
+        let temp = TempDir::new("snooze-nulos");
+        let store = open_store(&temp);
+        let c = store.connection();
+        upsert_snooze(c, "<sin@x>", "INBOX", None, None, 2_000, 1).unwrap();
+        upsert_snooze(c, "<con@x>", "INBOX", Some(0), Some(0), 3_000, 1).unwrap();
+
+        let rows = list_snoozed(c).unwrap();
+        assert_eq!((rows[0].new_uid, rows[0].uidvalidity), (None, None));
+        // Un 0 de verdad se conserva: no se confunde con la ausencia.
+        assert_eq!((rows[1].new_uid, rows[1].uidvalidity), (Some(0), Some(0)));
+
+        // Y reponer con UID pasa de nada a valor, y de valor a nada.
+        upsert_snooze(c, "<sin@x>", "INBOX", Some(11), Some(5), 2_000, 1).unwrap();
+        upsert_snooze(c, "<con@x>", "INBOX", None, None, 3_000, 1).unwrap();
+        let rows = list_snoozed(c).unwrap();
+        assert_eq!((rows[0].new_uid, rows[0].uidvalidity), (Some(11), Some(5)));
+        assert_eq!((rows[1].new_uid, rows[1].uidvalidity), (None, None));
+    }
+
+    /// Una fila por mensaje, y cada cola es independiente de la otra: el mismo
+    /// `Message-ID` puede estar pospuesto y con seguimiento a la vez.
+    #[test]
+    fn las_dos_colas_son_independientes_para_el_mismo_mensaje() {
+        let temp = TempDir::new("colas");
+        let store = open_store(&temp);
+        let c = store.connection();
+        snooze(c, "<m@x>", 2_000);
+        followup(c, "<m@x>", 3_000);
+
+        assert!(delete_snooze(c, "<m@x>").unwrap());
+        assert!(list_snoozed(c).unwrap().is_empty());
+        assert_eq!(list_followups(c).unwrap().len(), 1);
+    }
+}

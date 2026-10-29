@@ -1678,11 +1678,79 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .unwrap();
-        let all = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11];
+        let all = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12];
         Migrations::new(all[..version].iter().map(|sql| M::up(sql)).collect())
             .to_latest(&mut connection)
             .unwrap();
         connection
+    }
+
+    /// **v12 → v13 no pierde nada**: lo que había (un buzón) sigue, las dos colas
+    /// nuevas nacen vacías y cada una admite una sola fila por `message_id` —lo
+    /// que hace posible el upsert— aunque otra tabla repita ese mismo id.
+    #[test]
+    fn de_v12_a_v13_se_conserva_lo_que_habia_y_nacen_las_dos_colas() {
+        let mut connection = at_version(12);
+        assert_eq!(schema_version(&connection).unwrap(), 12);
+        for table in ["snoozed_messages", "followups"] {
+            assert!(connection
+                .prepare(&format!("SELECT 1 FROM {table}"))
+                .is_err());
+        }
+        connection
+            .execute(
+                "INSERT INTO mailboxes (name, display_name, role, updated_at)
+                 VALUES ('INBOX', 'Bandeja', 'inbox', 'ayer')",
+                [],
+            )
+            .unwrap();
+
+        apply(&mut connection).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 13);
+
+        let count = |sql: &str| -> i64 { connection.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(count("SELECT count(*) FROM mailboxes"), 1);
+        assert_eq!(count("SELECT count(*) FROM snoozed_messages"), 0);
+        assert_eq!(count("SELECT count(*) FROM followups"), 0);
+
+        connection
+            .execute(
+                "INSERT INTO snoozed_messages (message_id, origin_mailbox, return_at, created_at)
+                 VALUES ('<a@x>', 'INBOX', 10, 1)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO followups (message_id, recipients, remind_at, created_at)
+                 VALUES ('<a@x>', 'ana@x.com', 10, 1)",
+                [],
+            )
+            .unwrap();
+        // `new_uid` y `uidvalidity` son opcionales: nacen en NULL.
+        let nulls: (Option<i64>, Option<i64>) = connection
+            .query_row(
+                "SELECT new_uid, uidvalidity FROM snoozed_messages",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(nulls, (None, None));
+        // Un segundo `message_id` igual en la misma cola lo rechaza la base.
+        assert!(connection
+            .execute(
+                "INSERT INTO snoozed_messages (message_id, origin_mailbox, return_at, created_at)
+                 VALUES ('<a@x>', 'INBOX', 20, 2)",
+                [],
+            )
+            .is_err());
+        assert!(connection
+            .execute(
+                "INSERT INTO followups (message_id, recipients, remind_at, created_at)
+                 VALUES ('<a@x>', 'beto@x.com', 20, 2)",
+                [],
+            )
+            .is_err());
     }
 
     /// **v1 → v2 no pierde nada**: la bitácora y el estado de la
