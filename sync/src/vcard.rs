@@ -1890,4 +1890,23 @@ mod tests {
         assert!(c.addresses[0].street.ends_with('…'));
         assert!(c.addresses[0].street.len() <= MAX_VALUE + 4);
     }
+
+    /// `dom`, `intl`, `postal` y `parcel` son el tipo de **entrega** del `ADR`, no
+    /// su etiqueta: una 3.0 legacy con `TYPE=dom,home,postal,parcel` se muestra
+    /// como «home», no como «dom» (y al editar no se pierde el «home»).
+    #[test]
+    fn los_tipos_de_entrega_de_una_direccion_no_son_su_etiqueta() {
+        assert_eq!(label_from(&["TYPE=dom,home,postal,parcel".into()]), "home");
+        // La forma 2.1, con los parámetros sueltos.
+        assert_eq!(label_from(&["POSTAL".into(), "HOME".into()]), "home");
+        assert_eq!(label_from(&["INTL".into(), "WORK".into()]), "work");
+        // Sin nada más que el tipo de entrega, no hay etiqueta.
+        assert_eq!(label_from(&["TYPE=dom,parcel".into()]), "");
+
+        let card = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Ana\r\n\
+            ADR;TYPE=dom,home,postal,parcel:;;Calle 1;Rosario;;2000;AR\r\nEND:VCARD";
+        let c = contact_from(card, "").unwrap();
+        assert_eq!(c.addresses.len(), 1);
+        assert_eq!(c.addresses[0].label, "home");
+    }
 }
