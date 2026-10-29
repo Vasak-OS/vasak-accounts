@@ -48,6 +48,7 @@ pub mod paths;
 pub mod queue;
 pub mod readers;
 pub mod smime_key;
+pub mod snooze;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -635,7 +636,7 @@ mod tests {
             .connection()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
     }
 
     /// 0700 la carpeta y 0600 los tres archivos, y otra vez en cada apertura si
