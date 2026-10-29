@@ -915,7 +915,7 @@ impl Service {
         drop(reader);
         // Y que el almacén se entere sin esperar su vuelta: las aplicaciones
         // leen de ahí. Del origen se saca ya; donde llegó lo trae la vuelta.
-        if matches!(outcome, imap::MoveOutcome::Complete) {
+        if matches!(outcome, imap::MoveOutcome::Complete { .. }) {
             store_api::store_forget(&account_id, &origin, uid).await;
         }
         store_api::nudge_email(&account_id);
@@ -923,7 +923,9 @@ impl Service {
         // La lista en memoria es la de la de entrada. Si de ahí salió algo, se
         // saca ya en vez de esperar la próxima vuelta: la ventana lo acaba de
         // mover y verlo seguir ahí parece que no funcionó.
-        if origin.eq_ignore_ascii_case("INBOX") && matches!(outcome, imap::MoveOutcome::Complete) {
+        if origin.eq_ignore_ascii_case("INBOX")
+            && matches!(outcome, imap::MoveOutcome::Complete { .. })
+        {
             let mut state = self.state.lock().await;
             if let Some(list) = state.messages.get_mut(&account_id) {
                 list.retain(|m| m.uid != uid);

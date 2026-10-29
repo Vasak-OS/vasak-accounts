@@ -43,6 +43,14 @@ pub enum Term {
     /// Desde una fecha, en el formato de IMAP: `1-Jan-2026`.
     #[serde(rename = "desde")]
     Since(String),
+    /// En un encabezado puntual: `(nombre, valor)`.
+    ///
+    /// Lo que habilita enhebrar una conversación —buscar por `Message-ID`,
+    /// `References`, `In-Reply-To`—. El nombre del encabezado va contra una lista
+    /// blanca (ver `allowed_header`); el valor viaja como cualquier otro texto,
+    /// entre comillas o como literal.
+    #[serde(rename = "encabezado")]
+    Header(String, String),
 }
 
 /// Cómo se le manda un texto al servidor.
@@ -68,6 +76,7 @@ fn search_key(term: &Term) -> &'static str {
         Term::Unread => "UNSEEN",
         Term::Flagged => "FLAGGED",
         Term::Since(_) => "SINCE",
+        Term::Header(..) => "HEADER",
     }
 }
 
@@ -80,8 +89,23 @@ fn term_text(term: &Term) -> Option<&str> {
         | Term::Body(t)
         | Term::Any(t)
         | Term::Since(t) => Some(t),
+        // Del par, lo que acompaña es el valor; el nombre lo pega `build_criteria`.
+        Term::Header(_, value) => Some(value),
         Term::Unread | Term::Flagged => None,
     }
+}
+
+/// El nombre del encabezado, si está en la lista que la ventana puede buscar.
+///
+/// Lista blanca y no validación de forma: el nombre va **crudo** en el comando,
+/// pegado a `HEADER`, y un encabezado arbitrario con un espacio adentro sería
+/// otro comando. Son los tres que hacen falta para enhebrar una conversación. Se
+/// compara sin distinguir mayúsculas pero se emite el nombre canónico, así lo que
+/// llega al servidor es siempre uno de esos tres literales.
+fn allowed_header(field: &str) -> Option<&'static str> {
+    ["Message-ID", "References", "In-Reply-To"]
+        .into_iter()
+        .find(|h| field.eq_ignore_ascii_case(h))
 }
 
 /// Si una fecha tiene la forma que IMAP espera: `1-Jan-2026`.
@@ -135,7 +159,16 @@ pub fn build_criteria(terms: &[Term]) -> Vec<Chunk> {
                     chunks.push(Chunk::Inline(format!("{key} {value}")));
                     continue;
                 }
-                chunks.push(Chunk::Inline(key.to_string()));
+                // La clave: para `HEADER` lleva pegado el nombre del encabezado
+                // validado (`HEADER Message-ID`); para el resto va sola. Lo que no
+                // está en la lista blanca se descarta, como una fecha inválida.
+                match term {
+                    Term::Header(field, _) => match allowed_header(field) {
+                        Some(name) => chunks.push(Chunk::Inline(format!("{key} {name}"))),
+                        None => continue,
+                    },
+                    _ => chunks.push(Chunk::Inline(key.to_string())),
+                }
                 if value.is_ascii() {
                     chunks.push(Chunk::Inline(quote_string(value)));
                 } else {
