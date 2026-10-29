@@ -510,78 +510,35 @@ async fn fetch_contact_groups(
     base_url: &str,
     limits: &PeopleLimits,
 ) -> Result<HashMap<String, String>, PeopleError> {
-    let base = url::Url::parse(base_url).map_err(|_| PeopleError::MalformedUrl)?;
     let mut names: HashMap<String, String> = HashMap::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut page_token: Option<String> = None;
-
-    for _page in 0..limits.max_pages {
-        let mut url = base.clone();
-        {
-            let mut seg = url
-                .path_segments_mut()
-                .map_err(|_| PeopleError::MalformedUrl)?;
-            seg.pop_if_empty();
-            seg.push("contactGroups");
-        }
-        url.query_pairs_mut()
-            .append_pair("groupFields", "name")
-            .append_pair("pageSize", &limits.page_size.to_string());
-        if let Some(token) = &page_token {
-            url.query_pairs_mut().append_pair("pageToken", token);
-        }
-
-        let deadline = tokio::time::Instant::now() + graph::REQUEST_TIMEOUT;
-        let request = client
-            .get(url.as_str())
-            .bearer_auth(token)
-            .header("Accept", "application/json");
-        let max_bytes = limits.max_response_bytes;
-        let fetch = async move {
-            let response = request
-                .send()
-                .await
-                .map_err(|e| PeopleError::Network(e.to_string()))?;
-            if !response.status().is_success() {
-                return Err(PeopleError::Http(response.status()));
-            }
-            let body = read_capped(response, max_bytes).await?;
-            serde_json::from_slice::<ContactGroups>(&body).map_err(|_| PeopleError::Parse)
-        };
-        let data = match tokio::time::timeout_at(deadline, fetch).await {
-            Ok(result) => result?,
-            Err(_) => return Err(PeopleError::Timeout),
-        };
-
-        for group in data.contact_groups {
-            if group.resource_name.is_empty() || group.formatted_name.is_empty() {
-                continue;
-            }
-            if names.len() >= limits.max_groups {
-                return Err(PeopleError::TooManyItems);
-            }
-            // Acotar el largo del nombre: es dato de red y va a parar a un vCard.
-            let name: String = group
-                .formatted_name
-                .chars()
-                .take(MAX_GROUP_NAME_CHARS)
-                .collect();
-            names.insert(group.resource_name, name);
-        }
-
-        match data.next_page_token {
-            None => return Ok(names),
-            Some(token) if token.is_empty() => return Ok(names),
-            Some(token) => {
-                if !seen.insert(token.clone()) {
-                    return Err(PeopleError::PaginationLoop);
+    paginate_people::<ContactGroups, _>(
+        client,
+        token,
+        base_url,
+        &["contactGroups"],
+        &[("groupFields", "name")],
+        limits,
+        |page| {
+            for group in page.contact_groups {
+                if group.resource_name.is_empty() || group.formatted_name.is_empty() {
+                    continue;
                 }
-                page_token = Some(token);
+                if names.len() >= limits.max_groups {
+                    return Err(PeopleError::TooManyItems);
+                }
+                // Acotar el largo del nombre: es dato de red y va a parar a un vCard.
+                let name: String = group
+                    .formatted_name
+                    .chars()
+                    .take(MAX_GROUP_NAME_CHARS)
+                    .collect();
+                names.insert(group.resource_name, name);
             }
-        }
-    }
-
-    Err(PeopleError::TooManyPages)
+            Ok(page.next_page_token)
+        },
+    )
+    .await?;
+    Ok(names)
 }
 
 /// Trae todas las personas de `people/me/connections` paginando por
@@ -596,8 +553,52 @@ async fn fetch_connections(
     base_url: &str,
     limits: &PeopleLimits,
 ) -> Result<Vec<Person>, PeopleError> {
-    let base = url::Url::parse(base_url).map_err(|_| PeopleError::MalformedUrl)?;
     let mut all: Vec<Person> = Vec::new();
+    paginate_people::<PeopleConnections, _>(
+        client,
+        token,
+        base_url,
+        &["people", "me", "connections"],
+        &[("personFields", "emailAddresses,photos,memberships")],
+        limits,
+        |page| {
+            all.extend(page.connections);
+            if all.len() > limits.max_people {
+                return Err(PeopleError::TooManyItems);
+            }
+            Ok(page.next_page_token)
+        },
+    )
+    .await?;
+    Ok(all)
+}
+
+/// El paginador acotado que comparten [`fetch_connections`] y
+/// [`fetch_contact_groups`]: hace una sola vez el bucle, el deduplicado del
+/// `pageToken`, el tope de páginas, el plazo por pedido, el GET con `bearer_auth`
+/// sobre **nuestra** url base y el parseo acotado del cuerpo. Cada llamador
+/// parametriza sólo lo que difiere: el `path` (`people/me/connections` vs
+/// `contactGroups`), los `query_fields` propios (`personFields` vs `groupFields`),
+/// el tipo de página `P` que se deserializa y el `accumulate`, que procesa cada
+/// página contra su acumulador (aplicando su propio tope de ítems) y devuelve el
+/// `nextPageToken` de esa página.
+///
+/// **El `nextPageToken` es opaco y se pega a la url base**, nunca se sigue una url
+/// que venga en la respuesta: el riesgo de host-no-confiable de OData no aplica.
+async fn paginate_people<P, A>(
+    client: &reqwest::Client,
+    token: &str,
+    base_url: &str,
+    path: &[&str],
+    query_fields: &[(&str, &str)],
+    limits: &PeopleLimits,
+    mut accumulate: A,
+) -> Result<(), PeopleError>
+where
+    P: serde::de::DeserializeOwned,
+    A: FnMut(P) -> Result<Option<String>, PeopleError>,
+{
+    let base = url::Url::parse(base_url).map_err(|_| PeopleError::MalformedUrl)?;
     // Los `pageToken` ya pedidos, para cortar un servidor que repite el mismo en
     // bucle.
     let mut seen: HashSet<String> = HashSet::new();
@@ -610,13 +611,17 @@ async fn fetch_connections(
                 .path_segments_mut()
                 .map_err(|_| PeopleError::MalformedUrl)?;
             seg.pop_if_empty();
-            for s in ["people", "me", "connections"] {
+            for s in path {
                 seg.push(s);
             }
         }
-        url.query_pairs_mut()
-            .append_pair("personFields", "emailAddresses,photos,memberships")
-            .append_pair("pageSize", &limits.page_size.to_string());
+        {
+            let mut pairs = url.query_pairs_mut();
+            for (key, value) in query_fields {
+                pairs.append_pair(key, value);
+            }
+            pairs.append_pair("pageSize", &limits.page_size.to_string());
+        }
         if let Some(token) = &page_token {
             url.query_pairs_mut().append_pair("pageToken", token);
         }
@@ -636,21 +641,16 @@ async fn fetch_connections(
                 return Err(PeopleError::Http(response.status()));
             }
             let body = read_capped(response, max_bytes).await?;
-            serde_json::from_slice::<PeopleConnections>(&body).map_err(|_| PeopleError::Parse)
+            serde_json::from_slice::<P>(&body).map_err(|_| PeopleError::Parse)
         };
         let data = match tokio::time::timeout_at(deadline, fetch).await {
             Ok(result) => result?,
             Err(_) => return Err(PeopleError::Timeout),
         };
 
-        all.extend(data.connections);
-        if all.len() > limits.max_people {
-            return Err(PeopleError::TooManyItems);
-        }
-
-        match data.next_page_token {
-            None => return Ok(all),
-            Some(token) if token.is_empty() => return Ok(all),
+        match accumulate(data)? {
+            None => return Ok(()),
+            Some(token) if token.is_empty() => return Ok(()),
             Some(token) => {
                 if !seen.insert(token.clone()) {
                     return Err(PeopleError::PaginationLoop);
