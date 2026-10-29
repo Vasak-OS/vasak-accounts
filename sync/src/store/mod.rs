@@ -48,6 +48,7 @@ pub mod paths;
 pub mod queue;
 pub mod readers;
 pub mod smime_key;
+pub mod snooze;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

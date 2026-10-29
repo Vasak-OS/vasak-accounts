@@ -651,6 +651,61 @@ ALTER TABLE contact_enrichment ADD COLUMN groups TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE contact_enrichment ADD COLUMN starred INTEGER NOT NULL DEFAULT 0;
 ";
 
+/// v13 (PR 2 de `vasak-accounts#22`): las dos colas privadas del correo —posponer
+/// un mensaje y recordar un seguimiento—, revisadas por reloj (como los
+/// recordatorios del calendario) para devolver el mensaje o avisar a su hora.
+///
+/// Las dos viven **dentro de la base cifrada** y no en un archivo aparte, por el
+/// mismo motivo que `pending_dav_ops` (V5): una lista de `Message-ID` con fechas
+/// y ruteo es metadato privado del correo, que `main.rs` nunca escribe en claro.
+/// Al vivir acá heredan el cifrado del almacén y se barren gratis: un
+/// `ClearStore` o un `SetStoreEnabled(false)` rehacen la base vacía
+/// (ver `lifecycle::StoreManager::remove_store`, que borra el archivo entero), y
+/// con ella estas dos tablas. No llevan `account_id`: hay una base por cuenta.
+///
+/// Los tiempos son segundos epoch (`INTEGER`), igual que `alarms.fires_at` y
+/// `messages.date_ts`: el bucle los compara contra la hora de ahora sin volver a
+/// mirar ninguna zona. El `id` entero es sólo la clave de fila; la identidad
+/// estable del mensaje es `message_id` (`UNIQUE`), que sobrevive a que el `UID`
+/// cambie al mover de casilla.
+///
+/// - **`snoozed_messages`**: un mensaje que se sacó del INBOX hasta `return_at`.
+///   `origin_mailbox` es a dónde volver; `new_uid`/`uidvalidity` son el UID que
+///   dejó el `COPYUID` al mover a la casilla de pospuestos, **nulos** cuando el
+///   servidor no dio `COPYUID` (sin `UIDPLUS`): ahí el retorno re-ubica por
+///   `Message-ID`. Índice por `return_at` para el próximo vencimiento.
+/// - **`followups`**: un mensaje enviado para el que hay que recordar un
+///   seguimiento a `remind_at` si no hubo respuesta. `recipients` es a quién se le
+///   escribió, para el texto del aviso. Índice por `remind_at`.
+///
+/// Una fila por mensaje (`UNIQUE (message_id)`): reponer un posponer o un
+/// seguimiento ya puesto **actualiza** su hora (upsert), no duplica ni falla
+/// (ver `store::snooze`). La fila se borra al atender o al cancelar, que es la
+/// anti-repetición: el bucle consulta `*_at <= now` sin borde inferior.
+const V13: &str = "
+CREATE TABLE snoozed_messages (
+    id             INTEGER PRIMARY KEY,
+    message_id     TEXT NOT NULL UNIQUE,
+    origin_mailbox TEXT NOT NULL,
+    new_uid        INTEGER,
+    uidvalidity    INTEGER,
+    return_at      INTEGER NOT NULL,
+    created_at     INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX snoozed_messages_by_return ON snoozed_messages (return_at);
+
+CREATE TABLE followups (
+    id         INTEGER PRIMARY KEY,
+    message_id TEXT NOT NULL UNIQUE,
+    recipients TEXT NOT NULL,
+    remind_at  INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX followups_by_remind ON followups (remind_at);
+";
+
 /// Todas las migraciones, en orden.
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
@@ -666,6 +721,7 @@ pub fn migrations() -> Migrations<'static> {
         M::up(V10),
         M::up(V11),
         M::up(V12),
+        M::up(V13),
     ])
 }
 
@@ -702,7 +758,7 @@ mod tests {
         let mut connection = Connection::open_in_memory().unwrap();
         apply(&mut connection).unwrap();
         let version = schema_version(&connection).unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
 
         let tables = |c: &Connection| -> Vec<String> {
             let mut statement = c
@@ -762,6 +818,10 @@ mod tests {
             "pending_dav_ops_by_area",
             "contact_enrichment",
             "contact_enrichment_by_resource",
+            "snoozed_messages",
+            "snoozed_messages_by_return",
+            "followups",
+            "followups_by_remind",
         ] {
             assert!(before.iter().any(|t| t == table), "falta {table}");
         }
@@ -827,7 +887,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 12);
+        assert_eq!(schema_version(&connection).unwrap(), 13);
 
         // Lo que había sigue, y la marca nueva es NULL.
         let object_mark: Option<String> = connection
@@ -870,7 +930,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 12);
+        assert_eq!(schema_version(&connection).unwrap(), 13);
 
         // La op sigue, en conflicto, y las columnas nuevas son NULL.
         let (state, server_etag, server_raw): (String, Option<String>, Option<Vec<u8>>) =
@@ -929,7 +989,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 12);
+        assert_eq!(schema_version(&connection).unwrap(), 13);
 
         // El contacto sigue, y la tabla nueva arranca vacía.
         let contacts: i64 = connection
@@ -1041,7 +1101,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 12);
+        assert_eq!(schema_version(&connection).unwrap(), 13);
 
         // El enlace sigue, y las columnas nuevas arrancan nulas.
         let (resource, photo, media): (String, Option<Vec<u8>>, Option<String>) = connection
@@ -1105,7 +1165,7 @@ mod tests {
 
         apply(&mut connection).unwrap();
         assert_eq!(columns(&connection), before);
-        assert_eq!(schema_version(&connection).unwrap(), 12);
+        assert_eq!(schema_version(&connection).unwrap(), 13);
     }
 
     /// **v11 → v12 no pierde nada**: un enlace con su foto de una base de la v11
@@ -1141,7 +1201,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 12);
+        assert_eq!(schema_version(&connection).unwrap(), 13);
 
         // Lo que había sigue, y las columnas nuevas traen sus defaults.
         let row: (String, Option<Vec<u8>>, String, i64) = connection
@@ -1199,7 +1259,7 @@ mod tests {
         let object = insert_object(&connection, calendar, "https://x/c/1.ics");
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 12);
+        assert_eq!(schema_version(&connection).unwrap(), 13);
 
         // Lo que había sigue.
         assert_eq!(
@@ -1297,7 +1357,7 @@ mod tests {
 
         apply(&mut fresh).unwrap();
         assert_eq!(columns(&fresh), before);
-        assert_eq!(schema_version(&fresh).unwrap(), 12);
+        assert_eq!(schema_version(&fresh).unwrap(), 13);
 
         let mut from_v8 = at_version(8);
         apply(&mut from_v8).unwrap();
@@ -1354,7 +1414,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 12);
+        assert_eq!(schema_version(&connection).unwrap(), 13);
 
         // Lo que había sigue, y las columnas nuevas son NULL.
         let row: (String, Option<String>, i64, Option<i64>, Option<String>) = connection
@@ -1385,7 +1445,7 @@ mod tests {
         let before = columns(&connection);
         apply(&mut connection).unwrap();
         assert_eq!(columns(&connection), before);
-        assert_eq!(schema_version(&connection).unwrap(), 12);
+        assert_eq!(schema_version(&connection).unwrap(), 13);
     }
 
     /// **v10 → v11 no pierde nada**: el cuerpo, la firma y el firmante de una base de
@@ -1438,7 +1498,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 12);
+        assert_eq!(schema_version(&connection).unwrap(), 13);
 
         let row: (String, Option<String>, i64, Option<i64>, Option<String>, Option<i64>) =
             connection
@@ -1474,7 +1534,7 @@ mod tests {
         let before = columns(&connection);
         apply(&mut connection).unwrap();
         assert_eq!(columns(&connection), before);
-        assert_eq!(schema_version(&connection).unwrap(), 12);
+        assert_eq!(schema_version(&connection).unwrap(), 13);
     }
 
     /// La marca `pending_op` sólo acepta los dos valores conocidos, o `NULL`.
@@ -1645,7 +1705,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 12);
+        assert_eq!(schema_version(&connection).unwrap(), 13);
         let message: String = connection
             .query_row("SELECT message FROM sync_log", [], |row| row.get(0))
             .unwrap();
@@ -1946,7 +2006,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 12);
+        assert_eq!(schema_version(&connection).unwrap(), 13);
         assert_eq!(found(&connection, "jose"), vec![id]);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_emails"), 1);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_phones"), 1);
@@ -2117,7 +2177,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 12);
+        assert_eq!(schema_version(&connection).unwrap(), 13);
         assert_eq!(found(&connection, "jose"), vec![id]);
         assert_eq!(count(&connection, "SELECT count(*) FROM occurrences"), 2);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_emails"), 1);
