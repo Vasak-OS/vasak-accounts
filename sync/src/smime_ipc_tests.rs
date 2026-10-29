@@ -5,6 +5,7 @@
 //! ventana —un cliente— llamando por el bus. Lo que se mira es lo que ve la
 //! ventana: el nombre del error D-Bus, lo que queda en el llavero y el JSON.
 
+use crate::access::tests::Answer;
 use crate::smime_sign::test_support::*;
 use crate::smime_sign::{certificate_matches_address, certificate_summary};
 use crate::store::key::tests::{lock_and_announce, unlock_and_announce};
@@ -614,6 +615,88 @@ async fn importar_de_nuevo_reemplaza_la_identidad_anterior() {
     import(&f, ACCOUNT, RSA_P12, PASSWORD).await.unwrap();
     import(&f, ACCOUNT, RSA_P12, PASSWORD).await.unwrap();
 
+    assert_eq!(identity(&f, ACCOUNT).await["present"], true);
+    f.call("RemoveSmimeIdentity", &(ACCOUNT,)).await.unwrap();
+    assert_eq!(identity(&f, ACCOUNT).await["present"], false);
+}
+
+// ── Quién puede mutar la identidad (vasak-accounts#135) ─────────────────
+
+/// Siembra la identidad directo en el llavero falso, sin pasar por el servicio:
+/// el fixture fija la respuesta de permisos al construirse, así que para probar
+/// un borrado denegado la identidad ya tiene que estar.
+async fn seed_identity(f: &Fixture, address: &str) {
+    let imported = parse_pkcs12(RSA_P12, PASSWORD).unwrap();
+    f.keys()
+        .store_smime_identity(address, &imported)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn importar_sin_permiso_da_accessdenied_y_no_guarda_nada() {
+    let f = Fixture::start_with_permission(&[(ACCOUNT, RSA_ADDRESS)], Answer::Deny).await;
+
+    let name = short_name(import(&f, ACCOUNT, RSA_P12, PASSWORD).await);
+
+    assert_eq!(name, "AccessDenied");
+    assert_nothing_stored(&f, RSA_ADDRESS).await;
+}
+
+#[tokio::test]
+async fn borrar_sin_permiso_da_accessdenied_y_la_identidad_sigue() {
+    let f = Fixture::start_with_permission(&[(ACCOUNT, RSA_ADDRESS)], Answer::Deny).await;
+    seed_identity(&f, RSA_ADDRESS).await;
+
+    let name = short_name(f.call("RemoveSmimeIdentity", &(ACCOUNT,)).await);
+
+    assert_eq!(name, "AccessDenied");
+    assert_eq!(identity(&f, ACCOUNT).await["present"], true);
+    assert!(f
+        .keys()
+        .find_smime_private_key(RSA_ADDRESS)
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn un_fallo_del_servicio_de_permisos_tambien_cierra() {
+    let f = Fixture::start_with_permission(&[(ACCOUNT, RSA_ADDRESS)], Answer::Fail).await;
+
+    let name = short_name(import(&f, ACCOUNT, RSA_P12, PASSWORD).await);
+    assert_eq!(name, "AccessDenied");
+    assert_nothing_stored(&f, RSA_ADDRESS).await;
+
+    seed_identity(&f, RSA_ADDRESS).await;
+    let name = short_name(f.call("RemoveSmimeIdentity", &(ACCOUNT,)).await);
+    assert_eq!(name, "AccessDenied");
+    assert_eq!(identity(&f, ACCOUNT).await["present"], true);
+}
+
+#[tokio::test]
+async fn sin_servicio_de_permisos_configurado_tambien_cierra() {
+    let service = crate::Service::default();
+
+    let result = service.authorize_smime(Some(":1.7"), RSA_ADDRESS).await;
+
+    assert!(matches!(result, Err(crate::SmimeIpcError::AccessDenied)));
+}
+
+#[tokio::test]
+async fn consultar_la_identidad_no_pide_permiso() {
+    let f = Fixture::start_with_permission(&[(ACCOUNT, RSA_ADDRESS)], Answer::Deny).await;
+
+    assert_eq!(identity(&f, ACCOUNT).await["present"], false);
+    seed_identity(&f, RSA_ADDRESS).await;
+    assert_eq!(identity(&f, ACCOUNT).await["present"], true);
+}
+
+#[tokio::test]
+async fn con_permiso_importar_y_borrar_siguen_funcionando() {
+    let f = Fixture::start_with_permission(&[(ACCOUNT, RSA_ADDRESS)], Answer::Allow).await;
+
+    import(&f, ACCOUNT, RSA_P12, PASSWORD).await.unwrap();
     assert_eq!(identity(&f, ACCOUNT).await["present"], true);
     f.call("RemoveSmimeIdentity", &(ACCOUNT,)).await.unwrap();
     assert_eq!(identity(&f, ACCOUNT).await["present"], false);
