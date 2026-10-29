@@ -239,15 +239,35 @@ pub fn search_result_count(line: &str) -> Option<u32> {
 /// se copió y se marcó para borrar, pero **la copia vieja sigue ahí** porque
 /// borrarla de verdad habría borrado también lo de otro. Quien llame tiene que
 /// poder decirlo.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MoveOutcome {
     /// Está en el destino y ya no está en el origen.
-    #[serde(rename = "entero")]
-    Complete,
+    ///
+    /// Con UIDPLUS (RFC 4315) o MOVE (RFC 6851) el servidor dice en qué UID
+    /// quedó la copia nueva, en `[COPYUID …]`; sin eso, `None`. Lo necesita
+    /// quien quiera volver a encontrar el mensaje en el destino —posponer, por
+    /// ejemplo—, no quien sólo lo mueve.
+    Complete {
+        new_uid: Option<u32>,
+        uidvalidity: Option<u32>,
+    },
     /// Está en el destino y en el origen sigue, marcado para borrar.
-    #[serde(rename = "sin_borrar_el_viejo")]
     OldCopyKept,
+}
+
+/// Cómo se le cuenta a la ventana cómo terminó: **igual que siempre**, un texto.
+///
+/// El `[COPYUID …]` que ahora lleva `Complete` es para el proceso de sync, no
+/// para el bus: serializarlo dentro del enum cambiaría la respuesta de
+/// `move_message` que la ventana lee hoy. Por eso se serializa a mano y el UID
+/// nuevo no viaja por acá —hasta que un consumidor lo pida, en su propio cambio.
+impl serde::Serialize for MoveOutcome {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(match self {
+            MoveOutcome::Complete { .. } => "entero",
+            MoveOutcome::OldCopyKept => "sin_borrar_el_viejo",
+        })
+    }
 }
 
 /// Si un número de parte tiene la forma que IMAP espera: `2`, `1.3.2`.
@@ -396,6 +416,69 @@ pub fn response_code_number(line: &str, code: &str) -> Option<u64> {
         return None;
     }
     words.next()?.parse().ok()
+}
+
+/// El `[COPYUID <uidvalidity> <origen> <destino>]` de una respuesta de estado.
+///
+/// Devuelve `(uidvalidity, destino)`: el UID que el mensaje tiene **en la casilla
+/// nueva**, que es lo único que hace falta para volver a encontrarlo ahí. Es un
+/// código de **tres** números —a diferencia de `response_code_number`, que lee
+/// uno—, y aparece en los dos lados: el `* OK [COPYUID …]` que RFC 6851 manda
+/// antes del expurgo del `UID MOVE`, sin etiqueta, y el `<tag> OK [COPYUID …]`
+/// con el que el `UID COPY` de UIDPLUS contesta. Por eso se saltea el primer
+/// token sea `*` o una etiqueta.
+///
+/// `None` si el servidor no lo mandó —no implementa UIDPLUS— o si el destino
+/// viene como un conjunto en vez de un UID suelto, que no pasa moviendo un
+/// mensaje por vez: el mismo texto en el asunto de un mensaje no puede pasar por
+/// el estado de la casilla, igual que en `response_code_number`.
+pub fn copyuid_from(line: &str) -> Option<(u32, u32)> {
+    let (_, rest) = line.split_once(' ')?;
+    let (status, rest) = rest.split_once(' ')?;
+    if !["OK", "NO", "BAD", "PREAUTH", "BYE"]
+        .iter()
+        .any(|s| status.eq_ignore_ascii_case(s))
+    {
+        return None;
+    }
+    let rest = rest.trim_start().strip_prefix('[')?;
+    let inside = &rest[..rest.find(']')?];
+    let mut words = inside.split_ascii_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("COPYUID") {
+        return None;
+    }
+    let uidvalidity = words.next()?.parse().ok()?;
+    let _source = words.next()?;
+    let destination = words.next()?.parse().ok()?;
+    Some((uidvalidity, destination))
+}
+
+/// Si el rechazo a un `CREATE` quiere decir «ya existía».
+///
+/// Las tres formas en que los servidores lo dicen: el código `[ALREADYEXISTS]`
+/// de RFC 5530, el texto libre «already exists», y `[TRYCREATE]`. Todas son el
+/// estado que quería quien creó la casilla, así que `create_mailbox` las trata
+/// como éxito.
+pub fn already_exists(detail: &str) -> bool {
+    let upper = detail.to_ascii_uppercase();
+    upper.contains("ALREADYEXISTS")
+        || upper.contains("ALREADY EXISTS")
+        || upper.contains("TRYCREATE")
+}
+
+/// Un `Complete` a partir del `[COPYUID …]`, si el servidor lo mandó.
+///
+/// Sin UIDPLUS no hay número y los dos campos quedan en `None`: el movimiento
+/// igual se completó, sólo que no se sabe el UID nuevo.
+fn complete_from(copyuid: Option<(u32, u32)>) -> MoveOutcome {
+    let (uidvalidity, new_uid) = match copyuid {
+        Some((validity, uid)) => (Some(validity), Some(uid)),
+        None => (None, None),
+    };
+    MoveOutcome::Complete {
+        new_uid,
+        uidvalidity,
+    }
 }
 
 /// Las banderas de `FLAGS (...)` de una respuesta de `FETCH`.
@@ -1334,6 +1417,35 @@ impl<F: AsyncRead + AsyncWrite + Unpin + Send> Session<F> {
             .await
     }
 
+    /// Marca un mensaje como **no** leído en el servidor.
+    ///
+    /// El espejo de `mark_read`: `-FLAGS` saca la bandera, `+FLAGS` la pone. El
+    /// mismo motivo para que viaje —la persona lee en varios lados— y la misma
+    /// condición: la casilla tiene que estar abierta con `SELECT`.
+    pub async fn mark_unread(&mut self, uid: u32) -> Result<(), ImapError> {
+        self.command(&format!("UID STORE {uid} -FLAGS (\\Seen)"))
+            .await
+    }
+
+    /// Crea una casilla, y **no falla si ya existía**.
+    ///
+    /// Es idempotente a propósito: quien la crea quiere que exista, no que exista
+    /// por primera vez. El servidor avisa de varias formas que ya estaba
+    /// —`[ALREADYEXISTS]`, «already exists», `[TRYCREATE]`— y todas son el estado
+    /// que se quería, así que se toman como éxito.
+    ///
+    /// El nombre va **entre comillas** como en `move_to`/`select`: concatenarlo
+    /// crudo dejaría que un nombre con un salto de línea arme otro comando IMAP.
+    pub async fn create_mailbox(&mut self, name: &str) -> Result<(), ImapError> {
+        let quoted_name = quoted(name)
+            .ok_or_else(|| ImapError::Failed("el nombre de la casilla no es válido".into()))?;
+        match self.command(&format!("CREATE {quoted_name}")).await {
+            Ok(()) => Ok(()),
+            Err(ImapError::Rejected(detail)) if already_exists(&detail) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Mueve un mensaje a otra casilla.
     ///
     /// # Los tres caminos, y por qué el tercero no borra
@@ -1354,20 +1466,24 @@ impl<F: AsyncRead + AsyncWrite + Unpin + Send> Session<F> {
             .ok_or_else(|| ImapError::Failed("el nombre de la casilla no es válido".into()))?;
 
         if self.capabilities.iter().any(|c| c == "MOVE") {
-            self.command(&format!("UID MOVE {uid} {name}")).await?;
-            return Ok(MoveOutcome::Complete);
+            let copyuid = self
+                .command_copyuid(&format!("UID MOVE {uid} {name}"))
+                .await?;
+            return Ok(complete_from(copyuid));
         }
 
         // La copia primero. Si falla, no se marcó nada y el mensaje sigue donde
         // estaba: el orden es lo que hace que un fallo a mitad de camino no
         // pierda nada.
-        self.command(&format!("UID COPY {uid} {name}")).await?;
+        let copyuid = self
+            .command_copyuid(&format!("UID COPY {uid} {name}"))
+            .await?;
         self.command(&format!("UID STORE {uid} +FLAGS (\\Deleted)"))
             .await?;
 
         if self.capabilities.iter().any(|c| c == "UIDPLUS") {
             self.command(&format!("UID EXPUNGE {uid}")).await?;
-            return Ok(MoveOutcome::Complete);
+            return Ok(complete_from(copyuid));
         }
 
         Ok(MoveOutcome::OldCopyKept)
@@ -1460,6 +1576,35 @@ impl<F: AsyncRead + AsyncWrite + Unpin + Send> Session<F> {
                     // `NO` es el servidor entendiendo y diciendo que no: casi
                     // siempre, credenciales. Se distingue porque insistir con una
                     // contraseña rechazada es cómo se bloquea una cuenta.
+                    Some(TaggedStatus::No(d)) => return Err(ImapError::Rejected(d)),
+                    Some(TaggedStatus::Bad(d)) => {
+                        return Err(ImapError::Failed(format!("el servidor no entendió: {d}")))
+                    }
+                    None => continue,
+                }
+            }
+        })
+        .await
+    }
+
+    /// Como `command`, pero se queda con el `[COPYUID …]` si el servidor lo da.
+    ///
+    /// `UID COPY` lo trae en su propia respuesta con etiqueta y `UID MOVE` en un
+    /// `* OK` anterior al expurgo: por eso se mira **cada** línea, no sólo la
+    /// final. El manejo de errores es el mismo que el de `command`.
+    async fn command_copyuid(&mut self, command: &str) -> Result<Option<(u32, u32)>, ImapError> {
+        let tag = self.next_tag();
+        self.write_line(&format!("{tag} {command}")).await?;
+
+        Self::with_timeout("la respuesta al comando", async {
+            let mut copyuid = None;
+            loop {
+                let line = self.read_line().await?;
+                if let Some(ids) = copyuid_from(&line) {
+                    copyuid = Some(ids);
+                }
+                match tagged_status(&line, &tag) {
+                    Some(TaggedStatus::Ok) => return Ok(copyuid),
                     Some(TaggedStatus::No(d)) => return Err(ImapError::Rejected(d)),
                     Some(TaggedStatus::Bad(d)) => {
                         return Err(ImapError::Failed(format!("el servidor no entendió: {d}")))
@@ -1864,7 +2009,10 @@ pub(crate) mod tests {
 
         assert_eq!(
             session.move_to(7, "Papelera").await.unwrap(),
-            MoveOutcome::Complete
+            MoveOutcome::Complete {
+                new_uid: None,
+                uidvalidity: None,
+            }
         );
         assert_eq!(task.await.unwrap().len(), 1);
     }
@@ -1886,7 +2034,10 @@ pub(crate) mod tests {
 
         assert_eq!(
             session.move_to(7, "Papelera").await.unwrap(),
-            MoveOutcome::Complete
+            MoveOutcome::Complete {
+                new_uid: None,
+                uidvalidity: None,
+            }
         );
         let received = task.await.unwrap();
         assert_eq!(received.len(), 3);
@@ -2367,12 +2518,293 @@ pub(crate) mod tests {
         assert!(pending.is_empty());
     }
 
+    // -----------------------------------------------------------------------
+    // Primitivas de posponer y seguimiento (#22)
+    // -----------------------------------------------------------------------
+
+    /// El `[COPYUID …]` trae tres números y de ellos hace falta el primero (la
+    /// validez) y el tercero (el UID en el destino), no el del medio.
+    #[test]
+    fn el_copyuid_da_la_validez_y_el_uid_del_destino() {
+        // `UID MOVE` (RFC 6851): sin etiqueta, antes del expurgo.
+        assert_eq!(
+            copyuid_from("* OK [COPYUID 1 7 42] mensaje movido"),
+            Some((1, 42))
+        );
+        // `UID COPY` (UIDPLUS): con la etiqueta del comando.
+        assert_eq!(
+            copyuid_from("a3 OK [COPYUID 38505 304 3956] copiado"),
+            Some((38505, 3956))
+        );
+        // Sin distinguir mayúsculas en el código.
+        assert_eq!(copyuid_from("* OK [copyuid 2 5 6]"), Some((2, 6)));
+    }
+
+    #[test]
+    fn un_copyuid_que_no_es_de_un_solo_mensaje_no_se_toma() {
+        // Un conjunto o un rango de destino: no hay un UID que devolver.
+        assert_eq!(copyuid_from("a3 OK [COPYUID 1 7:9 42:44] copiado"), None);
+        assert_eq!(copyuid_from("a3 OK [COPYUID 1 7,9 42,44] copiado"), None);
+        // Le faltan números.
+        assert_eq!(copyuid_from("a3 OK [COPYUID 1 7] copiado"), None);
+        assert_eq!(copyuid_from("a3 OK [COPYUID] copiado"), None);
+    }
+
+    #[test]
+    fn sin_copyuid_no_hay_uid_nuevo() {
+        for line in [
+            "a3 OK copiado",
+            "a3 OK [APPENDUID 1 42] otro código",
+            "* OK [UIDNEXT 4392] el que sigue",
+            "",
+            "a3",
+        ] {
+            assert_eq!(copyuid_from(line), None, "{line:?}");
+        }
+    }
+
+    /// El texto de un mensaje no puede pasar por el estado del servidor: sólo
+    /// vale una línea de estado, no un dato como `* 1 FETCH (…)`.
+    #[test]
+    fn un_copyuid_en_un_dato_del_mensaje_no_se_toma() {
+        assert_eq!(copyuid_from("* 1 FETCH (BODY[] [COPYUID 1 7 42])"), None);
+        assert_eq!(copyuid_from("* SEARCH [COPYUID 1 7 42]"), None);
+        assert_eq!(copyuid_from("a3 OK copiado COPYUID 1 7 42"), None);
+        assert_eq!(copyuid_from("a3 OK [COPYUID 1 7 42"), None);
+    }
+
+    #[tokio::test]
+    async fn con_move_el_copyuid_del_aviso_previo_da_el_uid_nuevo() {
+        let (mut session, task) = with_server(
+            "* OK listo",
+            vec![(
+                "UID MOVE 7 \"Pospuestos\"",
+                vec![
+                    "* OK [COPYUID 1 7 42] movido",
+                    "* 3 EXPUNGE",
+                    "{tag} OK MOVE completado",
+                ],
+            )],
+        );
+        session.capabilities = vec!["MOVE".into(), "UIDPLUS".into()];
+
+        assert_eq!(
+            session.move_to(7, "Pospuestos").await.unwrap(),
+            MoveOutcome::Complete {
+                new_uid: Some(42),
+                uidvalidity: Some(1),
+            }
+        );
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn con_copy_y_uidplus_el_copyuid_de_la_copia_da_el_uid_nuevo() {
+        let (mut session, task) = with_server(
+            "* OK listo",
+            vec![
+                (
+                    "UID COPY 7 \"Pospuestos\"",
+                    vec!["{tag} OK [COPYUID 5 7 99] copiado"],
+                ),
+                (
+                    "UID STORE 7 +FLAGS (\\Deleted)",
+                    vec!["{tag} OK completado"],
+                ),
+                ("UID EXPUNGE 7", vec!["{tag} OK completado"]),
+            ],
+        );
+        session.capabilities = vec!["UIDPLUS".into()];
+
+        assert_eq!(
+            session.move_to(7, "Pospuestos").await.unwrap(),
+            MoveOutcome::Complete {
+                new_uid: Some(99),
+                uidvalidity: Some(5),
+            }
+        );
+        task.await.unwrap();
+    }
+
+    /// Si el destino llega como conjunto, el movimiento igual se completó: sólo
+    /// no se sabe el UID nuevo.
+    #[tokio::test]
+    async fn un_copyuid_con_rango_completa_el_movimiento_sin_uid() {
+        let (mut session, task) = with_server(
+            "* OK listo",
+            vec![(
+                "UID MOVE 7",
+                vec!["* OK [COPYUID 1 7 42:43] movido", "{tag} OK completado"],
+            )],
+        );
+        session.capabilities = vec!["MOVE".into()];
+
+        assert_eq!(
+            session.move_to(7, "Pospuestos").await.unwrap(),
+            MoveOutcome::Complete {
+                new_uid: None,
+                uidvalidity: None,
+            }
+        );
+        task.await.unwrap();
+    }
+
+    /// Sin UIDPLUS ni MOVE sigue sin expurgarse nada, y no hay UID que contar
+    /// porque el viejo sigue ahí.
+    #[tokio::test]
+    async fn sin_uidplus_el_viejo_sigue_aunque_el_servidor_mande_un_copyuid() {
+        let (mut session, task) = with_server(
+            "* OK listo",
+            vec![
+                ("UID COPY 7", vec!["{tag} OK [COPYUID 5 7 99] copiado"]),
+                ("UID STORE 7 +FLAGS", vec!["{tag} OK completado"]),
+            ],
+        );
+        session.capabilities = vec![];
+
+        assert_eq!(
+            session.move_to(7, "Pospuestos").await.unwrap(),
+            MoveOutcome::OldCopyKept
+        );
+        assert_eq!(task.await.unwrap().len(), 2);
+    }
+
+    /// El rechazo del servidor sigue siendo un error con `command_copyuid`, no
+    /// un `Complete` sin números.
+    #[tokio::test]
+    async fn un_move_rechazado_sigue_siendo_un_error() {
+        let (mut session, task) = with_server(
+            "* OK listo",
+            vec![("UID MOVE", vec!["{tag} NO [TRYCREATE] no existe"])],
+        );
+        session.capabilities = vec!["MOVE".into()];
+
+        assert!(matches!(
+            session.move_to(7, "NoExiste").await,
+            Err(ImapError::Rejected(_))
+        ));
+        task.await.unwrap();
+    }
+
+    /// Un `BAD` no es un rechazo del contenido sino un comando mal armado, y se
+    /// dice como tal, igual que con `command`.
+    #[tokio::test]
+    async fn un_move_que_el_servidor_no_entiende_es_un_fallo() {
+        let (mut session, task) = with_server(
+            "* OK listo",
+            vec![("UID MOVE", vec!["{tag} BAD comando desconocido"])],
+        );
+        session.capabilities = vec!["MOVE".into()];
+
+        assert!(matches!(
+            session.move_to(7, "Pospuestos").await,
+            Err(ImapError::Failed(_))
+        ));
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn crear_una_casilla_la_manda_entre_comillas() {
+        let (mut session, task) =
+            with_server("* OK listo", vec![("CREATE", vec!["{tag} OK creada"])]);
+
+        session.create_mailbox("Pospuestos/Mañana").await.unwrap();
+        let received = task.await.unwrap();
+        assert_eq!(received.len(), 1);
+        assert!(
+            received[0].ends_with(" CREATE \"Pospuestos/Mañana\""),
+            "{}",
+            received[0]
+        );
+    }
+
+    /// Quien la crea quiere que exista, no que sea la primera vez: las tres
+    /// maneras en que un servidor dice «ya estaba» son éxito.
+    #[tokio::test]
+    async fn crear_una_casilla_que_ya_existe_no_es_un_error() {
+        for reply in [
+            "{tag} NO [ALREADYEXISTS] la casilla ya existe",
+            "{tag} NO Mailbox already exists",
+            "{tag} NO [TRYCREATE] pruebe crearla",
+        ] {
+            let (mut session, task) = with_server("* OK listo", vec![("CREATE", vec![reply])]);
+            assert!(
+                session.create_mailbox("Pospuestos").await.is_ok(),
+                "falló con {reply:?}"
+            );
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn crear_una_casilla_rechazada_por_otra_razon_es_un_error() {
+        let (mut session, task) = with_server(
+            "* OK listo",
+            vec![("CREATE", vec!["{tag} NO [NOPERM] no tiene permiso"])],
+        );
+        assert!(matches!(
+            session.create_mailbox("Pospuestos").await,
+            Err(ImapError::Rejected(_))
+        ));
+        task.await.unwrap();
+
+        // Un `BAD` tampoco se confunde con «ya existía».
+        let (mut session, task) = with_server(
+            "* OK listo",
+            vec![("CREATE", vec!["{tag} BAD already exists? no entendí"])],
+        );
+        assert!(session.create_mailbox("Pospuestos").await.is_err());
+        task.await.unwrap();
+    }
+
+    /// Un nombre con salto de línea armaría un segundo comando; con comillas se
+    /// escapa. En ningún caso llega crudo.
+    #[tokio::test]
+    async fn el_nombre_de_una_casilla_nueva_no_inyecta_comandos() {
+        let (mut session, task) = with_server("* OK listo", vec![]);
+        assert!(session
+            .create_mailbox("x\r\na2 DELETE \"INBOX\"")
+            .await
+            .is_err());
+        assert!(task.await.unwrap().is_empty(), "no tenía que mandar nada");
+
+        let (mut session, task) =
+            with_server("* OK listo", vec![("CREATE", vec!["{tag} OK creada"])]);
+        session.create_mailbox("a\"b\\c").await.unwrap();
+        let received = task.await.unwrap();
+        assert!(
+            received[0].ends_with(" CREATE \"a\\\"b\\\\c\""),
+            "{}",
+            received[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn marcar_como_no_leido_saca_la_bandera_de_leido() {
+        let (mut session, task) = with_server(
+            "* OK listo",
+            vec![("UID STORE", vec!["{tag} OK completado"])],
+        );
+
+        session.mark_unread(7).await.unwrap();
+        let received = task.await.unwrap();
+        assert!(
+            received[0].ends_with(" UID STORE 7 -FLAGS (\\Seen)"),
+            "{}",
+            received[0]
+        );
+    }
+
     /// `MoveMessage` y `DeleteMessage` contestan uno de dos textos, y son los
     /// de siempre.
     #[test]
     fn como_termino_un_movimiento_se_dice_como_antes() {
         assert_eq!(
-            serde_json::to_string(&MoveOutcome::Complete).unwrap(),
+            serde_json::to_string(&MoveOutcome::Complete {
+                new_uid: None,
+                uidvalidity: None,
+            })
+            .unwrap(),
             "\"entero\""
         );
         assert_eq!(

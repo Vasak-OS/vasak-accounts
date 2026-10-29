@@ -43,6 +43,14 @@ pub enum Term {
     /// Desde una fecha, en el formato de IMAP: `1-Jan-2026`.
     #[serde(rename = "desde")]
     Since(String),
+    /// En un encabezado puntual: `(nombre, valor)`.
+    ///
+    /// Lo que habilita enhebrar una conversación —buscar por `Message-ID`,
+    /// `References`, `In-Reply-To`—. El nombre del encabezado va contra una lista
+    /// blanca (ver `allowed_header`); el valor viaja como cualquier otro texto,
+    /// entre comillas o como literal.
+    #[serde(rename = "encabezado")]
+    Header(String, String),
 }
 
 /// Cómo se le manda un texto al servidor.
@@ -68,6 +76,7 @@ fn search_key(term: &Term) -> &'static str {
         Term::Unread => "UNSEEN",
         Term::Flagged => "FLAGGED",
         Term::Since(_) => "SINCE",
+        Term::Header(..) => "HEADER",
     }
 }
 
@@ -80,8 +89,23 @@ fn term_text(term: &Term) -> Option<&str> {
         | Term::Body(t)
         | Term::Any(t)
         | Term::Since(t) => Some(t),
+        // Del par, lo que acompaña es el valor; el nombre lo pega `build_criteria`.
+        Term::Header(_, value) => Some(value),
         Term::Unread | Term::Flagged => None,
     }
+}
+
+/// El nombre del encabezado, si está en la lista que la ventana puede buscar.
+///
+/// Lista blanca y no validación de forma: el nombre va **crudo** en el comando,
+/// pegado a `HEADER`, y un encabezado arbitrario con un espacio adentro sería
+/// otro comando. Son los tres que hacen falta para enhebrar una conversación. Se
+/// compara sin distinguir mayúsculas pero se emite el nombre canónico, así lo que
+/// llega al servidor es siempre uno de esos tres literales.
+fn allowed_header(field: &str) -> Option<&'static str> {
+    ["Message-ID", "References", "In-Reply-To"]
+        .into_iter()
+        .find(|h| field.eq_ignore_ascii_case(h))
 }
 
 /// Si una fecha tiene la forma que IMAP espera: `1-Jan-2026`.
@@ -135,7 +159,16 @@ pub fn build_criteria(terms: &[Term]) -> Vec<Chunk> {
                     chunks.push(Chunk::Inline(format!("{key} {value}")));
                     continue;
                 }
-                chunks.push(Chunk::Inline(key.to_string()));
+                // La clave: para `HEADER` lleva pegado el nombre del encabezado
+                // validado (`HEADER Message-ID`); para el resto va sola. Lo que no
+                // está en la lista blanca se descarta, como una fecha inválida.
+                match term {
+                    Term::Header(field, _) => match allowed_header(field) {
+                        Some(name) => chunks.push(Chunk::Inline(format!("{key} {name}"))),
+                        None => continue,
+                    },
+                    _ => chunks.push(Chunk::Inline(key.to_string())),
+                }
                 if value.is_ascii() {
                     chunks.push(Chunk::Inline(quote_string(value)));
                 } else {
@@ -373,5 +406,71 @@ mod tests {
 
         // Y un nombre en inglés no es un término: la ventana no lo manda.
         assert!(serde_json::from_str::<Term>(r#"{"campo": "sender", "valor": "x"}"#).is_err());
+    }
+
+    #[test]
+    fn el_termino_encabezado_se_lee_con_el_nombre_del_bus() {
+        let term: Term =
+            serde_json::from_str(r#"{"campo":"encabezado","valor":["Message-ID","<x@y>"]}"#)
+                .unwrap();
+        assert_eq!(term, Term::Header("Message-ID".into(), "<x@y>".into()));
+    }
+
+    #[test]
+    fn un_encabezado_se_busca_por_nombre_y_valor() {
+        assert_eq!(
+            build_criteria(&[Term::Header("Message-ID".into(), "<x@y>".into())]),
+            vec![
+                Chunk::Inline("HEADER Message-ID".into()),
+                Chunk::Inline("\"<x@y>\"".into()),
+            ]
+        );
+    }
+
+    /// El nombre va crudo en el comando: sólo pasan los tres de enhebrar, y se
+    /// emite el nombre canónico aunque llegue en otras mayúsculas.
+    #[test]
+    fn el_nombre_del_encabezado_sale_de_una_lista_blanca() {
+        for (given, canonical) in [
+            ("message-id", "Message-ID"),
+            ("REFERENCES", "References"),
+            ("in-reply-to", "In-Reply-To"),
+        ] {
+            assert_eq!(
+                build_criteria(&[Term::Header(given.into(), "<a@b>".into())])[0],
+                Chunk::Inline(format!("HEADER {canonical}")),
+            );
+        }
+
+        for bad in [
+            "Subject",
+            "X-Raro",
+            "Message-ID ALL",
+            "Message-ID\r\na2 LOGOUT",
+            "",
+        ] {
+            assert!(
+                build_criteria(&[Term::Header(bad.into(), "<a@b>".into())]).is_empty(),
+                "pasó: {bad:?}"
+            );
+        }
+
+        // Descartado el término, los demás siguen.
+        assert_eq!(
+            build_criteria(&[Term::Header("Subject".into(), "x".into()), Term::Unread]),
+            vec![Chunk::Inline("UNSEEN".into())]
+        );
+    }
+
+    #[test]
+    fn el_valor_de_un_encabezado_no_ascii_viaja_como_literal() {
+        let chunks = build_criteria(&[Term::Header("References".into(), "<ñandú@y>".into())]);
+        assert_eq!(chunks[0], Chunk::Inline("HEADER References".into()));
+        assert_eq!(chunks[1], Chunk::Literal("<ñandú@y>".into()));
+    }
+
+    #[test]
+    fn el_valor_de_un_encabezado_vacio_se_saltea() {
+        assert!(build_criteria(&[Term::Header("Message-ID".into(), String::new())]).is_empty());
     }
 }
