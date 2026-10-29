@@ -27,6 +27,13 @@ use crate::access::{Access, CallerProcess, PermissionBackend, SystemClock};
 use crate::store::key::tests::{fake_keyring_on_bus, Shared};
 use crate::store::key::SecretServiceKeys;
 
+/// El certificado (autofirmado, de `localhost`, vigente cien años) con el que
+/// habla el servidor IMAP de mentira. La clave está junto, en `key.der`.
+pub(crate) const IMAP_TEST_CERT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/imap-tls/cert.pem"
+);
+
 pub(crate) const SYNC_PATH: &str = "/ar/net/vasak/os/AccountsSync";
 pub(crate) const SYNC_INTERFACE: &str = "ar.net.vasak.os.AccountsSync";
 
@@ -72,6 +79,9 @@ fn daemon() -> &'static Daemon {
         std::fs::create_dir_all(&data_home).unwrap();
         std::env::set_var("DBUS_SYSTEM_BUS_ADDRESS", &address);
         std::env::set_var("XDG_DATA_HOME", &data_home);
+        // El único certificado de confianza para el IMAP de mentira de las
+        // pruebas de `snooze_tests`: es de `localhost` y autofirmado.
+        std::env::set_var("SSL_CERT_FILE", IMAP_TEST_CERT);
 
         install_log_capture();
 
@@ -133,13 +143,21 @@ pub(crate) fn captured_logs() -> String {
 // ── El servicio de cuentas falso ────────────────────────────────────────
 
 /// `ListAccounts` y `GetAccountData`, con la forma que contesta el de verdad.
-struct FakeAccountManager(Vec<(String, String)>);
+///
+/// Con `imap_port` la configuración trae un servidor IMAP en `localhost` en ese
+/// puerto (y `GetAccessToken` da una contraseña): es lo que deja a una prueba
+/// llevar al servicio hasta un servidor de mentira. Sin él, la cuenta no tiene
+/// servidor guardado.
+struct FakeAccountManager {
+    accounts: Vec<(String, String)>,
+    imap_port: Option<u16>,
+}
 
 #[zbus::interface(name = "ar.net.vasak.os.AccountManager")]
 impl FakeAccountManager {
     async fn list_accounts(&self) -> String {
         let accounts: Vec<_> = self
-            .0
+            .accounts
             .iter()
             .map(|(id, _)| {
                 serde_json::json!({
@@ -160,16 +178,34 @@ impl FakeAccountManager {
         capability: String,
     ) -> zbus::fdo::Result<String> {
         let (_, address) = self
-            .0
+            .accounts
             .iter()
             .find(|(id, _)| *id == account_id)
             .ok_or_else(|| zbus::fdo::Error::Failed("cuenta no encontrada".into()))?;
+        let mut config = serde_json::json!({ "username": address });
+        if let Some(port) = self.imap_port {
+            config["imap_server"] = "localhost".into();
+            config["imap_port"] = port.into();
+        }
         Ok(serde_json::json!({
             "account_id": account_id,
             "capability": capability,
-            "config": { "username": address },
+            "config": config,
         })
         .to_string())
+    }
+
+    /// Sólo si hay un servidor IMAP de mentira a donde usarlo: sin él, pedir un
+    /// token sigue siendo un error, como antes.
+    async fn get_access_token(
+        &self,
+        _account_id: String,
+        _capability: String,
+    ) -> zbus::fdo::Result<String> {
+        match self.imap_port {
+            Some(_) => Ok("secreto-de-prueba".to_string()),
+            None => Err(zbus::fdo::Error::Failed("sin token en la prueba".into())),
+        }
     }
 }
 
@@ -247,6 +283,16 @@ impl Fixture {
     /// mutaciones de identidad S/MIME (`Allow`/`Deny`/`Fail`): para las pruebas
     /// del gating de `vasak-accounts#135`.
     pub(crate) async fn start_with_permission(accounts: &[(&str, &str)], answer: Answer) -> Self {
+        Self::start_full(accounts, answer, None).await
+    }
+
+    /// Lo mismo que [`Fixture::start`], con las cuentas apuntando a un servidor
+    /// IMAP en `localhost:imap_port` (ver [`FakeAccountManager`]).
+    pub(crate) async fn start_with_imap(accounts: &[(&str, &str)], imap_port: u16) -> Self {
+        Self::start_full(accounts, Answer::Allow, Some(imap_port)).await
+    }
+
+    async fn start_full(accounts: &[(&str, &str)], answer: Answer, imap_port: Option<u16>) -> Self {
         let guard = LOCK.lock().await;
         let address = daemon().address.as_str();
         LOGS.lock().unwrap().clear();
@@ -256,12 +302,13 @@ impl Fixture {
         use zbus::fdo::RequestNameFlags::{AllowReplacement, DoNotQueue, ReplaceExisting};
         let flags = AllowReplacement | DoNotQueue | ReplaceExisting;
 
-        let fake_accounts = FakeAccountManager(
-            accounts
+        let fake_accounts = FakeAccountManager {
+            accounts: accounts
                 .iter()
                 .map(|(id, address)| (id.to_string(), address.to_string()))
                 .collect(),
-        );
+            imap_port,
+        };
         let account_service = zbus::connection::Builder::address(address)
             .unwrap()
             .serve_at("/ar/net/vasak/os/AccountManager", fake_accounts)

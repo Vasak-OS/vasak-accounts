@@ -97,6 +97,8 @@ mod smime_ipc_tests;
 mod smime_send_tests;
 mod smime_sign;
 mod smtp;
+#[cfg(test)]
+mod snooze_tests;
 // El bucle que devuelve los pospuestos a su hora (`vasak-accounts#22`, PR 3). La
 // cola la escribe el almacén (`store::snooze`, PR 2); acá está sólo el reloj y
 // la vuelta por IMAP.

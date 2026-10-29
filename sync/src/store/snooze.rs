@@ -564,4 +564,110 @@ mod tests {
         assert!(list_snoozed(c).unwrap().is_empty());
         assert_eq!(list_followups(c).unwrap().len(), 1);
     }
+
+    /// Lo que `ListSnoozed` le da a la ventana: exactamente estos campos, con
+    /// estos nombres, y nada de lo de adentro (`id` de fila, `created_at`). La
+    /// ventana lee el JSON desde afuera de este proceso, así que renombrar un
+    /// campo en Rust tiene que romper acá y no en su pantalla.
+    #[test]
+    fn el_json_de_un_pospuesto_lleva_solo_los_campos_de_la_ventana() {
+        let row = SnoozedMessage {
+            id: 41,
+            message_id: "<a@x>".into(),
+            origin_mailbox: "INBOX".into(),
+            new_uid: Some(7),
+            uidvalidity: Some(3),
+            return_at: 2_000,
+            created_at: 500,
+        };
+        let json = serde_json::to_value(&row).unwrap();
+
+        assert_eq!(
+            crate::test_support::json_keys(&json),
+            [
+                "casilla_origen",
+                "message_id",
+                "uid",
+                "uidvalidity",
+                "volver_a"
+            ]
+        );
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "message_id": "<a@x>",
+                "casilla_origen": "INBOX",
+                "uid": 7,
+                "uidvalidity": 3,
+                "volver_a": 2_000,
+            })
+        );
+    }
+
+    /// Sin `COPYUID` (servidor sin UIDPLUS) el UID y su validez no salen: no hay
+    /// nada que decir, y la ventana no recibe un `null` por un número.
+    #[test]
+    fn el_json_sin_copyuid_omite_el_uid_y_su_validez() {
+        let row = SnoozedMessage {
+            id: 1,
+            message_id: "<b@x>".into(),
+            origin_mailbox: "Trabajo".into(),
+            new_uid: None,
+            uidvalidity: None,
+            return_at: 9,
+            created_at: 1,
+        };
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(
+            crate::test_support::json_keys(&json),
+            ["casilla_origen", "message_id", "volver_a"]
+        );
+    }
+
+    /// Lo que se lee del almacén sale tal cual por el JSON de la lista: la ruta
+    /// de punta a punta de `ListSnoozed` sin el bus.
+    #[test]
+    fn la_lista_del_almacen_se_serializa_para_la_ventana() {
+        let temp = TempDir::new("snooze-json");
+        let store = open_store(&temp);
+        let c = store.connection();
+        upsert_snooze(c, "<a@x>", "INBOX", Some(7), Some(3), 2_000, 500).unwrap();
+
+        let json = serde_json::to_value(list_snoozed(c).unwrap()).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!([{
+                "message_id": "<a@x>",
+                "casilla_origen": "INBOX",
+                "uid": 7,
+                "uidvalidity": 3,
+                "volver_a": 2_000,
+            }])
+        );
+    }
+
+    /// La escritura por el `Store` (el camino que usa el servicio): pospone,
+    /// repone con la hora nueva sin duplicar, y borra devolviendo si había fila.
+    #[test]
+    fn el_store_pospone_repone_y_borra() {
+        let temp = TempDir::new("snooze-store");
+        let store = open_store(&temp);
+
+        store
+            .upsert_snooze("<a@x>", "INBOX", Some(7), Some(3), 2_000, 500)
+            .unwrap();
+        // Reponer: misma identidad, hora y UID nuevos, una sola fila.
+        store
+            .upsert_snooze("<a@x>", "INBOX", None, None, 3_000, 600)
+            .unwrap();
+
+        let rows = list_snoozed(store.connection()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].return_at, 3_000);
+        assert_eq!((rows[0].new_uid, rows[0].uidvalidity), (None, None));
+
+        assert!(store.delete_snooze("<a@x>").unwrap());
+        assert!(!store.delete_snooze("<a@x>").unwrap());
+        assert!(list_snoozed(store.connection()).unwrap().is_empty());
+    }
 }
