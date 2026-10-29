@@ -363,9 +363,13 @@ pub fn label_from(params: &[String]) -> String {
     let meaningful = |p: &str| {
         let lower = p.to_ascii_lowercase();
         // Lo que no es una etiqueta para mostrar: cómo viene codificado, en qué
-        // juego de caracteres, y cuál es el preferido.
-        !matches!(lower.as_str(), "pref" | "internet" | "voice" | "x400")
-            && !lower.starts_with("encoding=")
+        // juego de caracteres, cuál es el preferido, y los tipos de entrega de
+        // `ADR` (`dom`/`intl`/`postal`/`parcel`), que una 3.0 legacy pone antes
+        // de `home`/`work` y no son una etiqueta.
+        !matches!(
+            lower.as_str(),
+            "pref" | "internet" | "voice" | "x400" | "dom" | "intl" | "postal" | "parcel"
+        ) && !lower.starts_with("encoding=")
             && !lower.starts_with("charset=")
             && !lower.starts_with("value=")
             && !lower.starts_with("pref=")
