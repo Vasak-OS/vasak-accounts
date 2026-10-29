@@ -2410,14 +2410,15 @@ impl StoreService<SecretServiceKeys> {
     /// No falla por el almacén: sin directorio de datos o sin llavero la
     /// interfaz se publica igual y cada cuenta se ve «no disponible». Lo que no
     /// esté se tiene que ver como no disponible, nunca como roto.
-    pub async fn start(connection: &zbus::Connection) -> zbus::Result<Self> {
+    ///
+    /// El `Access` lo arma y lo pasa quien llama (`main::run`): es **el mismo**
+    /// que usan las mutaciones de identidad S/MIME de `AccountsSync`, de modo que
+    /// los dos objetos comparten una caché de permisos y un solo
+    /// `watch_departures`.
+    pub async fn start(connection: &zbus::Connection, access: Arc<Access>) -> zbus::Result<Self> {
         let keys = SecretServiceKeys::on_session_bus(connection.clone());
         let manager = Arc::new(StoreManager::new(keys, Locations::from_environment()));
         let _ = LIVE_STORE.set(Arc::clone(&manager));
-        let access = Arc::new(Access::new(
-            Arc::new(access::DbusPermissions::new(connection.clone())),
-            Arc::new(access::SystemClock),
-        ));
         let (email, email_pending) = mpsc::channel(PENDING_REQUESTS);
         let _ = EMAIL_NUDGE.set(email.clone());
         let (contacts, contacts_pending) = mpsc::channel(PENDING_REQUESTS);

@@ -115,6 +115,7 @@ use zbus::interface;
 use zbus::object_server::SignalEmitter;
 use zeroize::Zeroizing;
 
+use access::Access;
 use broker::{Broker, BrokerError};
 
 /// Cada cuánto se vuelve a mirar cuando el servidor **no** sabe avisar.
@@ -211,6 +212,15 @@ struct State {
 
 #[derive(Clone, Default)]
 struct Service {
+    /// El permiso de quien llama para las **mutaciones** de identidad S/MIME
+    /// (`ImportSmimeIdentity`, `RemoveSmimeIdentity`), por el recurso
+    /// `store.email` compartido con el almacén local. Es el mismo `Access` que
+    /// `StoreService`, así que comparten una caché y un `watch_departures`.
+    ///
+    /// `None` **falla cerrado**: sin él las dos mutaciones contestan
+    /// `AccessDenied`. Sólo lo ven los `Service::default()` de las pruebas que no
+    /// ejercen S/MIME; en producción `run` siempre lo pone con `Some`.
+    access: Option<Arc<Access>>,
     state: Arc<Mutex<State>>,
     /// La segunda conexión de cada cuenta, la que atiende lo que pide la
     /// ventana. Se crea cuando alguien abre un mensaje por primera vez.
@@ -613,6 +623,12 @@ enum SmimeIpcError {
     KeyringLocked,
     /// El `.p12` supera el tope de tamaño.
     TooBig,
+    /// Quien llama no tiene el permiso `store.email` sobre la cuenta, o no se
+    /// pudo preguntar (falla cerrado). Mismo concepto que el `AccessDenied` del
+    /// almacén (`access.rs`), pero el nombre D-Bus sale del prefijo de este
+    /// error: `ar.net.vasak.os.AccountsSync.AccessDenied`, de la misma familia
+    /// que las otras variantes, y la ventana lo traduce igual.
+    AccessDenied,
     /// Cualquier otro fallo (sin material sensible en el texto).
     Failed(String),
 }
@@ -1159,12 +1175,18 @@ impl Service {
     /// validados (ver [`read_sealed_fd`]). La contraseña entra en memoria que se
     /// borra sola y no va a ningún lado.
     ///
-    /// Este método **todavía no está tras `vasak-permissions`**: un proceso del
-    /// mismo usuario podría reemplazar la identidad de firma. Ese gating se trata
-    /// aparte en `vasak-accounts#135`, no es este endurecimiento.
+    /// Está **tras `vasak-permissions`** (`vasak-accounts#135`): reemplazar la
+    /// identidad de firma pide el permiso `store.email` de quien llama sobre la
+    /// cuenta, el mismo recurso con el que el almacén entrega el correo guardado
+    /// (el scope de vasak-mail ya lo concede, `vasak-permissions#99`). Sin
+    /// permiso —o si no se pudo preguntar— contesta `AccessDenied` y no toca el
+    /// llavero. Sólo se gatean las dos mutaciones (importar y borrar), no
+    /// `GetSmimeIdentity`, que es sólo estado; el resto de `AccountsSync`
+    /// (correo) sigue siendo same-user por diseño.
     async fn import_smime_identity(
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
         account_id: String,
         p12: zbus::zvariant::OwnedFd,
         password: zbus::zvariant::OwnedFd,
@@ -1184,6 +1206,12 @@ impl Service {
         .map_err(|_| SmimeIpcError::Failed("la lectura de los descriptores se cortó".into()))??;
 
         let address = self.account_address(&account_id).await?;
+
+        // El permiso de quien llama, **después** de leer y capar los fds (el tope
+        // se mira antes que nada) pero **antes** de parsear el `.p12` y de tocar
+        // el llavero: nada se escribe sin permiso.
+        self.authorize_smime(header.sender().map(|s| s.as_str()), &address)
+            .await?;
 
         // El parseo hace KDF (CPU): fuera del worker de Tokio. `p12` y la
         // contraseña se mueven al hilo (la contraseña se borra al terminar).
@@ -1236,12 +1264,19 @@ impl Service {
 
     /// Borra la identidad S/MIME de una cuenta, para deshacer una importación
     /// equivocada.
+    ///
+    /// Gateada como la importación (`store.email` de quien llama sobre la
+    /// cuenta): borrar la clave de firma es una mutación, así que pide permiso
+    /// antes de tocar el llavero.
     async fn remove_smime_identity(
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
         account_id: String,
     ) -> Result<(), SmimeIpcError> {
         let address = self.account_address(&account_id).await?;
+        self.authorize_smime(header.sender().map(|s| s.as_str()), &address)
+            .await?;
         let keys = store::key::SecretServiceKeys::on_session_bus(connection.clone());
         keys.delete_smime_identity(&address)
             .await
@@ -1352,6 +1387,34 @@ impl Service {
             .ok_or_else(|| {
                 zbus::fdo::Error::Failed(format!("la cuenta «{account_id}» ya no existe"))
             })
+    }
+
+    /// Autoriza una **mutación** de identidad S/MIME: el permiso `store.email`
+    /// de `sender` sobre la cuenta cuya dirección es `address` (que va al diálogo
+    /// del servicio de permisos). Falla cerrado: sin `Access` configurado, sin
+    /// permiso, o si no se pudo preguntar, devuelve `AccessDenied` y no se filtra
+    /// el motivo del fallo a la ventana (sólo al diario).
+    ///
+    /// Reusa el recurso del almacén a propósito (decisión de `#135`): el permiso
+    /// que deja leer el correo guardado es el que deja administrar la identidad
+    /// de firma de esa misma cuenta, y el scope de vasak-mail ya lo concede
+    /// (`vasak-permissions#99`).
+    async fn authorize_smime(
+        &self,
+        sender: Option<&str>,
+        address: &str,
+    ) -> Result<(), SmimeIpcError> {
+        let Some(access) = self.access.as_ref() else {
+            return Err(SmimeIpcError::AccessDenied);
+        };
+        match access.check(sender, access::EMAIL_RESOURCE, address).await {
+            access::Verdict::Allowed => Ok(()),
+            access::Verdict::Denied => Err(SmimeIpcError::AccessDenied),
+            access::Verdict::Failed(reason) => {
+                tracing::warn!("no se pudo autorizar la mutación S/MIME: {reason}");
+                Err(SmimeIpcError::AccessDenied)
+            }
+        }
     }
 
     /// La dirección de una cuenta, la misma que el `From` al enviar. Es la
@@ -2112,22 +2175,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // se pudo mudar sigue en `salientes/`, sin borrar.
     migrate_outbox();
 
-    let service = Service::default();
-
     // El bus de **sesión**: es un servicio del usuario y lo que publica es suyo.
     //
+    // La conexión se arma primero y **sin publicar nada**: el `Access` que
+    // deciden las mutaciones S/MIME y el almacén necesita la conexión, y ambos
+    // objetos tienen que compartir **uno solo** —una caché y un
+    // `watch_departures`—, así que no se puede servir el objeto en el `Builder`
+    // antes de tenerlo.
+    let connection = zbus::connection::Builder::session()?.build().await?;
+
+    // El permiso de quien llama, uno para los dos objetos (`store.email` y los
+    // demás recursos del almacén). `DbusPermissions` pregunta por el bus de
+    // sesión y por `vasak-permissions` en el del sistema (ver `access.rs`).
+    let access = Arc::new(Access::new(
+        Arc::new(access::DbusPermissions::new(connection.clone())),
+        Arc::new(access::SystemClock),
+    ));
+
+    // El servicio, con su `Access` (sin él las mutaciones S/MIME fallan
+    // cerradas), publicado **antes** de pedir el nombre.
+    let service = Service {
+        access: Some(Arc::clone(&access)),
+        ..Default::default()
+    };
+    connection
+        .object_server()
+        .at("/ar/net/vasak/os/AccountsSync", service.clone())
+        .await?;
+
+    // El almacén local cifrado, compartiendo el mismo `Access`. No frena nada si
+    // falta el llavero: cada cuenta se ve «no disponible» en su estado y el
+    // correo sigue en memoria.
+    let store = store_api::StoreService::start(&connection, access).await?;
+
     // El nombre se pide recién cuando están publicados los dos objetos: con la
     // activación por D-Bus, el primer mensaje llega apenas el nombre tiene
     // dueño, y un objeto que todavía no está contesta `UnknownObject`.
-    let connection = zbus::connection::Builder::session()?
-        .serve_at("/ar/net/vasak/os/AccountsSync", service.clone())?
-        .build()
-        .await?;
-
-    // El almacén local cifrado. No frena nada si falta el llavero: cada cuenta
-    // se ve «no disponible» en su estado y el correo sigue en memoria.
-    let store = store_api::StoreService::start(&connection).await?;
-
     connection
         .request_name("ar.net.vasak.os.AccountsSync")
         .await?;

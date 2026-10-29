@@ -18,8 +18,12 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{ChildStdin, Command, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use futures_util::future::{BoxFuture, FutureExt};
+
+use crate::access::tests::Answer;
+use crate::access::{Access, CallerProcess, PermissionBackend, SystemClock};
 use crate::store::key::tests::{fake_keyring_on_bus, Shared};
 use crate::store::key::SecretServiceKeys;
 
@@ -169,6 +173,51 @@ impl FakeAccountManager {
     }
 }
 
+// ── La puerta de permisos del fixture ─────────────────────────────────────
+
+/// Un [`PermissionBackend`] que contesta siempre lo mismo, **sin tocar ningún
+/// bus**: la puerta de permisos de las pruebas de `AccountsSync`. Reusa el
+/// [`Answer`] de `access::tests`. Por omisión el fixture lo arma con
+/// [`Answer::Allow`], así que las pruebas que no son del gating ni se enteran.
+struct FixedPermission(Answer);
+
+impl PermissionBackend for FixedPermission {
+    fn caller_process(
+        &self,
+        _unique_name: String,
+    ) -> BoxFuture<'static, Result<CallerProcess, String>> {
+        async {
+            Ok(CallerProcess {
+                pid: std::process::id(),
+                pidfd: None,
+            })
+        }
+        .boxed()
+    }
+
+    fn start_time(&self, _caller: &CallerProcess) -> Result<u64, String> {
+        Ok(0)
+    }
+
+    fn check_permission_for(
+        &self,
+        _pid: u32,
+        _start_time: u64,
+        _resource: String,
+        _detail: String,
+    ) -> BoxFuture<'static, Result<bool, String>> {
+        let answer = self.0;
+        async move {
+            match answer {
+                Answer::Allow => Ok(true),
+                Answer::Deny => Ok(false),
+                Answer::Fail => Err("permiso roto (prueba)".to_string()),
+            }
+        }
+        .boxed()
+    }
+}
+
 // ── Todo junto ──────────────────────────────────────────────────────────
 
 /// Un servicio `AccountsSync` de verdad, un servicio de cuentas con las cuentas
@@ -188,8 +237,16 @@ pub(crate) struct Fixture {
 
 impl Fixture {
     /// `accounts`: `(id, dirección)` de cada cuenta que conoce el servicio de
-    /// cuentas.
+    /// cuentas. La puerta de permisos de las mutaciones S/MIME dice que **sí** a
+    /// todo: lo que prueban casi todas las pruebas es otra cosa.
     pub(crate) async fn start(accounts: &[(&str, &str)]) -> Self {
+        Self::start_with_permission(accounts, Answer::Allow).await
+    }
+
+    /// Lo mismo, pero con la respuesta que da la puerta de permisos a las
+    /// mutaciones de identidad S/MIME (`Allow`/`Deny`/`Fail`): para las pruebas
+    /// del gating de `vasak-accounts#135`.
+    pub(crate) async fn start_with_permission(accounts: &[(&str, &str)], answer: Answer) -> Self {
         let guard = LOCK.lock().await;
         let address = daemon().address.as_str();
         LOGS.lock().unwrap().clear();
@@ -219,9 +276,19 @@ impl Fixture {
 
         let (keyring_server, keyring) = fake_keyring_on_bus(address).await;
 
+        let access = Arc::new(Access::new(
+            Arc::new(FixedPermission(answer)),
+            Arc::new(SystemClock),
+        ));
         let service = zbus::connection::Builder::address(address)
             .unwrap()
-            .serve_at(SYNC_PATH, crate::Service::default())
+            .serve_at(
+                SYNC_PATH,
+                crate::Service {
+                    access: Some(access),
+                    ..Default::default()
+                },
+            )
             .unwrap()
             .build()
             .await
