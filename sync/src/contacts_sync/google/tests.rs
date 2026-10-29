@@ -1621,3 +1621,183 @@ async fn con_op_pendiente_no_se_enriquecen_los_grupos_y_la_lectura_sirve_el_crud
     set_pending("NULL").await;
     assert_eq!(read_vcard(&manager).await, vcard, "al irse la op, vuelven");
 }
+
+/// Los grupos guardados de un contacto, tal como quedaron en la columna.
+async fn stored_groups(manager: &Arc<StoreManager<FakeKeys>>, id: i64) -> Vec<String> {
+    let json: String = manager
+        .with_store(ACCOUNT, move |s| {
+            Ok(s.connection()
+                .query_row(
+                    "SELECT groups FROM contact_enrichment WHERE contact_id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap())
+        })
+        .await
+        .unwrap();
+    serde_json::from_str(&json).unwrap()
+}
+
+/// **Regresión**: un catálogo de grupos que falla (5xx, o una respuesta que no es
+/// JSON) es «no disponible», no «sin grupos». La pasada no puede reescribir los
+/// grupos con una lista vacía: los `CATEGORIES` ya guardados se conservan y el
+/// destacado, que sale de las pertenencias de la persona, se actualiza igual.
+#[tokio::test]
+async fn un_catalogo_que_falla_no_borra_los_grupos_guardados_pero_actualiza_el_destacado() {
+    let (_temp, manager) = store("google_catalogo_preserva").await;
+    let id = seed(&manager, "Ana", "ana@x.com").await;
+
+    // Primera pasada, catálogo bueno: queda en el grupo «Familia», sin destacar.
+    let server = FakeGraph::start().await;
+    server.push(
+        r#"{"connections":[{"resourceName":"people/c1",
+            "emailAddresses":[{"value":"ana@x.com"}],
+            "memberships":[
+              {"contactGroupMembership":{"contactGroupResourceName":"contactGroups/g1"}}]}]}"#,
+    );
+    server.push(format!(
+        r#"{{"contactGroups":[{}]}}"#,
+        group_json("contactGroups/g1", "Familia")
+    ));
+    enrich(&manager, &server).await.unwrap();
+    assert_eq!(stored_groups(&manager, id).await, vec!["Familia"]);
+    assert!(!read_vcard(&manager).await.contains("X-VASAK-STARRED"));
+
+    // Segunda pasada: People ahora la destaca, pero el catálogo falla de dos
+    // maneras distintas (cada una en su pasada).
+    for failure in [(500u16, "{}"), (200, "esto no es json")] {
+        server.push(
+            r#"{"connections":[{"resourceName":"people/c1",
+                "emailAddresses":[{"value":"ana@x.com"}],
+                "memberships":[
+                  {"contactGroupMembership":{"contactGroupResourceName":"contactGroups/starred"}},
+                  {"contactGroupMembership":{"contactGroupResourceName":"contactGroups/g1"}}]}]}"#,
+        );
+        server.push_status(failure.0, failure.1);
+        enrich(&manager, &server)
+            .await
+            .expect("el catálogo es mejor esfuerzo");
+
+        assert_eq!(
+            stored_groups(&manager, id).await,
+            vec!["Familia"],
+            "un catálogo caído no borra los grupos ({failure:?})"
+        );
+        let vcard = read_vcard(&manager).await;
+        assert!(vcard.contains("\r\nCATEGORIES:Familia\r\n"), "{vcard}");
+        assert!(
+            vcard.contains("\r\nX-VASAK-STARRED:1\r\n"),
+            "el destacado se actualiza igual: {vcard}"
+        );
+
+        // Se vuelve a dejar sin destacar para la vuelta siguiente.
+        manager
+            .with_store(ACCOUNT, move |s| s.set_contact_groups(id, None, false))
+            .await
+            .unwrap();
+    }
+}
+
+/// Control: con el catálogo **disponible**, un contacto que ya no pertenece a
+/// ningún grupo sí queda sin grupos (la limpieza legítima sigue funcionando), ya
+/// sea porque ninguna persona tiene grupos (no se pide el catálogo) o porque el
+/// catálogo vino y no trae el grupo que la persona nombra.
+#[tokio::test]
+async fn con_el_catalogo_disponible_un_contacto_sin_grupos_queda_sin_grupos() {
+    let (_temp, manager) = store("google_catalogo_limpia").await;
+    let id = seed(&manager, "Ana", "ana@x.com").await;
+    let with_group = r#"{"connections":[{"resourceName":"people/c1",
+        "emailAddresses":[{"value":"ana@x.com"}],
+        "memberships":[
+          {"contactGroupMembership":{"contactGroupResourceName":"contactGroups/g1"}}]}]}"#;
+    let catalog = format!(
+        r#"{{"contactGroups":[{}]}}"#,
+        group_json("contactGroups/g1", "Familia")
+    );
+
+    let server = FakeGraph::start().await;
+    server.push(with_group);
+    server.push(catalog.clone());
+    enrich(&manager, &server).await.unwrap();
+    assert_eq!(stored_groups(&manager, id).await, vec!["Familia"]);
+
+    // Sin ninguna pertenencia a grupo: no hay catálogo que pedir y se limpia.
+    server.push(
+        r#"{"connections":[{"resourceName":"people/c1",
+            "emailAddresses":[{"value":"ana@x.com"}]}]}"#,
+    );
+    enrich(&manager, &server).await.unwrap();
+    assert!(stored_groups(&manager, id).await.is_empty());
+
+    // Con el catálogo bueno pero sin el grupo que la persona nombra: también `[]`.
+    server.push(with_group);
+    server.push(catalog.clone());
+    enrich(&manager, &server).await.unwrap();
+    assert_eq!(stored_groups(&manager, id).await, vec!["Familia"]);
+    server.push(with_group);
+    server.push(format!(
+        r#"{{"contactGroups":[{}]}}"#,
+        group_json("contactGroups/otro", "Otro")
+    ));
+    enrich(&manager, &server).await.unwrap();
+    assert!(stored_groups(&manager, id).await.is_empty());
+    assert!(!read_vcard(&manager).await.contains("CATEGORIES"));
+}
+
+/// `set_contact_groups(id, None, starred)` no toca los grupos pero sí cambia el
+/// destacado, y sólo sube la generación cuando el destacado cambia.
+#[tokio::test]
+async fn guardar_sin_grupos_conserva_los_grupos_y_cambia_solo_el_destacado() {
+    let (_temp, manager) = store("google_grupos_none").await;
+    let id = seed(&manager, "Ana", "ana@x.com").await;
+    manager
+        .with_store(ACCOUNT, move |s| {
+            s.upsert_contact_enrichment(&ContactEnrichment {
+                contact_id: id,
+                resource_name: "people/c1".into(),
+                etag: None,
+                photo_etag: None,
+            })?;
+            s.set_contact_groups(id, Some(&["Familia".to_string()]), false)
+        })
+        .await
+        .unwrap();
+    let starred = |manager: Arc<StoreManager<FakeKeys>>| async move {
+        manager
+            .with_store(ACCOUNT, move |s| {
+                Ok(s.connection()
+                    .query_row(
+                        "SELECT starred FROM contact_enrichment WHERE contact_id = ?1",
+                        [id],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .unwrap())
+            })
+            .await
+            .unwrap()
+    };
+    let set = |starred: bool| {
+        let manager = manager.clone();
+        async move {
+            manager
+                .with_store(ACCOUNT, move |s| s.set_contact_groups(id, None, starred))
+                .await
+                .unwrap();
+        }
+    };
+
+    let before = generation(&manager).await;
+    set(false).await;
+    assert_eq!(generation(&manager).await, before, "nada cambió: no sube");
+
+    set(true).await;
+    assert_eq!(starred(manager.clone()).await, 1);
+    assert_eq!(stored_groups(&manager, id).await, vec!["Familia"]);
+    let after = generation(&manager).await;
+    assert!(after > before, "el destacado cambió: sube");
+
+    set(false).await;
+    assert_eq!(starred(manager.clone()).await, 0);
+    assert_eq!(stored_groups(&manager, id).await, vec!["Familia"]);
+}
