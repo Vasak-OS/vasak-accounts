@@ -25,21 +25,31 @@
 
 use rusqlite::Connection;
 
-use super::{classify, StoreError};
+use super::{classify, Store, StoreError};
 
 /// Un mensaje sacado del INBOX hasta `return_at`, con lo que hace falta para
 /// devolverlo a su casilla. La identidad estable es `message_id`; `new_uid` y
 /// `uidvalidity` son el UID que dejó el `COPYUID` al mover a pospuestos, y están
 /// en `None` cuando el servidor no dio `COPYUID` (sin `UIDPLUS`): ahí el retorno
 /// re-ubica el mensaje por `Message-ID`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Se serializa para `ListSnoozed`: `message_id` tal cual —es un identificador,
+/// como en `ReplyInfo`— y el resto con nombres en español. El `id` de fila y el
+/// `created_at` no salen: son de adentro, no los mira la ventana.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SnoozedMessage {
+    #[serde(skip)]
     pub id: i64,
     pub message_id: String,
+    #[serde(rename = "casilla_origen")]
     pub origin_mailbox: String,
+    #[serde(rename = "uid", skip_serializing_if = "Option::is_none")]
     pub new_uid: Option<i64>,
+    #[serde(rename = "uidvalidity", skip_serializing_if = "Option::is_none")]
     pub uidvalidity: Option<i64>,
+    #[serde(rename = "volver_a")]
     pub return_at: i64,
+    #[serde(skip)]
     pub created_at: i64,
 }
 
@@ -221,6 +231,38 @@ pub fn delete_followup(connection: &Connection, message_id: &str) -> Result<bool
         )
         .map_err(classify)?;
     Ok(affected > 0)
+}
+
+/// La escritura de los pospuestos pasa por el `Store`, que es el único que tiene
+/// la conexión de escritura (el camino con la cerradura del administrador, como
+/// el resto de las mutaciones). Las lecturas, en cambio, van por el grupo de
+/// lectura con las funciones libres de arriba, así que no necesitan método acá.
+impl Store {
+    /// Pospone (o repone) un mensaje. Delega en [`upsert_snooze`].
+    pub fn upsert_snooze(
+        &self,
+        message_id: &str,
+        origin_mailbox: &str,
+        new_uid: Option<i64>,
+        uidvalidity: Option<i64>,
+        return_at: i64,
+        created_at: i64,
+    ) -> Result<(), StoreError> {
+        upsert_snooze(
+            &self.connection,
+            message_id,
+            origin_mailbox,
+            new_uid,
+            uidvalidity,
+            return_at,
+            created_at,
+        )
+    }
+
+    /// Borra el posponer de un mensaje. Delega en [`delete_snooze`].
+    pub fn delete_snooze(&self, message_id: &str) -> Result<bool, StoreError> {
+        delete_snooze(&self.connection, message_id)
+    }
 }
 
 fn row_to_snoozed(row: &rusqlite::Row) -> rusqlite::Result<SnoozedMessage> {

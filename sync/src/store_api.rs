@@ -75,6 +75,7 @@ use crate::store::lifecycle::{
     CALENDAR_AREA, CONTACTS_AREA, EMAIL_AREA, SYNCED_AREAS,
 };
 use crate::store::queue::ConflictChoice;
+use crate::store::snooze::{self, SnoozedMessage};
 use crate::store::{paths, Store, StoreError};
 
 /// Dónde se publica la interfaz.
@@ -191,6 +192,134 @@ pub async fn store_forget(account_id: &str, mailbox: &str, uid: u32) {
     {
         tracing::debug!("'{account_id}': no se reflejó el movimiento en el almacén: {e}");
     }
+}
+
+/// Un error de lectura del almacén que no es «cerrado» ni «bloqueado»: esos dos
+/// son el estado normal mientras nadie desbloqueó la sesión y llenarían el
+/// diario. Igual que [`crate::reminders`].
+fn log_snooze_error(account_id: &str, error: StoreError) {
+    if !matches!(error, StoreError::Missing | StoreError::Key(_)) {
+        tracing::debug!("pospuestos de «{account_id}»: {error}");
+    }
+}
+
+/// Si el almacén de una cuenta se puede escribir **ahora**: antes de mover un
+/// mensaje a Pospuestos se comprueba, para no moverlo y después no poder anotar
+/// la fila que lo trae de vuelta. Una lectura de nada basta: abre el grupo de
+/// lectura releyendo el llavero, y falla igual que fallaría la escritura.
+pub async fn snooze_store_ready(account_id: &str) -> bool {
+    let Some(manager) = LIVE_STORE.get() else {
+        return false;
+    };
+    manager
+        .read(account_id, |_| Ok::<(), StoreError>(()))
+        .await
+        .is_ok()
+}
+
+/// Anota (o repone) un pospuesto en el almacén de una cuenta. `new_uid` y
+/// `uidvalidity` son los del `COPYUID` del movimiento, o `None` si el servidor
+/// no lo dio (sin `UIDPLUS`): ahí la vuelta re-ubica por `Message-ID`.
+pub async fn snooze_upsert(
+    account_id: &str,
+    message_id: &str,
+    origin_mailbox: &str,
+    new_uid: Option<u32>,
+    uidvalidity: Option<u32>,
+    return_at: i64,
+) -> Result<(), String> {
+    let Some(manager) = LIVE_STORE.get() else {
+        return Err("el almacén no está disponible".into());
+    };
+    let message_id = message_id.to_string();
+    let origin_mailbox = origin_mailbox.to_string();
+    let created_at = chrono::Utc::now().timestamp();
+    manager
+        .with_store(account_id, move |store| {
+            store.upsert_snooze(
+                &message_id,
+                &origin_mailbox,
+                new_uid.map(i64::from),
+                uidvalidity.map(i64::from),
+                return_at,
+                created_at,
+            )
+        })
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Borra el pospuesto de un mensaje. Devuelve si había fila.
+pub async fn snooze_delete(account_id: &str, message_id: &str) -> Result<bool, String> {
+    let Some(manager) = LIVE_STORE.get() else {
+        return Err("el almacén no está disponible".into());
+    };
+    let message_id = message_id.to_string();
+    manager
+        .with_store(account_id, move |store| store.delete_snooze(&message_id))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Todos los pospuestos de una cuenta, para `ListSnoozed`.
+pub async fn snooze_list(account_id: &str) -> Result<Vec<SnoozedMessage>, String> {
+    let Some(manager) = LIVE_STORE.get() else {
+        return Err("el almacén no está disponible".into());
+    };
+    manager
+        .read(account_id, snooze::list_snoozed)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Los pospuestos vencidos de **todas** las cuentas con correo encendido, hasta
+/// `limit`, ordenados por hora de vuelta. Salta la base cerrada o la cuenta
+/// apagada, como el planificador de recordatorios.
+pub async fn snooze_due_all(now: i64, limit: usize) -> Vec<(String, SnoozedMessage)> {
+    let Some(manager) = LIVE_STORE.get() else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, SnoozedMessage)> = Vec::new();
+    for (account_id, account) in manager.area_accounts(EMAIL_AREA).await {
+        if !account.active {
+            continue;
+        }
+        match manager
+            .read(&account_id, move |connection| {
+                snooze::due_snoozed(connection, now)
+            })
+            .await
+        {
+            Ok(rows) => out.extend(rows.into_iter().map(|row| (account_id.clone(), row))),
+            Err(error) => log_snooze_error(&account_id, error),
+        }
+    }
+    out.sort_by_key(|(_, row)| row.return_at);
+    out.truncate(limit);
+    out
+}
+
+/// La próxima hora de vuelta después de `now` entre todas las cuentas, o nada: el
+/// techo del sueño del bucle de vuelta.
+pub async fn snooze_next_after(now: i64) -> Option<i64> {
+    let manager = LIVE_STORE.get()?;
+    let mut soonest: Option<i64> = None;
+    for (account_id, account) in manager.area_accounts(EMAIL_AREA).await {
+        if !account.active {
+            continue;
+        }
+        match manager
+            .read(&account_id, move |connection| {
+                snooze::next_snooze_at(connection, now)
+            })
+            .await
+        {
+            Ok(Some(at)) => soonest = Some(soonest.map_or(at, |s| s.min(at))),
+            Ok(None) => {}
+            Err(error) => log_snooze_error(&account_id, error),
+        }
+    }
+    soonest
 }
 
 /// El objeto de D-Bus.
