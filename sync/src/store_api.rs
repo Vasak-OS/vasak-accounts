@@ -162,6 +162,13 @@ fn enqueue(queue: &mpsc::Sender<String>, area: &'static str, account_id: &str) {
 static LIVE_STORE: std::sync::OnceLock<Arc<StoreManager<SecretServiceKeys>>> =
     std::sync::OnceLock::new();
 
+/// El almacén de la sesión en vivo, si ya está disponible. Lo usa `main.rs` para
+/// pasarle el `StoreManager` por parámetro a la lógica de posponer, y así poder
+/// ejercerla con un almacén de prueba en vez de alcanzarlo sólo por este global.
+pub(crate) fn live_store() -> Option<&'static Arc<StoreManager<SecretServiceKeys>>> {
+    LIVE_STORE.get()
+}
+
 /// Marca como leído en el almacén un mensaje que se acaba de marcar en el
 /// servidor. Si la cuenta no tiene almacén, o el mensaje no está guardado, no
 /// hace nada: la próxima vuelta lo pone al día igual.
@@ -208,9 +215,18 @@ fn log_snooze_error(account_id: &str, error: StoreError) {
 /// la fila que lo trae de vuelta. Una lectura de nada basta: abre el grupo de
 /// lectura releyendo el llavero, y falla igual que fallaría la escritura.
 pub async fn snooze_store_ready(account_id: &str) -> bool {
-    let Some(manager) = LIVE_STORE.get() else {
-        return false;
-    };
+    match LIVE_STORE.get() {
+        Some(manager) => snooze_store_ready_in(manager, account_id).await,
+        None => false,
+    }
+}
+
+/// El cuerpo de [`snooze_store_ready`] sobre un almacén dado: la costura para
+/// probarlo con un `StoreManager` de prueba sin pasar por [`LIVE_STORE`].
+pub(crate) async fn snooze_store_ready_in<K: KeySource>(
+    manager: &StoreManager<K>,
+    account_id: &str,
+) -> bool {
     manager
         .read(account_id, |_| Ok::<(), StoreError>(()))
         .await
@@ -220,6 +236,11 @@ pub async fn snooze_store_ready(account_id: &str) -> bool {
 /// Anota (o repone) un pospuesto en el almacén de una cuenta. `new_uid` y
 /// `uidvalidity` son los del `COPYUID` del movimiento, o `None` si el servidor
 /// no lo dio (sin `UIDPLUS`): ahí la vuelta re-ubica por `Message-ID`.
+///
+/// `main.rs` le pasa ahora el manager por parámetro (vía [`snooze_upsert_in`]),
+/// así que en producción nadie entra por acá; la deja viva la prueba de «sin
+/// almacén», que comprueba el camino `None`. Por eso el `allow`.
+#[allow(dead_code)]
 pub async fn snooze_upsert(
     account_id: &str,
     message_id: &str,
@@ -231,6 +252,28 @@ pub async fn snooze_upsert(
     let Some(manager) = LIVE_STORE.get() else {
         return Err("el almacén no está disponible".into());
     };
+    snooze_upsert_in(
+        manager,
+        account_id,
+        message_id,
+        origin_mailbox,
+        new_uid,
+        uidvalidity,
+        return_at,
+    )
+    .await
+}
+
+/// El cuerpo de [`snooze_upsert`] sobre un almacén dado.
+pub(crate) async fn snooze_upsert_in<K: KeySource>(
+    manager: &StoreManager<K>,
+    account_id: &str,
+    message_id: &str,
+    origin_mailbox: &str,
+    new_uid: Option<u32>,
+    uidvalidity: Option<u32>,
+    return_at: i64,
+) -> Result<(), String> {
     let message_id = message_id.to_string();
     let origin_mailbox = origin_mailbox.to_string();
     let created_at = chrono::Utc::now().timestamp();
@@ -250,10 +293,23 @@ pub async fn snooze_upsert(
 }
 
 /// Borra el pospuesto de un mensaje. Devuelve si había fila.
+///
+/// Como [`snooze_upsert`], en producción se entra por [`snooze_delete_in`] con el
+/// manager inyectado; esta forma la deja viva la prueba de «sin almacén».
+#[allow(dead_code)]
 pub async fn snooze_delete(account_id: &str, message_id: &str) -> Result<bool, String> {
     let Some(manager) = LIVE_STORE.get() else {
         return Err("el almacén no está disponible".into());
     };
+    snooze_delete_in(manager, account_id, message_id).await
+}
+
+/// El cuerpo de [`snooze_delete`] sobre un almacén dado.
+pub(crate) async fn snooze_delete_in<K: KeySource>(
+    manager: &StoreManager<K>,
+    account_id: &str,
+    message_id: &str,
+) -> Result<bool, String> {
     let message_id = message_id.to_string();
     manager
         .with_store(account_id, move |store| store.delete_snooze(&message_id))
@@ -266,6 +322,14 @@ pub async fn snooze_list(account_id: &str) -> Result<Vec<SnoozedMessage>, String
     let Some(manager) = LIVE_STORE.get() else {
         return Err("el almacén no está disponible".into());
     };
+    snooze_list_in(manager, account_id).await
+}
+
+/// El cuerpo de [`snooze_list`] sobre un almacén dado.
+pub(crate) async fn snooze_list_in<K: KeySource>(
+    manager: &StoreManager<K>,
+    account_id: &str,
+) -> Result<Vec<SnoozedMessage>, String> {
     manager
         .read(account_id, snooze::list_snoozed)
         .await
@@ -276,9 +340,18 @@ pub async fn snooze_list(account_id: &str) -> Result<Vec<SnoozedMessage>, String
 /// `limit`, ordenados por hora de vuelta. Salta la base cerrada o la cuenta
 /// apagada, como el planificador de recordatorios.
 pub async fn snooze_due_all(now: i64, limit: usize) -> Vec<(String, SnoozedMessage)> {
-    let Some(manager) = LIVE_STORE.get() else {
-        return Vec::new();
-    };
+    match LIVE_STORE.get() {
+        Some(manager) => snooze_due_all_in(manager, now, limit).await,
+        None => Vec::new(),
+    }
+}
+
+/// El cuerpo de [`snooze_due_all`] sobre un almacén dado.
+pub(crate) async fn snooze_due_all_in<K: KeySource>(
+    manager: &StoreManager<K>,
+    now: i64,
+    limit: usize,
+) -> Vec<(String, SnoozedMessage)> {
     let mut out: Vec<(String, SnoozedMessage)> = Vec::new();
     for (account_id, account) in manager.area_accounts(EMAIL_AREA).await {
         if !account.active {
@@ -302,7 +375,14 @@ pub async fn snooze_due_all(now: i64, limit: usize) -> Vec<(String, SnoozedMessa
 /// La próxima hora de vuelta después de `now` entre todas las cuentas, o nada: el
 /// techo del sueño del bucle de vuelta.
 pub async fn snooze_next_after(now: i64) -> Option<i64> {
-    let manager = LIVE_STORE.get()?;
+    snooze_next_after_in(LIVE_STORE.get()?, now).await
+}
+
+/// El cuerpo de [`snooze_next_after`] sobre un almacén dado.
+pub(crate) async fn snooze_next_after_in<K: KeySource>(
+    manager: &StoreManager<K>,
+    now: i64,
+) -> Option<i64> {
     let mut soonest: Option<i64> = None;
     for (account_id, account) in manager.area_accounts(EMAIL_AREA).await {
         if !account.active {

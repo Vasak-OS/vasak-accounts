@@ -123,6 +123,8 @@ use zeroize::Zeroizing;
 
 use access::Access;
 use broker::{Broker, BrokerError};
+use store::key::KeySource;
+use store::lifecycle::StoreManager;
 
 /// Cada cuánto se vuelve a mirar cuando el servidor **no** sabe avisar.
 ///
@@ -1139,57 +1141,32 @@ impl Service {
                 .map_err(zbus::fdo::Error::Failed)?
         };
 
-        if matches!(outcome, imap::MoveOutcome::OldCopyKept) {
+        // El almacén vivo es el que la comprobación de arriba dio por disponible;
+        // se lo pasamos por parámetro a la lógica decidible para poder ejercerla
+        // con un almacén de prueba sin pasar por el global.
+        let Some(manager) = store_api::live_store() else {
             return Err(zbus::fdo::Error::Failed(
-                "el servidor no puede mover el mensaje sin dejar una copia en la casilla de \
-                 origen (no admite MOVE ni UIDPLUS); no se pospuso"
-                    .into(),
+                "el almacén de la cuenta no está disponible; no se puede posponer".into(),
             ));
-        }
-
-        // Anotar el pospuesto con el UID nuevo (si el servidor lo dio).
-        let (new_uid, uidvalidity) = match outcome {
-            imap::MoveOutcome::Complete {
-                new_uid,
-                uidvalidity,
-            } => (new_uid, uidvalidity),
-            imap::MoveOutcome::OldCopyKept => unreachable!("rechazado más arriba"),
         };
-        if let Err(e) = store_api::snooze_upsert(
+        snooze_commit_in(
+            manager,
             &account_id,
-            &message_id,
             &origin,
-            new_uid,
-            uidvalidity,
+            uid,
+            &message_id,
+            &outcome,
             return_at,
         )
         .await
-        {
-            // El mensaje ya se movió pero no se pudo anotar: el almacén se cayó en
-            // la ventana entre la comprobación y ahora. Queda en el diario; el
-            // mensaje está en Pospuestos y la persona puede moverlo a mano.
-            tracing::error!(
-                "'{account_id}': se movió a pospuestos pero no se anotó la fila: {e}. El mensaje \
-                 «{message_id}» quedó en {SNOOZE_MAILBOX}"
-            );
-            return Err(zbus::fdo::Error::Failed(format!(
-                "se movió a pospuestos pero no se pudo registrar: {e}"
-            )));
-        }
-
-        // Que el almacén refleje el movimiento sin esperar su vuelta, y despertar
-        // al bucle por si este pospuesto vence antes del techo del sueño.
-        store_api::store_forget(&account_id, &origin, uid).await;
-        store_api::nudge_email(&account_id);
-        snooze_return::nudge_snooze();
+        .map_err(zbus::fdo::Error::Failed)?;
 
         // La lista en memoria es la de la de entrada: si de ahí salió, se saca ya.
-        if origin.eq_ignore_ascii_case("INBOX") {
+        let removed_from_inbox = {
             let mut state = self.state.lock().await;
-            if let Some(list) = state.messages.get_mut(&account_id) {
-                list.retain(|m| m.uid != uid);
-            }
-            drop(state);
+            drop_inbox_message(&mut state, &account_id, &origin, uid)
+        };
+        if removed_from_inbox {
             let _ = Service::messages_changed(&emitter).await;
         }
 
@@ -1221,25 +1198,19 @@ impl Service {
         account_id: String,
         message_id: String,
     ) -> zbus::fdo::Result<String> {
-        let rows = store_api::snooze_list(&account_id)
-            .await
-            .map_err(zbus::fdo::Error::Failed)?;
-        let Some(row) = rows.into_iter().find(|r| r.message_id == message_id) else {
-            return serde_json::to_string("no_estaba")
-                .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")));
+        let Some(manager) = store_api::live_store() else {
+            return Err(zbus::fdo::Error::Failed(
+                "el almacén no está disponible".into(),
+            ));
         };
+        let account_id = account_id.as_str();
+        let outcome = cancel_snooze_in(manager, account_id, &message_id, |row| async move {
+            self.return_to_inbox(account_id, &row).await
+        })
+        .await
+        .map_err(zbus::fdo::Error::Failed)?;
 
-        let moved = self
-            .return_to_inbox(&account_id, &row)
-            .await
-            .map_err(zbus::fdo::Error::Failed)?;
-
-        // Se encontrara o no en Pospuestos, la fila se va: o se devolvió, o ya no
-        // estaba y no hay nada que seguir.
-        let _ = store_api::snooze_delete(&account_id, &message_id).await;
-        store_api::nudge_email(&account_id);
-
-        serde_json::to_string(if moved { "devuelto" } else { "ya_no_estaba" })
+        serde_json::to_string(outcome)
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
     }
 
@@ -2187,6 +2158,111 @@ fn mailbox_or_inbox(mailbox: &str) -> String {
     }
 }
 
+/// Lo decidible de `SnoozeMessage` una vez que el servidor movió el mensaje:
+/// rechaza el movimiento que dejó copia en el origen, anota (o repone) la fila en
+/// el almacén dado y refleja el movimiento en la sesión en vivo. No toca el
+/// servidor ni la lista en memoria; de eso se ocupa el método D-Bus. Recibe el
+/// almacén por parámetro para poder ejercerse con uno de prueba.
+async fn snooze_commit_in<K: KeySource>(
+    manager: &StoreManager<K>,
+    account_id: &str,
+    origin: &str,
+    uid: u32,
+    message_id: &str,
+    outcome: &imap::MoveOutcome,
+    return_at: i64,
+) -> Result<(), String> {
+    if matches!(outcome, imap::MoveOutcome::OldCopyKept) {
+        return Err(
+            "el servidor no puede mover el mensaje sin dejar una copia en la casilla de \
+                    origen (no admite MOVE ni UIDPLUS); no se pospuso"
+                .into(),
+        );
+    }
+
+    // Anotar el pospuesto con el UID nuevo (si el servidor lo dio).
+    let (new_uid, uidvalidity) = match outcome {
+        imap::MoveOutcome::Complete {
+            new_uid,
+            uidvalidity,
+        } => (*new_uid, *uidvalidity),
+        imap::MoveOutcome::OldCopyKept => unreachable!("rechazado más arriba"),
+    };
+    if let Err(e) = store_api::snooze_upsert_in(
+        manager,
+        account_id,
+        message_id,
+        origin,
+        new_uid,
+        uidvalidity,
+        return_at,
+    )
+    .await
+    {
+        // El mensaje ya se movió pero no se pudo anotar: el almacén se cayó en la
+        // ventana entre la comprobación y ahora. Queda en el diario; el mensaje
+        // está en Pospuestos y la persona puede moverlo a mano.
+        tracing::error!(
+            "'{account_id}': se movió a pospuestos pero no se anotó la fila: {e}. El mensaje \
+             «{message_id}» quedó en {SNOOZE_MAILBOX}"
+        );
+        return Err(format!(
+            "se movió a pospuestos pero no se pudo registrar: {e}"
+        ));
+    }
+
+    // Que el almacén refleje el movimiento sin esperar su vuelta, y despertar al
+    // bucle por si este pospuesto vence antes del techo del sueño.
+    store_api::store_forget(account_id, origin, uid).await;
+    store_api::nudge_email(account_id);
+    snooze_return::nudge_snooze();
+    Ok(())
+}
+
+/// Saca de la lista en memoria de la bandeja de entrada el mensaje `uid` de una
+/// cuenta. La lista en memoria es la de la bandeja: un mensaje que salió de otra
+/// casilla no la toca. Devuelve si corresponde avisar a las ventanas.
+fn drop_inbox_message(state: &mut State, account_id: &str, origin: &str, uid: u32) -> bool {
+    if !origin.eq_ignore_ascii_case("INBOX") {
+        return false;
+    }
+    if let Some(list) = state.messages.get_mut(account_id) {
+        list.retain(|m| m.uid != uid);
+    }
+    true
+}
+
+/// Lo decidible de `CancelSnooze`: busca la fila del mensaje en el almacén dado,
+/// la devuelve a su casilla con `return_row` —el movimiento por IMAP, que inyecta
+/// quien llama— y borra la fila. Sin fila, `no_estaba`; con fila, `devuelto` o
+/// `ya_no_estaba` según si el mensaje seguía en Pospuestos. El movimiento va por
+/// parámetro para poder ejercer la decisión con un almacén de prueba.
+async fn cancel_snooze_in<K, F, Fut>(
+    manager: &StoreManager<K>,
+    account_id: &str,
+    message_id: &str,
+    return_row: F,
+) -> Result<&'static str, String>
+where
+    K: KeySource,
+    F: FnOnce(store::snooze::SnoozedMessage) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, String>>,
+{
+    let rows = store_api::snooze_list_in(manager, account_id).await?;
+    let Some(row) = rows.into_iter().find(|r| r.message_id == message_id) else {
+        return Ok("no_estaba");
+    };
+
+    let moved = return_row(row).await?;
+
+    // Se encontrara o no en Pospuestos, la fila se va: o se devolvió, o ya no
+    // estaba y no hay nada que seguir.
+    let _ = store_api::snooze_delete_in(manager, account_id, message_id).await;
+    store_api::nudge_email(account_id);
+
+    Ok(if moved { "devuelto" } else { "ya_no_estaba" })
+}
+
 /// El productor del bucle de vuelta: mueve cada pospuesto vencido con el IMAP del
 /// servicio y, **sólo si salió de Pospuestos** (se movió, o ya no estaba), borra
 /// su fila. Un error de red no borra nada: la próxima vuelta lo reintenta, para
@@ -2198,15 +2274,37 @@ struct ServiceSnoozeReturner {
 
 impl snooze_return::SnoozeReturner for ServiceSnoozeReturner {
     async fn return_due(&self, account_id: &str, row: &store::snooze::SnoozedMessage) {
-        match self.service.return_to_inbox(account_id, row).await {
-            Ok(_) => {
-                let _ = store_api::snooze_delete(account_id, &row.message_id).await;
-                store_api::nudge_email(account_id);
+        let moved = self.service.return_to_inbox(account_id, row).await;
+        apply_return_in(
+            store_api::live_store().map(|m| &**m),
+            account_id,
+            &row.message_id,
+            moved,
+        )
+        .await;
+    }
+}
+
+/// Lo decidible del productor del bucle de vuelta: con el resultado de devolver
+/// el pospuesto, si salió bien borra su fila del almacén dado y pide una vuelta
+/// del correo; si falló, lo registra y no borra nada (la próxima vuelta lo
+/// reintenta, para que un pospuesto no se pierda porque el servidor estaba
+/// caído a su hora).
+async fn apply_return_in<K: KeySource>(
+    manager: Option<&StoreManager<K>>,
+    account_id: &str,
+    message_id: &str,
+    moved: Result<bool, String>,
+) {
+    match moved {
+        Ok(_) => {
+            if let Some(manager) = manager {
+                let _ = store_api::snooze_delete_in(manager, account_id, message_id).await;
             }
-            Err(e) => tracing::debug!(
-                "'{account_id}': no se devolvió el pospuesto «{}»: {e}",
-                row.message_id
-            ),
+            store_api::nudge_email(account_id);
+        }
+        Err(e) => {
+            tracing::debug!("'{account_id}': no se devolvió el pospuesto «{message_id}»: {e}")
         }
     }
 }
