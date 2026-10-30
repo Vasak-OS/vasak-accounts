@@ -201,6 +201,37 @@ async fn borrar_un_seguimiento_dice_si_habia_fila() {
 }
 
 #[tokio::test]
+async fn cancelar_un_seguimiento_dice_cancelado_si_habia_fila_y_no_estaba_si_no() {
+    let (_t, manager) = store_with("seg-cancelar", &["cta"], &["cta"]).await;
+    put(&manager, "cta", "<a@x>", 100).await;
+    put(&manager, "cta", "<b@x>", 200).await;
+
+    let con_fila = crate::cancel_followup_in(&manager, "cta", "<a@x>").await;
+    assert_eq!(con_fila, Ok("cancelado"));
+    assert_eq!(ids(&manager, "cta").await, ["<b@x>"], "la fila se borró");
+
+    // Sin fila previa: avisa `no_estaba` y no toca las demás.
+    let sin_fila = crate::cancel_followup_in(&manager, "cta", "<a@x>").await;
+    assert_eq!(sin_fila, Ok("no_estaba"));
+    assert_eq!(ids(&manager, "cta").await, ["<b@x>"]);
+}
+
+#[tokio::test]
+async fn anotar_el_seguimiento_deja_el_message_id_y_los_destinatarios_del_envio() {
+    let (_t, manager) = store_with("seg-anotado", &["cta"], &["cta"]).await;
+
+    crate::note_followup_in(&manager, "cta", "<envio@x>", "ana@x.com, bo@x.com", 7_000)
+        .await
+        .unwrap();
+
+    let rows = store_api::followup_list_in(&manager, "cta").await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].message_id, "<envio@x>");
+    assert_eq!(rows[0].recipients, "ana@x.com, bo@x.com");
+    assert_eq!(rows[0].remind_at, 7_000);
+}
+
+#[tokio::test]
 async fn una_cuenta_sin_almacen_da_error_y_no_una_lista_vacia() {
     let (_t, manager) = store_with("seg-sin-cuenta", &["cta"], &["cta"]).await;
 
