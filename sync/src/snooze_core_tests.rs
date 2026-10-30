@@ -28,7 +28,7 @@ fn account(id: &str) -> Account {
 /// Un almacén de prueba con las cuentas dadas. Las de `active` tienen el área de
 /// correo encendida (las que el bucle de vuelta recorre); las otras existen pero
 /// están apagadas. El directorio vive mientras viva el almacén.
-async fn store_with(
+pub(crate) async fn store_with(
     label: &str,
     accounts: &[&str],
     active: &[&str],
@@ -37,7 +37,7 @@ async fn store_with(
 }
 
 /// Lo mismo con el llavero falso en mano, para poder bloquearlo.
-async fn store_with_keys(
+pub(crate) async fn store_with_keys(
     label: &str,
     accounts: &[&str],
     active: &[&str],
