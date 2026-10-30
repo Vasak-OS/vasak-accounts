@@ -92,11 +92,11 @@ mod replay;
 // La etapa de empuje por Microsoft Graph: el espejo de `replay` para las cuentas
 // Graph (`/me/events`, `/me/contacts`), con su propio `@odata.etag` y
 // `POST`/`PATCH`/`DELETE` (`vasak-accounts#97`).
-mod graph_write;
 #[cfg(test)]
 mod followup_loop_tests;
 #[cfg(test)]
 mod followup_tests;
+mod graph_write;
 // El lado de la escritura conservadora de iCalendar y vCard. La superficie
 // D-Bus que arma los parches y encola es el PR siguiente de este hito
 // (`vasak-accounts#23`); por ahora lo ejercitan sus pruebas y la cola.
