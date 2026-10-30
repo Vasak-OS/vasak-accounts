@@ -13,8 +13,8 @@ use crate::store::snooze::SnoozedMessage;
 use crate::test_bus::{captured_logs, error_of, Fixture};
 use crate::{store_api, Service, ServiceSnoozeReturner};
 
-const ACCOUNT: &str = "cta";
-const ADDRESS: &str = "ana@vasak.test";
+pub(crate) const ACCOUNT: &str = "cta";
+pub(crate) const ADDRESS: &str = "ana@vasak.test";
 
 fn row(message_id: &str) -> SnoozedMessage {
     SnoozedMessage {
@@ -162,7 +162,7 @@ use tokio_rustls::TlsAcceptor;
 use crate::imap::MoveOutcome;
 use crate::SNOOZE_MAILBOX;
 
-type Script = Vec<(&'static str, Vec<&'static str>)>;
+pub(crate) type Script = Vec<(&'static str, Vec<&'static str>)>;
 
 /// Un guion; `caps` son las capacidades que anuncia el servidor (`MOVE`, `UIDPLUS`).
 /// El saludo, el `LOGIN`, el `CAPABILITY` y el `SELECT "INBOX"` con que `Reader`
@@ -189,7 +189,7 @@ fn prelude(caps: &'static str) -> Script {
 }
 
 /// Levanta el servidor y devuelve su puerto y la tarea con lo recibido.
-async fn imap_server(
+pub(crate) async fn imap_server(
     caps: &'static str,
     script: Script,
 ) -> (u16, tokio::task::JoinHandle<Vec<String>>) {
@@ -253,7 +253,7 @@ async fn imap_server(
 
 /// Lo que mandó el cliente tras la apertura de sesión (`LOGIN`, `CAPABILITY`,
 /// `SELECT "INBOX"`), sin las etiquetas.
-fn after_open(received: &[String]) -> Vec<String> {
+pub(crate) fn after_open(received: &[String]) -> Vec<String> {
     received
         .iter()
         .skip(3)
@@ -263,7 +263,7 @@ fn after_open(received: &[String]) -> Vec<String> {
 
 /// Espera al servidor de mentira con un tope: si el guion pedía más de lo que el
 /// cliente mandó, se dice en vez de colgar la prueba.
-async fn finish(task: tokio::task::JoinHandle<Vec<String>>) -> Vec<String> {
+pub(crate) async fn finish(task: tokio::task::JoinHandle<Vec<String>>) -> Vec<String> {
     tokio::time::timeout(Duration::from_secs(10), task)
         .await
         .expect("el servidor esperaba más comandos de los que mandó el cliente")
@@ -284,14 +284,14 @@ fn fetch_with_id() -> Vec<&'static str> {
 
 /// Una cuenta contra el servidor de mentira, con el `Service` y lo que hace falta
 /// para llamar a `Reader`.
-struct Client {
-    service: Service,
-    broker: crate::broker::Broker,
-    account: crate::broker::Account,
+pub(crate) struct Client {
+    pub(crate) service: Service,
+    pub(crate) broker: crate::broker::Broker,
+    pub(crate) account: crate::broker::Account,
     _fixture: Fixture,
 }
 
-async fn client(port: u16) -> Client {
+pub(crate) async fn client(port: u16) -> Client {
     let fixture = Fixture::start_with_imap(&[(ACCOUNT, ADDRESS)], port).await;
     let service = Service::default();
     let (broker, account) = service.account(ACCOUNT).await.unwrap();

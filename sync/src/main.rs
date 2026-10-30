@@ -99,6 +99,10 @@ mod graph_write;
 #[allow(dead_code)]
 mod serialize;
 #[cfg(test)]
+mod followup_loop_tests;
+#[cfg(test)]
+mod followup_tests;
+#[cfg(test)]
 mod smime_ipc_tests;
 #[cfg(test)]
 mod smime_send_tests;
