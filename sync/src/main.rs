@@ -1289,10 +1289,14 @@ impl Service {
         account_id: String,
         message_id: String,
     ) -> zbus::fdo::Result<String> {
-        let had = store_api::followup_delete(&account_id, &message_id)
+        let Some(manager) = store_api::live_store() else {
+            return Err(zbus::fdo::Error::Failed(
+                "el almacén no está disponible".into(),
+            ));
+        };
+        let outcome = cancel_followup_in(manager, &account_id, &message_id)
             .await
             .map_err(zbus::fdo::Error::Failed)?;
-        let outcome = if had { "cancelado" } else { "no_estaba" };
         serde_json::to_string(outcome)
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
     }
@@ -1498,14 +1502,24 @@ impl Service {
         // disponible no se falla el envío —el recordatorio es secundario—; queda
         // en el diario. El bucle de seguimiento la atiende a su hora.
         if let Some(remind_at) = followup_at {
-            if let Err(e) = store_api::followup_upsert(
-                &outgoing.account_id,
-                &outgoing.message_id,
-                &followup_to,
-                remind_at,
-            )
-            .await
-            {
+            // El almacén vivo se saca acá y la fila la anota `note_followup_in`,
+            // para poder comprobar con un almacén de prueba que queda con el
+            // `Message-ID` y los destinatarios correctos. Mejor-esfuerzo: si el
+            // almacén no está, se registra y no se falla el envío (ya salió).
+            let noted = match store_api::live_store() {
+                Some(manager) => {
+                    note_followup_in(
+                        manager,
+                        &outgoing.account_id,
+                        &outgoing.message_id,
+                        &followup_to,
+                        remind_at,
+                    )
+                    .await
+                }
+                None => Err("el almacén no está disponible".into()),
+            };
+            if let Err(e) = noted {
                 tracing::warn!(
                     "'{}': el mensaje salió pero no se anotó el seguimiento de «{}»: {e}",
                     outgoing.account_id,
@@ -2527,6 +2541,34 @@ async fn apply_followup_in<K, N, Fut>(
             )
         }
     }
+}
+
+/// Lo decidible de `CancelFollowup`: borra la fila del seguimiento en el almacén
+/// dado y decide el resultado —`cancelado` si había fila, `no_estaba` si no—. No
+/// toca el servidor: el mensaje ya salió, esto sólo olvida el recordatorio. El
+/// almacén va por parámetro para poder ejercer la decisión con uno de prueba.
+async fn cancel_followup_in<K: KeySource>(
+    manager: &StoreManager<K>,
+    account_id: &str,
+    message_id: &str,
+) -> Result<&'static str, String> {
+    let had = store_api::followup_delete_in(manager, account_id, message_id).await?;
+    Ok(if had { "cancelado" } else { "no_estaba" })
+}
+
+/// Lo decidible del anotado de seguimiento de `send_message`: anota (o repone) la
+/// fila en el almacén dado con el `Message-ID` del envío y sus destinatarios. El
+/// mejor-esfuerzo —no fallar el envío si el almacén no está— lo conserva quien
+/// llama; acá sólo se anota, para poder comprobar con un almacén de prueba que la
+/// fila queda con el `Message-ID` y los destinatarios correctos.
+async fn note_followup_in<K: KeySource>(
+    manager: &StoreManager<K>,
+    account_id: &str,
+    message_id: &str,
+    recipients: &str,
+    remind_at: i64,
+) -> Result<(), String> {
+    store_api::followup_upsert_in(manager, account_id, message_id, recipients, remind_at).await
 }
 
 /// Una sesión, de principio a fin. Nunca vuelve bien: o se corta o la rechazan.

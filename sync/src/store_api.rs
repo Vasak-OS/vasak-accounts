@@ -421,9 +421,11 @@ fn log_followup_error(account_id: &str, error: StoreError) {
     }
 }
 
-/// Anota (o repone) un seguimiento en el almacén de una cuenta. Lo llama
-/// `send_message` al encolar; si el almacén no está, falla y quien llama decide
-/// (el envío ya salió, así que sólo lo registra).
+/// Anota (o repone) un seguimiento en el almacén de una cuenta. `send_message` le
+/// pasa ahora el manager por parámetro (vía [`followup_upsert_in`]), así que en
+/// producción nadie entra por acá; la deja viva la prueba de «sin almacén», que
+/// comprueba el camino `None`. Por eso el `allow`.
+#[allow(dead_code)]
 pub async fn followup_upsert(
     account_id: &str,
     message_id: &str,
@@ -455,8 +457,11 @@ pub(crate) async fn followup_upsert_in<K: KeySource>(
         .map_err(|e| e.to_string())
 }
 
-/// Borra el seguimiento de un mensaje. Devuelve si había fila. Lo llama
-/// `CancelFollowup` y el bucle de aviso al atender uno.
+/// Borra el seguimiento de un mensaje. Devuelve si había fila. Como
+/// [`followup_upsert`], en producción se entra por [`followup_delete_in`] con el
+/// manager inyectado (`CancelFollowup` y el bucle de aviso); esta forma la deja
+/// viva la prueba de «sin almacén».
+#[allow(dead_code)]
 pub async fn followup_delete(account_id: &str, message_id: &str) -> Result<bool, String> {
     let Some(manager) = LIVE_STORE.get() else {
         return Err("el almacén no está disponible".into());
