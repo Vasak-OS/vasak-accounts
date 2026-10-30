@@ -65,7 +65,14 @@ mod compose;
 mod contacts_sync;
 mod dav;
 mod dav_sync;
+// El reloj compartido de las dos colas del correo (posponer y seguimiento): el
+// bucle que duerme hasta la próxima hora y atiende lo vencido, una sola vez.
+mod due_loop;
 mod email_sync;
+// El bucle que avisa un seguimiento a su hora si el mensaje sigue sin respuesta
+// (`vasak-accounts#22`, PR 4). La cola la escribe `send_message` (tabla
+// `followups`, PR 2); acá está el reloj y la comprobación por IMAP.
+mod followup_notify;
 mod graph;
 mod html;
 mod ical;
@@ -516,6 +523,46 @@ impl Reader {
                 };
                 session.move_to(uid, &destination).await?;
                 Ok(true)
+            })
+        })
+        .await
+    }
+
+    /// Comprueba si llegó una respuesta a un mensaje que la persona mandó,
+    /// buscándola en INBOX por su `Message-ID` (lo que enhebra una conversación:
+    /// `References` o `In-Reply-To` con ese id). Lo usa el bucle de seguimiento.
+    ///
+    /// `Ok(true)` alguien respondió; `Ok(false)` la búsqueda anduvo y no había
+    /// nada; `Err` la búsqueda falló (red, servidor, o ni siquiera hay INBOX).
+    /// Quien llama distingue las dos últimas: «vacío» avisa, «falló» reintenta.
+    ///
+    /// `EXAMINE` y no `SELECT`: sólo se busca, no se escribe. Y **dos búsquedas**
+    /// con su unión, no una: los términos de `search` se juntan con `AND`, así que
+    /// `References` ∪ `In-Reply-To` van por separado.
+    async fn check_followup(
+        &mut self,
+        broker: &Broker,
+        account: &broker::Account,
+        message_id: &str,
+    ) -> Result<bool, String> {
+        let message_id = message_id.to_string();
+        self.with_retry(broker, account, move |session| {
+            let message_id = message_id.clone();
+            Box::pin(async move {
+                session.examine("INBOX").await?;
+                let by_references = session
+                    .search(&[query::Term::Header("References".into(), message_id.clone())])
+                    .await?;
+                if !by_references.is_empty() {
+                    return Ok(true);
+                }
+                let by_in_reply_to = session
+                    .search(&[query::Term::Header(
+                        "In-Reply-To".into(),
+                        message_id.clone(),
+                    )])
+                    .await?;
+                Ok(!by_in_reply_to.is_empty())
             })
         })
         .await
@@ -1216,6 +1263,36 @@ impl Service {
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
     }
 
+    /// Los seguimientos pendientes de una cuenta, en JSON. Para pintar la vista
+    /// de seguimientos sin ir al servidor.
+    async fn list_followups(&self, account_id: String) -> zbus::fdo::Result<String> {
+        let rows = store_api::followup_list(&account_id)
+            .await
+            .map_err(zbus::fdo::Error::Failed)?;
+        serde_json::to_string(&rows)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
+    }
+
+    /// Cancela un seguimiento: borra su fila, sin tocar el servidor (el mensaje
+    /// ya salió; esto es sólo olvidar el recordatorio). `cancelado` si había
+    /// fila, `no_estaba` si no (nunca se pidió, o ya se avisó).
+    ///
+    /// Sin puerta de permiso, igual que `SnoozeMessage`/`CancelSnooze` y el resto
+    /// de `AccountsSync`: es el servicio del usuario tocando el estado del usuario
+    /// por el bus de sesión. Que `security` lo evalúe en ese marco.
+    async fn cancel_followup(
+        &self,
+        account_id: String,
+        message_id: String,
+    ) -> zbus::fdo::Result<String> {
+        let had = store_api::followup_delete(&account_id, &message_id)
+            .await
+            .map_err(zbus::fdo::Error::Failed)?;
+        let outcome = if had { "cancelado" } else { "no_estaba" };
+        serde_json::to_string(outcome)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
+    }
+
     /// El texto de un mensaje.
     ///
     /// Se trae del servidor en el momento: guardar todos los cuerpos sería
@@ -1378,6 +1455,14 @@ impl Service {
             }
         }
 
+        // El seguimiento, antes de que el borrador se mude al `Outgoing`. Los
+        // destinatarios a esperar son los de `to`: el seguimiento es «¿me
+        // respondieron?», y el `Cc` es a quien se le mandó una copia, no a quien
+        // se le pidió algo; además es sólo el texto del aviso (la respuesta se
+        // detecta por `Message-ID`, no por destinatario).
+        let followup_at = draft.followup_at;
+        let followup_to = draft.to.join(", ");
+
         let now = chrono::Utc::now();
         let unique = next_unique();
         let outgoing = outbox::Outgoing {
@@ -1403,6 +1488,28 @@ impl Service {
         // la revisión por reloj lo levanta igual.
         self.outbox_wakeup.notify_one();
         let _ = Service::outbox_changed(&emitter).await;
+
+        // Y, si se pidió, la fila de seguimiento. **Best-effort**: el mensaje ya
+        // está encolado (ya salió, o va a salir), así que si el almacén no está
+        // disponible no se falla el envío —el recordatorio es secundario—; queda
+        // en el diario. El bucle de seguimiento la atiende a su hora.
+        if let Some(remind_at) = followup_at {
+            if let Err(e) = store_api::followup_upsert(
+                &outgoing.account_id,
+                &outgoing.message_id,
+                &followup_to,
+                remind_at,
+            )
+            .await
+            {
+                tracing::warn!(
+                    "'{}': el mensaje salió pero no se anotó el seguimiento de «{}»: {e}",
+                    outgoing.account_id,
+                    outgoing.message_id
+                );
+            }
+        }
+
         Ok(outgoing.id)
     }
 
@@ -1676,6 +1783,16 @@ impl Service {
         reader
             .return_from_snooze(&broker, &account, SNOOZE_MAILBOX, row)
             .await
+    }
+
+    /// Mira si un mensaje que la persona mandó ya tuvo respuesta, por IMAP. Lo usa
+    /// el productor del bucle de seguimiento; delega en [`Reader::check_followup`]
+    /// por la conexión de lectura de la cuenta.
+    async fn check_followup(&self, account_id: &str, message_id: &str) -> Result<bool, String> {
+        let (broker, account) = self.account(account_id).await.map_err(|e| e.to_string())?;
+        let reader = self.reader(account_id).await;
+        let mut reader = reader.lock().await;
+        reader.check_followup(&broker, &account, message_id).await
     }
 
     /// La dirección de una cuenta, la misma que el `From` al enviar. Es la
@@ -2311,6 +2428,103 @@ async fn apply_return_in<K: KeySource>(
     }
 }
 
+/// El productor del bucle de seguimiento: a la hora de cada fila mira si hubo
+/// respuesta con el IMAP del servicio y, con ese resultado, [`apply_followup_in`]
+/// decide (avisar/borrar/dejar). Lleva la conexión de sesión para el cartel.
+#[derive(Clone)]
+struct ServiceFollowupNotifier {
+    service: Service,
+    connection: zbus::Connection,
+}
+
+impl ServiceFollowupNotifier {
+    /// Muestra el cartel de «sin respuesta» con botón «Ver». El botón lo atiende
+    /// `follow_notification_actions` —la acción «abrir», la misma del correo
+    /// nuevo— y abre `vasak-mail`; llevar al hilo concreto queda para el UI (no
+    /// hay enlace profundo todavía). El cartel va con su **propia clave** para no
+    /// pisar el de correo nuevo de la cuenta ni al revés.
+    async fn show_followup_notice(&self, account_id: &str, row: &store::snooze::Followup) {
+        let (title, body) = notifications::followup_text(&row.recipients);
+        let actions: &[(&str, &str)] = if notifications::supports_actions(&self.connection).await {
+            &[(notifications::OPEN_ACTION, "Ver")]
+        } else {
+            &[]
+        };
+        let key = notifications::followup_key(account_id);
+        let mut shown = self.service.shown_notifications.lock().await;
+        let card = notifications::Card {
+            app_name: notifications::MAIL_APP_NAME,
+            icon: notifications::MAIL_ICON,
+            desktop_entry: notifications::MAIL_DESKTOP_ENTRY,
+            replaces: shown.previous(&key),
+            title: &title,
+            body: &body,
+            actions,
+        };
+        if let Some(id) = notifications::show(&self.connection, &card).await {
+            shown.remember(&key, id);
+        }
+    }
+}
+
+impl followup_notify::FollowupNotifier for ServiceFollowupNotifier {
+    async fn notify_due(&self, account_id: &str, row: &store::snooze::Followup) {
+        let checked = self
+            .service
+            .check_followup(account_id, &row.message_id)
+            .await;
+        apply_followup_in(
+            store_api::live_store().map(|m| &**m),
+            account_id,
+            row,
+            checked,
+            || self.show_followup_notice(account_id, row),
+        )
+        .await;
+    }
+}
+
+/// Lo decidible del productor del bucle de seguimiento: con el resultado de
+/// comprobar si hubo respuesta, decide qué hacer con la fila del almacén dado.
+///
+/// - `Ok(true)` respondieron → se borra la fila, sin avisar.
+/// - `Ok(false)` la búsqueda anduvo y no hubo nada → se avisa (`notify`) y se
+///   borra la fila (el recordatorio es de un solo disparo).
+/// - `Err(_)` la búsqueda falló (red) → **ni se avisa ni se borra**: la próxima
+///   vuelta lo reintenta, para no avisar «sin respuesta» sólo porque el servidor
+///   estaba caído a su hora.
+///
+/// El aviso entra por `notify` para poder ejercer la decisión sin un bus detrás.
+async fn apply_followup_in<K, N, Fut>(
+    manager: Option<&StoreManager<K>>,
+    account_id: &str,
+    row: &store::snooze::Followup,
+    checked: Result<bool, String>,
+    notify: N,
+) where
+    K: KeySource,
+    N: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    match checked {
+        Ok(replied) => {
+            if !replied {
+                notify().await;
+            }
+            // En los dos casos la fila se atendió: se va.
+            if let Some(manager) = manager {
+                let _ = store_api::followup_delete_in(manager, account_id, &row.message_id).await;
+            }
+        }
+        Err(e) => {
+            tracing::debug!(
+                "'{account_id}': no se pudo comprobar el seguimiento «{}»: {e}",
+                row.message_id
+            )
+        }
+    }
+}
+
 /// Una sesión, de principio a fin. Nunca vuelve bien: o se corta o la rechazan.
 async fn account_session(
     broker: &Broker,
@@ -2630,6 +2844,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         snooze_return::StoreSnoozeSource,
         ServiceSnoozeReturner {
             service: service.clone(),
+        },
+        reminders::system_clock(),
+        Arc::new(tokio::sync::Notify::new()),
+    ));
+
+    // El bucle de seguimiento, al lado del de posponer y por lo mismo: necesita
+    // las dos mitades del proceso —el almacén (de dónde salen las filas vencidas)
+    // y el IMAP del `Service` (que comprueba si hubo respuesta)—, y además la
+    // conexión de sesión para el cartel de aviso. Sin `nudge`: un seguimiento
+    // vence dentro de horas o días, nunca antes del techo del sueño, así que el
+    // `Notify` está sólo por la firma del reloj compartido.
+    tokio::spawn(followup_notify::run(
+        followup_notify::StoreFollowupSource,
+        ServiceFollowupNotifier {
+            service: service.clone(),
+            connection: connection.clone(),
         },
         reminders::system_clock(),
         Arc::new(tokio::sync::Notify::new()),

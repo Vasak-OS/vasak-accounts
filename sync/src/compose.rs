@@ -112,6 +112,18 @@ pub struct Draft {
     /// idéntica y el campo sólo aparece cuando de verdad se pidió firmar.
     #[serde(default, skip_serializing_if = "is_false", rename = "firmar")]
     pub sign: bool,
+    /// Si al enviar hay que recordar un seguimiento: el instante (epoch
+    /// segundos) en que avisar si para entonces nadie respondió. Lo pone la
+    /// ventana con el toggle de seguimiento (PR5); por omisión no hay
+    /// seguimiento y **no se serializa**, así la cola vieja y el UI que no lo
+    /// mandan se vuelven a escribir idénticos, y el campo sólo aparece cuando de
+    /// verdad se pidió.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "recordar_en"
+    )]
+    pub followup_at: Option<i64>,
 }
 
 fn is_false(value: &bool) -> bool {

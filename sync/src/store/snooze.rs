@@ -56,12 +56,22 @@ pub struct SnoozedMessage {
 /// Un mensaje enviado para el que hay que recordar un seguimiento a `remind_at`
 /// si no hubo respuesta. `recipients` es a quién se le escribió, para el texto
 /// del aviso.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Se serializa para `ListFollowups`: `message_id` tal cual —es un
+/// identificador, como en `SnoozedMessage`— y el resto con nombres en español.
+/// El `id` de fila y el `created_at` no salen: son de adentro, no los mira la
+/// ventana. El `recordar_en` comparte nombre con el campo del `Draft` que lo
+/// originó.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Followup {
+    #[serde(skip)]
     pub id: i64,
     pub message_id: String,
+    #[serde(rename = "destinatarios")]
     pub recipients: String,
+    #[serde(rename = "recordar_en")]
     pub remind_at: i64,
+    #[serde(skip)]
     pub created_at: i64,
 }
 
@@ -262,6 +272,28 @@ impl Store {
     /// Borra el posponer de un mensaje. Delega en [`delete_snooze`].
     pub fn delete_snooze(&self, message_id: &str) -> Result<bool, StoreError> {
         delete_snooze(&self.connection, message_id)
+    }
+
+    /// Anota (o repone) un seguimiento. Delega en [`upsert_followup`].
+    pub fn upsert_followup(
+        &self,
+        message_id: &str,
+        recipients: &str,
+        remind_at: i64,
+        created_at: i64,
+    ) -> Result<(), StoreError> {
+        upsert_followup(
+            &self.connection,
+            message_id,
+            recipients,
+            remind_at,
+            created_at,
+        )
+    }
+
+    /// Borra el seguimiento de un mensaje. Delega en [`delete_followup`].
+    pub fn delete_followup(&self, message_id: &str) -> Result<bool, StoreError> {
+        delete_followup(&self.connection, message_id)
     }
 }
 

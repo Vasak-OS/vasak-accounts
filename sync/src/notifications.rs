@@ -141,6 +141,33 @@ pub fn notification_text(
     (title, body)
 }
 
+/// Lo que dice el cartel de un seguimiento sin respuesta: que un mensaje que la
+/// persona mandó sigue sin contestar, y a quién se lo había mandado. **Nada del
+/// contenido** —ni asunto ni cuerpo— por lo mismo que el de correo nuevo: la
+/// pantalla puede estar bloqueada o proyectada.
+///
+/// `recipients` lo escribió la persona al redactar; se acorta y se escapa como
+/// cualquier texto que llega de afuera (una dirección válida no trae marcado,
+/// pero el campo no se revalida acá).
+pub fn followup_text(recipients: &str) -> (String, String) {
+    let who = for_notification(recipients.trim());
+    let body = if who.is_empty() {
+        "Tu mensaje sigue sin respuesta".to_string()
+    } else {
+        format!("Tu mensaje a {who} sigue sin respuesta")
+    };
+    ("Sin respuesta todavía".to_string(), body)
+}
+
+/// La clave con la que se recuerda el cartel de seguimiento de una cuenta, en
+/// [`ShownNotifications`]. Distinta de la del correo nuevo para que un
+/// seguimiento no pise el cartel de «llegaron N mensajes» ni al revés; el botón
+/// «Ver» sigue andando porque [`ShownNotifications::is_ours`] mira todos los
+/// carteles guardados, sean de la cola que sean.
+pub(crate) fn followup_key(account: &str) -> String {
+    format!("seguimiento\u{0}{account}")
+}
+
 /// Cómo se nombra a quien lo mandó.
 ///
 /// El nombre con el que se firma si lo hay, y la dirección si no. **No los dos**:

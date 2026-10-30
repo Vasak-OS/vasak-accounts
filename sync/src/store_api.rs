@@ -75,7 +75,7 @@ use crate::store::lifecycle::{
     CALENDAR_AREA, CONTACTS_AREA, EMAIL_AREA, SYNCED_AREAS,
 };
 use crate::store::queue::ConflictChoice;
-use crate::store::snooze::{self, SnoozedMessage};
+use crate::store::snooze::{self, Followup, SnoozedMessage};
 use crate::store::{paths, Store, StoreError};
 
 /// Dónde se publica la interfaz.
@@ -397,6 +397,166 @@ pub(crate) async fn snooze_next_after_in<K: KeySource>(
             Ok(Some(at)) => soonest = Some(soonest.map_or(at, |s| s.min(at))),
             Ok(None) => {}
             Err(error) => log_snooze_error(&account_id, error),
+        }
+    }
+    soonest
+}
+
+// ── Seguimientos ────────────────────────────────────────────────────────────
+//
+// El espejo de los pospuestos sobre la otra cola de `store::snooze` (tabla
+// `followups`, misma migración V13). Las dos capas calcadas a propósito: el
+// wrapper fino que alcanza el `LIVE_STORE` del proceso y el **core `*_in` sobre
+// un `&StoreManager<K>`** que recibe el almacén por parámetro, para que las
+// pruebas lo ejerzan con uno de prueba sin pasar por el global. Lo escribe el
+// bucle de aviso (`followup_notify`) y los métodos D-Bus `ListFollowups`/
+// `CancelFollowup`; la fila la pone `send_message` al encolar un envío que pidió
+// seguimiento.
+
+/// Como [`log_snooze_error`], para los seguimientos: «cerrado» y «bloqueado» son
+/// el estado normal sin la sesión desbloqueada y no van al diario.
+fn log_followup_error(account_id: &str, error: StoreError) {
+    if !matches!(error, StoreError::Missing | StoreError::Key(_)) {
+        tracing::debug!("seguimientos de «{account_id}»: {error}");
+    }
+}
+
+/// Anota (o repone) un seguimiento en el almacén de una cuenta. Lo llama
+/// `send_message` al encolar; si el almacén no está, falla y quien llama decide
+/// (el envío ya salió, así que sólo lo registra).
+pub async fn followup_upsert(
+    account_id: &str,
+    message_id: &str,
+    recipients: &str,
+    remind_at: i64,
+) -> Result<(), String> {
+    let Some(manager) = LIVE_STORE.get() else {
+        return Err("el almacén no está disponible".into());
+    };
+    followup_upsert_in(manager, account_id, message_id, recipients, remind_at).await
+}
+
+/// El cuerpo de [`followup_upsert`] sobre un almacén dado.
+pub(crate) async fn followup_upsert_in<K: KeySource>(
+    manager: &StoreManager<K>,
+    account_id: &str,
+    message_id: &str,
+    recipients: &str,
+    remind_at: i64,
+) -> Result<(), String> {
+    let message_id = message_id.to_string();
+    let recipients = recipients.to_string();
+    let created_at = chrono::Utc::now().timestamp();
+    manager
+        .with_store(account_id, move |store| {
+            store.upsert_followup(&message_id, &recipients, remind_at, created_at)
+        })
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Borra el seguimiento de un mensaje. Devuelve si había fila. Lo llama
+/// `CancelFollowup` y el bucle de aviso al atender uno.
+pub async fn followup_delete(account_id: &str, message_id: &str) -> Result<bool, String> {
+    let Some(manager) = LIVE_STORE.get() else {
+        return Err("el almacén no está disponible".into());
+    };
+    followup_delete_in(manager, account_id, message_id).await
+}
+
+/// El cuerpo de [`followup_delete`] sobre un almacén dado.
+pub(crate) async fn followup_delete_in<K: KeySource>(
+    manager: &StoreManager<K>,
+    account_id: &str,
+    message_id: &str,
+) -> Result<bool, String> {
+    let message_id = message_id.to_string();
+    manager
+        .with_store(account_id, move |store| store.delete_followup(&message_id))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Todos los seguimientos de una cuenta, para `ListFollowups`.
+pub async fn followup_list(account_id: &str) -> Result<Vec<Followup>, String> {
+    let Some(manager) = LIVE_STORE.get() else {
+        return Err("el almacén no está disponible".into());
+    };
+    followup_list_in(manager, account_id).await
+}
+
+/// El cuerpo de [`followup_list`] sobre un almacén dado.
+pub(crate) async fn followup_list_in<K: KeySource>(
+    manager: &StoreManager<K>,
+    account_id: &str,
+) -> Result<Vec<Followup>, String> {
+    manager
+        .read(account_id, snooze::list_followups)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Los seguimientos vencidos de **todas** las cuentas con correo encendido, hasta
+/// `limit`, ordenados por hora de aviso. Salta la base cerrada o la cuenta
+/// apagada, como los pospuestos.
+pub async fn followup_due_all(now: i64, limit: usize) -> Vec<(String, Followup)> {
+    match LIVE_STORE.get() {
+        Some(manager) => followup_due_all_in(manager, now, limit).await,
+        None => Vec::new(),
+    }
+}
+
+/// El cuerpo de [`followup_due_all`] sobre un almacén dado.
+pub(crate) async fn followup_due_all_in<K: KeySource>(
+    manager: &StoreManager<K>,
+    now: i64,
+    limit: usize,
+) -> Vec<(String, Followup)> {
+    let mut out: Vec<(String, Followup)> = Vec::new();
+    for (account_id, account) in manager.area_accounts(EMAIL_AREA).await {
+        if !account.active {
+            continue;
+        }
+        match manager
+            .read(&account_id, move |connection| {
+                snooze::due_followups(connection, now)
+            })
+            .await
+        {
+            Ok(rows) => out.extend(rows.into_iter().map(|row| (account_id.clone(), row))),
+            Err(error) => log_followup_error(&account_id, error),
+        }
+    }
+    out.sort_by_key(|(_, row)| row.remind_at);
+    out.truncate(limit);
+    out
+}
+
+/// La próxima hora de aviso después de `now` entre todas las cuentas, o nada: el
+/// techo del sueño del bucle de seguimiento.
+pub async fn followup_next_after(now: i64) -> Option<i64> {
+    followup_next_after_in(LIVE_STORE.get()?, now).await
+}
+
+/// El cuerpo de [`followup_next_after`] sobre un almacén dado.
+pub(crate) async fn followup_next_after_in<K: KeySource>(
+    manager: &StoreManager<K>,
+    now: i64,
+) -> Option<i64> {
+    let mut soonest: Option<i64> = None;
+    for (account_id, account) in manager.area_accounts(EMAIL_AREA).await {
+        if !account.active {
+            continue;
+        }
+        match manager
+            .read(&account_id, move |connection| {
+                snooze::next_followup_at(connection, now)
+            })
+            .await
+        {
+            Ok(Some(at)) => soonest = Some(soonest.map_or(at, |s| s.min(at))),
+            Ok(None) => {}
+            Err(error) => log_followup_error(&account_id, error),
         }
     }
     soonest

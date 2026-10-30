@@ -9,8 +9,8 @@
 //!
 //! # En qué se parece a los recordatorios y en qué no
 //!
-//! Igual: duerme hasta la próxima vuelta con un techo ([`MAX_SLEEP`]) por si el
-//! reloj salta —suspender, un ajuste de NTP—, y lo despierta además un `wake`
+//! Igual: duerme hasta la próxima vuelta con un techo ([`crate::due_loop::MAX_SLEEP`])
+//! por si el reloj salta —suspender, un ajuste de NTP—, y lo despierta además un `wake`
 //! cuando alguien pospone algo que puede vencer antes del techo.
 //!
 //! Distinto: **no hay borde `since`**. El recordatorio no se borra y se acota con
@@ -27,21 +27,15 @@
 //! que borra tras una vuelta buena y calla ante un error de red.
 
 use std::sync::Arc;
+// Sólo lo usa `step`, que ahora es el punto de entrada de las pruebas.
+#[cfg(test)]
 use std::time::Duration;
 
 use tokio::sync::Notify;
 
 use crate::calendar_sync::Clock;
+use crate::due_loop;
 use crate::store::snooze::SnoozedMessage;
-
-/// Cuánto, como mucho, se vuelve a mirar aunque no venza ninguno ni llegue un
-/// `wake`. La red para un reloj que saltó, como en los recordatorios.
-const MAX_SLEEP: Duration = Duration::from_secs(15 * 60);
-
-/// Cuántos vencidos se devuelven de una pasada. Una tanda de pospuestos a la
-/// misma hora no abre decenas de conexiones de una; el resto espera la siguiente
-/// vuelta.
-const BATCH: usize = 50;
 
 /// Con qué se despierta al bucle cuando aparece un pospuesto que puede vencer
 /// antes del techo del sueño. Lo toca `nudge_snooze` desde `SnoozeMessage`.
@@ -83,8 +77,44 @@ pub trait SnoozeReturner: Send + Sync {
     ) -> impl std::future::Future<Output = ()> + Send;
 }
 
+/// Adaptan los traits propios de esta cola al reloj compartido
+/// ([`crate::due_loop`]), que es quien tiene el bucle. Son finos a propósito:
+/// reenvían y nada más, así las pruebas de esta cola siguen implementando
+/// `SnoozeSource`/`SnoozeReturner` tal cual.
+struct AsSource<'a, S: ?Sized>(&'a S);
+struct AsAction<'a, A: ?Sized>(&'a A);
+
+impl<S: SnoozeSource + ?Sized> due_loop::DueSource for AsSource<'_, S> {
+    type Row = SnoozedMessage;
+
+    fn due(
+        &self,
+        now: i64,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Vec<(String, SnoozedMessage)>> + Send {
+        self.0.due(now, limit)
+    }
+
+    fn next_after(&self, now: i64) -> impl std::future::Future<Output = Option<i64>> + Send {
+        self.0.next_after(now)
+    }
+}
+
+impl<A: SnoozeReturner + ?Sized> due_loop::DueAction for AsAction<'_, A> {
+    type Row = SnoozedMessage;
+
+    fn act(
+        &self,
+        account_id: &str,
+        row: &SnoozedMessage,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        self.0.return_due(account_id, row)
+    }
+}
+
 /// El bucle: devuelve lo vencido, duerme hasta la próxima vuelta, y se despierta
-/// también cuando `wake` lo toca (alguien pospuso algo más cercano).
+/// también cuando `wake` lo toca (alguien pospuso algo más cercano). El reloj es
+/// el compartido; acá sólo se fija el `WAKE` de esta cola y se adapta.
 pub async fn run<Src, Snk>(source: Src, returner: Snk, clock: Clock, wake: Arc<Notify>)
 where
     Src: SnoozeSource,
@@ -92,36 +122,20 @@ where
 {
     // Para que `SnoozeMessage` pueda acortar el sueño al posponer algo cercano.
     let _ = WAKE.set(Arc::clone(&wake));
-    loop {
-        let now = clock().timestamp();
-        let sleep = step(now, &source, &returner).await;
-        tokio::select! {
-            _ = tokio::time::sleep(sleep) => {}
-            _ = wake.notified() => {}
-        }
-    }
+    due_loop::run(AsSource(&source), AsAction(&returner), clock, wake).await;
 }
 
-/// Una pasada: devuelve los vencidos y calcula cuánto dormir hasta el próximo.
-///
-/// Separada del bucle para probarla con horas dadas a mano. Sin borde `since`:
-/// la anti-repetición es que el `SnoozeReturner` borra la fila al atenderla.
+/// Una pasada, **para las pruebas** de esta cola: delega en el reloj compartido,
+/// adaptando sus traits. El bucle de producción (`run`) ya no la usa —va directo
+/// al reloj compartido—, así que es sólo el punto de entrada que las pruebas de
+/// PR3 ejercen con horas dadas a mano.
+#[cfg(test)]
 async fn step<Src, Snk>(now: i64, source: &Src, returner: &Snk) -> Duration
 where
     Src: SnoozeSource + ?Sized,
     Snk: SnoozeReturner + ?Sized,
 {
-    for (account_id, row) in source.due(now, BATCH).await {
-        returner.return_due(&account_id, &row).await;
-    }
-
-    match source.next_after(now).await {
-        Some(next) => {
-            let seconds = (next - now).clamp(0, MAX_SLEEP.as_secs() as i64);
-            Duration::from_secs(seconds as u64)
-        }
-        None => MAX_SLEEP,
-    }
+    due_loop::step(now, &AsSource(source), &AsAction(returner)).await
 }
 
 /// Los pospuestos del almacén de cada cuenta con correo, leídos por las
@@ -142,6 +156,7 @@ impl SnoozeSource for StoreSnoozeSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::due_loop::{BATCH, MAX_SLEEP};
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicI64, Ordering};
     use std::sync::Mutex;

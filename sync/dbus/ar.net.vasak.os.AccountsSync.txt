@@ -1,4 +1,5 @@
 interface ar.net.vasak.os.AccountsSync
+  method CancelFollowup(in s account_id, in s message_id, out s)
   method CancelSnooze(in s account_id, in s message_id, out s)
   method DeleteMessage(in s account_id, in s mailbox, in u uid, out s)
   method DiscardOutgoing(in s id)
@@ -7,6 +8,7 @@ interface ar.net.vasak.os.AccountsSync
   method GetMessage(in s account_id, in s mailbox, in u uid, out s)
   method GetSmimeIdentity(in s account_id, out s)
   method ImportSmimeIdentity(in s account_id, in h p12, in h password)
+  method ListFollowups(in s account_id, out s)
   method ListMailboxes(in s account_id, out s)
   method ListMessages(in s account_id, in s mailbox, out s)
   method ListOutbox(out s)
