@@ -908,7 +908,6 @@ async fn un_corte_a_mitad_de_la_vuelta_la_corta() {
         ],
     );
     let result = sync_session(&fixture.manager, ACCOUNT, &mut session, None).await;
-    drop(session);
     let received = task.await.unwrap();
     assert!(
         matches!(result, Err(RoundError::Imap(ImapError::Failed(_)))),
@@ -935,4 +934,93 @@ async fn con_el_llavero_bloqueado_no_se_conecta_a_nada() {
     assert_eq!(sync.sync_account(ACCOUNT).await, EmailOutcome::StoreClosed);
     assert!(!sync.attempt(ACCOUNT).await);
     assert_eq!(sync.interval(), EMAIL_INTERVAL);
+}
+
+// ── Ejecución de reglas (execute_ops) ──────────────────────────────────────
+
+/// Sin operaciones no se abre la casilla para escribir: el invariante «mirar no
+/// escribe» queda intacto cuando ninguna regla coincide.
+#[tokio::test]
+async fn sin_operaciones_no_se_abre_la_casilla_para_escribir() {
+    let (mut session, task) = with_server_caps("* OK listo", &[], vec![]);
+    let mut report = EmailReport::default();
+    super::execute_ops(&mut session, &[], ACCOUNT, &mut report)
+        .await
+        .unwrap();
+    assert!(task.await.unwrap().is_empty(), "sin ops no se manda nada");
+}
+
+/// Con operaciones se hace `SELECT` una sola vez y se mandan en el orden del
+/// plan: las de bandera antes del movimiento.
+#[tokio::test]
+async fn con_operaciones_selecciona_una_vez_y_manda_en_orden() {
+    let (mut session, task) = with_server_caps(
+        "* OK listo",
+        &["MOVE"],
+        vec![
+            (
+                "SELECT \"INBOX\"",
+                vec!["* 0 EXISTS", "{tag} OK [READ-WRITE] completado"],
+            ),
+            ("UID STORE 7 +FLAGS (\\Seen)", vec!["{tag} OK completado"]),
+            (
+                "UID STORE 7 +FLAGS (\\Flagged)",
+                vec!["{tag} OK completado"],
+            ),
+            ("UID MOVE 7 \"Bancos\"", vec!["{tag} OK completado"]),
+        ],
+    );
+    let mut report = EmailReport::default();
+    let ops = vec![
+        crate::rules::MailOp::MarkRead(7),
+        crate::rules::MailOp::Flag(7),
+        crate::rules::MailOp::MoveTo(7, "Bancos".into()),
+    ];
+    super::execute_ops(&mut session, &ops, ACCOUNT, &mut report)
+        .await
+        .unwrap();
+    let received = task.await.unwrap();
+    assert_eq!(received.len(), 4, "{received:?}");
+    assert!(received[0].contains("SELECT"), "{received:?}");
+    assert!(
+        received[1].ends_with("UID STORE 7 +FLAGS (\\Seen)"),
+        "{received:?}"
+    );
+    assert!(
+        received[2].ends_with("UID STORE 7 +FLAGS (\\Flagged)"),
+        "{received:?}"
+    );
+    assert!(
+        received[3].ends_with("UID MOVE 7 \"Bancos\""),
+        "{received:?}"
+    );
+}
+
+/// Una operación que el servidor rechaza se saltea y las demás siguen: un
+/// destino borrado no corta la vuelta.
+#[tokio::test]
+async fn un_destino_rechazado_se_saltea_y_las_demas_siguen() {
+    let (mut session, task) = with_server_caps(
+        "* OK listo",
+        &["MOVE"],
+        vec![
+            ("SELECT \"INBOX\"", vec!["{tag} OK completado"]),
+            ("UID MOVE 7 \"NoExiste\"", vec!["{tag} NO no existe"]),
+            ("UID STORE 8 +FLAGS (\\Seen)", vec!["{tag} OK completado"]),
+        ],
+    );
+    let mut report = EmailReport::default();
+    let ops = vec![
+        crate::rules::MailOp::MoveTo(7, "NoExiste".into()),
+        crate::rules::MailOp::MarkRead(8),
+    ];
+    super::execute_ops(&mut session, &ops, ACCOUNT, &mut report)
+        .await
+        .unwrap();
+    let received = task.await.unwrap();
+    assert_eq!(received.len(), 3, "{received:?}");
+    assert!(
+        received[2].ends_with("UID STORE 8 +FLAGS (\\Seen)"),
+        "{received:?}"
+    );
 }

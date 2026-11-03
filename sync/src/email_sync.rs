@@ -47,8 +47,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::broker::{self, Broker, BrokerError};
 use crate::dav_sync::{self, AreaSync};
-use crate::imap::{self, HeaderRecord, ImapError, Session, UidFlags};
+use crate::imap::{self, HeaderRecord, ImapError, MoveOutcome, Session, UidFlags};
 use crate::mailboxes::{self, Mailbox};
+use crate::rules;
 use crate::store::email::{
     MailboxListing, MailboxRole, MessageAttachmentRow, MessageBodyRow, MessageOp, MessageRow,
     StoredFlags, StoredMailbox, WRITE_BATCH_ROWS,
@@ -116,6 +117,8 @@ pub struct EmailReport {
     /// Casillas vaciadas porque el servidor cambió el `UIDVALIDITY`.
     pub resets: usize,
     pub bodies: usize,
+    /// Operaciones de reglas de correo aplicadas sobre la bandeja de entrada.
+    pub rules_applied: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -676,6 +679,14 @@ where
         .with_store(account_id, move |s| s.upsert_mailboxes(&listings))
         .await?;
 
+    // El contexto que las reglas necesitan, resuelto una vez por vuelta: las
+    // casillas que existen (reusamos `names`) y la papelera, con el mismo
+    // criterio que `Reader::trash` pero sin su round IMAP extra.
+    let trash = listed
+        .iter()
+        .find(|m| m.role == mailboxes::MailboxRole::Trash && m.selectable)
+        .map(|m| m.path.clone());
+
     for (mailbox, listing) in boxes.iter().zip(listed.iter()) {
         let role = store_role(listing.role);
         match sync_mailbox(
@@ -686,6 +697,8 @@ where
             role,
             &mut report,
             smime,
+            &names,
+            trash.as_deref(),
         )
         .await
         {
@@ -717,6 +730,8 @@ async fn sync_mailbox<K, F>(
     role: MailboxRole,
     report: &mut EmailReport,
     smime: Option<&SmimeMaterial>,
+    known_mailboxes: &HashSet<String>,
+    trash: Option<&str>,
 ) -> Result<(), RoundError>
 where
     K: KeySource,
@@ -791,6 +806,21 @@ where
             .await?;
     }
 
+    // Las reglas de correo sólo corren sobre la bandeja de entrada, y se cargan
+    // una vez por vuelta —fuera del bucle de lotes—. Un problema para abrirlas o
+    // leerlas no corta la sync: se registra y la casilla se guarda igual.
+    let ruleset = if inbox {
+        match rules::RuleStore::open(rules::rules_dir()).and_then(|store| store.load(account_id)) {
+            Ok(ruleset) => Some(ruleset),
+            Err(e) => {
+                tracing::warn!("'{account_id}': no se pudieron cargar las reglas: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     for chunk in plan.new.chunks(HEADER_CHUNK) {
         let records = session
             .header_records(chunk)
@@ -804,6 +834,15 @@ where
         manager
             .with_store(account_id, move |s| s.apply_messages(ops, id))
             .await?;
+
+        // Guardar-primero-actuar-después: con las cabeceras ya en el almacén,
+        // se resuelve el plan de reglas (puro) y se ejecuta por IMAP. Una op que
+        // falla deja el mensaje en INBOX, a salvo, y no se reintenta.
+        if let Some(ruleset) = &ruleset {
+            let mail_ops =
+                rules::plan_ops(ruleset, now.uidvalidity, &records, known_mailboxes, trash);
+            execute_ops(session, &mail_ops, account_id, report).await?;
+        }
     }
 
     // Recién ahora: una vuelta cortada a la mitad no deja la casilla por al
@@ -816,6 +855,66 @@ where
 
     if inbox {
         prefetch_bodies(manager, account_id, session, id, report, smime).await?;
+    }
+    Ok(())
+}
+
+/// Ejecuta por IMAP el plan de operaciones que las reglas resolvieron sobre la
+/// bandeja de entrada.
+///
+/// `plan_ops` ya decidió todo —qué, en qué orden, con el destino ya validado— y
+/// esta función sólo lo lleva a cabo. Nada de re-decidir.
+///
+/// - Sin operaciones no se hace **nada**, ni siquiera el `SELECT`: así «mirar no
+///   escribe» se mantiene en el caso común. Con operaciones, un solo `SELECT`
+///   —`mark_read`/`flag`/`move_to` necesitan la casilla abierta para escribir,
+///   al revés del `EXAMINE` del resto de la sync—.
+/// - El destino de un movimiento va por `move_to`, que lo cita con `quoted()`:
+///   nunca se arma el comando a mano.
+/// - Una op que el servidor rechaza —destino borrado, mensaje que ya no está—
+///   se registra y se saltea, sin cortar las demás ni la vuelta. Un error de
+///   conexión sí corta. `OldCopyKept` se da por cumplido y no se reintenta:
+///   reintentar duplicaría el mensaje.
+/// - No se registran datos del mensaje (asunto, remitente): sólo la cuenta y el
+///   motivo, como el resto del módulo.
+async fn execute_ops<F>(
+    session: &mut Session<F>,
+    ops: &[rules::MailOp],
+    account_id: &str,
+    report: &mut EmailReport,
+) -> Result<(), RoundError>
+where
+    F: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    if ops.is_empty() {
+        return Ok(());
+    }
+    session.select("INBOX").await.map_err(RoundError::Imap)?;
+
+    for op in ops {
+        let result = match op {
+            rules::MailOp::MarkRead(uid) => session.mark_read(*uid).await.map(|()| None),
+            rules::MailOp::Flag(uid) => session.flag(*uid).await.map(|()| None),
+            rules::MailOp::MoveTo(uid, dest) => session.move_to(*uid, dest).await.map(Some),
+        };
+        match result {
+            Ok(outcome) => {
+                if matches!(outcome, Some(MoveOutcome::OldCopyKept)) {
+                    tracing::info!(
+                        "'{account_id}': regla movió un mensaje dejando la copia vieja marcada"
+                    );
+                }
+                report.rules_applied += 1;
+            }
+            // El servidor dijo que no a **este** comando (destino borrado, el
+            // mensaje ya no está): se saltea, el mensaje queda en INBOX.
+            Err(ImapError::Refused(detail)) | Err(ImapError::Rejected(detail)) => {
+                tracing::info!("'{account_id}': una regla no se pudo aplicar: {detail}");
+            }
+            // Corte, tiempo vencido, conexión desincronizada: la sesión ya no
+            // sirve, se corta la vuelta.
+            Err(e) => return Err(RoundError::Imap(e)),
+        }
     }
     Ok(())
 }
