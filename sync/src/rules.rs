@@ -652,6 +652,12 @@ pub const MAX_CONDITIONS_PER_RULE: usize = 100;
 pub const MAX_ACTIONS_PER_RULE: usize = 20;
 pub const MAX_CONDITION_VALUE_BYTES: usize = 1024;
 pub const MAX_RULE_NAME_BYTES: usize = 256;
+/// Tope del nombre de casilla destino de una acción `MoverA`.
+///
+/// Entra por el mismo contrato no confiable que el valor de una condición y el
+/// nombre de la regla, así que se acota igual. 256 bytes es holgado para
+/// cualquier ruta de casilla IMAP real (`INBOX/Proyectos/2026`, etc.).
+pub const MAX_FOLDER_NAME_BYTES: usize = 256;
 
 /// Interpreta el JSON de una regla que manda la ventana, como dato no confiable.
 ///
@@ -692,6 +698,14 @@ pub fn parse_rule(json: &str) -> Result<Rule, String> {
     if rule.name.len() > MAX_RULE_NAME_BYTES {
         return Err(format!(
             "el nombre de una regla no puede superar {MAX_RULE_NAME_BYTES} bytes"
+        ));
+    }
+    if rule.actions.iter().any(|a| match a {
+        Action::MoveToFolder(dest) => dest.len() > MAX_FOLDER_NAME_BYTES,
+        _ => false,
+    }) {
+        return Err(format!(
+            "el nombre de la casilla destino no puede superar {MAX_FOLDER_NAME_BYTES} bytes"
         ));
     }
     Ok(rule)
@@ -744,22 +758,34 @@ pub fn remove_rule(ruleset: &mut RuleSet, id: &str) -> Result<(), String> {
 /// Reordena las reglas según `ids` (el orden = prioridad). No toca la marca.
 ///
 /// `ids` tiene que ser **exactamente** el conjunto de ids actuales, sin faltar,
-/// sobrar ni repetir: un reordenamiento parcial perdería o duplicaría reglas. Un
-/// id repetido se detecta porque la segunda vez ya no está para reubicar.
+/// sobrar ni repetir: un reordenamiento parcial perdería o duplicaría reglas.
+///
+/// **Valida antes de mutar**: resuelve la posición de cada id y marca las usadas
+/// para rechazar repetidos, sin tocar `ruleset.rules` hasta estar seguro de que
+/// el reordenamiento no va a fallar. Así un `Err` deja el conjunto intacto, en vez
+/// de dejarlo a medio vaciar si un id posterior no existe.
 pub fn reorder_rules(ruleset: &mut RuleSet, ids: &[String]) -> Result<(), String> {
     if ids.len() != ruleset.rules.len() {
         return Err("la lista de ids no coincide con las reglas de la cuenta".into());
     }
-    let mut reordered = Vec::with_capacity(ids.len());
+    let mut used = vec![false; ruleset.rules.len()];
+    let mut positions = Vec::with_capacity(ids.len());
     for id in ids {
         let pos = ruleset
             .rules
             .iter()
             .position(|r| &r.id == id)
             .ok_or_else(|| format!("no hay una regla con id {id} para reordenar"))?;
-        reordered.push(ruleset.rules.remove(pos));
+        if std::mem::replace(&mut used[pos], true) {
+            return Err(format!("el id {id} aparece más de una vez"));
+        }
+        positions.push(pos);
     }
-    ruleset.rules = reordered;
+    // Validado el conjunto, recién ahora se arma el nuevo orden.
+    ruleset.rules = positions
+        .iter()
+        .map(|&p| ruleset.rules[p].clone())
+        .collect();
     Ok(())
 }
 

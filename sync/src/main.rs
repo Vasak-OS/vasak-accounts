@@ -270,6 +270,16 @@ struct Service {
     /// Sirven para reemplazar el anterior en vez de apilar: veinte mensajes que
     /// llegan juntos son un cartel que dice cuántos, no veinte carteles.
     shown_notifications: Arc<Mutex<notifications::ShownNotifications>>,
+    /// Serializa el ciclo leer-modificar-guardar del `RuleStore`.
+    ///
+    /// Los handlers de reglas (`create_rule`/`update_rule`/`delete_rule`/
+    /// `reorder_rules`) son `&self` y pueden correr concurrentes: sin este lock dos
+    /// llamadas cargan el mismo `RuleSet`, cada una guarda el suyo y la segunda pisa
+    /// el cambio de la primera (lost update), devolviendo éxito las dos. Cada handler
+    /// lo toma **antes de `load`** y lo suelta recién **después de `save`**. `Arc`
+    /// para que todos los clones del servicio compartan el mismo lock; `list_rules`
+    /// no lo toma porque sólo lee.
+    rules_lock: Arc<Mutex<()>>,
 }
 
 /// Un mensaje abierto, listo para mostrar.
@@ -1359,6 +1369,9 @@ impl Service {
         self.authorize_rules(header.sender().map(|s| s.as_str()), &address)
             .await?;
 
+        // Se mantiene todo el ciclo leer-modificar-guardar bajo el lock para que
+        // dos creaciones concurrentes no se pisen (ver `rules_lock`).
+        let _guard = self.rules_lock.lock().await;
         let store = rules::RuleStore::open(rules::rules_dir()).map_err(zbus::fdo::Error::Failed)?;
         let mut ruleset = store.load(&account_id).map_err(zbus::fdo::Error::Failed)?;
 
@@ -1392,6 +1405,7 @@ impl Service {
         self.authorize_rules(header.sender().map(|s| s.as_str()), &address)
             .await?;
 
+        let _guard = self.rules_lock.lock().await;
         let store = rules::RuleStore::open(rules::rules_dir()).map_err(zbus::fdo::Error::Failed)?;
         let mut ruleset = store.load(&account_id).map_err(zbus::fdo::Error::Failed)?;
         rules::replace_rule(&mut ruleset, rule).map_err(zbus::fdo::Error::Failed)?;
@@ -1415,6 +1429,7 @@ impl Service {
         self.authorize_rules(header.sender().map(|s| s.as_str()), &address)
             .await?;
 
+        let _guard = self.rules_lock.lock().await;
         let store = rules::RuleStore::open(rules::rules_dir()).map_err(zbus::fdo::Error::Failed)?;
         let mut ruleset = store.load(&account_id).map_err(zbus::fdo::Error::Failed)?;
         rules::remove_rule(&mut ruleset, &rule_id).map_err(zbus::fdo::Error::Failed)?;
@@ -1432,10 +1447,6 @@ impl Service {
         account_id: String,
         ids_json: String,
     ) -> zbus::fdo::Result<()> {
-        let ids: Vec<String> = serde_json::from_str(&ids_json).map_err(|e| {
-            zbus::fdo::Error::InvalidArgs(format!("no se pudo interpretar la lista de ids: {e}"))
-        })?;
-
         let address = self
             .account_address(&account_id)
             .await
@@ -1443,6 +1454,14 @@ impl Service {
         self.authorize_rules(header.sender().map(|s| s.as_str()), &address)
             .await?;
 
+        // La entrada se interpreta **después** de autorizar: un llamador sin
+        // permiso recibe `AccessDenied` sin que su `ids_json` se procese, igual que
+        // el resto de las mutaciones.
+        let ids: Vec<String> = serde_json::from_str(&ids_json).map_err(|e| {
+            zbus::fdo::Error::InvalidArgs(format!("no se pudo interpretar la lista de ids: {e}"))
+        })?;
+
+        let _guard = self.rules_lock.lock().await;
         let store = rules::RuleStore::open(rules::rules_dir()).map_err(zbus::fdo::Error::Failed)?;
         let mut ruleset = store.load(&account_id).map_err(zbus::fdo::Error::Failed)?;
         rules::reorder_rules(&mut ruleset, &ids).map_err(zbus::fdo::Error::Failed)?;
