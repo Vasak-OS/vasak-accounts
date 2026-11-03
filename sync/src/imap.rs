@@ -1427,6 +1427,17 @@ impl<F: AsyncRead + AsyncWrite + Unpin + Send> Session<F> {
             .await
     }
 
+    /// Marca un mensaje como destacado (`\Flagged`) en el servidor.
+    ///
+    /// El mismo mecanismo que `mark_read`, con otra bandera: `+FLAGS` pone
+    /// `\Flagged`. En el servidor y no sólo acá por el mismo motivo —la persona
+    /// lee en varios lados— y con la misma condición: la casilla tiene que estar
+    /// abierta con `SELECT`, no con `EXAMINE`.
+    pub async fn flag(&mut self, uid: u32) -> Result<(), ImapError> {
+        self.command(&format!("UID STORE {uid} +FLAGS (\\Flagged)"))
+            .await
+    }
+
     /// Crea una casilla, y **no falla si ya existía**.
     ///
     /// Es idempotente a propósito: quien la crea quiere que exista, no que exista
@@ -2790,6 +2801,22 @@ pub(crate) mod tests {
         let received = task.await.unwrap();
         assert!(
             received[0].ends_with(" UID STORE 7 -FLAGS (\\Seen)"),
+            "{}",
+            received[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn destacar_pone_la_bandera_flagged() {
+        let (mut session, task) = with_server(
+            "* OK listo",
+            vec![("UID STORE", vec!["{tag} OK completado"])],
+        );
+
+        session.flag(7).await.unwrap();
+        let received = task.await.unwrap();
+        assert!(
+            received[0].ends_with(" UID STORE 7 +FLAGS (\\Flagged)"),
             "{}",
             received[0]
         );
