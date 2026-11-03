@@ -506,3 +506,273 @@ fn valid_account_id(account_id: &str) -> Result<(), String> {
     validate_account_id(account_id)
         .map_err(|_| format!("el identificador de cuenta {account_id:?} no sirve como archivo"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cabeceras de un mensaje de prueba: de un banco, con asunto y adjunto.
+    fn headers_banco() -> Headers {
+        Headers::parse(
+            "From: Soporte <soporte@Banco.com>\r\n\
+             To: ana@ejemplo.org\r\n\
+             Cc: equipo@ejemplo.org\r\n\
+             Subject: Factura 123\r\n\
+             Reply-To: no-reply@banco.com\r\n\
+             List-Id: Avisos <avisos.banco.com>\r\n\
+             Content-Type: multipart/mixed; boundary=xyz\r\n",
+        )
+    }
+
+    /// Una condición suelta, sin negar.
+    fn cond(field: Field, test: Test, value: &str) -> Condition {
+        Condition {
+            field,
+            test,
+            value: value.to_string(),
+            negate: false,
+        }
+    }
+
+    /// Una regla con una sola condición y una sola acción de mover.
+    fn regla(id: &str, condition: Condition) -> Rule {
+        Rule {
+            id: id.to_string(),
+            name: String::new(),
+            enabled: true,
+            match_: Match {
+                op: MatchOp::All,
+                conditions: vec![condition],
+            },
+            actions: vec![Action::MoveToFolder("Destino".into())],
+            stop: false,
+        }
+    }
+
+    fn solo(account_id: &str, rules: Vec<Rule>) -> RuleSet {
+        RuleSet {
+            account_id: account_id.into(),
+            version: RULESET_VERSION,
+            rules,
+        }
+    }
+
+    // ── Evaluación ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn una_regla_sin_condiciones_no_coincide() {
+        let mut r = regla("1", cond(Field::Subject, Test::Contains, "x"));
+        r.match_.conditions.clear();
+        assert!(!matches(&r, &headers_banco(), 100));
+    }
+
+    #[test]
+    fn los_campos_de_texto_salen_de_las_cabeceras() {
+        let h = headers_banco();
+        assert!(matches(
+            &regla("", cond(Field::From, Test::Contains, "banco")),
+            &h,
+            0
+        ));
+        assert!(matches(
+            &regla("", cond(Field::To, Test::Equals, "ana@ejemplo.org")),
+            &h,
+            0
+        ));
+        assert!(matches(
+            &regla("", cond(Field::Cc, Test::Contains, "equipo")),
+            &h,
+            0
+        ));
+        assert!(matches(
+            &regla("", cond(Field::Subject, Test::StartsWith, "Factura")),
+            &h,
+            0
+        ));
+        assert!(matches(
+            &regla("", cond(Field::ReplyTo, Test::Contains, "no-reply")),
+            &h,
+            0
+        ));
+        assert!(matches(
+            &regla("", cond(Field::ListId, Test::Contains, "avisos")),
+            &h,
+            0
+        ));
+        assert!(!matches(
+            &regla("", cond(Field::Subject, Test::Equals, "otra cosa")),
+            &h,
+            0
+        ));
+    }
+
+    #[test]
+    fn el_texto_no_distingue_mayusculas() {
+        // La regla dice BANCO.COM y el From trae Banco.com.
+        let r = regla("", cond(Field::From, Test::Contains, "BANCO.COM"));
+        assert!(matches(&r, &headers_banco(), 0));
+    }
+
+    #[test]
+    fn op_todas_exige_todas_y_cualquiera_con_una_basta() {
+        let h = headers_banco();
+        let dos = |op| Rule {
+            match_: Match {
+                op,
+                conditions: vec![
+                    cond(Field::From, Test::Contains, "banco"),
+                    cond(Field::Subject, Test::Contains, "no-esta"),
+                ],
+            },
+            ..regla("", cond(Field::From, Test::Contains, "banco"))
+        };
+        // Una de dos: con Todas no alcanza, con Cualquiera sí.
+        assert!(!matches(&dos(MatchOp::All), &h, 0));
+        assert!(matches(&dos(MatchOp::Any), &h, 0));
+    }
+
+    #[test]
+    fn negar_invierte_la_condicion() {
+        let mut c = cond(Field::Subject, Test::Contains, "factura");
+        c.negate = true;
+        // El asunto SÍ contiene «factura», así que negada no coincide.
+        assert!(!matches(&regla("", c), &headers_banco(), 0));
+    }
+
+    #[test]
+    fn el_tamano_usa_mayor_y_menor_y_rechaza_lo_que_no_es_numero() {
+        let h = headers_banco();
+        assert!(matches(
+            &regla("", cond(Field::Size, Test::Gt, "1000")),
+            &h,
+            5000
+        ));
+        assert!(matches(
+            &regla("", cond(Field::Size, Test::Lt, "1000")),
+            &h,
+            500
+        ));
+        assert!(!matches(
+            &regla("", cond(Field::Size, Test::Gt, "1000")),
+            &h,
+            500
+        ));
+        // Un valor que no es número no coincide, en vez de mover todo.
+        assert!(!matches(
+            &regla("", cond(Field::Size, Test::Gt, "mucho")),
+            &h,
+            5000
+        ));
+        // Una prueba de texto sobre el tamaño no quiere decir nada.
+        assert!(!matches(
+            &regla("", cond(Field::Size, Test::Contains, "5000")),
+            &h,
+            5000
+        ));
+    }
+
+    #[test]
+    fn tiene_adjuntos_mira_el_content_type() {
+        let h = headers_banco(); // multipart/mixed → con adjuntos
+        assert!(matches(
+            &regla("", cond(Field::HasAttachment, Test::Equals, "si")),
+            &h,
+            0
+        ));
+        assert!(!matches(
+            &regla("", cond(Field::HasAttachment, Test::Equals, "no")),
+            &h,
+            0
+        ));
+        let sin = Headers::parse("Subject: Hola\r\nContent-Type: text/plain\r\n");
+        assert!(!matches(
+            &regla("", cond(Field::HasAttachment, Test::Equals, "si")),
+            &sin,
+            0
+        ));
+    }
+
+    #[test]
+    fn una_prueba_que_no_corresponde_al_campo_no_coincide() {
+        // Mayor sobre el asunto no significa nada.
+        assert!(!matches(
+            &regla("", cond(Field::Subject, Test::Gt, "A")),
+            &headers_banco(),
+            0
+        ));
+    }
+
+    #[test]
+    fn detener_corta_las_reglas_siguientes() {
+        let mut r1 = regla("1", cond(Field::From, Test::Contains, "banco"));
+        r1.stop = true;
+        r1.actions = vec![Action::MarkRead];
+        let r2 = regla("2", cond(Field::From, Test::Contains, "banco")); // también coincidiría
+        let acciones = actions_for(&solo("a", vec![r1, r2]), &headers_banco(), 0);
+        assert_eq!(acciones, vec![Action::MarkRead]);
+    }
+
+    #[test]
+    fn una_regla_apagada_no_se_evalua() {
+        let mut r = regla("1", cond(Field::From, Test::Contains, "banco"));
+        r.enabled = false;
+        assert!(actions_for(&solo("a", vec![r]), &headers_banco(), 0).is_empty());
+    }
+
+    #[test]
+    fn actions_for_junta_las_acciones_en_orden() {
+        let mut r1 = regla("1", cond(Field::From, Test::Contains, "banco"));
+        r1.actions = vec![Action::Flag];
+        let mut r2 = regla("2", cond(Field::Subject, Test::Contains, "factura"));
+        r2.actions = vec![Action::MarkRead, Action::MoveToFolder("Bancos".into())];
+        let acciones = actions_for(&solo("a", vec![r1, r2]), &headers_banco(), 0);
+        assert_eq!(
+            acciones,
+            vec![
+                Action::Flag,
+                Action::MarkRead,
+                Action::MoveToFolder("Bancos".into())
+            ]
+        );
+    }
+
+    // ── Almacén ─────────────────────────────────────────────────────────────
+
+    /// Una carpeta de servicio temporal con `rules/` adentro, lista para abrir.
+    fn temp_rules_dir() -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let app = std::env::temp_dir().join(format!(
+            "vasak-reglas-{unique}-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&app).unwrap();
+        app.join(RULES_DIR)
+    }
+
+    #[test]
+    fn guardar_y_leer_devuelve_las_mismas_reglas() {
+        let store = RuleStore::open(temp_rules_dir()).unwrap();
+        let rs = solo(
+            "ana",
+            vec![regla("1", cond(Field::From, Test::Contains, "banco"))],
+        );
+        store.save(&rs).unwrap();
+        assert_eq!(store.load("ana").unwrap(), rs);
+    }
+
+    #[test]
+    fn sin_archivo_las_reglas_estan_vacias() {
+        let store = RuleStore::open(temp_rules_dir()).unwrap();
+        assert_eq!(store.load("nadie").unwrap(), RuleSet::empty("nadie"));
+    }
+
+    #[test]
+    fn un_id_de_cuenta_invalido_no_toca_el_disco() {
+        let store = RuleStore::open(temp_rules_dir()).unwrap();
+        assert!(store.load("../otra").is_err());
+        assert!(store.save(&RuleSet::empty("../otra")).is_err());
+    }
+}
