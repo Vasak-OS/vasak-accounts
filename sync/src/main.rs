@@ -1307,6 +1307,118 @@ impl Service {
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
     }
 
+    // ── Reglas de correo (vasak-accounts#20, PR4) ───────────────────────────
+    //
+    // El CRUD de las reglas que se aplican a INBOX. La evaluación y la ejecución
+    // viven en `rules.rs`/`email_sync.rs` (PR3); acá sólo se editan y se guardan,
+    // una base JSON por cuenta (`RuleStore`), con una señal por cambio para que
+    // la ventana vuelva a leer.
+    //
+    // **Sin puerta de permiso, igual que `MoveMessage`/`SnoozeMessage` y el resto
+    // de `AccountsSync`**: es el servicio del usuario tocando la configuración del
+    // usuario por el bus de sesión. Pero a diferencia de mover un mensaje, esto
+    // escribe configuración que **después mueve correo sola**, en cada vuelta, así
+    // que es el candidato más fuerte de esta interfaz a gatear por `EMAIL_RESOURCE`
+    // (`access.rs`). Que `security` lo evalúe en ese marco.
+
+    /// Las reglas de correo de una cuenta, en JSON (el `RuleSet` entero: reglas,
+    /// versión y marca de agua).
+    async fn list_rules(&self, account_id: String) -> zbus::fdo::Result<String> {
+        let ruleset = rules::RuleStore::open(rules::rules_dir())
+            .and_then(|store| store.load(&account_id))
+            .map_err(zbus::fdo::Error::Failed)?;
+        serde_json::to_string(&ruleset)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
+    }
+
+    /// Agrega una regla al final y devuelve el id que se le asignó.
+    ///
+    /// **Al crear la primera regla fija la marca de agua** que impide el barrido
+    /// retroactivo: lee el borde de INBOX (`UIDVALIDITY` y el próximo UID) del
+    /// almacén y lo guarda en el `RuleSet`. Si INBOX todavía no se sincronizó no
+    /// hay un borde seguro, así que se **rechaza** en vez de crear una regla que
+    /// nunca actuaría (ver [`rules::ensure_watermark`]). La marca se fija una sola
+    /// vez; las reglas siguientes no la tocan.
+    ///
+    /// La `rule_json` es dato no confiable de la ventana: se rechaza si no parsea
+    /// o si no trae condiciones, y hay un tope de reglas por cuenta
+    /// ([`rules::MAX_RULES`]).
+    async fn create_rule(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        account_id: String,
+        rule_json: String,
+    ) -> zbus::fdo::Result<String> {
+        let rule = rules::parse_rule(&rule_json).map_err(zbus::fdo::Error::InvalidArgs)?;
+
+        let store = rules::RuleStore::open(rules::rules_dir()).map_err(zbus::fdo::Error::Failed)?;
+        let mut ruleset = store.load(&account_id).map_err(zbus::fdo::Error::Failed)?;
+
+        if ruleset.watermark.is_none() {
+            let inbox = store_api::inbox_token(&account_id)
+                .await
+                .map(|token| (token.uidvalidity, token.uid_next));
+            rules::ensure_watermark(&mut ruleset, inbox).map_err(zbus::fdo::Error::Failed)?;
+        }
+
+        let id = rules::add_rule(&mut ruleset, rule).map_err(zbus::fdo::Error::Failed)?;
+        store.save(&ruleset).map_err(zbus::fdo::Error::Failed)?;
+        let _ = Service::rules_changed(&emitter, &account_id).await;
+        Ok(id)
+    }
+
+    /// Reemplaza la regla con el id que trae `rule_json`. Falla si no existe.
+    async fn update_rule(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        account_id: String,
+        rule_json: String,
+    ) -> zbus::fdo::Result<()> {
+        let rule = rules::parse_rule(&rule_json).map_err(zbus::fdo::Error::InvalidArgs)?;
+
+        let store = rules::RuleStore::open(rules::rules_dir()).map_err(zbus::fdo::Error::Failed)?;
+        let mut ruleset = store.load(&account_id).map_err(zbus::fdo::Error::Failed)?;
+        rules::replace_rule(&mut ruleset, rule).map_err(zbus::fdo::Error::Failed)?;
+        store.save(&ruleset).map_err(zbus::fdo::Error::Failed)?;
+        let _ = Service::rules_changed(&emitter, &account_id).await;
+        Ok(())
+    }
+
+    /// Saca la regla con ese id. Falla si no existe.
+    async fn delete_rule(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        account_id: String,
+        rule_id: String,
+    ) -> zbus::fdo::Result<()> {
+        let store = rules::RuleStore::open(rules::rules_dir()).map_err(zbus::fdo::Error::Failed)?;
+        let mut ruleset = store.load(&account_id).map_err(zbus::fdo::Error::Failed)?;
+        rules::remove_rule(&mut ruleset, &rule_id).map_err(zbus::fdo::Error::Failed)?;
+        store.save(&ruleset).map_err(zbus::fdo::Error::Failed)?;
+        let _ = Service::rules_changed(&emitter, &account_id).await;
+        Ok(())
+    }
+
+    /// Reordena las reglas según la lista de ids en `ids_json` (el orden es la
+    /// prioridad). La lista tiene que ser exactamente los ids actuales.
+    async fn reorder_rules(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        account_id: String,
+        ids_json: String,
+    ) -> zbus::fdo::Result<()> {
+        let ids: Vec<String> = serde_json::from_str(&ids_json).map_err(|e| {
+            zbus::fdo::Error::InvalidArgs(format!("no se pudo interpretar la lista de ids: {e}"))
+        })?;
+
+        let store = rules::RuleStore::open(rules::rules_dir()).map_err(zbus::fdo::Error::Failed)?;
+        let mut ruleset = store.load(&account_id).map_err(zbus::fdo::Error::Failed)?;
+        rules::reorder_rules(&mut ruleset, &ids).map_err(zbus::fdo::Error::Failed)?;
+        store.save(&ruleset).map_err(zbus::fdo::Error::Failed)?;
+        let _ = Service::rules_changed(&emitter, &account_id).await;
+        Ok(())
+    }
+
     /// El texto de un mensaje.
     ///
     /// Se trae del servidor en el momento: guardar todos los cuerpos sería
@@ -1721,6 +1833,14 @@ impl Service {
     /// señales que se pueden perder.
     #[zbus(signal)]
     async fn mailbox_changed(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
+
+    /// Señal `RulesChanged(account_id)` — cambiaron las reglas de una cuenta.
+    ///
+    /// Lleva la cuenta porque la ventana edita las de una cuenta por vez; quien la
+    /// recibe para esa cuenta vuelve a leer con `ListRules` y ve el estado
+    /// completo, en vez de reconciliar señales que se pueden perder.
+    #[zbus(signal)]
+    async fn rules_changed(emitter: &SignalEmitter<'_>, account_id: &str) -> zbus::Result<()>;
 }
 
 /// Lo que necesita el servicio y no es un método de D-Bus.

@@ -106,6 +106,10 @@ impl RuleSet {
 /// Una regla: a qué mensajes mira y qué les hace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rule {
+    /// Lo asigna el servicio, no la ventana: al crear una regla el id que venga
+    /// se ignora y se pone uno nuevo. Por omisión vacío para poder interpretar
+    /// el JSON de una regla que todavía no lo tiene (ver [`parse_rule`]).
+    #[serde(default)]
     pub id: String,
     #[serde(default, rename = "nombre")]
     pub name: String,
@@ -616,6 +620,142 @@ impl RuleStore {
 fn valid_account_id(account_id: &str) -> Result<(), String> {
     validate_account_id(account_id)
         .map_err(|_| format!("el identificador de cuenta {account_id:?} no sirve como archivo"))
+}
+
+// ---------------------------------------------------------------------------
+// CRUD — mutaciones validadas, el cuerpo del contrato de D-Bus (PR 4)
+// ---------------------------------------------------------------------------
+
+/// Tope de reglas por cuenta.
+///
+/// Un número holgado para lo que arma una persona, y a la vez un techo a lo que
+/// la ventana puede empujar: cada regla se evalúa por cada mensaje de cada
+/// vuelta, así que una lista sin límite es un pie de denegación de servicio
+/// contra el propio sync. 100 alcanza de sobra; si hiciera falta más, se sube
+/// acá a conciencia.
+pub const MAX_RULES: usize = 100;
+
+/// Interpreta el JSON de una regla que manda la ventana, como dato no confiable.
+///
+/// Rechaza lo que no parsea y la regla sin condiciones: una regla vacía hoy
+/// coincide con nada (la evaluación la trata como no-coincide), pero guardarla
+/// no tiene sentido y confunde. **No** valida el destino de un `MoverA`: la
+/// ejecución ya saltea una casilla que no existe, y acá no se tiene la lista de
+/// casillas a mano sin una vuelta al servidor.
+pub fn parse_rule(json: &str) -> Result<Rule, String> {
+    let rule: Rule =
+        serde_json::from_str(json).map_err(|e| format!("no se pudo interpretar la regla: {e}"))?;
+    if rule.match_.conditions.is_empty() {
+        return Err("una regla necesita al menos una condición".into());
+    }
+    Ok(rule)
+}
+
+/// Agrega una regla al final y le asigna un id nuevo. Devuelve el id asignado.
+///
+/// El id es un UUID v4: estable (nunca cambia una vez puesto), único dentro de
+/// la cuenta y sin depender de un contador que haya que guardar ni reutilizar un
+/// id borrado —que colisionaría con una referencia vieja de la ventana—. El id
+/// que trajera `rule` se descarta. Rechaza si ya se llegó al [`MAX_RULES`].
+pub fn add_rule(ruleset: &mut RuleSet, mut rule: Rule) -> Result<String, String> {
+    if ruleset.rules.len() >= MAX_RULES {
+        return Err(format!(
+            "no se pueden tener más de {MAX_RULES} reglas en una cuenta"
+        ));
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    rule.id = id.clone();
+    ruleset.rules.push(rule);
+    Ok(id)
+}
+
+/// Reemplaza la regla que tiene el id de `rule`. Error si no existe: la ventana
+/// y el servicio quedaron desfasados, y avisar es mejor que crear una regla
+/// sorpresa. No toca la marca de agua (se fija una sola vez, al crear).
+pub fn replace_rule(ruleset: &mut RuleSet, rule: Rule) -> Result<(), String> {
+    if rule.id.is_empty() {
+        return Err("la regla a editar no trae id".into());
+    }
+    let slot = ruleset
+        .rules
+        .iter_mut()
+        .find(|r| r.id == rule.id)
+        .ok_or_else(|| format!("no hay una regla con id {}", rule.id))?;
+    *slot = rule;
+    Ok(())
+}
+
+/// Saca la regla con ese id. Error si no existe. No toca la marca de agua.
+pub fn remove_rule(ruleset: &mut RuleSet, id: &str) -> Result<(), String> {
+    let before = ruleset.rules.len();
+    ruleset.rules.retain(|r| r.id != id);
+    if ruleset.rules.len() == before {
+        return Err(format!("no hay una regla con id {id}"));
+    }
+    Ok(())
+}
+
+/// Reordena las reglas según `ids` (el orden = prioridad). No toca la marca.
+///
+/// `ids` tiene que ser **exactamente** el conjunto de ids actuales, sin faltar,
+/// sobrar ni repetir: un reordenamiento parcial perdería o duplicaría reglas. Un
+/// id repetido se detecta porque la segunda vez ya no está para reubicar.
+pub fn reorder_rules(ruleset: &mut RuleSet, ids: &[String]) -> Result<(), String> {
+    if ids.len() != ruleset.rules.len() {
+        return Err("la lista de ids no coincide con las reglas de la cuenta".into());
+    }
+    let mut reordered = Vec::with_capacity(ids.len());
+    for id in ids {
+        let pos = ruleset
+            .rules
+            .iter()
+            .position(|r| &r.id == id)
+            .ok_or_else(|| format!("no hay una regla con id {id} para reordenar"))?;
+        reordered.push(ruleset.rules.remove(pos));
+    }
+    ruleset.rules = reordered;
+    Ok(())
+}
+
+/// La marca de agua inicial a partir de lo que el almacén sabe de INBOX.
+///
+/// `uid_next` es el UID que el servidor le dará al próximo mensaje: desde ahí
+/// para adelante están los que llegan después de crear la primera regla, que es
+/// justo la ventana que las reglas pueden tocar sin barrer el backlog. Un
+/// `uid_from` de 0 barrería todo el backlog —lo marcó `security`—, así que si
+/// `uid_next` falta o es 0 no hay marca segura y se devuelve `None`.
+pub fn initial_watermark(uidvalidity: u32, uid_next: Option<u32>) -> Option<Watermark> {
+    match uid_next {
+        Some(uid_from) if uid_from >= 1 => Some(Watermark {
+            uidvalidity,
+            uid_from,
+        }),
+        _ => None,
+    }
+}
+
+/// Fija la marca de agua **la primera vez**, con el estado de INBOX que da el
+/// almacén (`uidvalidity` y `uid_next`, o `None` si INBOX no se sincronizó).
+///
+/// Si el conjunto ya tiene marca, no la toca: se fija una sola vez, al crear la
+/// primera regla; editar, borrar y reordenar nunca la cambian. Si hay que
+/// fijarla y no hay una marca segura, **rechaza**: una regla con marca `None`
+/// nunca actúa, y crear una regla inerte confunde más que pedir que se espere a
+/// que la bandeja de entrada termine de sincronizarse.
+pub fn ensure_watermark(
+    ruleset: &mut RuleSet,
+    inbox: Option<(u32, Option<u32>)>,
+) -> Result<(), String> {
+    if ruleset.watermark.is_some() {
+        return Ok(());
+    }
+    match inbox.and_then(|(uidvalidity, uid_next)| initial_watermark(uidvalidity, uid_next)) {
+        Some(watermark) => {
+            ruleset.watermark = Some(watermark);
+            Ok(())
+        }
+        None => Err("esperá a que se sincronice la bandeja de entrada para crear reglas".into()),
+    }
 }
 
 #[cfg(test)]
