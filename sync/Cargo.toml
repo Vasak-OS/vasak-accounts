@@ -57,6 +57,10 @@ rusqlite_migration = "2.6"
 zeroize = "1"
 # Los 32 bytes al azar de cada clave, del generador del sistema operativo.
 getrandom = "0.4"
+# El id de una regla de correo: un UUID v4, estable y único por cuenta, sin
+# contador que guardar ni ids borrados que reutilizar. Ya estaba en el candado
+# (lo usa el demonio), así que no suma crate nueva. Ver `rules::add_rule`.
+uuid = { version = "1", features = ["v4"] }
 # Borrar bajo `stores/` relativo a un descriptor abierto sin seguir enlaces
 # (`openat`, `unlinkat`), y el límite de volcados (`RLIMIT_CORE`) al arrancar. Ya estaba en el
 # candado por zbus —la misma versión y las mismas funciones—, así que no suma

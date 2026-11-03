@@ -106,6 +106,10 @@ impl RuleSet {
 /// Una regla: a qué mensajes mira y qué les hace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rule {
+    /// Lo asigna el servicio, no la ventana: al crear una regla el id que venga
+    /// se ignora y se pone uno nuevo. Por omisión vacío para poder interpretar
+    /// el JSON de una regla que todavía no lo tiene (ver [`parse_rule`]).
+    #[serde(default)]
     pub id: String,
     #[serde(default, rename = "nombre")]
     pub name: String,
@@ -359,7 +363,12 @@ pub enum MailOp {
 /// la misma encarnación, sólo lo que está en el UID de la marca o más nuevo.
 fn is_eligible(watermark: Option<Watermark>, now_uidvalidity: u32, uid: u32) -> bool {
     match watermark {
-        Some(w) => w.uidvalidity == now_uidvalidity && uid >= w.uid_from,
+        // `uid_from >= 1` como defensa en profundidad: `initial_watermark` nunca
+        // guarda 0, pero el archivo de reglas vive en el perfil del usuario y una
+        // app del mismo usuario podría escribir `uid_desde: 0`, que con `uid >= 0`
+        // barrería todo el backlog. La lectura mantiene el invariante pase lo que
+        // pase con la procedencia del archivo.
+        Some(w) => w.uidvalidity == now_uidvalidity && w.uid_from >= 1 && uid >= w.uid_from,
         None => false,
     }
 }
@@ -616,6 +625,209 @@ impl RuleStore {
 fn valid_account_id(account_id: &str) -> Result<(), String> {
     validate_account_id(account_id)
         .map_err(|_| format!("el identificador de cuenta {account_id:?} no sirve como archivo"))
+}
+
+// ---------------------------------------------------------------------------
+// CRUD — mutaciones validadas, el cuerpo del contrato de D-Bus (PR 4)
+// ---------------------------------------------------------------------------
+
+/// Tope de reglas por cuenta.
+///
+/// Un número holgado para lo que arma una persona, y a la vez un techo a lo que
+/// la ventana puede empujar: cada regla se evalúa por cada mensaje de cada
+/// vuelta, así que una lista sin límite es un pie de denegación de servicio
+/// contra el propio sync. 100 alcanza de sobra; si hiciera falta más, se sube
+/// acá a conciencia.
+pub const MAX_RULES: usize = 100;
+
+/// Topes por regla, además de [`MAX_RULES`], que sólo limita el conteo.
+///
+/// Cada condición se evalúa por cada mensaje de cada vuelta del sync, así que una
+/// regla gigante —miles de condiciones, o valores enormes— es una denegación de
+/// servicio **persistente** contra el propio sync: no un pico pasajero, sino un
+/// costo que se paga en cada vuelta mientras la regla exista. `MAX_RULES` topa
+/// cuántas reglas hay, no cuántos bytes pesa cada una; estos topan la regla.
+/// Números holgados para cualquier regla que arme una persona.
+pub const MAX_CONDITIONS_PER_RULE: usize = 100;
+pub const MAX_ACTIONS_PER_RULE: usize = 20;
+pub const MAX_CONDITION_VALUE_BYTES: usize = 1024;
+pub const MAX_RULE_NAME_BYTES: usize = 256;
+/// Tope del nombre de casilla destino de una acción `MoverA`.
+///
+/// Entra por el mismo contrato no confiable que el valor de una condición y el
+/// nombre de la regla, así que se acota igual. 256 bytes es holgado para
+/// cualquier ruta de casilla IMAP real (`INBOX/Proyectos/2026`, etc.).
+pub const MAX_FOLDER_NAME_BYTES: usize = 256;
+
+/// Interpreta el JSON de una regla que manda la ventana, como dato no confiable.
+///
+/// Rechaza lo que no parsea y la regla sin condiciones: una regla vacía hoy
+/// coincide con nada (la evaluación la trata como no-coincide), pero guardarla
+/// no tiene sentido y confunde. **No** valida el destino de un `MoverA`: la
+/// ejecución ya saltea una casilla que no existe, y acá no se tiene la lista de
+/// casillas a mano sin una vuelta al servidor.
+pub fn parse_rule(json: &str) -> Result<Rule, String> {
+    let rule: Rule =
+        serde_json::from_str(json).map_err(|e| format!("no se pudo interpretar la regla: {e}"))?;
+    if rule.match_.conditions.is_empty() {
+        return Err("una regla necesita al menos una condición".into());
+    }
+    // Topes por regla: una regla gigante es un DoS persistente del sync —cada
+    // condición se evalúa por mensaje por vuelta— y `MAX_RULES` sólo topa el
+    // conteo, no los bytes por regla (ver las constantes).
+    if rule.match_.conditions.len() > MAX_CONDITIONS_PER_RULE {
+        return Err(format!(
+            "una regla no puede tener más de {MAX_CONDITIONS_PER_RULE} condiciones"
+        ));
+    }
+    if rule.actions.len() > MAX_ACTIONS_PER_RULE {
+        return Err(format!(
+            "una regla no puede tener más de {MAX_ACTIONS_PER_RULE} acciones"
+        ));
+    }
+    if rule
+        .match_
+        .conditions
+        .iter()
+        .any(|c| c.value.len() > MAX_CONDITION_VALUE_BYTES)
+    {
+        return Err(format!(
+            "el valor de una condición no puede superar {MAX_CONDITION_VALUE_BYTES} bytes"
+        ));
+    }
+    if rule.name.len() > MAX_RULE_NAME_BYTES {
+        return Err(format!(
+            "el nombre de una regla no puede superar {MAX_RULE_NAME_BYTES} bytes"
+        ));
+    }
+    if rule.actions.iter().any(|a| match a {
+        Action::MoveToFolder(dest) => dest.len() > MAX_FOLDER_NAME_BYTES,
+        _ => false,
+    }) {
+        return Err(format!(
+            "el nombre de la casilla destino no puede superar {MAX_FOLDER_NAME_BYTES} bytes"
+        ));
+    }
+    Ok(rule)
+}
+
+/// Agrega una regla al final y le asigna un id nuevo. Devuelve el id asignado.
+///
+/// El id es un UUID v4: estable (nunca cambia una vez puesto), único dentro de
+/// la cuenta y sin depender de un contador que haya que guardar ni reutilizar un
+/// id borrado —que colisionaría con una referencia vieja de la ventana—. El id
+/// que trajera `rule` se descarta. Rechaza si ya se llegó al [`MAX_RULES`].
+pub fn add_rule(ruleset: &mut RuleSet, mut rule: Rule) -> Result<String, String> {
+    if ruleset.rules.len() >= MAX_RULES {
+        return Err(format!(
+            "no se pueden tener más de {MAX_RULES} reglas en una cuenta"
+        ));
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    rule.id = id.clone();
+    ruleset.rules.push(rule);
+    Ok(id)
+}
+
+/// Reemplaza la regla que tiene el id de `rule`. Error si no existe: la ventana
+/// y el servicio quedaron desfasados, y avisar es mejor que crear una regla
+/// sorpresa. No toca la marca de agua (se fija una sola vez, al crear).
+pub fn replace_rule(ruleset: &mut RuleSet, rule: Rule) -> Result<(), String> {
+    if rule.id.is_empty() {
+        return Err("la regla a editar no trae id".into());
+    }
+    let slot = ruleset
+        .rules
+        .iter_mut()
+        .find(|r| r.id == rule.id)
+        .ok_or_else(|| format!("no hay una regla con id {}", rule.id))?;
+    *slot = rule;
+    Ok(())
+}
+
+/// Saca la regla con ese id. Error si no existe. No toca la marca de agua.
+pub fn remove_rule(ruleset: &mut RuleSet, id: &str) -> Result<(), String> {
+    let before = ruleset.rules.len();
+    ruleset.rules.retain(|r| r.id != id);
+    if ruleset.rules.len() == before {
+        return Err(format!("no hay una regla con id {id}"));
+    }
+    Ok(())
+}
+
+/// Reordena las reglas según `ids` (el orden = prioridad). No toca la marca.
+///
+/// `ids` tiene que ser **exactamente** el conjunto de ids actuales, sin faltar,
+/// sobrar ni repetir: un reordenamiento parcial perdería o duplicaría reglas.
+///
+/// **Valida antes de mutar**: resuelve la posición de cada id y marca las usadas
+/// para rechazar repetidos, sin tocar `ruleset.rules` hasta estar seguro de que
+/// el reordenamiento no va a fallar. Así un `Err` deja el conjunto intacto, en vez
+/// de dejarlo a medio vaciar si un id posterior no existe.
+pub fn reorder_rules(ruleset: &mut RuleSet, ids: &[String]) -> Result<(), String> {
+    if ids.len() != ruleset.rules.len() {
+        return Err("la lista de ids no coincide con las reglas de la cuenta".into());
+    }
+    let mut used = vec![false; ruleset.rules.len()];
+    let mut positions = Vec::with_capacity(ids.len());
+    for id in ids {
+        let pos = ruleset
+            .rules
+            .iter()
+            .position(|r| &r.id == id)
+            .ok_or_else(|| format!("no hay una regla con id {id} para reordenar"))?;
+        if std::mem::replace(&mut used[pos], true) {
+            return Err(format!("el id {id} aparece más de una vez"));
+        }
+        positions.push(pos);
+    }
+    // Validado el conjunto, recién ahora se arma el nuevo orden.
+    ruleset.rules = positions
+        .iter()
+        .map(|&p| ruleset.rules[p].clone())
+        .collect();
+    Ok(())
+}
+
+/// La marca de agua inicial a partir de lo que el almacén sabe de INBOX.
+///
+/// `uid_next` es el UID que el servidor le dará al próximo mensaje: desde ahí
+/// para adelante están los que llegan después de crear la primera regla, que es
+/// justo la ventana que las reglas pueden tocar sin barrer el backlog. Un
+/// `uid_from` de 0 barrería todo el backlog —lo marcó `security`—, así que si
+/// `uid_next` falta o es 0 no hay marca segura y se devuelve `None`.
+pub fn initial_watermark(uidvalidity: u32, uid_next: Option<u32>) -> Option<Watermark> {
+    match uid_next {
+        Some(uid_from) if uid_from >= 1 => Some(Watermark {
+            uidvalidity,
+            uid_from,
+        }),
+        _ => None,
+    }
+}
+
+/// Fija la marca de agua **la primera vez**, con el estado de INBOX que da el
+/// almacén (`uidvalidity` y `uid_next`, o `None` si INBOX no se sincronizó).
+///
+/// Si el conjunto ya tiene marca, no la toca: se fija una sola vez, al crear la
+/// primera regla; editar, borrar y reordenar nunca la cambian. Si hay que
+/// fijarla y no hay una marca segura, **rechaza**: una regla con marca `None`
+/// nunca actúa, y crear una regla inerte confunde más que pedir que se espere a
+/// que la bandeja de entrada termine de sincronizarse.
+pub fn ensure_watermark(
+    ruleset: &mut RuleSet,
+    inbox: Option<(u32, Option<u32>)>,
+) -> Result<(), String> {
+    if ruleset.watermark.is_some() {
+        return Ok(());
+    }
+    match inbox.and_then(|(uidvalidity, uid_next)| initial_watermark(uidvalidity, uid_next)) {
+        Some(watermark) => {
+            ruleset.watermark = Some(watermark);
+            Ok(())
+        }
+        None => Err("esperá a que se sincronice la bandeja de entrada para crear reglas".into()),
+    }
 }
 
 #[cfg(test)]
@@ -972,7 +1184,7 @@ mod tests {
         // La regla las trae al revés (mover primero); la terminal va al final.
         let rs = con_marca(
             1,
-            0,
+            1,
             vec![Action::MoveToFolder("Bancos".into()), Action::Flag],
         );
         let ops = plan_ops(&rs, 1, &[rec(5, 0)], &casillas(&["Bancos"]), None);
@@ -986,7 +1198,7 @@ mod tests {
     fn de_dos_terminales_sale_solo_la_primera() {
         let rs = con_marca(
             1,
-            0,
+            1,
             vec![Action::MoveToFolder("Bancos".into()), Action::Delete],
         );
         let ops = plan_ops(
@@ -1001,7 +1213,7 @@ mod tests {
 
     #[test]
     fn borrar_es_a_la_papelera_y_sin_papelera_se_saltea() {
-        let rs = con_marca(1, 0, vec![Action::Delete]);
+        let rs = con_marca(1, 1, vec![Action::Delete]);
         // Con papelera: borrar = mover a ella.
         let ops = plan_ops(&rs, 1, &[rec(5, 0)], &casillas(&[]), Some("Papelera"));
         assert_eq!(ops, vec![MailOp::MoveTo(5, "Papelera".into())]);
@@ -1012,16 +1224,213 @@ mod tests {
 
     #[test]
     fn mover_a_una_casilla_desconocida_o_a_inbox_se_saltea() {
-        let rs = con_marca(1, 0, vec![Action::MoveToFolder("NoExiste".into())]);
+        let rs = con_marca(1, 1, vec![Action::MoveToFolder("NoExiste".into())]);
         assert!(plan_ops(&rs, 1, &[rec(5, 0)], &casillas(&["Bancos"]), None).is_empty());
-        let rs = con_marca(1, 0, vec![Action::MoveToFolder("inbox".into())]);
+        let rs = con_marca(1, 1, vec![Action::MoveToFolder("inbox".into())]);
         assert!(plan_ops(&rs, 1, &[rec(5, 0)], &casillas(&["Bancos"]), None).is_empty());
     }
 
     #[test]
     fn marcar_leido_y_destacar_son_las_dos_en_sitio() {
-        let rs = con_marca(1, 0, vec![Action::MarkRead, Action::Flag]);
+        let rs = con_marca(1, 1, vec![Action::MarkRead, Action::Flag]);
         let ops = plan_ops(&rs, 1, &[rec(5, 0)], &casillas(&[]), None);
         assert_eq!(ops, vec![MailOp::MarkRead(5), MailOp::Flag(5)]);
+    }
+
+    #[test]
+    fn un_watermark_con_uid_desde_cero_no_barre_nada() {
+        // El CRUD nunca escribe uid_from=0, pero un archivo del perfil del usuario
+        // podría traerlo; el piso de is_eligible lo trata como no elegible en vez
+        // de dejar pasar todo el backlog (uid >= 0 sería siempre verdadero).
+        let rs = con_marca(1, 0, vec![Action::MoveToFolder("Bancos".into())]);
+        assert!(plan_ops(&rs, 1, &[rec(5, 0)], &casillas(&["Bancos"]), None).is_empty());
+    }
+
+    // ── CRUD y marca de agua ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_rule_rechaza_lo_que_no_sirve_y_acepta_lo_valido() {
+        assert!(parse_rule("no es json").is_err());
+        // Una regla sin condiciones no se guarda.
+        let vacia = serde_json::to_string(&Rule {
+            match_: Match {
+                op: MatchOp::All,
+                conditions: vec![],
+            },
+            ..regla("x", cond(Field::From, Test::Contains, "banco"))
+        })
+        .unwrap();
+        assert!(parse_rule(&vacia).is_err());
+        let buena =
+            serde_json::to_string(&regla("x", cond(Field::From, Test::Contains, "banco"))).unwrap();
+        assert!(parse_rule(&buena).is_ok());
+    }
+
+    #[test]
+    fn add_rule_asigna_un_id_propio_y_respeta_el_tope() {
+        let mut rs = RuleSet::empty("a");
+        let id = add_rule(
+            &mut rs,
+            regla("ignorame", cond(Field::From, Test::Contains, "x")),
+        )
+        .unwrap();
+        assert!(!id.is_empty());
+        assert_ne!(id, "ignorame", "el id que trae la regla se descarta");
+        assert_eq!(rs.rules.len(), 1);
+        assert_eq!(rs.rules[0].id, id);
+        // Lleno hasta el tope y la siguiente se rechaza.
+        while rs.rules.len() < MAX_RULES {
+            add_rule(&mut rs, regla("", cond(Field::From, Test::Contains, "x"))).unwrap();
+        }
+        assert!(add_rule(&mut rs, regla("", cond(Field::From, Test::Contains, "x"))).is_err());
+    }
+
+    #[test]
+    fn replace_y_remove_por_id() {
+        let mut rs = RuleSet::empty("a");
+        let id = add_rule(
+            &mut rs,
+            regla("", cond(Field::Subject, Test::Contains, "a")),
+        )
+        .unwrap();
+        let mut editada = regla("", cond(Field::Subject, Test::Contains, "b"));
+        editada.id = id.clone();
+        replace_rule(&mut rs, editada).unwrap();
+        assert_eq!(rs.rules[0].match_.conditions[0].value, "b");
+        // Id inexistente o vacío → error.
+        assert!(replace_rule(
+            &mut rs,
+            regla("noexiste", cond(Field::Subject, Test::Contains, "c"))
+        )
+        .is_err());
+        assert!(remove_rule(&mut rs, "noexiste").is_err());
+        remove_rule(&mut rs, &id).unwrap();
+        assert!(rs.rules.is_empty());
+    }
+
+    #[test]
+    fn reorder_exige_el_mismo_conjunto() {
+        let mut rs = RuleSet::empty("a");
+        let a = add_rule(&mut rs, regla("", cond(Field::From, Test::Contains, "a"))).unwrap();
+        let b = add_rule(&mut rs, regla("", cond(Field::From, Test::Contains, "b"))).unwrap();
+        reorder_rules(&mut rs, &[b.clone(), a.clone()]).unwrap();
+        assert_eq!(rs.rules[0].id, b);
+        assert_eq!(rs.rules[1].id, a);
+        // Faltante, sobrante o repetido → error, sin tocar las reglas.
+        assert!(reorder_rules(&mut rs, &[a.clone()]).is_err());
+        assert!(reorder_rules(&mut rs, &[a.clone(), a.clone()]).is_err());
+        assert!(reorder_rules(&mut rs, &[a, b, "extra".into()]).is_err());
+    }
+
+    #[test]
+    fn un_reorder_rechazado_deja_las_reglas_intactas() {
+        // Largo correcto pero con un id que no existe: pasa el chequeo de cantidad
+        // y antes validaba a mitad del bucle, dejando el ruleset a medio vaciar.
+        let mut rs = RuleSet::empty("a");
+        let a = add_rule(&mut rs, regla("", cond(Field::From, Test::Contains, "a"))).unwrap();
+        let b = add_rule(&mut rs, regla("", cond(Field::From, Test::Contains, "b"))).unwrap();
+        let antes: Vec<String> = rs.rules.iter().map(|r| r.id.clone()).collect();
+        assert!(reorder_rules(&mut rs, &[a, "noexiste".into()]).is_err());
+        let despues: Vec<String> = rs.rules.iter().map(|r| r.id.clone()).collect();
+        assert_eq!(antes, despues, "un reorder fallido no toca las reglas");
+        assert_eq!(despues, vec![/*a*/ antes[0].clone(), /*b*/ b]);
+    }
+
+    #[test]
+    fn parse_rule_topa_el_nombre_de_la_casilla_destino() {
+        let con_destino = |n: usize| {
+            let mut r = regla("x", cond(Field::From, Test::Contains, "x"));
+            r.actions = vec![Action::MoveToFolder("a".repeat(n))];
+            serde_json::to_string(&r).unwrap()
+        };
+        assert!(parse_rule(&con_destino(MAX_FOLDER_NAME_BYTES)).is_ok());
+        assert!(parse_rule(&con_destino(MAX_FOLDER_NAME_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn initial_watermark_exige_uid_desde_uno() {
+        assert_eq!(
+            initial_watermark(7, Some(100)),
+            Some(Watermark {
+                uidvalidity: 7,
+                uid_from: 100
+            })
+        );
+        // uid_next ausente o 0 → sin marca segura (un 0 barrería el backlog).
+        assert_eq!(initial_watermark(7, None), None);
+        assert_eq!(initial_watermark(7, Some(0)), None);
+    }
+
+    #[test]
+    fn parse_rule_topa_cada_regla() {
+        // Una sola regla gigante esquivaría MAX_RULES (que topa el conteo) y sería
+        // DoS persistente del sync: cada condición se evalúa por mensaje por vuelta.
+        let con_condiciones = |n: usize| {
+            serde_json::to_string(&Rule {
+                match_: Match {
+                    op: MatchOp::All,
+                    conditions: vec![cond(Field::From, Test::Contains, "x"); n],
+                },
+                ..regla("x", cond(Field::From, Test::Contains, "x"))
+            })
+            .unwrap()
+        };
+        assert!(parse_rule(&con_condiciones(MAX_CONDITIONS_PER_RULE)).is_ok());
+        assert!(parse_rule(&con_condiciones(MAX_CONDITIONS_PER_RULE + 1)).is_err());
+
+        let con_acciones = |n: usize| {
+            serde_json::to_string(&Rule {
+                actions: vec![Action::MarkRead; n],
+                ..regla("x", cond(Field::From, Test::Contains, "x"))
+            })
+            .unwrap()
+        };
+        assert!(parse_rule(&con_acciones(MAX_ACTIONS_PER_RULE)).is_ok());
+        assert!(parse_rule(&con_acciones(MAX_ACTIONS_PER_RULE + 1)).is_err());
+
+        let con_valor = |n: usize| {
+            serde_json::to_string(&regla(
+                "x",
+                cond(Field::From, Test::Contains, &"a".repeat(n)),
+            ))
+            .unwrap()
+        };
+        assert!(parse_rule(&con_valor(MAX_CONDITION_VALUE_BYTES)).is_ok());
+        assert!(parse_rule(&con_valor(MAX_CONDITION_VALUE_BYTES + 1)).is_err());
+
+        let con_nombre = |n: usize| {
+            let mut r = regla("x", cond(Field::From, Test::Contains, "x"));
+            r.name = "a".repeat(n);
+            serde_json::to_string(&r).unwrap()
+        };
+        assert!(parse_rule(&con_nombre(MAX_RULE_NAME_BYTES)).is_ok());
+        assert!(parse_rule(&con_nombre(MAX_RULE_NAME_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn ensure_watermark_fija_una_vez_y_rechaza_sin_inbox() {
+        // Sin INBOX sincronizada → rechaza (no crea una regla inerte).
+        let mut rs = RuleSet::empty("a");
+        assert!(ensure_watermark(&mut rs, None).is_err());
+        assert!(ensure_watermark(&mut rs, Some((7, Some(0)))).is_err());
+        assert_eq!(rs.watermark, None);
+        // Con estado bueno → la fija.
+        ensure_watermark(&mut rs, Some((7, Some(100)))).unwrap();
+        assert_eq!(
+            rs.watermark,
+            Some(Watermark {
+                uidvalidity: 7,
+                uid_from: 100
+            })
+        );
+        // Ya fijada → no la toca, aunque INBOX haya cambiado.
+        ensure_watermark(&mut rs, Some((9, Some(500)))).unwrap();
+        assert_eq!(
+            rs.watermark,
+            Some(Watermark {
+                uidvalidity: 7,
+                uid_from: 100
+            })
+        );
     }
 }

@@ -270,6 +270,16 @@ struct Service {
     /// Sirven para reemplazar el anterior en vez de apilar: veinte mensajes que
     /// llegan juntos son un cartel que dice cuántos, no veinte carteles.
     shown_notifications: Arc<Mutex<notifications::ShownNotifications>>,
+    /// Serializa el ciclo leer-modificar-guardar del `RuleStore`.
+    ///
+    /// Los handlers de reglas (`create_rule`/`update_rule`/`delete_rule`/
+    /// `reorder_rules`) son `&self` y pueden correr concurrentes: sin este lock dos
+    /// llamadas cargan el mismo `RuleSet`, cada una guarda el suyo y la segunda pisa
+    /// el cambio de la primera (lost update), devolviendo éxito las dos. Cada handler
+    /// lo toma **antes de `load`** y lo suelta recién **después de `save`**. `Arc`
+    /// para que todos los clones del servicio compartan el mismo lock; `list_rules`
+    /// no lo toma porque sólo lee.
+    rules_lock: Arc<Mutex<()>>,
 }
 
 /// Un mensaje abierto, listo para mostrar.
@@ -1307,6 +1317,136 @@ impl Service {
             .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
     }
 
+    // ── Reglas de correo (vasak-accounts#20, PR4) ───────────────────────────
+    //
+    // El CRUD de las reglas que se aplican a INBOX. La evaluación y la ejecución
+    // viven en `rules.rs`/`email_sync.rs` (PR3); acá sólo se editan y se guardan,
+    // una base JSON por cuenta (`RuleStore`), con una señal por cambio para que
+    // la ventana vuelva a leer.
+    //
+    // **Sin puerta de permiso, igual que `MoveMessage`/`SnoozeMessage` y el resto
+    // de `AccountsSync`**: es el servicio del usuario tocando la configuración del
+    // usuario por el bus de sesión. Pero a diferencia de mover un mensaje, esto
+    // escribe configuración que **después mueve correo sola**, en cada vuelta, así
+    // que es el candidato más fuerte de esta interfaz a gatear por `EMAIL_RESOURCE`
+    // (`access.rs`). Que `security` lo evalúe en ese marco.
+
+    /// Las reglas de correo de una cuenta, en JSON (el `RuleSet` entero: reglas,
+    /// versión y marca de agua).
+    async fn list_rules(&self, account_id: String) -> zbus::fdo::Result<String> {
+        let ruleset = rules::RuleStore::open(rules::rules_dir())
+            .and_then(|store| store.load(&account_id))
+            .map_err(zbus::fdo::Error::Failed)?;
+        serde_json::to_string(&ruleset)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo serializar: {e}")))
+    }
+
+    /// Agrega una regla al final y devuelve el id que se le asignó.
+    ///
+    /// **Al crear la primera regla fija la marca de agua** que impide el barrido
+    /// retroactivo: lee el borde de INBOX (`UIDVALIDITY` y el próximo UID) del
+    /// almacén y lo guarda en el `RuleSet`. Si INBOX todavía no se sincronizó no
+    /// hay un borde seguro, así que se **rechaza** en vez de crear una regla que
+    /// nunca actuaría (ver [`rules::ensure_watermark`]). La marca se fija una sola
+    /// vez; las reglas siguientes no la tocan.
+    ///
+    /// La `rule_json` es dato no confiable de la ventana: se rechaza si no parsea
+    /// o si no trae condiciones, y hay un tope de reglas por cuenta
+    /// ([`rules::MAX_RULES`]).
+    async fn create_rule(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        account_id: String,
+        rule_json: String,
+    ) -> zbus::fdo::Result<String> {
+        let rule = rules::parse_rule(&rule_json).map_err(zbus::fdo::Error::InvalidArgs)?;
+
+        // La marca de agua necesita el borde de INBOX, una lectura async que no
+        // entra en el closure sync del helper: se resuelve acá y se captura.
+        // `ensure_watermark` es idempotente (no hace nada si ya hay marca), así que
+        // resolver el borde siempre no cambia lo que se guarda.
+        let inbox = store_api::inbox_token(&account_id)
+            .await
+            .map(|token| (token.uidvalidity, token.uid_next));
+
+        self.with_rules(
+            &emitter,
+            header.sender().map(|s| s.as_str()),
+            &account_id,
+            move |ruleset| {
+                rules::ensure_watermark(ruleset, inbox).map_err(zbus::fdo::Error::Failed)?;
+                rules::add_rule(ruleset, rule).map_err(zbus::fdo::Error::Failed)
+            },
+        )
+        .await
+    }
+
+    /// Reemplaza la regla con el id que trae `rule_json`. Falla si no existe.
+    async fn update_rule(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        account_id: String,
+        rule_json: String,
+    ) -> zbus::fdo::Result<()> {
+        let rule = rules::parse_rule(&rule_json).map_err(zbus::fdo::Error::InvalidArgs)?;
+
+        self.with_rules(
+            &emitter,
+            header.sender().map(|s| s.as_str()),
+            &account_id,
+            move |ruleset| rules::replace_rule(ruleset, rule).map_err(zbus::fdo::Error::Failed),
+        )
+        .await
+    }
+
+    /// Saca la regla con ese id. Falla si no existe.
+    async fn delete_rule(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        account_id: String,
+        rule_id: String,
+    ) -> zbus::fdo::Result<()> {
+        self.with_rules(
+            &emitter,
+            header.sender().map(|s| s.as_str()),
+            &account_id,
+            move |ruleset| rules::remove_rule(ruleset, &rule_id).map_err(zbus::fdo::Error::Failed),
+        )
+        .await
+    }
+
+    /// Reordena las reglas según la lista de ids en `ids_json` (el orden es la
+    /// prioridad). La lista tiene que ser exactamente los ids actuales.
+    async fn reorder_rules(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        account_id: String,
+        ids_json: String,
+    ) -> zbus::fdo::Result<()> {
+        // El closure corre **después** de autorizar (dentro del helper, tras
+        // `authorize_rules`), así que interpretar `ids_json` ahí mantiene que un
+        // llamador sin permiso reciba `AccessDenied` sin que su entrada se procese,
+        // igual que el resto de las mutaciones. Un `ids_json` malo da `InvalidArgs`.
+        self.with_rules(
+            &emitter,
+            header.sender().map(|s| s.as_str()),
+            &account_id,
+            move |ruleset| {
+                let ids: Vec<String> = serde_json::from_str(&ids_json).map_err(|e| {
+                    zbus::fdo::Error::InvalidArgs(format!(
+                        "no se pudo interpretar la lista de ids: {e}"
+                    ))
+                })?;
+                rules::reorder_rules(ruleset, &ids).map_err(zbus::fdo::Error::Failed)
+            },
+        )
+        .await
+    }
+
     /// El texto de un mensaje.
     ///
     /// Se trae del servidor en el momento: guardar todos los cuerpos sería
@@ -1721,6 +1861,14 @@ impl Service {
     /// señales que se pueden perder.
     #[zbus(signal)]
     async fn mailbox_changed(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
+
+    /// Señal `RulesChanged(account_id)` — cambiaron las reglas de una cuenta.
+    ///
+    /// Lleva la cuenta porque la ventana edita las de una cuenta por vez; quien la
+    /// recibe para esa cuenta vuelve a leer con `ListRules` y ve el estado
+    /// completo, en vez de reconciliar señales que se pueden perder.
+    #[zbus(signal)]
+    async fn rules_changed(emitter: &SignalEmitter<'_>, account_id: &str) -> zbus::Result<()>;
 }
 
 /// Lo que necesita el servicio y no es un método de D-Bus.
@@ -1790,6 +1938,74 @@ impl Service {
                 Err(SmimeIpcError::AccessDenied)
             }
         }
+    }
+
+    /// Autoriza una **escritura** de reglas de correo: el permiso `store.email`
+    /// de `sender` sobre la cuenta cuya dirección es `address` (que va al diálogo
+    /// del servicio de permisos). Es el mismo molde que [`Service::authorize_smime`],
+    /// para las cuatro escrituras de reglas (`CreateRule`/`UpdateRule`/`DeleteRule`/
+    /// `ReorderRules`): a diferencia de mover un mensaje, estas guardan
+    /// configuración que **después mueve correo sola** en cada vuelta del sync, así
+    /// que son el candidato más fuerte de esta interfaz a gatear. `ListRules` queda
+    /// sin puerta: es lectura, consistente con el resto de `AccountsSync`.
+    ///
+    /// Reusa `EMAIL_RESOURCE` a propósito (decisión de `#135`), el mismo recurso de
+    /// S/MIME y del almacén. Falla cerrado: sin `Access` configurado, sin permiso, o
+    /// si no se pudo preguntar, devuelve `AccessDenied` sin filtrar el motivo a la
+    /// ventana (sólo al diario). Devuelve `zbus::fdo::Error` —no `SmimeIpcError`—
+    /// porque los cuatro métodos de reglas contestan `zbus::fdo::Result`.
+    async fn authorize_rules(&self, sender: Option<&str>, address: &str) -> zbus::fdo::Result<()> {
+        let Some(access) = self.access.as_ref() else {
+            return Err(zbus::fdo::Error::AccessDenied(
+                "sin permiso sobre la cuenta".into(),
+            ));
+        };
+        match access.check(sender, access::EMAIL_RESOURCE, address).await {
+            access::Verdict::Allowed => Ok(()),
+            access::Verdict::Denied => Err(zbus::fdo::Error::AccessDenied(
+                "sin permiso sobre la cuenta".into(),
+            )),
+            access::Verdict::Failed(reason) => {
+                tracing::warn!("no se pudo autorizar la escritura de reglas: {reason}");
+                Err(zbus::fdo::Error::AccessDenied(
+                    "sin permiso sobre la cuenta".into(),
+                ))
+            }
+        }
+    }
+
+    /// Andamiaje compartido por los cuatro handlers de escritura de reglas
+    /// (`create_rule`/`update_rule`/`delete_rule`/`reorder_rules`): resuelve la
+    /// dirección de la cuenta, **autoriza antes de tocar el store**, y corre el
+    /// ciclo leer-modificar-guardar bajo `rules_lock` emitiendo `RulesChanged` al
+    /// final. `f` recibe el `RuleSet` cargado, lo muta y devuelve el resultado del
+    /// handler; corre **después de autorizar** y bajo el lock, así que interpretar
+    /// entrada no confiable ahí dentro (p. ej. los ids de `reorder`) sigue
+    /// respetando «después de autorizar». Devuelve `zbus::fdo::Result` para que `f`
+    /// elija el código de error (`InvalidArgs` para JSON malo, `Failed` para el
+    /// store), igual que antes de deduplicar.
+    async fn with_rules<T>(
+        &self,
+        emitter: &SignalEmitter<'_>,
+        sender: Option<&str>,
+        account_id: &str,
+        f: impl FnOnce(&mut rules::RuleSet) -> zbus::fdo::Result<T>,
+    ) -> zbus::fdo::Result<T> {
+        let address = self
+            .account_address(account_id)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        self.authorize_rules(sender, &address).await?;
+
+        // Todo el ciclo leer-modificar-guardar bajo el lock para que dos
+        // mutaciones concurrentes no se pisen (ver `rules_lock`).
+        let _guard = self.rules_lock.lock().await;
+        let store = rules::RuleStore::open(rules::rules_dir()).map_err(zbus::fdo::Error::Failed)?;
+        let mut ruleset = store.load(account_id).map_err(zbus::fdo::Error::Failed)?;
+        let out = f(&mut ruleset)?;
+        store.save(&ruleset).map_err(zbus::fdo::Error::Failed)?;
+        let _ = Service::rules_changed(emitter, account_id).await;
+        Ok(out)
     }
 
     /// Devuelve un pospuesto a su casilla de origen por IMAP. Lo comparten el

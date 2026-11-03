@@ -57,7 +57,7 @@ use crate::calendar_sync::{CalendarScheduler, CalendarSync, CALENDAR_TICK};
 use crate::contacts_sync::{ContactsScheduler, ContactsSync, CONTACTS_TICK};
 use crate::dav::webdav::{HttpPolicy, Limits};
 use crate::dav_sync::BrokerCredentials;
-use crate::email_sync::{EmailScheduler, EmailSync, EMAIL_TICK};
+use crate::email_sync::{EmailScheduler, EmailSync, MailboxToken, EMAIL_TICK};
 use crate::ical::recurrence::ExpansionLimits;
 use crate::reminders;
 use crate::serialize::ical::{DateSpec, EventPatch, SerializeError, TaskPatch, TodoStatus};
@@ -199,6 +199,32 @@ pub async fn store_forget(account_id: &str, mailbox: &str, uid: u32) {
     {
         tracing::debug!("'{account_id}': no se reflejó el movimiento en el almacén: {e}");
     }
+}
+
+/// El estado guardado de INBOX de una cuenta, decodificado.
+///
+/// `None` si la cuenta no tiene almacén, si INBOX todavía no se sincronizó, o si
+/// el token guardado no se entiende. Lo usa `CreateRule` para fijar la marca de
+/// agua de las reglas en el borde de lo ya sincronizado (ver
+/// [`crate::rules::ensure_watermark`]).
+pub async fn inbox_token(account_id: &str) -> Option<MailboxToken> {
+    match LIVE_STORE.get() {
+        Some(manager) => inbox_token_in(manager, account_id).await,
+        None => None,
+    }
+}
+
+/// El cuerpo de [`inbox_token`] sobre un almacén dado: la costura para probarlo
+/// con un `StoreManager` de prueba sin pasar por [`LIVE_STORE`].
+pub(crate) async fn inbox_token_in<K: KeySource>(
+    manager: &StoreManager<K>,
+    account_id: &str,
+) -> Option<MailboxToken> {
+    let modseq = manager
+        .with_store(account_id, |store| store.mailbox_modseq("INBOX"))
+        .await
+        .ok()??;
+    MailboxToken::decode(&modseq)
 }
 
 /// Un error de lectura del almacén que no es «cerrado» ni «bloqueado»: esos dos
