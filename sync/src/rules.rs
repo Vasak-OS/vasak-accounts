@@ -363,7 +363,12 @@ pub enum MailOp {
 /// la misma encarnación, sólo lo que está en el UID de la marca o más nuevo.
 fn is_eligible(watermark: Option<Watermark>, now_uidvalidity: u32, uid: u32) -> bool {
     match watermark {
-        Some(w) => w.uidvalidity == now_uidvalidity && uid >= w.uid_from,
+        // `uid_from >= 1` como defensa en profundidad: `initial_watermark` nunca
+        // guarda 0, pero el archivo de reglas vive en el perfil del usuario y una
+        // app del mismo usuario podría escribir `uid_desde: 0`, que con `uid >= 0`
+        // barrería todo el backlog. La lectura mantiene el invariante pase lo que
+        // pase con la procedencia del archivo.
+        Some(w) => w.uidvalidity == now_uidvalidity && w.uid_from >= 1 && uid >= w.uid_from,
         None => false,
     }
 }
@@ -635,6 +640,19 @@ fn valid_account_id(account_id: &str) -> Result<(), String> {
 /// acá a conciencia.
 pub const MAX_RULES: usize = 100;
 
+/// Topes por regla, además de [`MAX_RULES`], que sólo limita el conteo.
+///
+/// Cada condición se evalúa por cada mensaje de cada vuelta del sync, así que una
+/// regla gigante —miles de condiciones, o valores enormes— es una denegación de
+/// servicio **persistente** contra el propio sync: no un pico pasajero, sino un
+/// costo que se paga en cada vuelta mientras la regla exista. `MAX_RULES` topa
+/// cuántas reglas hay, no cuántos bytes pesa cada una; estos topan la regla.
+/// Números holgados para cualquier regla que arme una persona.
+pub const MAX_CONDITIONS_PER_RULE: usize = 100;
+pub const MAX_ACTIONS_PER_RULE: usize = 20;
+pub const MAX_CONDITION_VALUE_BYTES: usize = 1024;
+pub const MAX_RULE_NAME_BYTES: usize = 256;
+
 /// Interpreta el JSON de una regla que manda la ventana, como dato no confiable.
 ///
 /// Rechaza lo que no parsea y la regla sin condiciones: una regla vacía hoy
@@ -647,6 +665,34 @@ pub fn parse_rule(json: &str) -> Result<Rule, String> {
         serde_json::from_str(json).map_err(|e| format!("no se pudo interpretar la regla: {e}"))?;
     if rule.match_.conditions.is_empty() {
         return Err("una regla necesita al menos una condición".into());
+    }
+    // Topes por regla: una regla gigante es un DoS persistente del sync —cada
+    // condición se evalúa por mensaje por vuelta— y `MAX_RULES` sólo topa el
+    // conteo, no los bytes por regla (ver las constantes).
+    if rule.match_.conditions.len() > MAX_CONDITIONS_PER_RULE {
+        return Err(format!(
+            "una regla no puede tener más de {MAX_CONDITIONS_PER_RULE} condiciones"
+        ));
+    }
+    if rule.actions.len() > MAX_ACTIONS_PER_RULE {
+        return Err(format!(
+            "una regla no puede tener más de {MAX_ACTIONS_PER_RULE} acciones"
+        ));
+    }
+    if rule
+        .match_
+        .conditions
+        .iter()
+        .any(|c| c.value.len() > MAX_CONDITION_VALUE_BYTES)
+    {
+        return Err(format!(
+            "el valor de una condición no puede superar {MAX_CONDITION_VALUE_BYTES} bytes"
+        ));
+    }
+    if rule.name.len() > MAX_RULE_NAME_BYTES {
+        return Err(format!(
+            "el nombre de una regla no puede superar {MAX_RULE_NAME_BYTES} bytes"
+        ));
     }
     Ok(rule)
 }
