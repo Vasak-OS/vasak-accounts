@@ -1158,7 +1158,7 @@ mod tests {
         // La regla las trae al revés (mover primero); la terminal va al final.
         let rs = con_marca(
             1,
-            0,
+            1,
             vec![Action::MoveToFolder("Bancos".into()), Action::Flag],
         );
         let ops = plan_ops(&rs, 1, &[rec(5, 0)], &casillas(&["Bancos"]), None);
@@ -1172,7 +1172,7 @@ mod tests {
     fn de_dos_terminales_sale_solo_la_primera() {
         let rs = con_marca(
             1,
-            0,
+            1,
             vec![Action::MoveToFolder("Bancos".into()), Action::Delete],
         );
         let ops = plan_ops(
@@ -1187,7 +1187,7 @@ mod tests {
 
     #[test]
     fn borrar_es_a_la_papelera_y_sin_papelera_se_saltea() {
-        let rs = con_marca(1, 0, vec![Action::Delete]);
+        let rs = con_marca(1, 1, vec![Action::Delete]);
         // Con papelera: borrar = mover a ella.
         let ops = plan_ops(&rs, 1, &[rec(5, 0)], &casillas(&[]), Some("Papelera"));
         assert_eq!(ops, vec![MailOp::MoveTo(5, "Papelera".into())]);
@@ -1198,17 +1198,26 @@ mod tests {
 
     #[test]
     fn mover_a_una_casilla_desconocida_o_a_inbox_se_saltea() {
-        let rs = con_marca(1, 0, vec![Action::MoveToFolder("NoExiste".into())]);
+        let rs = con_marca(1, 1, vec![Action::MoveToFolder("NoExiste".into())]);
         assert!(plan_ops(&rs, 1, &[rec(5, 0)], &casillas(&["Bancos"]), None).is_empty());
-        let rs = con_marca(1, 0, vec![Action::MoveToFolder("inbox".into())]);
+        let rs = con_marca(1, 1, vec![Action::MoveToFolder("inbox".into())]);
         assert!(plan_ops(&rs, 1, &[rec(5, 0)], &casillas(&["Bancos"]), None).is_empty());
     }
 
     #[test]
     fn marcar_leido_y_destacar_son_las_dos_en_sitio() {
-        let rs = con_marca(1, 0, vec![Action::MarkRead, Action::Flag]);
+        let rs = con_marca(1, 1, vec![Action::MarkRead, Action::Flag]);
         let ops = plan_ops(&rs, 1, &[rec(5, 0)], &casillas(&[]), None);
         assert_eq!(ops, vec![MailOp::MarkRead(5), MailOp::Flag(5)]);
+    }
+
+    #[test]
+    fn un_watermark_con_uid_desde_cero_no_barre_nada() {
+        // El CRUD nunca escribe uid_from=0, pero un archivo del perfil del usuario
+        // podría traerlo; el piso de is_eligible lo trata como no elegible en vez
+        // de dejar pasar todo el backlog (uid >= 0 sería siempre verdadero).
+        let rs = con_marca(1, 0, vec![Action::MoveToFolder("Bancos".into())]);
+        assert!(plan_ops(&rs, 1, &[rec(5, 0)], &casillas(&["Bancos"]), None).is_empty());
     }
 
     // ── CRUD y marca de agua ──────────────────────────────────────────────────
@@ -1299,6 +1308,52 @@ mod tests {
         // uid_next ausente o 0 → sin marca segura (un 0 barrería el backlog).
         assert_eq!(initial_watermark(7, None), None);
         assert_eq!(initial_watermark(7, Some(0)), None);
+    }
+
+    #[test]
+    fn parse_rule_topa_cada_regla() {
+        // Una sola regla gigante esquivaría MAX_RULES (que topa el conteo) y sería
+        // DoS persistente del sync: cada condición se evalúa por mensaje por vuelta.
+        let con_condiciones = |n: usize| {
+            serde_json::to_string(&Rule {
+                match_: Match {
+                    op: MatchOp::All,
+                    conditions: vec![cond(Field::From, Test::Contains, "x"); n],
+                },
+                ..regla("x", cond(Field::From, Test::Contains, "x"))
+            })
+            .unwrap()
+        };
+        assert!(parse_rule(&con_condiciones(MAX_CONDITIONS_PER_RULE)).is_ok());
+        assert!(parse_rule(&con_condiciones(MAX_CONDITIONS_PER_RULE + 1)).is_err());
+
+        let con_acciones = |n: usize| {
+            serde_json::to_string(&Rule {
+                actions: vec![Action::MarkRead; n],
+                ..regla("x", cond(Field::From, Test::Contains, "x"))
+            })
+            .unwrap()
+        };
+        assert!(parse_rule(&con_acciones(MAX_ACTIONS_PER_RULE)).is_ok());
+        assert!(parse_rule(&con_acciones(MAX_ACTIONS_PER_RULE + 1)).is_err());
+
+        let con_valor = |n: usize| {
+            serde_json::to_string(&regla(
+                "x",
+                cond(Field::From, Test::Contains, &"a".repeat(n)),
+            ))
+            .unwrap()
+        };
+        assert!(parse_rule(&con_valor(MAX_CONDITION_VALUE_BYTES)).is_ok());
+        assert!(parse_rule(&con_valor(MAX_CONDITION_VALUE_BYTES + 1)).is_err());
+
+        let con_nombre = |n: usize| {
+            let mut r = regla("x", cond(Field::From, Test::Contains, "x"));
+            r.name = "a".repeat(n);
+            serde_json::to_string(&r).unwrap()
+        };
+        assert!(parse_rule(&con_nombre(MAX_RULE_NAME_BYTES)).is_ok());
+        assert!(parse_rule(&con_nombre(MAX_RULE_NAME_BYTES + 1)).is_err());
     }
 
     #[test]

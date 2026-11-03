@@ -971,3 +971,35 @@ async fn consultar_con_un_correo_hostil_en_el_certificado_sale_escapado_por_el_b
     // Ni rastro de la clave guardada.
     assert!(!reply.contains("clave-privada"));
 }
+
+// ── Gating del CRUD de reglas (#20) ────────────────────────────────────────
+
+/// Las cuatro escrituras de reglas exigen permiso sobre la cuenta, como la
+/// identidad S/MIME: una regla es config que mueve/borra correo sola, así que un
+/// llamador sin el scope no puede instalarla. `ListRules` (lectura) no se gatea.
+#[tokio::test]
+async fn el_crud_de_reglas_sin_permiso_da_accessdenied_y_no_escribe() {
+    let f = Fixture::start_with_permission(&[(ACCOUNT, RSA_ADDRESS)], Answer::Deny).await;
+    let rule = r#"{"coincidencia":{"condiciones":[{"campo":"de","prueba":"contiene","valor":"x"}]}}"#;
+
+    for result in [
+        f.call("CreateRule", &(ACCOUNT, rule)).await,
+        f.call("UpdateRule", &(ACCOUNT, rule)).await,
+        f.call("DeleteRule", &(ACCOUNT, "algun-id")).await,
+        f.call("ReorderRules", &(ACCOUNT, "[]")).await,
+    ] {
+        let (name, _) = error_of(result);
+        assert_eq!(name, "org.freedesktop.DBus.Error.AccessDenied", "{name}");
+    }
+
+    // Nada se escribió: ListRules (sin gate) sigue sin reglas.
+    let listed: String = f
+        .call("ListRules", &(ACCOUNT,))
+        .await
+        .unwrap()
+        .body()
+        .deserialize()
+        .unwrap();
+    let rs: crate::rules::RuleSet = serde_json::from_str(&listed).unwrap();
+    assert!(rs.rules.is_empty(), "{listed}");
+}
