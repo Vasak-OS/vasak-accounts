@@ -43,6 +43,7 @@ use rustix::fs::{AtFlags, Mode, OFlags, CWD};
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 
+use crate::imap::HeaderRecord;
 use crate::message::Headers;
 use crate::outbox::{entry_name, es_enlace, reject_symlink};
 use crate::store::paths::{open_dir_at, validate_account_id};
@@ -69,6 +70,25 @@ pub struct RuleSet {
     pub version: u32,
     #[serde(default, rename = "reglas")]
     pub rules: Vec<Rule>,
+    /// Hasta dónde ya se aplicó, para no barrer el backlog hacia atrás. Un
+    /// archivo viejo que no lo trae queda en `None` —inerte— hasta que PR4 lo
+    /// escriba por primera vez. PR3a no lo escribe nunca: sólo lo respeta.
+    #[serde(default, rename = "marca_de_agua")]
+    pub watermark: Option<Watermark>,
+}
+
+/// La frontera de aplicación de las reglas: desde qué UID, en qué encarnación
+/// de la casilla.
+///
+/// `UIDVALIDITY` es la identidad de esa encarnación: si el servidor la cambia,
+/// los UID se reinician y los viejos ya no significan lo mismo. Por eso la marca
+/// guarda las dos cosas y no sólo el UID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Watermark {
+    #[serde(rename = "uidvalidity")]
+    pub uidvalidity: u32,
+    #[serde(rename = "uid_desde")]
+    pub uid_from: u32,
 }
 
 impl RuleSet {
@@ -78,6 +98,7 @@ impl RuleSet {
             account_id: account_id.to_string(),
             version: RULESET_VERSION,
             rules: Vec::new(),
+            watermark: None,
         }
     }
 }
@@ -312,6 +333,96 @@ fn has_attachment(headers: &Headers) -> bool {
     headers
         .get("Content-Type")
         .is_some_and(|v| v.to_ascii_lowercase().contains("multipart/mixed"))
+}
+
+// ---------------------------------------------------------------------------
+// Planificación — de reglas a operaciones concretas, todavía pura
+// ---------------------------------------------------------------------------
+
+/// Una operación resuelta, lista para que PR3b la ejecute por IMAP.
+///
+/// Ya no hay `Delete`: sin papelera no se borra, y con papelera `Delete` es un
+/// `MoveTo` a ella. Todas llevan el UID del mensaje en INBOX sobre el que actúan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MailOp {
+    MarkRead(u32),
+    Flag(u32),
+    MoveTo(u32, String),
+}
+
+/// Si un mensaje entra en la ventana que las reglas pueden tocar.
+///
+/// Esta es la guarda que impide el barrido retroactivo. Sin marca de agua no se
+/// aplica nada (inerte, como queda PR3a). Si la `UIDVALIDITY` de ahora no es la
+/// de la marca, la casilla se reinició y los UID ya no son los de antes:
+/// aplicar barrería el backlog recién re-descargado, así que tampoco. Dentro de
+/// la misma encarnación, sólo lo que está en el UID de la marca o más nuevo.
+fn is_eligible(watermark: Option<Watermark>, now_uidvalidity: u32, uid: u32) -> bool {
+    match watermark {
+        Some(w) => w.uidvalidity == now_uidvalidity && uid >= w.uid_from,
+        None => false,
+    }
+}
+
+/// Las operaciones a ejecutar para un lote de mensajes, resueltas y en orden.
+///
+/// Puro: no habla con la red ni arma comandos IMAP —el destino es el nombre de
+/// la casilla a secas; citarlo es trabajo de PR3b—. Por cada mensaje elegible se
+/// evalúan las reglas y se traducen sus acciones:
+///
+/// - `MarkRead`/`Flag` son in-situ y van **siempre antes** de la terminal.
+/// - `MoveToFolder`/`Delete` sacan el mensaje de INBOX: son terminales y sólo
+///   cuenta la primera —el mensaje ya se fue—, haya emitido operación o no.
+/// - Un `MoveToFolder` a una casilla desconocida o a INBOX es un no-op; un
+///   `Delete` sin papelera, también. Nunca un EXPUNGE.
+pub fn plan_ops(
+    ruleset: &RuleSet,
+    now_uidvalidity: u32,
+    records: &[HeaderRecord],
+    known_mailboxes: &std::collections::HashSet<String>,
+    trash: Option<&str>,
+) -> Vec<MailOp> {
+    let mut ops = Vec::new();
+    for record in records {
+        if !is_eligible(ruleset.watermark, now_uidvalidity, record.uid) {
+            continue;
+        }
+        let actions = actions_for(ruleset, &Headers::parse(&record.headers), record.size);
+
+        let mut inplace = Vec::new();
+        let mut terminal = None;
+        let mut terminal_seen = false;
+        for action in actions {
+            match action {
+                Action::MarkRead => inplace.push(MailOp::MarkRead(record.uid)),
+                Action::Flag => inplace.push(MailOp::Flag(record.uid)),
+                // La primera terminal consume el lugar; las siguientes se
+                // descartan aunque la primera no haya emitido nada.
+                Action::MoveToFolder(_) | Action::Delete if terminal_seen => {}
+                Action::MoveToFolder(dest) => {
+                    terminal_seen = true;
+                    // INBOX es especial y no distingue mayúsculas (RFC 3501);
+                    // mover a INBOX es un no-op. El resto de los nombres son
+                    // sensibles a mayúsculas, así que se comparan exactos.
+                    if !dest.eq_ignore_ascii_case("INBOX") && known_mailboxes.contains(&dest) {
+                        terminal = Some(MailOp::MoveTo(record.uid, dest));
+                    }
+                }
+                Action::Delete => {
+                    terminal_seen = true;
+                    // Sin papelera no se borra: se saltea. Con papelera, borrar
+                    // es mover a ella.
+                    if let Some(t) = trash {
+                        terminal = Some(MailOp::MoveTo(record.uid, t.to_string()));
+                    }
+                }
+            }
+        }
+
+        ops.append(&mut inplace);
+        ops.extend(terminal);
+    }
+    ops
 }
 
 // ---------------------------------------------------------------------------
@@ -554,6 +665,7 @@ mod tests {
             account_id: account_id.into(),
             version: RULESET_VERSION,
             rules,
+            watermark: None,
         }
     }
 
