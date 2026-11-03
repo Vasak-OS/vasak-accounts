@@ -1164,4 +1164,121 @@ mod tests {
         let ops = plan_ops(&rs, 1, &[rec(5, 0)], &casillas(&[]), None);
         assert_eq!(ops, vec![MailOp::MarkRead(5), MailOp::Flag(5)]);
     }
+
+    // ── CRUD y marca de agua ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_rule_rechaza_lo_que_no_sirve_y_acepta_lo_valido() {
+        assert!(parse_rule("no es json").is_err());
+        // Una regla sin condiciones no se guarda.
+        let vacia = serde_json::to_string(&Rule {
+            match_: Match {
+                op: MatchOp::All,
+                conditions: vec![],
+            },
+            ..regla("x", cond(Field::From, Test::Contains, "banco"))
+        })
+        .unwrap();
+        assert!(parse_rule(&vacia).is_err());
+        let buena =
+            serde_json::to_string(&regla("x", cond(Field::From, Test::Contains, "banco"))).unwrap();
+        assert!(parse_rule(&buena).is_ok());
+    }
+
+    #[test]
+    fn add_rule_asigna_un_id_propio_y_respeta_el_tope() {
+        let mut rs = RuleSet::empty("a");
+        let id = add_rule(
+            &mut rs,
+            regla("ignorame", cond(Field::From, Test::Contains, "x")),
+        )
+        .unwrap();
+        assert!(!id.is_empty());
+        assert_ne!(id, "ignorame", "el id que trae la regla se descarta");
+        assert_eq!(rs.rules.len(), 1);
+        assert_eq!(rs.rules[0].id, id);
+        // Lleno hasta el tope y la siguiente se rechaza.
+        while rs.rules.len() < MAX_RULES {
+            add_rule(&mut rs, regla("", cond(Field::From, Test::Contains, "x"))).unwrap();
+        }
+        assert!(add_rule(&mut rs, regla("", cond(Field::From, Test::Contains, "x"))).is_err());
+    }
+
+    #[test]
+    fn replace_y_remove_por_id() {
+        let mut rs = RuleSet::empty("a");
+        let id = add_rule(
+            &mut rs,
+            regla("", cond(Field::Subject, Test::Contains, "a")),
+        )
+        .unwrap();
+        let mut editada = regla("", cond(Field::Subject, Test::Contains, "b"));
+        editada.id = id.clone();
+        replace_rule(&mut rs, editada).unwrap();
+        assert_eq!(rs.rules[0].match_.conditions[0].value, "b");
+        // Id inexistente o vacío → error.
+        assert!(replace_rule(
+            &mut rs,
+            regla("noexiste", cond(Field::Subject, Test::Contains, "c"))
+        )
+        .is_err());
+        assert!(remove_rule(&mut rs, "noexiste").is_err());
+        remove_rule(&mut rs, &id).unwrap();
+        assert!(rs.rules.is_empty());
+    }
+
+    #[test]
+    fn reorder_exige_el_mismo_conjunto() {
+        let mut rs = RuleSet::empty("a");
+        let a = add_rule(&mut rs, regla("", cond(Field::From, Test::Contains, "a"))).unwrap();
+        let b = add_rule(&mut rs, regla("", cond(Field::From, Test::Contains, "b"))).unwrap();
+        reorder_rules(&mut rs, &[b.clone(), a.clone()]).unwrap();
+        assert_eq!(rs.rules[0].id, b);
+        assert_eq!(rs.rules[1].id, a);
+        // Faltante, sobrante o repetido → error, sin tocar las reglas.
+        assert!(reorder_rules(&mut rs, &[a.clone()]).is_err());
+        assert!(reorder_rules(&mut rs, &[a.clone(), a.clone()]).is_err());
+        assert!(reorder_rules(&mut rs, &[a, b, "extra".into()]).is_err());
+    }
+
+    #[test]
+    fn initial_watermark_exige_uid_desde_uno() {
+        assert_eq!(
+            initial_watermark(7, Some(100)),
+            Some(Watermark {
+                uidvalidity: 7,
+                uid_from: 100
+            })
+        );
+        // uid_next ausente o 0 → sin marca segura (un 0 barrería el backlog).
+        assert_eq!(initial_watermark(7, None), None);
+        assert_eq!(initial_watermark(7, Some(0)), None);
+    }
+
+    #[test]
+    fn ensure_watermark_fija_una_vez_y_rechaza_sin_inbox() {
+        // Sin INBOX sincronizada → rechaza (no crea una regla inerte).
+        let mut rs = RuleSet::empty("a");
+        assert!(ensure_watermark(&mut rs, None).is_err());
+        assert!(ensure_watermark(&mut rs, Some((7, Some(0)))).is_err());
+        assert_eq!(rs.watermark, None);
+        // Con estado bueno → la fija.
+        ensure_watermark(&mut rs, Some((7, Some(100)))).unwrap();
+        assert_eq!(
+            rs.watermark,
+            Some(Watermark {
+                uidvalidity: 7,
+                uid_from: 100
+            })
+        );
+        // Ya fijada → no la toca, aunque INBOX haya cambiado.
+        ensure_watermark(&mut rs, Some((9, Some(500)))).unwrap();
+        assert_eq!(
+            rs.watermark,
+            Some(Watermark {
+                uidvalidity: 7,
+                uid_from: 100
+            })
+        );
+    }
 }
