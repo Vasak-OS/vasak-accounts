@@ -980,7 +980,8 @@ async fn consultar_con_un_correo_hostil_en_el_certificado_sale_escapado_por_el_b
 #[tokio::test]
 async fn el_crud_de_reglas_sin_permiso_da_accessdenied_y_no_escribe() {
     let f = Fixture::start_with_permission(&[(ACCOUNT, RSA_ADDRESS)], Answer::Deny).await;
-    let rule = r#"{"coincidencia":{"condiciones":[{"campo":"de","prueba":"contiene","valor":"x"}]}}"#;
+    let rule =
+        r#"{"coincidencia":{"condiciones":[{"campo":"de","prueba":"contiene","valor":"x"}]}}"#;
 
     for result in [
         f.call("CreateRule", &(ACCOUNT, rule)).await,
