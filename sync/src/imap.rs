@@ -2806,6 +2806,22 @@ pub(crate) mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn destacar_pone_la_bandera_flagged() {
+        let (mut session, task) = with_server(
+            "* OK listo",
+            vec![("UID STORE", vec!["{tag} OK completado"])],
+        );
+
+        session.flag(7).await.unwrap();
+        let received = task.await.unwrap();
+        assert!(
+            received[0].ends_with(" UID STORE 7 +FLAGS (\\Flagged)"),
+            "{}",
+            received[0]
+        );
+    }
+
     /// `MoveMessage` y `DeleteMessage` contestan uno de dos textos, y son los
     /// de siempre.
     #[test]
