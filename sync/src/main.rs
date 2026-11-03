@@ -1362,30 +1362,24 @@ impl Service {
     ) -> zbus::fdo::Result<String> {
         let rule = rules::parse_rule(&rule_json).map_err(zbus::fdo::Error::InvalidArgs)?;
 
-        let address = self
-            .account_address(&account_id)
+        // La marca de agua necesita el borde de INBOX, una lectura async que no
+        // entra en el closure sync del helper: se resuelve acá y se captura.
+        // `ensure_watermark` es idempotente (no hace nada si ya hay marca), así que
+        // resolver el borde siempre no cambia lo que se guarda.
+        let inbox = store_api::inbox_token(&account_id)
             .await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        self.authorize_rules(header.sender().map(|s| s.as_str()), &address)
-            .await?;
+            .map(|token| (token.uidvalidity, token.uid_next));
 
-        // Se mantiene todo el ciclo leer-modificar-guardar bajo el lock para que
-        // dos creaciones concurrentes no se pisen (ver `rules_lock`).
-        let _guard = self.rules_lock.lock().await;
-        let store = rules::RuleStore::open(rules::rules_dir()).map_err(zbus::fdo::Error::Failed)?;
-        let mut ruleset = store.load(&account_id).map_err(zbus::fdo::Error::Failed)?;
-
-        if ruleset.watermark.is_none() {
-            let inbox = store_api::inbox_token(&account_id)
-                .await
-                .map(|token| (token.uidvalidity, token.uid_next));
-            rules::ensure_watermark(&mut ruleset, inbox).map_err(zbus::fdo::Error::Failed)?;
-        }
-
-        let id = rules::add_rule(&mut ruleset, rule).map_err(zbus::fdo::Error::Failed)?;
-        store.save(&ruleset).map_err(zbus::fdo::Error::Failed)?;
-        let _ = Service::rules_changed(&emitter, &account_id).await;
-        Ok(id)
+        self.with_rules(
+            &emitter,
+            header.sender().map(|s| s.as_str()),
+            &account_id,
+            move |ruleset| {
+                rules::ensure_watermark(ruleset, inbox).map_err(zbus::fdo::Error::Failed)?;
+                rules::add_rule(ruleset, rule).map_err(zbus::fdo::Error::Failed)
+            },
+        )
+        .await
     }
 
     /// Reemplaza la regla con el id que trae `rule_json`. Falla si no existe.
@@ -1398,20 +1392,13 @@ impl Service {
     ) -> zbus::fdo::Result<()> {
         let rule = rules::parse_rule(&rule_json).map_err(zbus::fdo::Error::InvalidArgs)?;
 
-        let address = self
-            .account_address(&account_id)
-            .await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        self.authorize_rules(header.sender().map(|s| s.as_str()), &address)
-            .await?;
-
-        let _guard = self.rules_lock.lock().await;
-        let store = rules::RuleStore::open(rules::rules_dir()).map_err(zbus::fdo::Error::Failed)?;
-        let mut ruleset = store.load(&account_id).map_err(zbus::fdo::Error::Failed)?;
-        rules::replace_rule(&mut ruleset, rule).map_err(zbus::fdo::Error::Failed)?;
-        store.save(&ruleset).map_err(zbus::fdo::Error::Failed)?;
-        let _ = Service::rules_changed(&emitter, &account_id).await;
-        Ok(())
+        self.with_rules(
+            &emitter,
+            header.sender().map(|s| s.as_str()),
+            &account_id,
+            move |ruleset| rules::replace_rule(ruleset, rule).map_err(zbus::fdo::Error::Failed),
+        )
+        .await
     }
 
     /// Saca la regla con ese id. Falla si no existe.
@@ -1422,20 +1409,13 @@ impl Service {
         account_id: String,
         rule_id: String,
     ) -> zbus::fdo::Result<()> {
-        let address = self
-            .account_address(&account_id)
-            .await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        self.authorize_rules(header.sender().map(|s| s.as_str()), &address)
-            .await?;
-
-        let _guard = self.rules_lock.lock().await;
-        let store = rules::RuleStore::open(rules::rules_dir()).map_err(zbus::fdo::Error::Failed)?;
-        let mut ruleset = store.load(&account_id).map_err(zbus::fdo::Error::Failed)?;
-        rules::remove_rule(&mut ruleset, &rule_id).map_err(zbus::fdo::Error::Failed)?;
-        store.save(&ruleset).map_err(zbus::fdo::Error::Failed)?;
-        let _ = Service::rules_changed(&emitter, &account_id).await;
-        Ok(())
+        self.with_rules(
+            &emitter,
+            header.sender().map(|s| s.as_str()),
+            &account_id,
+            move |ruleset| rules::remove_rule(ruleset, &rule_id).map_err(zbus::fdo::Error::Failed),
+        )
+        .await
     }
 
     /// Reordena las reglas según la lista de ids en `ids_json` (el orden es la
@@ -1447,27 +1427,24 @@ impl Service {
         account_id: String,
         ids_json: String,
     ) -> zbus::fdo::Result<()> {
-        let address = self
-            .account_address(&account_id)
-            .await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        self.authorize_rules(header.sender().map(|s| s.as_str()), &address)
-            .await?;
-
-        // La entrada se interpreta **después** de autorizar: un llamador sin
-        // permiso recibe `AccessDenied` sin que su `ids_json` se procese, igual que
-        // el resto de las mutaciones.
-        let ids: Vec<String> = serde_json::from_str(&ids_json).map_err(|e| {
-            zbus::fdo::Error::InvalidArgs(format!("no se pudo interpretar la lista de ids: {e}"))
-        })?;
-
-        let _guard = self.rules_lock.lock().await;
-        let store = rules::RuleStore::open(rules::rules_dir()).map_err(zbus::fdo::Error::Failed)?;
-        let mut ruleset = store.load(&account_id).map_err(zbus::fdo::Error::Failed)?;
-        rules::reorder_rules(&mut ruleset, &ids).map_err(zbus::fdo::Error::Failed)?;
-        store.save(&ruleset).map_err(zbus::fdo::Error::Failed)?;
-        let _ = Service::rules_changed(&emitter, &account_id).await;
-        Ok(())
+        // El closure corre **después** de autorizar (dentro del helper, tras
+        // `authorize_rules`), así que interpretar `ids_json` ahí mantiene que un
+        // llamador sin permiso reciba `AccessDenied` sin que su entrada se procese,
+        // igual que el resto de las mutaciones. Un `ids_json` malo da `InvalidArgs`.
+        self.with_rules(
+            &emitter,
+            header.sender().map(|s| s.as_str()),
+            &account_id,
+            move |ruleset| {
+                let ids: Vec<String> = serde_json::from_str(&ids_json).map_err(|e| {
+                    zbus::fdo::Error::InvalidArgs(format!(
+                        "no se pudo interpretar la lista de ids: {e}"
+                    ))
+                })?;
+                rules::reorder_rules(ruleset, &ids).map_err(zbus::fdo::Error::Failed)
+            },
+        )
+        .await
     }
 
     /// El texto de un mensaje.
@@ -1995,6 +1972,40 @@ impl Service {
                 ))
             }
         }
+    }
+
+    /// Andamiaje compartido por los cuatro handlers de escritura de reglas
+    /// (`create_rule`/`update_rule`/`delete_rule`/`reorder_rules`): resuelve la
+    /// dirección de la cuenta, **autoriza antes de tocar el store**, y corre el
+    /// ciclo leer-modificar-guardar bajo `rules_lock` emitiendo `RulesChanged` al
+    /// final. `f` recibe el `RuleSet` cargado, lo muta y devuelve el resultado del
+    /// handler; corre **después de autorizar** y bajo el lock, así que interpretar
+    /// entrada no confiable ahí dentro (p. ej. los ids de `reorder`) sigue
+    /// respetando «después de autorizar». Devuelve `zbus::fdo::Result` para que `f`
+    /// elija el código de error (`InvalidArgs` para JSON malo, `Failed` para el
+    /// store), igual que antes de deduplicar.
+    async fn with_rules<T>(
+        &self,
+        emitter: &SignalEmitter<'_>,
+        sender: Option<&str>,
+        account_id: &str,
+        f: impl FnOnce(&mut rules::RuleSet) -> zbus::fdo::Result<T>,
+    ) -> zbus::fdo::Result<T> {
+        let address = self
+            .account_address(account_id)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        self.authorize_rules(sender, &address).await?;
+
+        // Todo el ciclo leer-modificar-guardar bajo el lock para que dos
+        // mutaciones concurrentes no se pisen (ver `rules_lock`).
+        let _guard = self.rules_lock.lock().await;
+        let store = rules::RuleStore::open(rules::rules_dir()).map_err(zbus::fdo::Error::Failed)?;
+        let mut ruleset = store.load(account_id).map_err(zbus::fdo::Error::Failed)?;
+        let out = f(&mut ruleset)?;
+        store.save(&ruleset).map_err(zbus::fdo::Error::Failed)?;
+        let _ = Service::rules_changed(emitter, account_id).await;
+        Ok(out)
     }
 
     /// Devuelve un pospuesto a su casilla de origen por IMAP. Lo comparten el
