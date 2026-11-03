@@ -1323,6 +1323,31 @@ mod tests {
     }
 
     #[test]
+    fn un_reorder_rechazado_deja_las_reglas_intactas() {
+        // Largo correcto pero con un id que no existe: pasa el chequeo de cantidad
+        // y antes validaba a mitad del bucle, dejando el ruleset a medio vaciar.
+        let mut rs = RuleSet::empty("a");
+        let a = add_rule(&mut rs, regla("", cond(Field::From, Test::Contains, "a"))).unwrap();
+        let b = add_rule(&mut rs, regla("", cond(Field::From, Test::Contains, "b"))).unwrap();
+        let antes: Vec<String> = rs.rules.iter().map(|r| r.id.clone()).collect();
+        assert!(reorder_rules(&mut rs, &[a, "noexiste".into()]).is_err());
+        let despues: Vec<String> = rs.rules.iter().map(|r| r.id.clone()).collect();
+        assert_eq!(antes, despues, "un reorder fallido no toca las reglas");
+        assert_eq!(despues, vec![/*a*/ antes[0].clone(), /*b*/ b]);
+    }
+
+    #[test]
+    fn parse_rule_topa_el_nombre_de_la_casilla_destino() {
+        let con_destino = |n: usize| {
+            let mut r = regla("x", cond(Field::From, Test::Contains, "x"));
+            r.actions = vec![Action::MoveToFolder("a".repeat(n))];
+            serde_json::to_string(&r).unwrap()
+        };
+        assert!(parse_rule(&con_destino(MAX_FOLDER_NAME_BYTES)).is_ok());
+        assert!(parse_rule(&con_destino(MAX_FOLDER_NAME_BYTES + 1)).is_err());
+    }
+
+    #[test]
     fn initial_watermark_exige_uid_desde_uno() {
         assert_eq!(
             initial_watermark(7, Some(100)),
