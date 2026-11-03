@@ -85,6 +85,12 @@ mod outbox;
 mod preferences;
 mod query;
 mod reminders;
+// Las reglas para el correo entrante: el modelo, la evaluación pura y el almacén
+// (`vasak-accounts#20`, PR 1). Las acciones por IMAP (PR 3) y el contrato de
+// D-Bus para editarlas (PR 4) lo usan después; por ahora sólo lo ejercitan sus
+// pruebas.
+#[allow(dead_code)]
+mod rules;
 // La etapa de empuje: drena la cola de escrituras hacia el servidor (ver
 // `store::queue`) en cada vuelta de sincronización, antes de dar la bajada por
 // al día (`vasak-accounts#23`, PR 3 de M2).

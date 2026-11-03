@@ -493,7 +493,7 @@ pub struct Outbox {
 /// FreeBSD. Los tres van, por eso y no por olvidarse uno. Y lo que **no** son
 /// enlaces se caen al mensaje genérico: sin permisos (`EACCES`), sin
 /// descriptores (`EMFILE`), sin el padre (`NOENT`).
-fn es_enlace(e: Errno) -> bool {
+pub(crate) fn es_enlace(e: Errno) -> bool {
     matches!(e, Errno::LOOP | Errno::NOTDIR | Errno::MLINK)
 }
 
@@ -502,7 +502,7 @@ fn es_enlace(e: Errno) -> bool {
 /// La misma comprobación que hace `StorePaths::prepare_dir` antes de crear
 /// `stores/`, y por el mismo motivo: si la ruta se puede seguir para crearla,
 /// el `O_NOFOLLOW` de después llega tarde.
-fn reject_symlink(path: &Path, what: &str) -> Result<(), String> {
+pub(crate) fn reject_symlink(path: &Path, what: &str) -> Result<(), String> {
     if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(format!(
             "{} es un enlace simbólico; no se usa para {what}",
@@ -513,7 +513,7 @@ fn reject_symlink(path: &Path, what: &str) -> Result<(), String> {
 }
 
 /// Un nombre de la cola como lo quieren las llamadas relativas al descriptor.
-fn entry_name(name: &str) -> Result<CString, String> {
+pub(crate) fn entry_name(name: &str) -> Result<CString, String> {
     CString::new(name).map_err(|_| format!("el nombre {name:?} no sirve para un archivo"))
 }
 
