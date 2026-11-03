@@ -887,4 +887,141 @@ mod tests {
         assert!(store.load("../otra").is_err());
         assert!(store.save(&RuleSet::empty("../otra")).is_err());
     }
+
+    // ── Planificación de operaciones (pura) ───────────────────────────────────
+
+    use crate::imap::HeaderRecord;
+    use std::collections::HashSet;
+
+    /// Un registro de INBOX con las cabeceras del banco (From banco, asunto
+    /// «Factura», multipart/mixed), para que una regla «de contiene banco»
+    /// coincida.
+    fn rec(uid: u32, size: u64) -> HeaderRecord {
+        HeaderRecord {
+            uid,
+            flags: Vec::new(),
+            size,
+            headers: "From: Soporte <soporte@Banco.com>\r\n\
+                      Subject: Factura 123\r\n\
+                      Content-Type: multipart/mixed; boundary=xyz\r\n"
+                .to_string(),
+        }
+    }
+
+    /// Un `RuleSet` con watermark y una regla de las condiciones/acciones dadas.
+    fn con_marca(uidvalidity: u32, uid_from: u32, actions: Vec<Action>) -> RuleSet {
+        let rule = Rule {
+            id: "1".into(),
+            name: String::new(),
+            enabled: true,
+            match_: Match {
+                op: MatchOp::All,
+                conditions: vec![cond(Field::From, Test::Contains, "banco")],
+            },
+            actions,
+            stop: false,
+        };
+        RuleSet {
+            account_id: "a".into(),
+            version: RULESET_VERSION,
+            rules: vec![rule],
+            watermark: Some(Watermark {
+                uidvalidity,
+                uid_from,
+            }),
+        }
+    }
+
+    fn casillas(nombres: &[&str]) -> HashSet<String> {
+        nombres.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn el_backlog_anterior_al_watermark_no_se_barre() {
+        // Watermark en uid 100; el 50 es backlog → ninguna acción, aunque coincida.
+        let rs = con_marca(1, 100, vec![Action::MoveToFolder("Bancos".into())]);
+        let ops = plan_ops(&rs, 1, &[rec(50, 0)], &casillas(&["Bancos"]), None);
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn el_correo_posterior_al_watermark_si_se_actua() {
+        let rs = con_marca(1, 100, vec![Action::MoveToFolder("Bancos".into())]);
+        let ops = plan_ops(&rs, 1, &[rec(150, 0)], &casillas(&["Bancos"]), None);
+        assert_eq!(ops, vec![MailOp::MoveTo(150, "Bancos".into())]);
+    }
+
+    #[test]
+    fn sin_watermark_no_se_actua() {
+        let mut rs = con_marca(1, 100, vec![Action::MoveToFolder("Bancos".into())]);
+        rs.watermark = None;
+        let ops = plan_ops(&rs, 1, &[rec(150, 0)], &casillas(&["Bancos"]), None);
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn con_uidvalidity_distinto_no_se_actua() {
+        // Watermark de otra uidvalidity: los UID se reiniciaron, no se aplica.
+        let rs = con_marca(1, 100, vec![Action::MoveToFolder("Bancos".into())]);
+        let ops = plan_ops(&rs, 2, &[rec(150, 0)], &casillas(&["Bancos"]), None);
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn las_acciones_en_sitio_van_antes_de_la_terminal() {
+        // La regla las trae al revés (mover primero); la terminal va al final.
+        let rs = con_marca(
+            1,
+            0,
+            vec![Action::MoveToFolder("Bancos".into()), Action::Flag],
+        );
+        let ops = plan_ops(&rs, 1, &[rec(5, 0)], &casillas(&["Bancos"]), None);
+        assert_eq!(
+            ops,
+            vec![MailOp::Flag(5), MailOp::MoveTo(5, "Bancos".into())]
+        );
+    }
+
+    #[test]
+    fn de_dos_terminales_sale_solo_la_primera() {
+        let rs = con_marca(
+            1,
+            0,
+            vec![Action::MoveToFolder("Bancos".into()), Action::Delete],
+        );
+        let ops = plan_ops(
+            &rs,
+            1,
+            &[rec(5, 0)],
+            &casillas(&["Bancos"]),
+            Some("Papelera"),
+        );
+        assert_eq!(ops, vec![MailOp::MoveTo(5, "Bancos".into())]);
+    }
+
+    #[test]
+    fn borrar_es_a_la_papelera_y_sin_papelera_se_saltea() {
+        let rs = con_marca(1, 0, vec![Action::Delete]);
+        // Con papelera: borrar = mover a ella.
+        let ops = plan_ops(&rs, 1, &[rec(5, 0)], &casillas(&[]), Some("Papelera"));
+        assert_eq!(ops, vec![MailOp::MoveTo(5, "Papelera".into())]);
+        // Sin papelera: no se borra.
+        let ops = plan_ops(&rs, 1, &[rec(5, 0)], &casillas(&[]), None);
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn mover_a_una_casilla_desconocida_o_a_inbox_se_saltea() {
+        let rs = con_marca(1, 0, vec![Action::MoveToFolder("NoExiste".into())]);
+        assert!(plan_ops(&rs, 1, &[rec(5, 0)], &casillas(&["Bancos"]), None).is_empty());
+        let rs = con_marca(1, 0, vec![Action::MoveToFolder("inbox".into())]);
+        assert!(plan_ops(&rs, 1, &[rec(5, 0)], &casillas(&["Bancos"]), None).is_empty());
+    }
+
+    #[test]
+    fn marcar_leido_y_destacar_son_las_dos_en_sitio() {
+        let rs = con_marca(1, 0, vec![Action::MarkRead, Action::Flag]);
+        let ops = plan_ops(&rs, 1, &[rec(5, 0)], &casillas(&[]), None);
+        assert_eq!(ops, vec![MailOp::MarkRead(5), MailOp::Flag(5)]);
+    }
 }
