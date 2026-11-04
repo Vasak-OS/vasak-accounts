@@ -24,7 +24,7 @@
 // y la resolución de destinatarios (PR6), que todavía no están. Hasta que lo
 // llamen, el chequeo de código muerto lo marcaría entero; se saca al engancharlo.
 // Mismo criterio que `pgp.rs` del PR1 y `smime_key`.
-#![allow(dead_code)]
+#![cfg_attr(not(test), allow(dead_code))]
 
 use rusqlite::Connection;
 
@@ -121,4 +121,85 @@ fn row_to_peer(row: &rusqlite::Row) -> rusqlite::Result<PgpPeer> {
         first_seen: row.get(4)?,
         updated_at: row.get(5)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::contacts::tests::open_store;
+    use super::super::paths::tests::TempDir;
+    use super::*;
+
+    #[test]
+    fn upsert_inserta_y_find_devuelve_la_fila() {
+        let temp = TempDir::new("pgp-peer-inserta");
+        let store = open_store(&temp);
+        store
+            .upsert_peer("ana@example.com", b"clave-1", "AAAA", 100)
+            .unwrap();
+
+        let peer = find_peer(store.connection(), "ana@example.com")
+            .unwrap()
+            .expect("hay peer");
+        assert_eq!(peer.address, "ana@example.com");
+        assert_eq!(peer.public_key, b"clave-1");
+        assert_eq!(peer.fingerprint, "AAAA");
+        assert_eq!(peer.first_seen, 100);
+        assert_eq!(peer.updated_at, 100);
+    }
+
+    #[test]
+    fn volver_a_ver_la_clave_actualiza_y_conserva_first_seen_sin_duplicar() {
+        let temp = TempDir::new("pgp-peer-upsert");
+        let store = open_store(&temp);
+        store
+            .upsert_peer("ana@example.com", b"clave-1", "AAAA", 100)
+            .unwrap();
+        let first = find_peer(store.connection(), "ana@example.com")
+            .unwrap()
+            .unwrap();
+        store
+            .upsert_peer("ana@example.com", b"clave-2", "BBBB", 200)
+            .unwrap();
+
+        let rows = list_peers(store.connection()).unwrap();
+        assert_eq!(rows.len(), 1, "una fila por dirección");
+        let peer = &rows[0];
+        assert_eq!(peer.id, first.id, "es la misma fila, no una nueva");
+        assert_eq!(peer.public_key, b"clave-2");
+        assert_eq!(peer.fingerprint, "BBBB");
+        assert_eq!(peer.updated_at, 200);
+        assert_eq!(peer.first_seen, 100, "TOFU: first_seen no se pisa");
+    }
+
+    #[test]
+    fn una_direccion_desconocida_no_tiene_peer() {
+        let temp = TempDir::new("pgp-peer-nada");
+        let store = open_store(&temp);
+        store
+            .upsert_peer("ana@example.com", b"k", "AAAA", 1)
+            .unwrap();
+        assert!(find_peer(store.connection(), "beto@example.com")
+            .unwrap()
+            .is_none());
+        // La dirección se guarda tal cual: otra capitalización es otra fila.
+        assert!(find_peer(store.connection(), "ANA@example.com")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn la_lista_sale_ordenada_por_direccion() {
+        let temp = TempDir::new("pgp-peer-orden");
+        let store = open_store(&temp);
+        assert!(list_peers(store.connection()).unwrap().is_empty());
+        for address in ["carla@x.com", "ana@x.com", "beto@x.com"] {
+            store.upsert_peer(address, b"k", "F", 1).unwrap();
+        }
+        let addresses: Vec<String> = list_peers(store.connection())
+            .unwrap()
+            .into_iter()
+            .map(|p| p.address)
+            .collect();
+        assert_eq!(addresses, ["ana@x.com", "beto@x.com", "carla@x.com"]);
+    }
 }

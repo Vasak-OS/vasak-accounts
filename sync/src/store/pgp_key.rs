@@ -22,7 +22,7 @@
 // descifrado (PR4/PR5), que todavía no están. Hasta que lo llamen, el chequeo de
 // código muerto lo marcaría entero; se saca al engancharlo. Mismo criterio que
 // `smime_key` y el núcleo `pgp.rs` del PR1.
-#![allow(dead_code)]
+#![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::HashMap;
 
@@ -162,5 +162,155 @@ impl SecretServiceKeys {
         self.close_session(&session).await;
         let (mut secret,) = reply?;
         Ok(Some(std::mem::take(&mut secret.value)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::key::tests::{fake_keyring, lock_and_announce};
+    use super::*;
+
+    #[tokio::test]
+    async fn guardar_y_leer_da_los_mismos_bytes_de_clave_y_de_contrasena() {
+        let (keys, _server, _shared) = fake_keyring().await;
+        let secret_key = [0u8, 1, 2, 0xff, 0xfe, 10, 13];
+        keys.store_pgp_identity("ana@example.com", &secret_key, b"pa ss\xc3\xb1")
+            .await
+            .unwrap();
+
+        let key = keys.find_pgp_secret_key("ana@example.com").await.unwrap();
+        let pass = keys.find_pgp_passphrase("ana@example.com").await.unwrap();
+        assert_eq!(key.expect("hay clave").as_slice(), &secret_key);
+        assert_eq!(pass.expect("hay contraseña").as_slice(), b"pa ss\xc3\xb1");
+    }
+
+    #[tokio::test]
+    async fn reimportar_reemplaza_y_no_deja_dos_items() {
+        let (keys, _server, _shared) = fake_keyring().await;
+        keys.store_pgp_identity("ana@example.com", b"clave-vieja", b"vieja")
+            .await
+            .unwrap();
+        keys.store_pgp_identity("ana@example.com", b"clave-nueva", b"nueva")
+            .await
+            .unwrap();
+
+        let key = keys.find_pgp_secret_key("ana@example.com").await.unwrap();
+        let pass = keys.find_pgp_passphrase("ana@example.com").await.unwrap();
+        assert_eq!(key.unwrap().as_slice(), b"clave-nueva");
+        assert_eq!(pass.unwrap().as_slice(), b"nueva");
+    }
+
+    #[tokio::test]
+    async fn borrar_quita_los_dos_items_y_deja_a_las_demas_cuentas() {
+        let (keys, _server, _shared) = fake_keyring().await;
+        keys.store_pgp_identity("ana@example.com", b"k-ana", b"p-ana")
+            .await
+            .unwrap();
+        keys.store_pgp_identity("beto@example.com", b"k-beto", b"p-beto")
+            .await
+            .unwrap();
+
+        keys.delete_pgp_identity("ana@example.com").await.unwrap();
+
+        assert!(keys
+            .find_pgp_secret_key("ana@example.com")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(keys
+            .find_pgp_passphrase("ana@example.com")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            keys.find_pgp_secret_key("beto@example.com")
+                .await
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"k-beto"
+        );
+    }
+
+    #[tokio::test]
+    async fn una_cuenta_sin_identidad_da_ausencia_y_borrarla_no_es_error() {
+        let (keys, _server, _shared) = fake_keyring().await;
+        assert!(keys
+            .find_pgp_secret_key("nadie@example.com")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(keys
+            .find_pgp_passphrase("nadie@example.com")
+            .await
+            .unwrap()
+            .is_none());
+        keys.delete_pgp_identity("nadie@example.com").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn la_identidad_de_una_cuenta_no_se_lee_con_otra() {
+        let (keys, _server, _shared) = fake_keyring().await;
+        keys.store_pgp_identity("ana@example.com", b"k-ana", b"p-ana")
+            .await
+            .unwrap();
+        assert!(keys
+            .find_pgp_secret_key("beto@example.com")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(keys
+            .find_pgp_passphrase("beto@example.com")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn clave_y_contrasena_no_se_confunden_entre_si() {
+        let (keys, _server, _shared) = fake_keyring().await;
+        keys.store_pgp_identity("ana@example.com", b"LA-CLAVE", b"LA-PASS")
+            .await
+            .unwrap();
+        assert_ne!(
+            keys.find_pgp_secret_key("ana@example.com")
+                .await
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            keys.find_pgp_passphrase("ana@example.com")
+                .await
+                .unwrap()
+                .unwrap()
+                .as_slice()
+        );
+    }
+
+    /// Con el llavero bloqueado `SearchItems` contesta vacío: no se puede tomar
+    /// por «no hay clave», es un error.
+    #[tokio::test]
+    async fn con_el_llavero_bloqueado_todo_da_error_y_no_ausencia() {
+        let (keys, server, shared) = fake_keyring().await;
+        keys.store_pgp_identity("ana@example.com", b"k", b"p")
+            .await
+            .unwrap();
+        lock_and_announce(&server, &shared).await.unwrap();
+
+        assert!(matches!(
+            keys.find_pgp_secret_key("ana@example.com").await,
+            Err(KeyError::Locked)
+        ));
+        assert!(matches!(
+            keys.find_pgp_passphrase("ana@example.com").await,
+            Err(KeyError::Locked)
+        ));
+        assert!(matches!(
+            keys.store_pgp_identity("ana@example.com", b"x", b"y").await,
+            Err(KeyError::Locked)
+        ));
+        assert!(matches!(
+            keys.delete_pgp_identity("ana@example.com").await,
+            Err(KeyError::Locked)
+        ));
     }
 }

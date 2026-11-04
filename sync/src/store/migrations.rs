@@ -1707,7 +1707,7 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .unwrap();
-        let all = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12];
+        let all = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13];
         Migrations::new(all[..version].iter().map(|sql| M::up(sql)).collect())
             .to_latest(&mut connection)
             .unwrap();
@@ -1780,6 +1780,43 @@ mod tests {
                 [],
             )
             .is_err());
+    }
+
+    /// **v13 → v14 no pierde nada**: lo que había (un buzón y una cola) sigue,
+    /// `pgp_peers` nace vacía y admite una sola fila por dirección.
+    #[test]
+    fn de_v13_a_v14_se_conserva_lo_que_habia_y_nace_el_peerstate() {
+        let mut connection = at_version(13);
+        assert_eq!(schema_version(&connection).unwrap(), 13);
+        assert!(connection.prepare("SELECT 1 FROM pgp_peers").is_err());
+        connection
+            .execute(
+                "INSERT INTO mailboxes (name, display_name, role, updated_at)
+                 VALUES ('INBOX', 'Bandeja', 'inbox', 'ayer')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO followups (message_id, recipients, remind_at, created_at)
+                 VALUES ('<a@x>', 'ana@x.com', 10, 1)",
+                [],
+            )
+            .unwrap();
+
+        apply(&mut connection).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 14);
+
+        let count = |sql: &str| -> i64 { connection.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(count("SELECT count(*) FROM mailboxes"), 1);
+        assert_eq!(count("SELECT count(*) FROM followups"), 1);
+        assert_eq!(count("SELECT count(*) FROM pgp_peers"), 0);
+
+        let insert =
+            "INSERT INTO pgp_peers (address, public_key, fingerprint, first_seen, updated_at)
+                      VALUES ('ana@x.com', x'01', 'AAAA', 1, 1)";
+        connection.execute(insert, []).unwrap();
+        assert!(connection.execute(insert, []).is_err(), "UNIQUE (address)");
     }
 
     /// **v1 → v2 no pierde nada**: la bitácora y el estado de la
