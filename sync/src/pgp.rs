@@ -51,7 +51,9 @@ use pgp::types::{KeyDetails, Password, Seipdv1ReadMode, Timestamp};
 use rand::rngs::OsRng;
 use zeroize::Zeroizing;
 
-use crate::message::{as_latin1, from_latin1, parse_content_type, split_headers, split_parts};
+use crate::message::{
+    as_latin1, decode_transfer, from_latin1, parse_content_type, split_headers, split_parts,
+};
 
 /// El `protocol` de un `multipart/encrypted` que es PGP/MIME (RFC 3156).
 const PGP_ENCRYPTED_PROTOCOL: &str = "application/pgp-encrypted";
@@ -71,6 +73,11 @@ const END_PGP_SIGNATURE: &str = "-----END PGP SIGNATURE-----";
 /// `shortcut: tope fijo de 64 MiB para el descifrado; upgrade si hiciera falta un
 /// tope por configuración o por tipo de adjunto`.
 const MAX_DECRYPTED: usize = 64 * 1024 * 1024;
+
+/// Tope de capas de compresión anidadas al descifrar (un paquete comprimido dentro
+/// de otro). Un mensaje legítimo lleva una sola; más allá de esto es una bomba de
+/// capas y se trata como [`Decryption::Unavailable`], nunca se materializa.
+const MAX_COMPRESSION_LAYERS: u32 = 4;
 
 // ── Estado expuesto a la ventana (calcado de smime_sign) ───────────────
 
@@ -140,29 +147,23 @@ impl std::error::Error for PgpError {}
 /// UID al `From` y los rechazos honestos son PR3; acá sólo se interpreta el
 /// material.
 pub fn parse_secret_key(bytes: &[u8]) -> Result<SignedSecretKey, PgpError> {
-    if looks_armored(bytes) {
-        SignedSecretKey::from_armor_single(bytes).map(|(key, _)| key)
-    } else {
-        SignedSecretKey::from_bytes(bytes)
-    }
-    .map_err(|e| PgpError::BadKey(e.to_string()))
+    // Binario primero: una clave binaria puede llevar `-----BEGIN` dentro de un UID
+    // y no por eso es armadura. El parser binario rechaza enseguida la armadura
+    // real (su primer byte, `-`, no es un encabezado de paquete válido), así que se
+    // cae al parser armor sin riesgo de interpretar mal.
+    SignedSecretKey::from_bytes(bytes)
+        .or_else(|_| SignedSecretKey::from_armor_single(bytes).map(|(key, _)| key))
+        .map_err(|e| PgpError::BadKey(e.to_string()))
 }
 
 /// Parsea una clave **pública** PGP, armada (ASCII) o binaria. Para los adjuntos
 /// `application/pgp-keys`, Autocrypt (PR3) y WKD (PR6).
 pub fn parse_public_key(bytes: &[u8]) -> Result<SignedPublicKey, PgpError> {
-    if looks_armored(bytes) {
-        SignedPublicKey::from_armor_single(bytes).map(|(key, _)| key)
-    } else {
-        SignedPublicKey::from_bytes(bytes)
-    }
-    .map_err(|e| PgpError::BadKey(e.to_string()))
-}
-
-fn looks_armored(bytes: &[u8]) -> bool {
-    bytes
-        .windows(b"-----BEGIN".len())
-        .any(|w| w == b"-----BEGIN")
+    // Binario primero (ver `parse_secret_key`): una clave binaria con `-----BEGIN`
+    // en un UID no es armadura.
+    SignedPublicKey::from_bytes(bytes)
+        .or_else(|_| SignedPublicKey::from_armor_single(bytes).map(|(key, _)| key))
+        .map_err(|e| PgpError::BadKey(e.to_string()))
 }
 
 // ── Descifrar ──────────────────────────────────────────────────────────
@@ -213,11 +214,24 @@ pub fn decrypt(raw: &[u8], secret_key: &SignedSecretKey, passphrase: &Password) 
         Err(e) => return Decryption::Unavailable(format!("no se pudo descifrar: {e}")),
     };
     // Un sobre PGP suele descifrar a un paquete comprimido (o firmado sobre uno):
-    // descomprimir es el idioma de rPGP antes de leer. No-op si no venía comprimido.
-    let mut decrypted = match decrypted.decompress() {
-        Ok(decrypted) => decrypted,
-        Err(e) => return Decryption::Unavailable(format!("descompresión: {e}")),
-    };
+    // descomprimir es el idioma de rPGP antes de leer. La primera pasada corre
+    // siempre (es no-op si no venía comprimido, y descomprime también el flujo de un
+    // mensaje firmado). Se repite mientras quede OTRO paquete comprimido anidado: sin
+    // el loop, `read_capped` soltaría los bytes crudos del paquete interno como si
+    // fueran el claro. La profundidad se acota contra una bomba de capas.
+    let mut decrypted = decrypted;
+    for layer in 0..MAX_COMPRESSION_LAYERS {
+        if layer > 0 && !decrypted.is_compressed() {
+            break;
+        }
+        decrypted = match decrypted.decompress() {
+            Ok(decrypted) => decrypted,
+            Err(e) => return Decryption::Unavailable(format!("descompresión: {e}")),
+        };
+    }
+    if decrypted.is_compressed() {
+        return Decryption::Unavailable("demasiadas capas de compresión anidadas".into());
+    }
 
     match read_capped(&mut decrypted, MAX_DECRYPTED) {
         Ok(data) => Decryption::Opened(Zeroizing::new(data)),
@@ -333,8 +347,14 @@ pub fn verify(raw: &[u8], candidate_keys: &[SignedPublicKey]) -> Verification {
 
 /// La firma separada de la parte `application/pgp-signature` (armada o binaria).
 fn parse_detached_signature(part: &str) -> Option<DetachedSignature> {
-    let (_part_headers, body) = split_headers(part);
-    let bytes = from_latin1(body);
+    let (part_headers, body) = split_headers(part);
+    // Se aplica el `Content-Transfer-Encoding` de la parte antes de parsear: una
+    // firma en base64 no es armadura ni paquete crudo hasta decodificarla. Sin
+    // header (o `7bit`/`8bit`/`binary`), `decode_transfer` deja los bytes tal cual.
+    let encoding = part_headers
+        .get("content-transfer-encoding")
+        .unwrap_or("7bit");
+    let bytes = decode_transfer(&from_latin1(body), encoding);
     DetachedSignature::from_armor_single(bytes.as_slice())
         .map(|(signature, _)| signature)
         .or_else(|_| DetachedSignature::from_bytes(bytes.as_slice()))
@@ -498,9 +518,56 @@ pub fn encrypt_to_keys(
 /// produzca el error «a quién le falta la clave» con la dirección.
 pub fn encryption_subkey(key: &SignedPublicKey) -> Option<&SignedPublicSubKey> {
     let now = Timestamp::now().as_secs();
+    // Una primaria muerta (revocada o expirada) descarta la clave entera, aunque
+    // tenga una subclave de cifrado vigente: no se cifra a una identidad revocada.
+    if !primary_usable(key, now) {
+        return None;
+    }
     key.public_subkeys
         .iter()
         .find(|subkey| subkey_usable(subkey, now, Usage::Encrypt))
+}
+
+/// Si la clave **primaria** sigue viva: no revocada y no expirada. Una primaria
+/// revocada o expirada mata la clave entera para cifrar, igual que una subclave
+/// muerta. La revocación se toma por presencia de una firma de revocación directa
+/// (verificarla es el gate de import, PR3). La expiración sale de la self-signature
+/// más reciente (firma directa de clave o auto-certificación de UID), relativa a la
+/// creación de la primaria; un vencimiento de cero segundos significa «nunca expira».
+fn primary_usable(key: &SignedPublicKey, now: u32) -> bool {
+    if key
+        .details
+        .revocation_signatures
+        .iter()
+        .any(|sig| sig.typ() == Some(SignatureType::KeyRevocation))
+    {
+        return false;
+    }
+
+    let latest_self_sig = key
+        .details
+        .direct_signatures
+        .iter()
+        .chain(
+            key.details
+                .users
+                .iter()
+                .flat_map(|user| user.signatures.iter()),
+        )
+        .filter_map(|sig| sig.created().map(|t| (t.as_secs(), sig)))
+        .max_by_key(|(created, _)| *created)
+        .map(|(_, sig)| sig);
+
+    if let Some(expiration) = latest_self_sig
+        .and_then(|sig| sig.key_expiration_time())
+        .filter(|d| d.as_secs() != 0)
+    {
+        let created = key.primary_key.created_at().as_secs();
+        if created.saturating_add(expiration.as_secs()) < now {
+            return false;
+        }
+    }
+    true
 }
 
 /// Para qué se busca una subclave.
@@ -539,7 +606,9 @@ fn subkey_usable(subkey: &SignedPublicSubKey, now: u32, usage: Usage) -> bool {
     };
 
     // Expirada → muerta. El vencimiento es relativo a la creación de la subclave.
-    if let Some(expiration) = binding.key_expiration_time() {
+    // `key_expiration_time()` de cero segundos significa «nunca expira» (RFC 9580
+    // §5.2.3.13), no «expiró al crearse»: se filtra para no matar esas subclaves.
+    if let Some(expiration) = binding.key_expiration_time().filter(|d| d.as_secs() != 0) {
         let created = subkey.created_at().as_secs();
         if created.saturating_add(expiration.as_secs()) < now {
             return false;
@@ -547,12 +616,22 @@ fn subkey_usable(subkey: &SignedPublicSubKey, now: u32, usage: Usage) -> bool {
     }
 
     let flags = binding.key_flags();
-    let any_flag =
-        flags.certify() || flags.sign() || flags.encrypt_comms() || flags.encrypt_storage();
+    let any_flag = flags.certify()
+        || flags.sign()
+        || flags.encrypt_comms()
+        || flags.encrypt_storage()
+        || flags.authentication();
     if any_flag {
+        // Con flags presentes se exige la capacidad pedida **y** que el algoritmo la
+        // soporte: una subclave con un flag de cifrado errado sobre un algoritmo que
+        // sólo firma no se elige (y al revés), para que la búsqueda siga a la próxima
+        // subclave en vez de elegir una que después falla en `encrypt_to_keys`.
         return match usage {
-            Usage::Encrypt => flags.encrypt_comms() || flags.encrypt_storage(),
-            Usage::Sign => flags.sign(),
+            Usage::Encrypt => {
+                (flags.encrypt_comms() || flags.encrypt_storage())
+                    && subkey.algorithm().can_encrypt()
+            }
+            Usage::Sign => flags.sign() && subkey.algorithm().can_sign(),
         };
     }
 
