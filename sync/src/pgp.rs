@@ -575,3 +575,731 @@ fn strip_one_trailing_crlf(mut bytes: Vec<u8>) -> Vec<u8> {
     }
     bytes
 }
+
+#[cfg(test)]
+mod tests {
+    //! Pruebas del núcleo OpenPGP. Las claves y los mensajes se generan acá con el
+    //! propio `pgp`: nada de binarios externos ni fixtures opacos. Lo que más
+    //! importa es **fallar cerrado**: un ciphertext manipulado nunca puede
+    //! mostrarse como texto, y una clave expirada o revocada no cifra.
+    use super::*;
+    use base64::Engine as _;
+    use pgp::armor::Dearmor;
+    use pgp::composed::{
+        EncryptionCaps, KeyType, SecretKeyParamsBuilder, SubkeyParams, SubkeyParamsBuilder,
+    };
+    use pgp::crypto::ecc_curve::ECCCurve;
+    use pgp::packet::{KeyFlags, SignatureConfig, Subpacket, SubpacketData};
+    use pgp::types::{CompressionAlgorithm, Duration as PgpDuration};
+
+    const CLARO: &str =
+        "Content-Type: text/plain; charset=utf-8\r\n\r\nSECRETO-DEL-TEST: el lince cena a las ocho";
+
+    fn vacia() -> Password {
+        Password::empty()
+    }
+
+    // ── Fixtures generadas con rPGP ────────────────────────────────────
+
+    fn subclave_de_firma() -> SubkeyParams {
+        let mut p = SubkeyParamsBuilder::default();
+        p.key_type(KeyType::Ed25519Legacy)
+            .can_sign(true)
+            .can_encrypt(EncryptionCaps::None)
+            .can_authenticate(false);
+        p.build().expect("params de la subclave de firma")
+    }
+
+    fn subclave_de_cifrado(creada: Option<Timestamp>) -> SubkeyParams {
+        let mut p = SubkeyParamsBuilder::default();
+        p.key_type(KeyType::ECDH(ECCCurve::Curve25519Legacy))
+            .can_sign(false)
+            .can_encrypt(EncryptionCaps::All)
+            .can_authenticate(false);
+        if let Some(creada) = creada {
+            p.created_at(creada);
+        }
+        p.build().expect("params de la subclave de cifrado")
+    }
+
+    fn generar(uid: &str, subclaves: Vec<SubkeyParams>) -> SignedSecretKey {
+        let mut p = SecretKeyParamsBuilder::default();
+        p.key_type(KeyType::Ed25519Legacy)
+            .can_certify(true)
+            .can_sign(false)
+            .can_encrypt(EncryptionCaps::None)
+            .primary_user_id(uid.into())
+            .subkeys(subclaves);
+        p.build()
+            .expect("params de la clave")
+            .generate(OsRng)
+            .expect("la clave se genera")
+    }
+
+    /// Una clave completa: primaria, subclave de firma y subclave de cifrado.
+    fn clave_completa(uid: &str) -> SignedSecretKey {
+        generar(uid, vec![subclave_de_firma(), subclave_de_cifrado(None)])
+    }
+
+    fn publica(secret: &SignedSecretKey) -> SignedPublicKey {
+        SignedPublicKey::from(secret.clone())
+    }
+
+    fn firmar_union(
+        secret: &SignedSecretKey,
+        subkey: &SignedPublicSubKey,
+        typ: SignatureType,
+        expiracion: Option<u32>,
+    ) -> pgp::packet::Signature {
+        let primaria = &secret.primary_key;
+        let mut flags = KeyFlags::default();
+        flags.set_encrypt_comms(true);
+        flags.set_encrypt_storage(true);
+        let mut config = SignatureConfig::from_key(OsRng, primaria, typ).expect("config");
+        config.hashed_subpackets = vec![
+            Subpacket::regular(SubpacketData::SignatureCreationTime(Timestamp::now())).unwrap(),
+            Subpacket::regular(SubpacketData::KeyFlags(flags)).unwrap(),
+            Subpacket::regular(SubpacketData::IssuerFingerprint(primaria.fingerprint())).unwrap(),
+        ];
+        if let Some(segundos) = expiracion {
+            config.hashed_subpackets.push(
+                Subpacket::regular(SubpacketData::KeyExpirationTime(PgpDuration::from_secs(
+                    segundos,
+                )))
+                .unwrap(),
+            );
+        }
+        config
+            .sign_subkey_binding(primaria, primaria.public_key(), &vacia(), &subkey.key)
+            .expect("firma de la unión")
+    }
+
+    /// La pública de `secret` con la subclave `index` reatada: con vencimiento
+    /// (`expiracion`, segundos desde su creación) y/o revocada.
+    fn con_subclave_reatada(
+        secret: &SignedSecretKey,
+        index: usize,
+        expiracion: Option<u32>,
+        revocada: bool,
+    ) -> SignedPublicKey {
+        let mut public = publica(secret);
+        let subkey = public.public_subkeys[index].clone();
+        let mut firmas = vec![firmar_union(
+            secret,
+            &subkey,
+            SignatureType::SubkeyBinding,
+            expiracion,
+        )];
+        if revocada {
+            firmas.push(firmar_union(
+                secret,
+                &subkey,
+                SignatureType::SubkeyRevocation,
+                None,
+            ));
+        }
+        public.public_subkeys[index].signatures = firmas;
+        public
+    }
+
+    // ── Armado de mensajes ─────────────────────────────────────────────
+
+    fn cifrar(claro: &[u8], para: &SignedPublicKey) -> Vec<u8> {
+        encrypt_to_keys(claro, std::slice::from_ref(para)).expect("el cifrado sale")
+    }
+
+    fn abrir(raw: &[u8], secret: &SignedSecretKey) -> Decryption {
+        decrypt(raw, secret, &vacia())
+    }
+
+    fn texto_abierto(d: Decryption) -> String {
+        match d {
+            Decryption::Opened(bytes) => String::from_utf8(bytes.to_vec()).unwrap(),
+            otro => panic!("se esperaba Opened, salió {otro:?}"),
+        }
+    }
+
+    /// Reenvuelve bytes binarios OpenPGP como armadura de mensaje.
+    fn armar(binario: &[u8]) -> Vec<u8> {
+        let cuerpo = base64::engine::general_purpose::STANDARD.encode(binario);
+        let mut out = String::from("-----BEGIN PGP MESSAGE-----\n\n");
+        for linea in cuerpo.as_bytes().chunks(64) {
+            out.push_str(std::str::from_utf8(linea).unwrap());
+            out.push('\n');
+        }
+        out.push_str("-----END PGP MESSAGE-----\n");
+        out.into_bytes()
+    }
+
+    /// Desarma el mensaje, aplica `cambio` a los bytes binarios y lo rearma:
+    /// así se manipula el ciphertext sin romper la armadura ni su CRC.
+    fn manipular(armado: &[u8], cambio: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+        let mut binario = Vec::new();
+        Dearmor::new(armado)
+            .read_to_end(&mut binario)
+            .expect("la armadura se desarma");
+        cambio(&mut binario);
+        armar(&binario)
+    }
+
+    fn correo_inline(armado: &[u8]) -> Vec<u8> {
+        let mut out = b"From: a@vasak.test\r\nContent-Type: text/plain\r\n\r\n".to_vec();
+        out.extend_from_slice(armado);
+        out
+    }
+
+    fn correo_pgp_mime(armado: &[u8]) -> Vec<u8> {
+        let mut out = b"From: a@vasak.test\r\nContent-Type: multipart/encrypted; \
+protocol=\"application/pgp-encrypted\"; boundary=\"B\"\r\n\r\n--B\r\n\
+Content-Type: application/pgp-encrypted\r\n\r\nVersion: 1\r\n--B\r\n\
+Content-Type: application/octet-stream\r\n\r\n"
+            .to_vec();
+        out.extend_from_slice(armado);
+        out.extend_from_slice(b"\r\n--B--\r\n");
+        out
+    }
+
+    fn assert_cerrado(resultado: &Decryption) {
+        match resultado {
+            Decryption::Unavailable(motivo) => {
+                assert!(
+                    !motivo.contains("SECRETO-DEL-TEST"),
+                    "el motivo no puede filtrar el claro: {motivo}"
+                );
+            }
+            Decryption::Opened(bytes) => panic!(
+                "falló abierto: un mensaje manipulado se mostró como texto: {:?}",
+                String::from_utf8_lossy(bytes)
+            ),
+            Decryption::NotEncrypted => panic!("no se reconoció como cifrado"),
+        }
+    }
+
+    // ── 1. Fallar cerrado ante ciphertext manipulado ───────────────────
+
+    /// El mensaje de referencia: cifrado a `bob`, y se comprueba que SIN
+    /// manipular sí abre (si no, los «falla cerrado» serían vacíos).
+    fn cifrado_de_referencia() -> (SignedSecretKey, Vec<u8>) {
+        let bob = clave_completa("Bob <bob@vasak.test>");
+        let armado = cifrar(CLARO.as_bytes(), &publica(&bob));
+        assert_eq!(
+            texto_abierto(abrir(&correo_inline(&armado), &bob)),
+            CLARO,
+            "sin manipular tiene que abrir"
+        );
+        (bob, armado)
+    }
+
+    #[test]
+    fn un_byte_cambiado_al_final_del_sobre_rompe_el_mdc_y_no_se_muestra() {
+        // SEIPD v1. El último byte del ciphertext cae dentro del MDC cifrado: el
+        // claro queda intacto y sólo la integridad avisa. Es el caso de la falla
+        // rPGP de 2019. rPGP 0.21 lo verifica entero al abrir, antes de soltar nada.
+        let (bob, armado) = cifrado_de_referencia();
+        let roto = manipular(&armado, |b| *b.last_mut().unwrap() ^= 0x01);
+        assert_cerrado(&abrir(&correo_inline(&roto), &bob));
+    }
+
+    #[test]
+    fn un_byte_cambiado_en_el_cuerpo_del_sobre_no_se_muestra() {
+        let (bob, armado) = cifrado_de_referencia();
+        let roto = manipular(&armado, |b| {
+            let medio = b.len() - 40;
+            b[medio] ^= 0x80;
+        });
+        assert_cerrado(&abrir(&correo_inline(&roto), &bob));
+    }
+
+    #[test]
+    fn un_sobre_sin_el_mdc_porque_lo_cortaron_no_se_muestra() {
+        let (bob, armado) = cifrado_de_referencia();
+        let roto = manipular(&armado, |b| b.truncate(b.len() - 12));
+        assert_cerrado(&abrir(&correo_inline(&roto), &bob));
+    }
+
+    /// Un sobre SEIPD v2 (AEAD, OCB) de varios chunks de 4 KiB, cifrado a `para`.
+    /// A diferencia de SEIPD v1 (que rPGP verifica entero antes de soltar nada),
+    /// cada chunk AEAD se autentica **a medida que se lee**: es el camino que
+    /// protege `read_capped`.
+    fn cifrar_aead(claro: &[u8], para: &SignedPublicKey) -> Vec<u8> {
+        use pgp::crypto::aead::{AeadAlgorithm, ChunkSize};
+        let mut rng = OsRng;
+        let mut builder = MessageBuilder::from_bytes("", claro.to_vec()).seipd_v2(
+            &mut rng,
+            SymmetricKeyAlgorithm::AES256,
+            AeadAlgorithm::Ocb,
+            ChunkSize::C4KiB,
+        );
+        builder
+            .encrypt_to_key(&mut rng, encryption_subkey(para).unwrap())
+            .unwrap();
+        builder
+            .to_armored_string(rng, Default::default())
+            .unwrap()
+            .into_bytes()
+    }
+
+    fn cifrado_aead_de_referencia() -> (SignedSecretKey, Vec<u8>, String) {
+        let bob = clave_completa("Bob <bob@vasak.test>");
+        let claro = format!("{CLARO}{}", "relleno ".repeat(12_000));
+        let armado = cifrar_aead(claro.as_bytes(), &publica(&bob));
+        assert_eq!(
+            texto_abierto(abrir(&correo_inline(&armado), &bob)),
+            claro,
+            "sin manipular tiene que abrir"
+        );
+        (bob, armado, claro)
+    }
+
+    #[test]
+    fn un_chunk_aead_manipulado_en_la_lectura_no_entrega_texto_parcial() {
+        // El primer chunk (que se autentica al abrir) queda sano: lo que falla es
+        // un chunk posterior, mientras se lee. Si `read_capped` tragara ese error
+        // devolvería el texto de los chunks anteriores como si fuera completo.
+        let (bob, armado, _claro) = cifrado_aead_de_referencia();
+        for posicion in [|len: usize| len - 1, |len: usize| len / 2] {
+            let roto = manipular(&armado, |b| {
+                let i = posicion(b.len());
+                b[i] ^= 0x01;
+            });
+            let resultado = abrir(&correo_inline(&roto), &bob);
+            assert_cerrado(&resultado);
+            match resultado {
+                Decryption::Unavailable(motivo) => assert!(
+                    motivo.contains("lectura del contenido descifrado"),
+                    "tenía que fallar en la lectura, no al abrir: {motivo}"
+                ),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn un_sobre_aead_cortado_no_entrega_texto_parcial() {
+        let (bob, armado, _claro) = cifrado_aead_de_referencia();
+        let roto = manipular(&armado, |b| b.truncate(b.len() - 200));
+        assert_cerrado(&abrir(&correo_inline(&roto), &bob));
+    }
+
+    #[test]
+    fn el_mdc_roto_tambien_falla_cerrado_dentro_de_pgp_mime() {
+        let (bob, armado) = cifrado_de_referencia();
+        let roto = manipular(&armado, |b| *b.last_mut().unwrap() ^= 0x01);
+        assert_cerrado(&abrir(&correo_pgp_mime(&roto), &bob));
+    }
+
+    #[test]
+    fn sin_nuestra_clave_el_sobre_queda_no_disponible() {
+        let (_bob, armado) = cifrado_de_referencia();
+        let carol = clave_completa("Carol <carol@vasak.test>");
+        assert_cerrado(&abrir(&correo_inline(&armado), &carol));
+    }
+
+    #[test]
+    fn un_bloque_pgp_ilegible_queda_no_disponible_y_no_entra_en_panico() {
+        let basura = b"-----BEGIN PGP MESSAGE-----\n\nAAAA\n-----END PGP MESSAGE-----\n";
+        let bob = clave_completa("Bob <bob@vasak.test>");
+        assert_cerrado(&abrir(&correo_inline(basura), &bob));
+    }
+
+    #[test]
+    fn un_mensaje_sin_pgp_no_esta_cifrado() {
+        let bob = clave_completa("Bob <bob@vasak.test>");
+        let raw = b"From: a@vasak.test\r\nContent-Type: text/plain\r\n\r\nhola\r\n";
+        assert!(!is_pgp_encrypted(raw));
+        assert!(matches!(abrir(raw, &bob), Decryption::NotEncrypted));
+    }
+
+    // ── 5. Tope anti-bomba ─────────────────────────────────────────────
+
+    #[test]
+    fn el_tope_deja_pasar_justo_el_limite_y_corta_un_byte_mas() {
+        let justo = vec![7u8; 10];
+        assert_eq!(read_capped(&mut justo.as_slice(), 10).unwrap(), justo);
+        let pasado = vec![7u8; 11];
+        let error = read_capped(&mut pasado.as_slice(), 10).unwrap_err();
+        assert!(error.contains("supera el tope"), "{error}");
+    }
+
+    fn cifrar_comprimido(claro: Vec<u8>, para: &SignedPublicKey) -> Vec<u8> {
+        let mut rng = OsRng;
+        let mut builder =
+            MessageBuilder::from_bytes("", claro).seipd_v1(&mut rng, SymmetricKeyAlgorithm::AES256);
+        builder.compression(CompressionAlgorithm::ZLIB);
+        builder
+            .encrypt_to_key(&mut rng, encryption_subkey(para).unwrap())
+            .unwrap();
+        builder
+            .to_armored_string(rng, Default::default())
+            .unwrap()
+            .into_bytes()
+    }
+
+    #[test]
+    fn un_mensaje_comprimido_chico_se_abre_y_uno_bomba_no_se_materializa() {
+        let bob = clave_completa("Bob <bob@vasak.test>");
+        let publica = publica(&bob);
+
+        // Control: la compresión funciona, así que la bomba no falla por eso.
+        let normal = cifrar_comprimido(vec![b'a'; 1024 * 1024], &publica);
+        let abierto = texto_abierto(abrir(&correo_inline(&normal), &bob));
+        assert_eq!(abierto.len(), 1024 * 1024);
+
+        // Bomba: una MiB más que el tope, comprimida a unos pocos KiB.
+        let bomba = cifrar_comprimido(vec![0u8; MAX_DECRYPTED + 1024 * 1024], &publica);
+        assert!(bomba.len() < 256 * 1024, "la bomba debe pesar poco");
+        match abrir(&correo_inline(&bomba), &bob) {
+            Decryption::Unavailable(motivo) => {
+                assert!(motivo.contains("supera el tope"), "{motivo}")
+            }
+            otro => panic!("la bomba no puede abrirse: {otro:?}"),
+        }
+    }
+
+    // ── 2. Ida y vuelta de cifrado ─────────────────────────────────────
+
+    #[test]
+    fn cifrar_a_una_publica_y_descifrar_con_su_privada_recupera_el_claro() {
+        let bob = clave_completa("Bob <bob@vasak.test>");
+        let armado = cifrar(CLARO.as_bytes(), &publica(&bob));
+        let texto = String::from_utf8(armado.clone()).unwrap();
+        assert!(texto.starts_with(BEGIN_PGP_MESSAGE), "{texto}");
+        assert!(!texto.contains("SECRETO-DEL-TEST"), "el claro no viaja");
+        assert_eq!(texto_abierto(abrir(&correo_inline(&armado), &bob)), CLARO);
+    }
+
+    #[test]
+    fn el_sobre_en_pgp_mime_tambien_se_abre() {
+        let bob = clave_completa("Bob <bob@vasak.test>");
+        let correo = correo_pgp_mime(&cifrar(CLARO.as_bytes(), &publica(&bob)));
+        assert!(is_pgp_encrypted(&correo));
+        assert_eq!(texto_abierto(abrir(&correo, &bob)), CLARO);
+    }
+
+    #[test]
+    fn un_sobre_para_dos_destinatarios_lo_abre_cada_uno_y_un_tercero_no() {
+        let (bob, carol, dave) = (
+            clave_completa("Bob <bob@vasak.test>"),
+            clave_completa("Carol <carol@vasak.test>"),
+            clave_completa("Dave <dave@vasak.test>"),
+        );
+        let armado = encrypt_to_keys(CLARO.as_bytes(), &[publica(&bob), publica(&carol)]).unwrap();
+        let correo = correo_inline(&armado);
+        assert_eq!(texto_abierto(abrir(&correo, &bob)), CLARO);
+        assert_eq!(texto_abierto(abrir(&correo, &carol)), CLARO);
+        assert_cerrado(&abrir(&correo, &dave));
+    }
+
+    #[test]
+    fn sin_destinatarios_no_se_cifra() {
+        assert!(matches!(
+            encrypt_to_keys(b"x", &[]),
+            Err(PgpError::NoEncryptionKey(_))
+        ));
+    }
+
+    // ── 3. Selección de subclave ───────────────────────────────────────
+
+    #[test]
+    fn la_subclave_de_cifrado_valida_se_elige_y_no_la_de_firma() {
+        let bob = clave_completa("Bob <bob@vasak.test>");
+        let publica = publica(&bob);
+        let elegida = encryption_subkey(&publica).expect("hay subclave de cifrado");
+        assert_eq!(
+            elegida.fingerprint(),
+            bob.secret_subkeys[1].fingerprint(),
+            "tiene que ser la de cifrado (la 2ª), no la de firma"
+        );
+    }
+
+    #[test]
+    fn una_subclave_de_cifrado_expirada_cuenta_como_sin_clave() {
+        let hace_un_ano = Timestamp::from_secs(Timestamp::now().as_secs() - 365 * 24 * 3600);
+        let bob = generar(
+            "Bob <bob@vasak.test>",
+            vec![subclave_de_firma(), subclave_de_cifrado(Some(hace_un_ano))],
+        );
+        // Venció hace unos 364 días.
+        let expirada = con_subclave_reatada(&bob, 1, Some(24 * 3600), false);
+        assert!(encryption_subkey(&expirada).is_none());
+        assert!(matches!(
+            encrypt_to_keys(b"x", &[expirada]),
+            Err(PgpError::NoEncryptionKey(_))
+        ));
+    }
+
+    #[test]
+    fn una_subclave_con_vencimiento_futuro_sigue_sirviendo() {
+        let hace_un_dia = Timestamp::from_secs(Timestamp::now().as_secs() - 24 * 3600);
+        let bob = generar(
+            "Bob <bob@vasak.test>",
+            vec![subclave_de_firma(), subclave_de_cifrado(Some(hace_un_dia))],
+        );
+        let vigente = con_subclave_reatada(&bob, 1, Some(30 * 24 * 3600), false);
+        assert!(encryption_subkey(&vigente).is_some());
+        let armado = encrypt_to_keys(CLARO.as_bytes(), &[vigente]).unwrap();
+        assert_eq!(texto_abierto(abrir(&correo_inline(&armado), &bob)), CLARO);
+    }
+
+    #[test]
+    fn una_subclave_de_cifrado_revocada_cuenta_como_sin_clave() {
+        let bob = clave_completa("Bob <bob@vasak.test>");
+        let revocada = con_subclave_reatada(&bob, 1, None, true);
+        assert!(encryption_subkey(&revocada).is_none());
+        assert!(matches!(
+            encrypt_to_keys(b"x", &[revocada]),
+            Err(PgpError::NoEncryptionKey(_))
+        ));
+    }
+
+    #[test]
+    fn con_una_expirada_y_otra_vigente_se_elige_la_vigente() {
+        let hace_un_ano = Timestamp::from_secs(Timestamp::now().as_secs() - 365 * 24 * 3600);
+        let bob = generar(
+            "Bob <bob@vasak.test>",
+            vec![
+                subclave_de_cifrado(Some(hace_un_ano)),
+                subclave_de_cifrado(None),
+            ],
+        );
+        let publica = con_subclave_reatada(&bob, 0, Some(24 * 3600), false);
+        let elegida = encryption_subkey(&publica).expect("queda la vigente");
+        assert_eq!(elegida.fingerprint(), bob.secret_subkeys[1].fingerprint());
+    }
+
+    #[test]
+    fn una_clave_con_solo_subclave_de_firma_no_cae_a_la_primaria() {
+        let solo_firma = generar("Solo <solo@vasak.test>", vec![subclave_de_firma()]);
+        let publica = publica(&solo_firma);
+        assert!(encryption_subkey(&publica).is_none());
+        match encrypt_to_keys(b"x", std::slice::from_ref(&publica)) {
+            Err(PgpError::NoEncryptionKey(quien)) => {
+                assert_eq!(quien, publica.primary_key.fingerprint().to_string())
+            }
+            otro => panic!("se esperaba NoEncryptionKey, salió {otro:?}"),
+        }
+    }
+
+    #[test]
+    fn si_a_un_destinatario_le_falta_la_clave_no_se_cifra_a_medias() {
+        let bob = clave_completa("Bob <bob@vasak.test>");
+        let solo_firma = generar("Solo <solo@vasak.test>", vec![subclave_de_firma()]);
+        let resultado = encrypt_to_keys(b"x", &[publica(&bob), publica(&solo_firma)]);
+        assert!(matches!(resultado, Err(PgpError::NoEncryptionKey(_))));
+    }
+
+    // ── 4. Firmar y verificar ──────────────────────────────────────────
+
+    const CONTENIDO: &str = "Content-Type: text/plain; charset=utf-8\r\n\r\nhola, esto va firmado";
+
+    fn correo_firmado(contenido: &str, firma_armada: &[u8]) -> Vec<u8> {
+        let mut out = format!(
+            "From: a@vasak.test\r\nContent-Type: multipart/signed; \
+protocol=\"application/pgp-signature\"; micalg=pgp-sha256; boundary=\"S\"\r\n\r\n\
+--S\r\n{contenido}\r\n--S\r\nContent-Type: application/pgp-signature\r\n\r\n"
+        )
+        .into_bytes();
+        out.extend_from_slice(firma_armada);
+        out.extend_from_slice(b"\r\n--S--\r\n");
+        out
+    }
+
+    #[test]
+    fn la_firma_separada_verifica_contra_la_clave_correcta() {
+        let alice = clave_completa("Alice <alice@vasak.test>");
+        let firma = sign_detached(CONTENIDO.as_bytes(), &alice, &vacia()).unwrap();
+        assert!(String::from_utf8_lossy(&firma).contains("BEGIN PGP SIGNATURE"));
+        let correo = correo_firmado(CONTENIDO, &firma);
+        assert_eq!(
+            verify(&correo, &[publica(&alice)]),
+            Verification::SignedUntrusted(alice.primary_key.fingerprint().to_string())
+        );
+    }
+
+    #[test]
+    fn la_firma_separada_no_verifica_contra_otra_clave() {
+        let alice = clave_completa("Alice <alice@vasak.test>");
+        let mallory = clave_completa("Mallory <mallory@vasak.test>");
+        let firma = sign_detached(CONTENIDO.as_bytes(), &alice, &vacia()).unwrap();
+        let correo = correo_firmado(CONTENIDO, &firma);
+        assert!(matches!(
+            verify(&correo, &[publica(&mallory)]),
+            Verification::Unverified(_)
+        ));
+        // Sin ninguna candidata (firmante desconocido) tampoco hay «firmado».
+        assert!(matches!(verify(&correo, &[]), Verification::Unverified(_)));
+    }
+
+    #[test]
+    fn la_firma_separada_gana_la_clave_que_cierra_entre_varias_candidatas() {
+        let alice = clave_completa("Alice <alice@vasak.test>");
+        let mallory = clave_completa("Mallory <mallory@vasak.test>");
+        let firma = sign_detached(CONTENIDO.as_bytes(), &alice, &vacia()).unwrap();
+        let correo = correo_firmado(CONTENIDO, &firma);
+        assert_eq!(
+            verify(&correo, &[publica(&mallory), publica(&alice)]),
+            Verification::SignedUntrusted(alice.primary_key.fingerprint().to_string())
+        );
+    }
+
+    #[test]
+    fn un_byte_cambiado_en_el_contenido_firmado_no_verifica() {
+        let alice = clave_completa("Alice <alice@vasak.test>");
+        let firma = sign_detached(CONTENIDO.as_bytes(), &alice, &vacia()).unwrap();
+        let adulterado = CONTENIDO.replace("hola", "chau");
+        let correo = correo_firmado(&adulterado, &firma);
+        assert!(matches!(
+            verify(&correo, &[publica(&alice)]),
+            Verification::Unverified(_)
+        ));
+    }
+
+    #[test]
+    fn se_firma_con_la_subclave_de_firma_aunque_la_de_cifrado_venga_primero() {
+        // Si eligiera la subclave ECDH (sólo de cifrado) la firma fallaría.
+        let alice = generar(
+            "Alice <alice@vasak.test>",
+            vec![subclave_de_cifrado(None), subclave_de_firma()],
+        );
+        let firma = sign_detached(CONTENIDO.as_bytes(), &alice, &vacia()).unwrap();
+        let correo = correo_firmado(CONTENIDO, &firma);
+        assert!(matches!(
+            verify(&correo, &[publica(&alice)]),
+            Verification::SignedUntrusted(_)
+        ));
+    }
+
+    #[test]
+    fn sin_subclave_de_firma_firma_la_primaria_y_verifica() {
+        let alice = generar("Alice <alice@vasak.test>", vec![subclave_de_cifrado(None)]);
+        let firma = sign_detached(CONTENIDO.as_bytes(), &alice, &vacia()).unwrap();
+        let correo = correo_firmado(CONTENIDO, &firma);
+        assert_eq!(
+            verify(&correo, &[publica(&alice)]),
+            Verification::SignedUntrusted(alice.primary_key.fingerprint().to_string())
+        );
+    }
+
+    #[test]
+    fn un_multipart_signed_con_una_tercera_parte_no_verifica() {
+        // RFC 1847: son exactamente dos partes; una tercera podría mostrar algo que
+        // la firma no cubre.
+        let alice = clave_completa("Alice <alice@vasak.test>");
+        let firma = sign_detached(CONTENIDO.as_bytes(), &alice, &vacia()).unwrap();
+        let correo = correo_firmado(CONTENIDO, &firma);
+        let texto = String::from_utf8(correo).unwrap();
+        let con_extra = texto.replace(
+            "\r\n--S--\r\n",
+            "\r\n--S\r\nContent-Type: text/plain\r\n\r\nINYECTADO\r\n--S--\r\n",
+        );
+        assert!(matches!(
+            verify(con_extra.as_bytes(), &[publica(&alice)]),
+            Verification::Unverified(_)
+        ));
+    }
+
+    #[test]
+    fn un_multipart_signed_que_no_es_pgp_no_se_muestra_como_pgp() {
+        let alice = clave_completa("Alice <alice@vasak.test>");
+        let firma = sign_detached(CONTENIDO.as_bytes(), &alice, &vacia()).unwrap();
+        let correo = String::from_utf8(correo_firmado(CONTENIDO, &firma))
+            .unwrap()
+            .replace(
+                "application/pgp-signature\"",
+                "application/pkcs7-signature\"",
+            );
+        assert_eq!(
+            verify(correo.as_bytes(), &[publica(&alice)]),
+            Verification::NotSigned
+        );
+    }
+
+    fn cleartext_de(texto: &str, firmante: &impl pgp::types::SigningKey) -> String {
+        CleartextSignedMessage::sign(OsRng, texto, firmante, &vacia())
+            .expect("firma cleartext")
+            .to_armored_string(Default::default())
+            .expect("armadura")
+    }
+
+    fn correo_con(bloque: &str) -> Vec<u8> {
+        format!("From: a@vasak.test\r\nContent-Type: text/plain\r\n\r\n{bloque}").into_bytes()
+    }
+
+    #[test]
+    fn el_cleartext_inline_verifica_con_la_subclave_de_firma() {
+        let alice = clave_completa("Alice <alice@vasak.test>");
+        let bloque = cleartext_de("hola en claro", &*alice.secret_subkeys[0]);
+        assert_eq!(
+            verify(&correo_con(&bloque), &[publica(&alice)]),
+            Verification::SignedUntrusted(alice.primary_key.fingerprint().to_string())
+        );
+    }
+
+    #[test]
+    fn el_cleartext_inline_verifica_con_la_primaria() {
+        let alice = clave_completa("Alice <alice@vasak.test>");
+        let bloque = cleartext_de("hola en claro", &alice.primary_key);
+        assert_eq!(
+            verify(&correo_con(&bloque), &[publica(&alice)]),
+            Verification::SignedUntrusted(alice.primary_key.fingerprint().to_string())
+        );
+    }
+
+    #[test]
+    fn el_cleartext_inline_no_verifica_contra_otra_clave() {
+        let alice = clave_completa("Alice <alice@vasak.test>");
+        let mallory = clave_completa("Mallory <mallory@vasak.test>");
+        let bloque = cleartext_de("hola en claro", &*alice.secret_subkeys[0]);
+        assert!(matches!(
+            verify(&correo_con(&bloque), &[publica(&mallory)]),
+            Verification::Unverified(_)
+        ));
+    }
+
+    #[test]
+    fn un_cleartext_con_el_texto_cambiado_no_verifica() {
+        let alice = clave_completa("Alice <alice@vasak.test>");
+        let bloque = cleartext_de("pago 100 pesos", &*alice.secret_subkeys[0])
+            .replace("100 pesos", "900 pesos");
+        assert!(matches!(
+            verify(&correo_con(&bloque), &[publica(&alice)]),
+            Verification::Unverified(_)
+        ));
+    }
+
+    #[test]
+    fn un_correo_sin_firma_no_esta_firmado() {
+        let alice = clave_completa("Alice <alice@vasak.test>");
+        let raw = b"From: a@vasak.test\r\nContent-Type: text/plain\r\n\r\nhola\r\n";
+        assert_eq!(verify(raw, &[publica(&alice)]), Verification::NotSigned);
+    }
+
+    // ── Claves: armadura y binario ─────────────────────────────────────
+
+    #[test]
+    fn las_claves_se_leen_armadas_y_binarias_y_una_basura_es_bad_key() {
+        use pgp::ser::Serialize;
+        let alice = clave_completa("Alice <alice@vasak.test>");
+        let pub_key = publica(&alice);
+
+        let armada = pub_key.to_armored_bytes(Default::default()).unwrap();
+        assert_eq!(parse_public_key(&armada).unwrap(), pub_key);
+        assert_eq!(
+            parse_public_key(&pub_key.to_bytes().unwrap()).unwrap(),
+            pub_key
+        );
+
+        let secreta = alice.to_armored_bytes(Default::default()).unwrap();
+        assert_eq!(parse_secret_key(&secreta).unwrap(), alice);
+        assert_eq!(parse_secret_key(&alice.to_bytes().unwrap()).unwrap(), alice);
+
+        assert!(matches!(
+            parse_public_key(b"esto no es una clave"),
+            Err(PgpError::BadKey(_))
+        ));
+        assert!(matches!(
+            parse_secret_key(b"-----BEGIN PGP PRIVATE KEY BLOCK-----\n\nAAAA\n-----END PGP PRIVATE KEY BLOCK-----\n"),
+            Err(PgpError::BadKey(_))
+        ));
+    }
+}
