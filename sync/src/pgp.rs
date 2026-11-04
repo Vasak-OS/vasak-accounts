@@ -933,7 +933,104 @@ Content-Type: application/octet-stream\r\n\r\n"
         assert!(matches!(abrir(raw, &bob), Decryption::NotEncrypted));
     }
 
+    // ── 1b. SED (tag 9, sin MDC): EFAIL / legacy ───────────────────────
+
+    /// Un sobre **SED crudo** (paquete tag 9, `SymEncryptedData`, sin MDC) cifrado a
+    /// `para`: PKESK v3 con la clave de sesión + SED con el CFB sin integridad. Se
+    /// arma a mano porque rPGP ya no sabe emitirlo (RFC 9580: «MUST NOT create»).
+    /// El claro es un paquete literal con `claro`, así que, **con `legacy` encendido**,
+    /// este sobre sí se abriría: eso lo comprueba la prueba de abajo como control.
+    fn cifrar_sed(claro: &[u8], para: &SignedPublicKey) -> Vec<u8> {
+        use pgp::composed::RawSessionKey;
+        use pgp::packet::{PacketTrait, PublicKeyEncryptedSessionKey};
+
+        let alg = SymmetricKeyAlgorithm::AES256;
+        let clave = vec![0x42u8; alg.key_size()];
+        let literal = MessageBuilder::from_bytes("", claro.to_vec())
+            .to_vec(OsRng)
+            .expect("el paquete literal");
+        let cuerpo = alg
+            .encrypt(OsRng, &clave, &literal)
+            .expect("el CFB sin MDC");
+
+        let mut sobre = Vec::new();
+        PublicKeyEncryptedSessionKey::from_session_key_v3(
+            OsRng,
+            &RawSessionKey::from(clave),
+            alg,
+            encryption_subkey(para).unwrap(),
+        )
+        .expect("el PKESK")
+        .to_writer_with_header(&mut sobre)
+        .expect("se serializa el PKESK");
+        // Cabecera de formato viejo: 0x80 | (tag 9 << 2) | longitud de 4 bytes.
+        sobre.push(0x80 | (9 << 2) | 0x02);
+        sobre.extend_from_slice(&(cuerpo.len() as u32).to_be_bytes());
+        sobre.extend_from_slice(&cuerpo);
+        sobre
+    }
+
+    #[test]
+    fn un_sobre_sed_sin_mdc_no_se_abre_aunque_traiga_nuestra_clave() {
+        // Blinda contra EFAIL (2019): SED es maleable y rPGP lo rechaza mientras
+        // `legacy` esté apagado en `TheRing`. Si alguien llama a `enable_legacy()`
+        // en `decrypt`, este sobre pasa a abrirse como texto y la prueba se rompe.
+        let bob = clave_completa("Bob <bob@vasak.test>");
+        let sed = cifrar_sed(CLARO.as_bytes(), &publica(&bob));
+        let armado = armar(&sed);
+
+        // Control: el sobre es válido. Con `legacy` encendido, rPGP lo abre al claro;
+        // si no, el «no se abre» de abajo pasaría por un sobre mal armado.
+        let (mensaje, _) = Message::from_reader(&armado[..]).expect("el sobre se parsea");
+        assert!(mensaje.is_encrypted());
+        let sin_passphrase = vacia();
+        let anillo = TheRing {
+            secret_keys: vec![&bob],
+            key_passwords: vec![&sin_passphrase],
+            decrypt_options: DecryptionOptions::new().enable_legacy(),
+            ..Default::default()
+        };
+        let (mut abierto, _) = mensaje
+            .decrypt_the_ring(anillo, true)
+            .expect("con legacy el SED se abriría");
+        let mut claro = Vec::new();
+        abierto.read_to_end(&mut claro).expect("se lee el claro");
+        assert_eq!(String::from_utf8(claro).unwrap(), CLARO);
+
+        // Lo que importa: nuestro núcleo, con `legacy` apagado, no lo abre.
+        for correo in [correo_inline(&armado), correo_pgp_mime(&armado)] {
+            let resultado = abrir(&correo, &bob);
+            assert_cerrado(&resultado);
+            match resultado {
+                Decryption::Unavailable(motivo) => assert!(
+                    motivo.contains("SymEncryptedData"),
+                    "tenía que rechazarlo por ser SED, no por otra cosa: {motivo}"
+                ),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn un_paquete_sed_suelto_o_con_basura_queda_no_disponible_y_no_entra_en_panico() {
+        // Un sobre que sólo trae el tag 9 (sin PKESK) y otro con cuerpo basura.
+        let bob = clave_completa("Bob <bob@vasak.test>");
+        for cuerpo in [&[][..], &[0xAB; 64][..]] {
+            let mut sed = vec![0x80 | (9 << 2) | 0x02];
+            sed.extend_from_slice(&(cuerpo.len() as u32).to_be_bytes());
+            sed.extend_from_slice(cuerpo);
+            assert_cerrado(&abrir(&correo_inline(&armar(&sed)), &bob));
+        }
+    }
+
     // ── 5. Tope anti-bomba ─────────────────────────────────────────────
+    //
+    // Fuera de alcance, a propósito: probar que `CheckFirst { max_message_size:
+    // MAX_DECRYPTED }` corta un SEIPD v1 *cifrado* de más de 64 MiB antes de
+    // bufferizar. Hace falta generar y cifrar > 64 MiB de ciphertext (la bomba de
+    // abajo comprime, así que su sobre es chico y no llega a ese tope): una prueba
+    // lenta y pesada para el CI. Ese techo queda cubierto por inspección de
+    // `decrypt` (`set_seipdv1_read_mode`), no por una prueba.
 
     #[test]
     fn el_tope_deja_pasar_justo_el_limite_y_corta_un_byte_mas() {
