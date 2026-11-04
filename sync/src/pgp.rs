@@ -539,8 +539,9 @@ pub fn encryption_subkey(key: &SignedPublicKey) -> Option<&SignedPublicSubKey> {
 
 /// Si la clave **primaria** sigue viva: no revocada y no expirada. Una primaria
 /// revocada o expirada mata la clave entera para cifrar, igual que una subclave
-/// muerta. La revocación se toma por presencia de una firma de revocación directa
-/// (verificarla es el gate de import, PR3). La expiración sale de la self-signature
+/// muerta. La revocación se toma por **presencia** de una `KeyRevocation`: es seguro
+/// porque el gate de import ya descartó las forjadas y guardó sólo las que verifican
+/// contra la primaria (`crate::pgp_import::ingest_peer_key`). La expiración sale de la self-signature
 /// más reciente (firma directa de clave o auto-certificación de UID), relativa a la
 /// creación de la primaria; un vencimiento de cero segundos significa «nunca expira».
 fn primary_usable(key: &SignedPublicKey, now: u32) -> bool {

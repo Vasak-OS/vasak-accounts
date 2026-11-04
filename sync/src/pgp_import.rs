@@ -40,6 +40,7 @@
 
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use pgp::composed::{SignedPublicKey, SignedSecretKey};
+use pgp::ser::Serialize;
 use pgp::types::{KeyDetails, Tag};
 
 use crate::message::parse_sender;
@@ -108,7 +109,9 @@ pub fn parse_identity_secret_key(
 pub enum Ingested {
     /// Primera clave que vemos para esta dirección: se guardó.
     New,
-    /// La misma clave que ya teníamos (misma huella): se refrescó `updated_at`.
+    /// Misma huella que ya teníamos: se refresca sólo `updated_at` sin reescribir la
+    /// clave guardada (un blob entrante con la misma primaria no debe **reducirla** —
+    /// p. ej. venir sin la subclave de cifrado—).
     Unchanged,
     /// Ya teníamos **otra** clave para esta dirección y la nueva difiere. Con
     /// confianza TOFU la política es **conservadora**: la clave conocida **no se
@@ -157,15 +160,18 @@ impl std::error::Error for IngestError {}
 /// 3. **Normaliza la dirección** ([`normalize_address`]) igual en escritura y en
 ///    lectura.
 /// 4. **Detecta el cambio TOFU**: lee el estado previo ([`Store::find_peer`]) antes
-///    de escribir; si ya había una clave con **otra** huella, devuelve
-///    [`Ingested::Changed`] y **no pisa** la conocida.
+///    de escribir. Si ya había una clave con **otra** huella, devuelve
+///    [`Ingested::Changed`] y **no pisa** la conocida; si es la **misma** huella no
+///    reescribe `public_key` (sólo refresca `updated_at`), porque un blob entrante
+///    nunca debe reducir la clave guardada. Al guardar una clave **nueva** descarta
+///    antes las revocaciones de primaria forjadas ([`strip_forged_revocations`]).
 pub fn ingest_peer_key(
     store: &Store,
     sender_address: &str,
     public_key_bytes: &[u8],
     now: i64,
 ) -> Result<Ingested, IngestError> {
-    let key = parse_public_key(public_key_bytes).map_err(IngestError::Key)?;
+    let mut key = parse_public_key(public_key_bytes).map_err(IngestError::Key)?;
     verify_key_bindings(&key).map_err(IngestError::Key)?;
     let new_fingerprint = key.primary_key.fingerprint().to_string();
 
@@ -185,15 +191,23 @@ pub fn ingest_peer_key(
             })
         }
         Some(_) => {
-            // La misma clave: se refresca `updated_at` (los bytes son idénticos).
+            // Misma huella: NO se reescribe `public_key`. Un blob entrante con la misma
+            // primaria pero la subclave de cifrado quitada (o una revocación) no debe
+            // **reducir** la clave ya guardada —TOFU conservador, decisión 3—; sólo se
+            // refresca `updated_at`.
             store
-                .upsert_peer(&address, public_key_bytes, &new_fingerprint, now)
+                .touch_peer(&address, now)
                 .map_err(IngestError::Store)?;
             Ok(Ingested::Unchanged)
         }
         None => {
+            // Primera vez: antes de guardar se descartan las revocaciones de primaria
+            // forjadas (ver `strip_forged_revocations`); una auto-revocación válida se
+            // conserva y la honra `crate::pgp::primary_usable`.
+            let stored =
+                strip_forged_revocations(&mut key, public_key_bytes).map_err(IngestError::Key)?;
             store
-                .upsert_peer(&address, public_key_bytes, &new_fingerprint, now)
+                .upsert_peer(&address, &stored, &new_fingerprint, now)
                 .map_err(IngestError::Store)?;
             Ok(Ingested::New)
         }
@@ -207,9 +221,14 @@ pub fn ingest_peer_key(
 ///
 /// - **cada subclave** cierra su firma de binding contra la primaria
 ///   ([`pgp::composed::SignedPublicSubKey::verify_bindings`], que verifica el
-///   binding y, para una subclave de firma, su backsig). Un binding **forjado**
-///   falla y se **rechaza la clave entera**: no se guarda una clave con una
-///   subclave que después elegiríamos para cifrar sin que su binding cierre.
+///   binding y, para una subclave de firma, su backsig). Una subclave **sin ninguna
+///   firma de binding** no llega hasta acá: rPGP 0.21 la descarta al parsear
+///   (`SignedPublicKey::new` retiene sólo las subclaves firmadas) y `verify_bindings`
+///   además exige al menos una firma (`ensure!(!signatures.is_empty())`) —no es un
+///   chequeo vacuo—, así que una subclave sin binding ni se guarda ni se elige para
+///   cifrar. Un binding **forjado** falla y se **rechaza la clave entera**: no se
+///   guarda una clave con una subclave que después elegiríamos para cifrar sin que su
+///   binding cierre.
 /// - la **primaria** trae al menos una auto-firma válida (una auto-certificación
 ///   de UID o una firma directa de clave): prueba que el material de la primaria
 ///   es coherente y auto-firmado, y descarta una primaria trasplantada con un UID
@@ -255,6 +274,36 @@ fn primary_has_valid_self_signature(key: &SignedPublicKey) -> bool {
                 .is_ok()
         })
     })
+}
+
+/// Descarta de `key` las firmas de revocación de la primaria que **no** verifican
+/// contra ella —forjadas por un atacante que spoofeó el `From`— y devuelve los bytes
+/// a guardar. Una **auto-revocación válida** se conserva (el contacto revocó su clave
+/// de verdad) y la honra [`crate::pgp::primary_usable`].
+///
+/// Por qué acá y no al honrar: `primary_usable` trata la clave como revocada por la
+/// **mera presencia** de una `KeyRevocation` (más barato por uso). Sin este filtro un
+/// atacante adjunta una revocación firmada por él a la primaria real de la víctima y,
+/// al guardarse, la inutiliza para cifrar (DoS). Filtrando en el import, lo guardado
+/// ya está saneado y el chequeo por presencia es sólido. (`revocation_signatures` sólo
+/// trae firmas de tipo `KeyRevocation`, que [`pgp::packet::Signature::verify_key`]
+/// comprueba contra la primaria.)
+///
+/// Si no se descartó ninguna firma, se guardan los bytes originales tal cual se
+/// ingirieron; si se descartó alguna, se re-serializa la clave saneada.
+fn strip_forged_revocations(
+    key: &mut SignedPublicKey,
+    original: &[u8],
+) -> Result<Vec<u8>, PgpError> {
+    let before = key.details.revocation_signatures.len();
+    key.details
+        .revocation_signatures
+        .retain(|sig| sig.verify_key(&key.primary_key).is_ok());
+    if key.details.revocation_signatures.len() == before {
+        return Ok(original.to_vec());
+    }
+    key.to_bytes()
+        .map_err(|e| PgpError::BadKey(format!("no se pudo re-serializar la clave saneada: {e}")))
 }
 
 /// Los correos de los UIDs **con auto-certificación válida** de una clave,

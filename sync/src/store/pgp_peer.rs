@@ -68,6 +68,21 @@ pub fn upsert_peer(
     Ok(())
 }
 
+/// Refresca sólo `updated_at` de una dirección ya conocida, sin tocar `public_key`
+/// ni `fingerprint`. La ingesta TOFU lo usa en la rama de **misma huella**: un blob
+/// entrante con la misma primaria pero una subclave de cifrado quitada (o una
+/// revocación) no debe **reducir** la clave guardada —escrituras conservadoras,
+/// decisión 3—. `now` es segundos epoch. Si la dirección no existe, no hace nada.
+pub fn touch_peer(connection: &Connection, address: &str, now: i64) -> Result<(), StoreError> {
+    connection
+        .execute(
+            "UPDATE pgp_peers SET updated_at = ?2 WHERE address = ?1",
+            rusqlite::params![address, now],
+        )
+        .map_err(classify)?;
+    Ok(())
+}
+
 /// La clave conocida de una dirección, o nada si no se la conoce.
 pub fn find_peer(connection: &Connection, address: &str) -> Result<Option<PgpPeer>, StoreError> {
     connection
@@ -109,6 +124,13 @@ impl Store {
         now: i64,
     ) -> Result<(), StoreError> {
         upsert_peer(&self.connection, address, public_key, fingerprint, now)
+    }
+
+    /// Refresca sólo `updated_at` de una dirección conocida, sin reescribir la clave.
+    /// Delega en [`touch_peer`]. La ingesta TOFU ([`crate::pgp_import::ingest_peer_key`])
+    /// lo usa en la rama de misma huella —por eso hay método, no sólo función libre—.
+    pub fn touch_peer(&self, address: &str, now: i64) -> Result<(), StoreError> {
+        touch_peer(&self.connection, address, now)
     }
 
     /// La clave conocida de una dirección, o nada. Delega en [`find_peer`]. La
