@@ -15,12 +15,16 @@
 //! firmante* (la pasa el llamador desde el peerstate) y dice si la firma cierra.
 //! Son dos operaciones distintas con dos estados distintos, igual que en S/MIME.
 //!
-//! **Fallar cerrado (la falla rPGP de 2019).** rPGP 0.21 comprueba la integridad
-//! (SEIPD/MDC) **a medida que se lee** el contenido descifrado: si falla, la
-//! lectura devuelve `Err`. Este módulo trata ese `Err` —y cualquier otro fallo de
-//! descifrado— como [`Decryption::Unavailable`], **nunca** devuelve el texto
-//! crudo y **nunca** confunde «descifrado» con «verificado». No hay ningún camino
-//! de respaldo a `raw` ante un `Err` de descifrado.
+//! **Fallar cerrado (la falla rPGP de 2019).** Para SEIPD v1 —el camino por
+//! defecto— rPGP 0.21 corre en modo `CheckFirst`: lee y verifica el contenido
+//! descifrado **entero antes** de soltar un solo byte de texto, y si la integridad
+//! (SEIPD/MDC) falla devuelve `Err` sin materializar nada. El «a medida que se lee»
+//! vale sólo para AEAD (SEIPD v2), donde cada chunk se autentica al leerlo. En los
+//! dos casos este módulo trata ese `Err` —y cualquier otro fallo de descifrado—
+//! como [`Decryption::Unavailable`], **nunca** devuelve el texto crudo y **nunca**
+//! confunde «descifrado» con «verificado». No hay ningún camino de respaldo a `raw`
+//! ante un `Err` de descifrado. El techo de bufferización de `CheckFirst` se iguala
+//! a `MAX_DECRYPTED` en [`decrypt`], no lo acota [`read_capped`].
 //!
 //! **Ligado al `From`.** `verify` devuelve la **huella** del firmante cuando la
 //! firma cierra contra una de las claves candidatas, pero **no afirma confianza**
@@ -37,13 +41,13 @@
 use std::io::Read;
 
 use pgp::composed::{
-    CleartextSignedMessage, Deserializable, DetachedSignature, Message, MessageBuilder,
-    SignedPublicKey, SignedPublicSubKey, SignedSecretKey,
+    CleartextSignedMessage, DecryptionOptions, Deserializable, DetachedSignature, Message,
+    MessageBuilder, SignedPublicKey, SignedPublicSubKey, SignedSecretKey, TheRing,
 };
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
 use pgp::packet::SignatureType;
-use pgp::types::{KeyDetails, Password, Timestamp};
+use pgp::types::{KeyDetails, Password, Seipdv1ReadMode, Timestamp};
 use rand::rngs::OsRng;
 use zeroize::Zeroizing;
 
@@ -189,8 +193,23 @@ pub fn decrypt(raw: &[u8], secret_key: &SignedSecretKey, passphrase: &Password) 
         return Decryption::Unavailable("el bloque PGP no es un sobre cifrado".into());
     }
 
-    let decrypted = match message.decrypt(passphrase, secret_key) {
-        Ok(decrypted) => decrypted,
+    // Para SEIPD v1, rPGP corre en modo `CheckFirst`, que bufferiza en RAM el
+    // contenido descifrado entero antes de verificarlo y soltarlo; su techo por
+    // defecto es 1 GiB. Se iguala a `MAX_DECRYPTED` para que esa bufferización no
+    // pueda exceder el mismo tope que el contenido descomprimido. `legacy:false`
+    // (el default) se mantiene: no habilitar SED sin MDC (vector EFAIL).
+    let ring = TheRing {
+        secret_keys: vec![secret_key],
+        key_passwords: vec![passphrase],
+        decrypt_options: DecryptionOptions::new().set_seipdv1_read_mode(
+            Seipdv1ReadMode::CheckFirst {
+                max_message_size: MAX_DECRYPTED,
+            },
+        ),
+        ..Default::default()
+    };
+    let decrypted = match message.decrypt_the_ring(ring, true) {
+        Ok((decrypted, _)) => decrypted,
         Err(e) => return Decryption::Unavailable(format!("no se pudo descifrar: {e}")),
     };
     // Un sobre PGP suele descifrar a un paquete comprimido (o firmado sobre uno):
@@ -206,11 +225,15 @@ pub fn decrypt(raw: &[u8], secret_key: &SignedSecretKey, passphrase: &Password) 
     }
 }
 
-/// Lee hasta el final con un tope, que es lo que **dispara la comprobación de
-/// integridad** (MDC/SEIPD) del lector de rPGP: si la integridad falla, la
-/// lectura devuelve `Err` y cae en `Unavailable` (fallar cerrado). El tope es
-/// contra bombas de compresión: se lee `cap + 1` para distinguir «justo en el
-/// tope» de «se pasó», y pasarse es un error.
+/// Lee hasta el final con un tope **contra bombas de compresión**: se lee `cap + 1`
+/// para distinguir «justo en el tope» de «se pasó», y pasarse es un error.
+///
+/// El tope **no** acota la memoria que usa rPGP al descifrar: para SEIPD v1 en
+/// `CheckFirst` rPGP ya bufferizó y verificó el contenido entero antes de que este
+/// lector vea un byte (ese techo es `max_message_size`, que [`decrypt`] iguala a
+/// `MAX_DECRYPTED`). Para AEAD (SEIPD v2) la integridad de cada chunk se comprueba
+/// **a medida que se lee**, así que acá sí puede llegar un `Err` de integridad, que
+/// cae en `Unavailable` (fallar cerrado).
 fn read_capped(reader: &mut impl Read, cap: usize) -> Result<Vec<u8>, String> {
     let mut data = Vec::new();
     reader
@@ -464,7 +487,7 @@ pub fn encrypt_to_keys(
     }
 
     builder
-        .to_armored_string(&mut rng, Default::default())
+        .to_armored_string(rng, Default::default())
         .map(String::into_bytes)
         .map_err(|e| PgpError::Crypto(e.to_string()))
 }
