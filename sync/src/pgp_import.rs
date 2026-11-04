@@ -353,3 +353,421 @@ pub fn parse_autocrypt_header(value: &str) -> Option<AutocryptHeader> {
     }
     Some(AutocryptHeader { addr, key })
 }
+
+#[cfg(test)]
+mod tests {
+    //! Pruebas del import y la ingesta de claves OpenPGP. Las claves se generan con
+    //! el propio `pgp` (helpers de `crate::pgp::tests`): nada de binarios opacos. La
+    //! que más importa es la adversaria: una primaria real con una subclave de
+    //! cifrado de **binding forjado** no puede entrar al peerstate.
+    use super::*;
+    use crate::pgp::tests::{clave_completa, publica, vacia};
+    use crate::pgp::{encryption_subkey, PgpError};
+    use crate::store::contacts::tests::open_store;
+    use crate::store::paths::tests::TempDir;
+    use pgp::composed::SignedPublicKey;
+    use pgp::packet::{KeyFlags, SignatureConfig, SignatureType, Subpacket, SubpacketData, UserId};
+    use pgp::ser::Serialize;
+    use pgp::types::{KeyDetails, PacketHeaderVersion, Tag, Timestamp};
+    use rand::rngs::OsRng;
+
+    const AHORA: i64 = 1_000;
+
+    fn bytes(key: &SignedPublicKey) -> Vec<u8> {
+        key.to_bytes().expect("la clave serializa")
+    }
+
+    fn huella(key: &SignedPublicKey) -> String {
+        key.primary_key.fingerprint().to_string()
+    }
+
+    fn es_bad_key<T: std::fmt::Debug>(r: Result<T, PgpError>) -> bool {
+        matches!(r, Err(PgpError::BadKey(_)))
+    }
+
+    fn es_error_de_clave(r: Result<Ingested, IngestError>) -> bool {
+        matches!(r, Err(IngestError::Key(_)))
+    }
+
+    // ── Identidad propia (clave secreta) ───────────────────────────────
+
+    #[test]
+    fn la_clave_cuyo_uid_liga_la_direccion_de_la_cuenta_se_importa() {
+        let key = clave_completa("Ana <ana@example.com>");
+        let armada = key.to_armored_bytes(Default::default()).unwrap();
+        // Ni la capitalización ni los espacios de la dirección de la cuenta importan.
+        assert!(parse_identity_secret_key(&armada, "  Ana@Example.com ").is_ok());
+        assert!(parse_identity_secret_key(&key.to_bytes().unwrap(), "ana@example.com").is_ok());
+    }
+
+    #[test]
+    fn la_clave_con_un_uid_de_otra_direccion_se_rechaza() {
+        let key = clave_completa("Ana <ana@example.com>");
+        let r = parse_identity_secret_key(&key.to_bytes().unwrap(), "beto@example.com");
+        assert!(es_bad_key(r));
+    }
+
+    #[test]
+    fn bytes_que_no_parsean_como_clave_secreta_son_bad_key() {
+        assert!(es_bad_key(parse_identity_secret_key(
+            b"esto no es una clave",
+            "ana@example.com"
+        )));
+        assert!(es_bad_key(parse_identity_secret_key(
+            b"",
+            "ana@example.com"
+        )));
+    }
+
+    #[test]
+    fn la_direccion_de_cuenta_vacia_se_rechaza() {
+        let key = clave_completa("Ana <ana@example.com>");
+        let b = key.to_bytes().unwrap();
+        assert!(es_bad_key(parse_identity_secret_key(&b, "")));
+        assert!(es_bad_key(parse_identity_secret_key(&b, "   ")));
+    }
+
+    #[test]
+    fn un_uid_con_el_correo_correcto_pero_sin_auto_firma_no_liga() {
+        let mut key = clave_completa("Ana <ana@example.com>");
+        key.details.users[0].signatures.clear();
+        let r = parse_identity_secret_key(&key.to_bytes().unwrap(), "ana@example.com");
+        assert!(es_bad_key(r), "un UID sin firmar no liga identidad");
+    }
+
+    #[test]
+    fn un_uid_pegado_con_el_correo_de_la_cuenta_reusando_la_firma_de_otro_no_liga() {
+        // La clave firma «otra@»; alguien le pega un UID «ana@» con esa misma firma
+        // (que cubre otro UID): la firma no cierra sobre el UID pegado.
+        let mut key = clave_completa("Otra <otra@example.com>");
+        let mut pegado = key.details.users[0].clone();
+        pegado.id = UserId::from_str(PacketHeaderVersion::New, "Ana <ana@example.com>").unwrap();
+        key.details.users.push(pegado);
+        let b = key.to_bytes().unwrap();
+        assert!(es_bad_key(parse_identity_secret_key(&b, "ana@example.com")));
+        // Control: el UID genuino sí liga.
+        assert!(parse_identity_secret_key(&b, "otra@example.com").is_ok());
+    }
+
+    // ── Ingesta pública: el binding forjado (adversario) ───────────────
+
+    /// La primaria real de la víctima con la subclave de **cifrado del atacante**
+    /// en su lugar (índice 1 de `clave_completa`), trayendo la firma de binding del
+    /// atacante: es válida para la primaria del atacante, no para la de la víctima.
+    fn primaria_de_la_victima_con_subclave_forjada() -> (SignedPublicKey, SignedPublicKey) {
+        let victima = publica(&clave_completa("Victima <victima@example.com>"));
+        let atacante = publica(&clave_completa("Atacante <atacante@example.com>"));
+        let mut forjada = victima.clone();
+        forjada.public_subkeys[1] = atacante.public_subkeys[1].clone();
+        (forjada, atacante)
+    }
+
+    #[test]
+    fn una_subclave_de_cifrado_con_binding_forjado_no_entra_al_peerstate() {
+        let temp = TempDir::new("pgp-import-forjada");
+        let store = open_store(&temp);
+        let (forjada, atacante) = primaria_de_la_victima_con_subclave_forjada();
+
+        // Premisa: sin la verificación criptográfica, el selector de subclave de
+        // cifrado elegiría la del atacante (sólo mira flags y fechas). Es la
+        // única defensa: por eso la ingesta tiene que rechazar la clave entera.
+        let elegida = encryption_subkey(&forjada).expect("el selector la elegiría");
+        assert_eq!(
+            elegida.key.fingerprint().to_string(),
+            atacante.public_subkeys[1].key.fingerprint().to_string()
+        );
+
+        let r = ingest_peer_key(&store, "victima@example.com", &bytes(&forjada), AHORA);
+        assert!(es_error_de_clave(r), "el binding forjado debe rechazarse");
+        assert!(
+            store.find_peer("victima@example.com").unwrap().is_none(),
+            "no se guarda nada en el peerstate"
+        );
+    }
+
+    #[test]
+    fn una_subclave_sin_ninguna_firma_de_binding_nunca_se_elige_para_cifrar() {
+        // `verify_bindings` de rPGP es vacuo sin firmas: la ingesta no la rechaza,
+        // pero sin binding el selector no la usa. Se fija ese invariante: nadie
+        // cifra a una subclave que no trae binding.
+        let temp = TempDir::new("pgp-import-sin-binding");
+        let store = open_store(&temp);
+        let mut key = publica(&clave_completa("Ana <ana@example.com>"));
+        key.public_subkeys[1].signatures.clear();
+        let _ = ingest_peer_key(&store, "ana@example.com", &bytes(&key), AHORA);
+        let guardada = store
+            .find_peer("ana@example.com")
+            .unwrap()
+            .map(|p| crate::pgp::parse_public_key(&p.public_key).unwrap());
+        if let Some(guardada) = guardada {
+            assert!(encryption_subkey(&guardada).is_none());
+        }
+    }
+
+    #[test]
+    fn una_subclave_de_firma_sin_backsig_valida_se_rechaza() {
+        let temp = TempDir::new("pgp-import-sin-backsig");
+        let store = open_store(&temp);
+        let secret = clave_completa("Ana <ana@example.com>");
+        // Control: la clave tal cual se generó (la subclave de firma trae su
+        // backsig) entra.
+        let sana = publica(&secret);
+        assert!(ingest_peer_key(&store, "ana@example.com", &bytes(&sana), AHORA).is_ok());
+
+        // Se reata la subclave 0 (de firma) con un binding que declara «firma» pero
+        // no trae la firma de vuelta (backsig) de la subclave: cualquiera podría
+        // haber atado esa subclave sin que su dueño lo consienta.
+        let mut flags = KeyFlags::default();
+        flags.set_sign(true);
+        let mut key = publica(&secret);
+        let subkey = key.public_subkeys[0].clone();
+        let primaria = &secret.primary_key;
+        let mut config =
+            SignatureConfig::from_key(OsRng, primaria, SignatureType::SubkeyBinding).unwrap();
+        config.hashed_subpackets = vec![
+            Subpacket::regular(SubpacketData::SignatureCreationTime(Timestamp::now())).unwrap(),
+            Subpacket::regular(SubpacketData::KeyFlags(flags)).unwrap(),
+            Subpacket::regular(SubpacketData::IssuerFingerprint(primaria.fingerprint())).unwrap(),
+        ];
+        key.public_subkeys[0].signatures = vec![config
+            .sign_subkey_binding(primaria, primaria.public_key(), &vacia(), &subkey.key)
+            .unwrap()];
+
+        let temp2 = TempDir::new("pgp-import-sin-backsig-2");
+        let store2 = open_store(&temp2);
+        let r = ingest_peer_key(&store2, "ana@example.com", &bytes(&key), AHORA);
+        assert!(es_error_de_clave(r), "sin backsig válida se rechaza");
+        assert!(store2.find_peer("ana@example.com").unwrap().is_none());
+    }
+
+    #[test]
+    fn una_primaria_sin_auto_firma_valida_se_rechaza() {
+        let temp = TempDir::new("pgp-import-sin-autofirma");
+        let store = open_store(&temp);
+        let mut key = publica(&clave_completa("Ana <ana@example.com>"));
+        key.details.users[0].signatures.clear();
+        let r = ingest_peer_key(&store, "ana@example.com", &bytes(&key), AHORA);
+        assert!(es_error_de_clave(r));
+        assert!(store.find_peer("ana@example.com").unwrap().is_none());
+    }
+
+    // ── Ingesta pública: TOFU ──────────────────────────────────────────
+
+    #[test]
+    fn una_clave_nueva_se_guarda_con_la_huella_recomputada_y_reingerirla_no_cambia_nada() {
+        let temp = TempDir::new("pgp-import-nueva");
+        let store = open_store(&temp);
+        let key = publica(&clave_completa("Ana <ana@example.com>"));
+        let b = bytes(&key);
+
+        assert_eq!(
+            ingest_peer_key(&store, "ana@example.com", &b, 100).unwrap(),
+            Ingested::New
+        );
+        let peer = store.find_peer("ana@example.com").unwrap().unwrap();
+        assert_eq!(peer.fingerprint, huella(&key), "la huella sale de la clave");
+        assert_eq!(peer.public_key, b);
+        assert_eq!((peer.first_seen, peer.updated_at), (100, 100));
+
+        assert_eq!(
+            ingest_peer_key(&store, "ana@example.com", &b, 200).unwrap(),
+            Ingested::Unchanged
+        );
+        let peer = store.find_peer("ana@example.com").unwrap().unwrap();
+        assert_eq!(peer.first_seen, 100, "TOFU: first_seen se conserva");
+        assert_eq!(peer.updated_at, 200, "se refresca updated_at");
+    }
+
+    #[test]
+    fn una_clave_distinta_para_la_misma_direccion_se_senala_y_no_pisa_la_conocida() {
+        let temp = TempDir::new("pgp-import-cambiada");
+        let store = open_store(&temp);
+        let a = publica(&clave_completa("Ana <ana@example.com>"));
+        let b = publica(&clave_completa("Ana <ana@example.com>"));
+        assert_ne!(huella(&a), huella(&b));
+
+        ingest_peer_key(&store, "ana@example.com", &bytes(&a), 100).unwrap();
+        let r = ingest_peer_key(&store, "ana@example.com", &bytes(&b), 200).unwrap();
+        assert_eq!(
+            r,
+            Ingested::Changed {
+                known_fingerprint: huella(&a),
+                new_fingerprint: huella(&b),
+            }
+        );
+        let peer = store.find_peer("ana@example.com").unwrap().unwrap();
+        assert_eq!(peer.fingerprint, huella(&a), "sigue la clave conocida");
+        assert_eq!(peer.public_key, bytes(&a));
+        assert_eq!(peer.updated_at, 100, "no se tocó la fila");
+    }
+
+    #[test]
+    fn la_direccion_se_normaliza_y_no_hay_dos_filas_por_capitalizacion() {
+        let temp = TempDir::new("pgp-import-normaliza");
+        let store = open_store(&temp);
+        let a = publica(&clave_completa("Ana <ana@example.com>"));
+        let b = publica(&clave_completa("Ana <ana@example.com>"));
+
+        ingest_peer_key(&store, "Ana@Example.com", &bytes(&a), 100).unwrap();
+        let r = ingest_peer_key(&store, "ana@example.com", &bytes(&b), 200).unwrap();
+        assert!(matches!(r, Ingested::Changed { .. }), "{r:?}");
+        let filas = crate::store::pgp_peer::list_peers(store.connection()).unwrap();
+        assert_eq!(filas.len(), 1);
+        assert_eq!(filas[0].address, "ana@example.com");
+    }
+
+    #[test]
+    fn una_clave_con_certificaciones_de_terceros_se_acepta() {
+        // Estilo `gpg --export`: el UID trae, antes de la auto-firma, la
+        // certificación de un tercero. El `verify_bindings` entero de rPGP la
+        // rechazaría; acá se tolera mientras la auto-firma y los bindings cierren.
+        let temp = TempDir::new("pgp-import-terceros");
+        let store = open_store(&temp);
+        let ana = clave_completa("Ana <ana@example.com>");
+        let tercero = clave_completa("Tercero <tercero@example.com>");
+        let mut key = publica(&ana);
+        let de_tercero =
+            SignatureConfig::from_key(OsRng, &tercero.primary_key, SignatureType::CertPositive)
+                .unwrap()
+                .sign_certification_third_party(
+                    &tercero.primary_key,
+                    &vacia(),
+                    &ana.primary_key.public_key().clone(),
+                    Tag::UserId,
+                    &key.details.users[0].id,
+                )
+                .expect("certificación de tercero");
+        key.details.users[0].signatures.insert(0, de_tercero);
+
+        let r = ingest_peer_key(&store, "ana@example.com", &bytes(&key), AHORA);
+        assert_eq!(r.unwrap(), Ingested::New);
+    }
+
+    #[test]
+    fn un_remitente_vacio_se_rechaza_y_no_guarda() {
+        let temp = TempDir::new("pgp-import-sin-remitente");
+        let store = open_store(&temp);
+        let b = bytes(&publica(&clave_completa("Ana <ana@example.com>")));
+        for vacio in ["", "   "] {
+            assert!(es_error_de_clave(ingest_peer_key(&store, vacio, &b, AHORA)));
+        }
+        assert!(crate::store::pgp_peer::list_peers(store.connection())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn bytes_que_no_son_una_clave_se_rechazan_sin_entrar_en_panico() {
+        let temp = TempDir::new("pgp-import-basura");
+        let store = open_store(&temp);
+        for basura in [
+            &b""[..],
+            b"hola",
+            b"-----BEGIN PGP PUBLIC KEY BLOCK-----\n\nAAAA\n-----END PGP PUBLIC KEY BLOCK-----\n",
+        ] {
+            assert!(es_error_de_clave(ingest_peer_key(
+                &store,
+                "ana@example.com",
+                basura,
+                AHORA
+            )));
+        }
+    }
+
+    // ── Autocrypt ──────────────────────────────────────────────────────
+
+    fn b64(b: &[u8]) -> String {
+        BASE64_STANDARD.encode(b)
+    }
+
+    #[test]
+    fn la_cabecera_autocrypt_valida_se_decodifica_aunque_el_base64_venga_plegado() {
+        let clave = (0u8..=200).collect::<Vec<u8>>();
+        let plegado = b64(&clave)
+            .as_bytes()
+            .chunks(20)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect::<Vec<_>>()
+            .join("\r\n\t ");
+        let h = parse_autocrypt_header(&format!("addr=ana@example.com; keydata= {plegado}"))
+            .expect("válida");
+        assert_eq!(h.addr, "ana@example.com");
+        assert_eq!(h.key, clave);
+    }
+
+    #[test]
+    fn la_cabecera_sin_addr_o_sin_keydata_es_invalida() {
+        let k = b64(b"clave");
+        assert_eq!(parse_autocrypt_header(&format!("keydata={k}")), None);
+        assert_eq!(parse_autocrypt_header("addr=ana@example.com"), None);
+        assert_eq!(parse_autocrypt_header(""), None);
+    }
+
+    #[test]
+    fn un_atributo_critico_desconocido_invalida_la_cabecera() {
+        let k = b64(b"clave");
+        assert_eq!(
+            parse_autocrypt_header(&format!("addr=a@b.c; novedad=1; keydata={k}")),
+            None
+        );
+    }
+
+    #[test]
+    fn los_atributos_no_criticos_y_prefer_encrypt_se_ignoran() {
+        let k = b64(b"clave");
+        let h = parse_autocrypt_header(&format!(
+            "addr=a@b.c; prefer-encrypt=mutual; _algo=ed25519; keydata={k}"
+        ))
+        .expect("sigue válida");
+        assert_eq!(h.addr, "a@b.c");
+        assert_eq!(h.key, b"clave");
+    }
+
+    #[test]
+    fn un_base64_ilegible_o_vacio_es_invalido() {
+        assert_eq!(
+            parse_autocrypt_header("addr=a@b.c; keydata=!!!no-base64!!!"),
+            None
+        );
+        assert_eq!(parse_autocrypt_header("addr=a@b.c; keydata="), None);
+    }
+
+    #[test]
+    fn la_basura_no_entra_en_panico() {
+        for basura in [
+            ";;;;",
+            "=",
+            "addr",
+            "addr=;keydata=;",
+            "\u{0}\u{ffff}=\u{1f980}",
+            "keydata==========",
+            &"x=;".repeat(10_000),
+        ] {
+            let _ = parse_autocrypt_header(basura);
+        }
+    }
+
+    #[test]
+    fn de_la_cabecera_autocrypt_a_la_ingesta_con_la_addr_como_remitente() {
+        let temp = TempDir::new("pgp-import-autocrypt");
+        let store = open_store(&temp);
+        let key = publica(&clave_completa("Ana <ana@example.com>"));
+        let valor = format!(
+            "addr=Ana@Example.com; prefer-encrypt=mutual; keydata={}",
+            b64(&bytes(&key))
+        );
+
+        let h = parse_autocrypt_header(&valor).expect("cabecera válida");
+        assert_eq!(
+            ingest_peer_key(&store, &h.addr, &h.key, AHORA).unwrap(),
+            Ingested::New
+        );
+        let peer = store.find_peer("ana@example.com").unwrap().unwrap();
+        assert_eq!(peer.fingerprint, huella(&key));
+    }
+
+    #[test]
+    fn la_normalizacion_recorta_y_pasa_a_minusculas() {
+        assert_eq!(normalize_address("  Ana@Example.COM \n"), "ana@example.com");
+    }
+}
