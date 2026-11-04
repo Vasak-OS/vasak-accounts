@@ -146,6 +146,13 @@ mod tests {
         let pass = keys.find_pgp_passphrase("ana@example.com").await.unwrap();
         assert_eq!(key.unwrap().as_slice(), b"clave-nueva");
         assert_eq!(pass.unwrap().as_slice(), b"nueva");
+        for type_ in [TYPE_SECRET_KEY, TYPE_PASSPHRASE] {
+            let items = keys
+                .search(&pgp_attributes("ana@example.com", type_))
+                .await
+                .unwrap();
+            assert_eq!(items.len(), 1, "un solo ítem de tipo {type_}");
+        }
     }
 
     #[tokio::test]
@@ -177,6 +184,14 @@ mod tests {
                 .unwrap()
                 .as_slice(),
             b"k-beto"
+        );
+        assert_eq!(
+            keys.find_pgp_passphrase("beto@example.com")
+                .await
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"p-beto"
         );
     }
 
