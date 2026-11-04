@@ -83,6 +83,7 @@ mod message;
 mod notifications;
 mod outbox;
 mod pgp;
+mod pgp_import;
 mod preferences;
 mod query;
 mod reminders;

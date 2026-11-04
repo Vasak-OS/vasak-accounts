@@ -110,6 +110,14 @@ impl Store {
     ) -> Result<(), StoreError> {
         upsert_peer(&self.connection, address, public_key, fingerprint, now)
     }
+
+    /// La clave conocida de una dirección, o nada. Delega en [`find_peer`]. La
+    /// ingesta TOFU ([`crate::pgp_import::ingest_peer_key`]) la necesita fuera de
+    /// `cfg(test)` —por eso hay método, no sólo la función libre—: lee el estado
+    /// previo antes de pisar, para detectar el cambio de clave.
+    pub fn find_peer(&self, address: &str) -> Result<Option<PgpPeer>, StoreError> {
+        find_peer(&self.connection, address)
+    }
 }
 
 fn row_to_peer(row: &rusqlite::Row) -> rusqlite::Result<PgpPeer> {
