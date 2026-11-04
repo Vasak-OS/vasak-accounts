@@ -125,6 +125,23 @@ cbc = { version = "0.1", features = ["alloc", "block-padding"] }
 sha1 = "0.10"
 hmac = "0.12"
 sha2 = "0.10"
+# OpenPGP para el correo (vasak-accounts#21). rPGP: Rust puro, sin ninguna
+# biblioteca compartida nueva (su stack cripto es RustCrypto, igual que el de
+# S/MIME; `readelf` confirma que el único NEEDED fuera de la libc sigue siendo
+# `libcrypto.so.3`, de SQLCipher). Arrastra otra generación de crates RustCrypto
+# (su propia línea de der/aes/sha2, aparte de la der-0.7 pineada para `cms`):
+# eso duplica crates en el árbol (`cargo tree -d`), es bloat de árbol y de
+# tamaño de binario, no un soname nuevo.
+#
+# Sin features extra, y con tres apagadas a propósito: `bzip2` (fuera → sin
+# bomba de descompresión por bzip2 ni dep de sistema), `large-rsa` (fuera → tope
+# RSA 8192 bits, sano) y `pqc` (fuera → sin post-cuántico). Rechaza fallar
+# abierto ante integridad rota (SEIPD/MDC): ver `pgp.rs`.
+pgp = { version = "0.21.0", default-features = false }
+# El generador para cifrar y firmar con rPGP, que toma un `Rng + CryptoRng`. Es
+# la misma versión (0.8) que `pgp` ya trae en el candado, así que no suma crate
+# nueva; `OsRng` lee del generador del sistema operativo, sin estado propio.
+rand = "0.8"
 
 [dev-dependencies]
 # Leer la superficie de `AccountsSync` y `AccountsStore` desde su `Introspect`,
