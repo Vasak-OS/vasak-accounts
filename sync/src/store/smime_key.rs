@@ -42,10 +42,9 @@ use pkcs12::safe_bag::{SafeBag, SafeContents};
 use pkcs8::EncryptedPrivateKeyInfo;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use x509_cert::Certificate;
-use zbus::zvariant::{OwnedObjectPath, Value};
 use zeroize::Zeroizing;
 
-use super::key::{KeyError, Secret, SecretServiceKeys};
+use super::key::{KeyError, SecretServiceKeys};
 
 /// El esquema protegido de las claves S/MIME. Tiene que coincidir con el que
 /// `vasak-keyring` restringe a este ejecutable (Vasak-OS/vasak-keyring#54).
@@ -56,9 +55,6 @@ const IDENTITY_ATTRIBUTE: &str = "identity";
 const TYPE_ATTRIBUTE: &str = "type";
 const TYPE_PRIVATE_KEY: &str = "private-key";
 const TYPE_CERTS: &str = "certs";
-
-const COLLECTION_IFACE: &str = "org.freedesktop.Secret.Collection";
-const ITEM_IFACE: &str = "org.freedesktop.Secret.Item";
 
 const ID_DATA: ObjectIdentifier = const_oid::db::rfc5911::ID_DATA;
 const ID_ENCRYPTED_DATA: ObjectIdentifier = const_oid::db::rfc5911::ID_ENCRYPTED_DATA;
@@ -510,16 +506,22 @@ impl SecretServiceKeys {
         identity: &str,
         imported: &ImportedIdentity,
     ) -> Result<(), KeyError> {
-        self.store_smime_item(
-            identity,
-            TYPE_PRIVATE_KEY,
+        let label = format!("Clave S/MIME de VasakOS ({identity})");
+        self.store_secret_item(
+            smime_attributes(identity, TYPE_PRIVATE_KEY),
+            label.clone(),
             &imported.private_key_pkcs8,
             "application/pkcs8",
         )
         .await?;
         let certs_blob = join_certs(&imported.certs);
-        self.store_smime_item(identity, TYPE_CERTS, &certs_blob, "application/pkix-cert")
-            .await
+        self.store_secret_item(
+            smime_attributes(identity, TYPE_CERTS),
+            label,
+            &certs_blob,
+            "application/pkix-cert",
+        )
+        .await
     }
 
     /// La clave privada (PKCS#8 DER) de una identidad, si hay una.
@@ -528,7 +530,7 @@ impl SecretServiceKeys {
         identity: &str,
     ) -> Result<Option<Zeroizing<Vec<u8>>>, KeyError> {
         Ok(self
-            .find_smime_item(identity, TYPE_PRIVATE_KEY)
+            .find_secret_item(&smime_attributes(identity, TYPE_PRIVATE_KEY))
             .await?
             .map(Zeroizing::new))
     }
@@ -538,7 +540,10 @@ impl SecretServiceKeys {
         &self,
         identity: &str,
     ) -> Result<Option<Vec<Vec<u8>>>, KeyError> {
-        match self.find_smime_item(identity, TYPE_CERTS).await? {
+        match self
+            .find_secret_item(&smime_attributes(identity, TYPE_CERTS))
+            .await?
+        {
             Some(blob) => Ok(Some(split_certs(&blob)?)),
             None => Ok(None),
         }
@@ -548,79 +553,10 @@ impl SecretServiceKeys {
     /// un error; la colección bloqueada sí ([`KeyError::Locked`]).
     pub(crate) async fn delete_smime_identity(&self, identity: &str) -> Result<(), KeyError> {
         for type_ in [TYPE_PRIVATE_KEY, TYPE_CERTS] {
-            let attributes = smime_attributes(identity, type_);
-            for item in self.search(&attributes).await? {
-                let prompt: OwnedObjectPath =
-                    self.call(item.as_str(), ITEM_IFACE, "Delete", &()).await?;
-                if prompt.as_str() != "/" {
-                    return Err(KeyError::PromptRequired);
-                }
-            }
+            self.delete_secret_items(&smime_attributes(identity, type_))
+                .await?;
         }
         Ok(())
-    }
-
-    async fn store_smime_item(
-        &self,
-        identity: &str,
-        type_: &str,
-        value: &[u8],
-        content_type: &str,
-    ) -> Result<(), KeyError> {
-        let collection = self.default_collection().await?;
-        let label = format!("Clave S/MIME de VasakOS ({identity})");
-        let attributes = smime_attributes(identity, type_);
-        let mut properties: HashMap<&str, Value<'_>> = HashMap::new();
-        properties.insert("org.freedesktop.Secret.Item.Label", Value::from(label));
-        properties.insert(
-            "org.freedesktop.Secret.Item.Attributes",
-            Value::from(attributes),
-        );
-
-        let session = self.open_session().await?;
-        let secret = Secret {
-            session: session.clone(),
-            parameters: Vec::new(),
-            value: value.to_vec(),
-            content_type: content_type.into(),
-        };
-        // `replace = true`: reimportar una identidad reemplaza su clave en vez
-        // de dejar dos que después no se sabe cuál es.
-        let reply: Result<(OwnedObjectPath, OwnedObjectPath), KeyError> = self
-            .call(
-                collection.as_str(),
-                COLLECTION_IFACE,
-                "CreateItem",
-                &(properties, &secret, true),
-            )
-            .await;
-        drop(secret);
-        self.close_session(&session).await;
-
-        let (_item, prompt) = reply?;
-        if prompt.as_str() != "/" {
-            return Err(KeyError::PromptRequired);
-        }
-        Ok(())
-    }
-
-    async fn find_smime_item(
-        &self,
-        identity: &str,
-        type_: &str,
-    ) -> Result<Option<Vec<u8>>, KeyError> {
-        let attributes = smime_attributes(identity, type_);
-        let items = self.search(&attributes).await?;
-        let Some(item) = items.first() else {
-            return Ok(None);
-        };
-        let session = self.open_session().await?;
-        let reply: Result<(Secret,), KeyError> = self
-            .call(item.as_str(), ITEM_IFACE, "GetSecret", &(&session,))
-            .await;
-        self.close_session(&session).await;
-        let (mut secret,) = reply?;
-        Ok(Some(std::mem::take(&mut secret.value)))
     }
 }
 

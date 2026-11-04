@@ -45,6 +45,8 @@ pub mod key;
 pub mod lifecycle;
 pub mod migrations;
 pub mod paths;
+pub mod pgp_key;
+pub mod pgp_peer;
 pub mod queue;
 pub mod readers;
 pub mod smime_key;
@@ -636,7 +638,7 @@ mod tests {
             .connection()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
     }
 
     /// 0700 la carpeta y 0600 los tres archivos, y otra vez en cada apertura si

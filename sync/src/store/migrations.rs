@@ -706,6 +706,33 @@ CREATE TABLE followups (
 CREATE INDEX followups_by_remind ON followups (remind_at);
 ";
 
+/// v14 (PR 2 de `vasak-accounts#21`, OpenPGP): el peerstate TOFU —las claves
+/// públicas de terceros conocidas, por dirección de correo—.
+///
+/// Las claves públicas no son secretas, pero sí son datos del usuario (con quién
+/// se cartea cifrado), así que viven **dentro de la base cifrada** y no en un
+/// archivo aparte, por el mismo motivo que `pending_dav_ops` (V5) y las colas de
+/// la V13: heredan el cifrado del almacén y se barren gratis con la cuenta (un
+/// `ClearStore` o quitar la cuenta rehacen la base vacía). La **clave privada**
+/// propia, en cambio, es secreto y va en el llavero (`store::pgp_key`), nunca acá.
+///
+/// Una fila por dirección (`UNIQUE (address)`): volver a ver la clave de un
+/// contacto **actualiza** `public_key`, `fingerprint` y `updated_at` (upsert por
+/// `address`), conservando `first_seen` —lo mínimo para TOFU (ver `store::pgp_peer`)—.
+/// `first_seen`/`updated_at` son segundos epoch, como `alarms.fires_at`. La
+/// política de confianza y la ingesta (Autocrypt, adjuntos, WKD) son PR3/PR4/PR6;
+/// esta tabla es sólo el almacenamiento.
+const V14: &str = "
+CREATE TABLE pgp_peers (
+    id          INTEGER PRIMARY KEY,
+    address     TEXT NOT NULL UNIQUE,
+    public_key  BLOB NOT NULL,
+    fingerprint TEXT NOT NULL,
+    first_seen  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+) STRICT;
+";
+
 /// Todas las migraciones, en orden.
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
@@ -722,6 +749,7 @@ pub fn migrations() -> Migrations<'static> {
         M::up(V11),
         M::up(V12),
         M::up(V13),
+        M::up(V14),
     ])
 }
 
@@ -758,7 +786,7 @@ mod tests {
         let mut connection = Connection::open_in_memory().unwrap();
         apply(&mut connection).unwrap();
         let version = schema_version(&connection).unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
 
         let tables = |c: &Connection| -> Vec<String> {
             let mut statement = c
@@ -822,6 +850,7 @@ mod tests {
             "snoozed_messages_by_return",
             "followups",
             "followups_by_remind",
+            "pgp_peers",
         ] {
             assert!(before.iter().any(|t| t == table), "falta {table}");
         }
@@ -887,7 +916,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 13);
+        assert_eq!(schema_version(&connection).unwrap(), 14);
 
         // Lo que había sigue, y la marca nueva es NULL.
         let object_mark: Option<String> = connection
@@ -930,7 +959,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 13);
+        assert_eq!(schema_version(&connection).unwrap(), 14);
 
         // La op sigue, en conflicto, y las columnas nuevas son NULL.
         let (state, server_etag, server_raw): (String, Option<String>, Option<Vec<u8>>) =
@@ -989,7 +1018,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 13);
+        assert_eq!(schema_version(&connection).unwrap(), 14);
 
         // El contacto sigue, y la tabla nueva arranca vacía.
         let contacts: i64 = connection
@@ -1101,7 +1130,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 13);
+        assert_eq!(schema_version(&connection).unwrap(), 14);
 
         // El enlace sigue, y las columnas nuevas arrancan nulas.
         let (resource, photo, media): (String, Option<Vec<u8>>, Option<String>) = connection
@@ -1165,7 +1194,7 @@ mod tests {
 
         apply(&mut connection).unwrap();
         assert_eq!(columns(&connection), before);
-        assert_eq!(schema_version(&connection).unwrap(), 13);
+        assert_eq!(schema_version(&connection).unwrap(), 14);
     }
 
     /// **v11 → v12 no pierde nada**: un enlace con su foto de una base de la v11
@@ -1201,7 +1230,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 13);
+        assert_eq!(schema_version(&connection).unwrap(), 14);
 
         // Lo que había sigue, y las columnas nuevas traen sus defaults.
         let row: (String, Option<Vec<u8>>, String, i64) = connection
@@ -1259,7 +1288,7 @@ mod tests {
         let object = insert_object(&connection, calendar, "https://x/c/1.ics");
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 13);
+        assert_eq!(schema_version(&connection).unwrap(), 14);
 
         // Lo que había sigue.
         assert_eq!(
@@ -1357,7 +1386,7 @@ mod tests {
 
         apply(&mut fresh).unwrap();
         assert_eq!(columns(&fresh), before);
-        assert_eq!(schema_version(&fresh).unwrap(), 13);
+        assert_eq!(schema_version(&fresh).unwrap(), 14);
 
         let mut from_v8 = at_version(8);
         apply(&mut from_v8).unwrap();
@@ -1414,7 +1443,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 13);
+        assert_eq!(schema_version(&connection).unwrap(), 14);
 
         // Lo que había sigue, y las columnas nuevas son NULL.
         let row: (String, Option<String>, i64, Option<i64>, Option<String>) = connection
@@ -1445,7 +1474,7 @@ mod tests {
         let before = columns(&connection);
         apply(&mut connection).unwrap();
         assert_eq!(columns(&connection), before);
-        assert_eq!(schema_version(&connection).unwrap(), 13);
+        assert_eq!(schema_version(&connection).unwrap(), 14);
     }
 
     /// **v10 → v11 no pierde nada**: el cuerpo, la firma y el firmante de una base de
@@ -1498,7 +1527,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 13);
+        assert_eq!(schema_version(&connection).unwrap(), 14);
 
         let row: (String, Option<String>, i64, Option<i64>, Option<String>, Option<i64>) =
             connection
@@ -1534,7 +1563,7 @@ mod tests {
         let before = columns(&connection);
         apply(&mut connection).unwrap();
         assert_eq!(columns(&connection), before);
-        assert_eq!(schema_version(&connection).unwrap(), 13);
+        assert_eq!(schema_version(&connection).unwrap(), 14);
     }
 
     /// La marca `pending_op` sólo acepta los dos valores conocidos, o `NULL`.
@@ -1678,7 +1707,7 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .unwrap();
-        let all = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12];
+        let all = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13];
         Migrations::new(all[..version].iter().map(|sql| M::up(sql)).collect())
             .to_latest(&mut connection)
             .unwrap();
@@ -1706,7 +1735,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 13);
+        assert_eq!(schema_version(&connection).unwrap(), 14);
 
         let count = |sql: &str| -> i64 { connection.query_row(sql, [], |r| r.get(0)).unwrap() };
         assert_eq!(count("SELECT count(*) FROM mailboxes"), 1);
@@ -1753,6 +1782,43 @@ mod tests {
             .is_err());
     }
 
+    /// **v13 → v14 no pierde nada**: lo que había (un buzón y una cola) sigue,
+    /// `pgp_peers` nace vacía y admite una sola fila por dirección.
+    #[test]
+    fn de_v13_a_v14_se_conserva_lo_que_habia_y_nace_el_peerstate() {
+        let mut connection = at_version(13);
+        assert_eq!(schema_version(&connection).unwrap(), 13);
+        assert!(connection.prepare("SELECT 1 FROM pgp_peers").is_err());
+        connection
+            .execute(
+                "INSERT INTO mailboxes (name, display_name, role, updated_at)
+                 VALUES ('INBOX', 'Bandeja', 'inbox', 'ayer')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO followups (message_id, recipients, remind_at, created_at)
+                 VALUES ('<a@x>', 'ana@x.com', 10, 1)",
+                [],
+            )
+            .unwrap();
+
+        apply(&mut connection).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 14);
+
+        let count = |sql: &str| -> i64 { connection.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(count("SELECT count(*) FROM mailboxes"), 1);
+        assert_eq!(count("SELECT count(*) FROM followups"), 1);
+        assert_eq!(count("SELECT count(*) FROM pgp_peers"), 0);
+
+        let insert =
+            "INSERT INTO pgp_peers (address, public_key, fingerprint, first_seen, updated_at)
+                      VALUES ('ana@x.com', x'01', 'AAAA', 1, 1)";
+        connection.execute(insert, []).unwrap();
+        assert!(connection.execute(insert, []).is_err(), "UNIQUE (address)");
+    }
+
     /// **v1 → v2 no pierde nada**: la bitácora y el estado de la
     /// sincronización de una base del PR 1 siguen ahí después de migrar.
     #[test]
@@ -1773,7 +1839,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 13);
+        assert_eq!(schema_version(&connection).unwrap(), 14);
         let message: String = connection
             .query_row("SELECT message FROM sync_log", [], |row| row.get(0))
             .unwrap();
@@ -2074,7 +2140,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 13);
+        assert_eq!(schema_version(&connection).unwrap(), 14);
         assert_eq!(found(&connection, "jose"), vec![id]);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_emails"), 1);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_phones"), 1);
@@ -2245,7 +2311,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 13);
+        assert_eq!(schema_version(&connection).unwrap(), 14);
         assert_eq!(found(&connection, "jose"), vec![id]);
         assert_eq!(count(&connection, "SELECT count(*) FROM occurrences"), 2);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_emails"), 1);

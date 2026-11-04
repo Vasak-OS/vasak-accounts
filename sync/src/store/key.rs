@@ -523,6 +523,91 @@ impl SecretServiceKeys {
             .await;
     }
 
+    /// Guarda un ítem secreto en la colección por omisión, reemplazando el que
+    /// tuviera los mismos atributos (`replace = true`). Es el `CreateItem` que
+    /// comparten la clave del almacén, S/MIME ([`super::smime_key`]) y OpenPGP
+    /// ([`super::pgp_key`]): lo único que cambia son los atributos, la etiqueta y
+    /// el content-type.
+    pub(super) async fn store_secret_item(
+        &self,
+        attributes: HashMap<&str, &str>,
+        label: String,
+        value: &[u8],
+        content_type: &str,
+    ) -> Result<(), KeyError> {
+        let collection = self.default_collection().await?;
+        let mut properties: HashMap<&str, Value<'_>> = HashMap::new();
+        properties.insert("org.freedesktop.Secret.Item.Label", Value::from(label));
+        properties.insert(
+            "org.freedesktop.Secret.Item.Attributes",
+            Value::from(attributes),
+        );
+
+        let session = self.open_session().await?;
+        let secret = Secret {
+            session: session.clone(),
+            parameters: Vec::new(),
+            value: value.to_vec(),
+            content_type: content_type.into(),
+        };
+        // `replace = true`: si ya hubiera una con los mismos atributos, se
+        // reemplaza en vez de sumar una segunda que después no se sabe cuál es.
+        let reply: Result<(OwnedObjectPath, OwnedObjectPath), KeyError> = self
+            .call(
+                collection.as_str(),
+                COLLECTION_IFACE,
+                "CreateItem",
+                &(properties, &secret, true),
+            )
+            .await;
+        drop(secret);
+        self.close_session(&session).await;
+
+        let (_item, prompt) = reply?;
+        if prompt.as_str() != "/" {
+            return Err(KeyError::PromptRequired);
+        }
+        Ok(())
+    }
+
+    /// El secreto en claro del primer ítem con estos atributos, o nada si no hay.
+    /// El valor se **mueve** del `Secret` (no se copia) y éste lo pone en cero al
+    /// soltarlo; quien lo recibe lo envuelve en `Zeroizing` para borrarlo.
+    pub(super) async fn find_secret_item(
+        &self,
+        attributes: &HashMap<&str, &str>,
+    ) -> Result<Option<Vec<u8>>, KeyError> {
+        let items = self.search(attributes).await?;
+        let Some(item) = items.first() else {
+            return Ok(None);
+        };
+        let session = self.open_session().await?;
+        // Un solo argumento que es una estructura: `((oayays))`, como lo manda
+        // el estándar y como lo contesta `vasak-keyring`.
+        let reply: Result<(Secret,), KeyError> = self
+            .call(item.as_str(), ITEM_IFACE, "GetSecret", &(&session,))
+            .await;
+        self.close_session(&session).await;
+        let (mut secret,) = reply?;
+        Ok(Some(std::mem::take(&mut secret.value)))
+    }
+
+    /// Borra todos los ítems con estos atributos. Que no hubiera ninguno no es un
+    /// error; un diálogo pedido por el llavero es [`KeyError::PromptRequired`].
+    pub(super) async fn delete_secret_items(
+        &self,
+        attributes: &HashMap<&str, &str>,
+    ) -> Result<(), KeyError> {
+        for item in self.search(attributes).await? {
+            let prompt: OwnedObjectPath =
+                self.call(item.as_str(), ITEM_IFACE, "Delete", &()).await?;
+            if prompt.as_str() != "/" {
+                return Err(KeyError::PromptRequired);
+            }
+        }
+        Ok(())
+    }
+
     /// Escucha los cambios de `Locked` de las colecciones.
     ///
     /// Lo que llega es sólo un aviso de que **puede** haber cambiado: quien lo
@@ -651,72 +736,29 @@ impl KeySource for SecretServiceKeys {
     }
 
     async fn find(&self, account_id: &str) -> Result<Option<StoreKey>, KeyError> {
-        let attributes = account_attributes(account_id);
-        let items = self.search(&attributes).await?;
-        let Some(item) = items.first() else {
-            return Ok(None);
-        };
-
-        let session = self.open_session().await?;
-        // Un solo argumento que es una estructura: `((oayays))`, como lo manda
-        // el estándar y como lo contesta `vasak-keyring`.
-        let reply: Result<(Secret,), KeyError> = self
-            .call(item.as_str(), ITEM_IFACE, "GetSecret", &(&session,))
-            .await;
-        self.close_session(&session).await;
-
-        let (mut secret,) = reply?;
-        StoreKey::from_secret(Zeroizing::new(std::mem::take(&mut secret.value))).map(Some)
+        match self
+            .find_secret_item(&account_attributes(account_id))
+            .await?
+        {
+            Some(value) => StoreKey::from_secret(Zeroizing::new(value)).map(Some),
+            None => Ok(None),
+        }
     }
 
     async fn store(&self, account_id: &str, key: &StoreKey) -> Result<(), KeyError> {
-        let collection = self.default_collection().await?;
-        let attributes = account_attributes(account_id);
         let label = format!("Almacén local de VasakOS ({account_id})");
-        let mut properties: HashMap<&str, Value<'_>> = HashMap::new();
-        properties.insert("org.freedesktop.Secret.Item.Label", Value::from(label));
-        properties.insert(
-            "org.freedesktop.Secret.Item.Attributes",
-            Value::from(attributes),
-        );
-
-        let session = self.open_session().await?;
-        let secret = Secret {
-            session: session.clone(),
-            parameters: Vec::new(),
-            value: key.hex().as_bytes().to_vec(),
-            content_type: "text/plain".into(),
-        };
-        // `replace = true`: si ya hubiera una con los mismos atributos, se
-        // reemplaza en vez de sumar una segunda que después no se sabe cuál es.
-        let reply: Result<(OwnedObjectPath, OwnedObjectPath), KeyError> = self
-            .call(
-                collection.as_str(),
-                COLLECTION_IFACE,
-                "CreateItem",
-                &(properties, &secret, true),
-            )
-            .await;
-        drop(secret);
-        self.close_session(&session).await;
-
-        let (_item, prompt) = reply?;
-        if prompt.as_str() != "/" {
-            return Err(KeyError::PromptRequired);
-        }
-        Ok(())
+        self.store_secret_item(
+            account_attributes(account_id),
+            label,
+            key.hex().as_bytes(),
+            "text/plain",
+        )
+        .await
     }
 
     async fn delete(&self, account_id: &str) -> Result<(), KeyError> {
-        let attributes = account_attributes(account_id);
-        for item in self.search(&attributes).await? {
-            let prompt: OwnedObjectPath =
-                self.call(item.as_str(), ITEM_IFACE, "Delete", &()).await?;
-            if prompt.as_str() != "/" {
-                return Err(KeyError::PromptRequired);
-            }
-        }
-        Ok(())
+        self.delete_secret_items(&account_attributes(account_id))
+            .await
     }
 
     async fn key_accounts(&self) -> Result<Vec<String>, KeyError> {
