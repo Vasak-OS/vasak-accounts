@@ -32,10 +32,9 @@
 
 use std::collections::HashMap;
 
-use zbus::zvariant::{OwnedObjectPath, Value};
 use zeroize::Zeroizing;
 
-use super::key::{KeyError, Secret, SecretServiceKeys};
+use super::key::{KeyError, SecretServiceKeys};
 
 /// El esquema protegido de las identidades OpenPGP. Tiene que coincidir con el
 /// que `vasak-keyring` restringe a este ejecutable, como el de S/MIME.
@@ -46,9 +45,6 @@ const ACCOUNT_ATTRIBUTE: &str = "account";
 const TYPE_ATTRIBUTE: &str = "type";
 const TYPE_SECRET_KEY: &str = "secret-key";
 const TYPE_PASSPHRASE: &str = "passphrase";
-
-const COLLECTION_IFACE: &str = "org.freedesktop.Secret.Collection";
-const ITEM_IFACE: &str = "org.freedesktop.Secret.Item";
 
 fn pgp_attributes<'a>(account: &'a str, type_: &'a str) -> HashMap<&'a str, &'a str> {
     HashMap::from([
@@ -67,10 +63,21 @@ impl SecretServiceKeys {
         secret_key: &[u8],
         passphrase: &[u8],
     ) -> Result<(), KeyError> {
-        self.store_pgp_item(account, TYPE_SECRET_KEY, secret_key, "application/pgp-keys")
-            .await?;
-        self.store_pgp_item(account, TYPE_PASSPHRASE, passphrase, "text/plain")
-            .await
+        let label = format!("Clave OpenPGP de VasakOS ({account})");
+        self.store_secret_item(
+            pgp_attributes(account, TYPE_SECRET_KEY),
+            label.clone(),
+            secret_key,
+            "application/pgp-keys",
+        )
+        .await?;
+        self.store_secret_item(
+            pgp_attributes(account, TYPE_PASSPHRASE),
+            label,
+            passphrase,
+            "text/plain",
+        )
+        .await
     }
 
     /// La clave privada OpenPGP de una cuenta, si hay una.
@@ -79,7 +86,7 @@ impl SecretServiceKeys {
         account: &str,
     ) -> Result<Option<Zeroizing<Vec<u8>>>, KeyError> {
         Ok(self
-            .find_pgp_item(account, TYPE_SECRET_KEY)
+            .find_secret_item(&pgp_attributes(account, TYPE_SECRET_KEY))
             .await?
             .map(Zeroizing::new))
     }
@@ -90,7 +97,7 @@ impl SecretServiceKeys {
         account: &str,
     ) -> Result<Option<Zeroizing<Vec<u8>>>, KeyError> {
         Ok(self
-            .find_pgp_item(account, TYPE_PASSPHRASE)
+            .find_secret_item(&pgp_attributes(account, TYPE_PASSPHRASE))
             .await?
             .map(Zeroizing::new))
     }
@@ -99,75 +106,10 @@ impl SecretServiceKeys {
     /// error; la colección bloqueada sí ([`KeyError::Locked`]).
     pub(crate) async fn delete_pgp_identity(&self, account: &str) -> Result<(), KeyError> {
         for type_ in [TYPE_SECRET_KEY, TYPE_PASSPHRASE] {
-            let attributes = pgp_attributes(account, type_);
-            for item in self.search(&attributes).await? {
-                let prompt: OwnedObjectPath =
-                    self.call(item.as_str(), ITEM_IFACE, "Delete", &()).await?;
-                if prompt.as_str() != "/" {
-                    return Err(KeyError::PromptRequired);
-                }
-            }
+            self.delete_secret_items(&pgp_attributes(account, type_))
+                .await?;
         }
         Ok(())
-    }
-
-    async fn store_pgp_item(
-        &self,
-        account: &str,
-        type_: &str,
-        value: &[u8],
-        content_type: &str,
-    ) -> Result<(), KeyError> {
-        let collection = self.default_collection().await?;
-        let label = format!("Clave OpenPGP de VasakOS ({account})");
-        let attributes = pgp_attributes(account, type_);
-        let mut properties: HashMap<&str, Value<'_>> = HashMap::new();
-        properties.insert("org.freedesktop.Secret.Item.Label", Value::from(label));
-        properties.insert(
-            "org.freedesktop.Secret.Item.Attributes",
-            Value::from(attributes),
-        );
-
-        let session = self.open_session().await?;
-        let secret = Secret {
-            session: session.clone(),
-            parameters: Vec::new(),
-            value: value.to_vec(),
-            content_type: content_type.into(),
-        };
-        // `replace = true`: reimportar una identidad reemplaza su clave en vez de
-        // dejar dos que después no se sabe cuál es.
-        let reply: Result<(OwnedObjectPath, OwnedObjectPath), KeyError> = self
-            .call(
-                collection.as_str(),
-                COLLECTION_IFACE,
-                "CreateItem",
-                &(properties, &secret, true),
-            )
-            .await;
-        drop(secret);
-        self.close_session(&session).await;
-
-        let (_item, prompt) = reply?;
-        if prompt.as_str() != "/" {
-            return Err(KeyError::PromptRequired);
-        }
-        Ok(())
-    }
-
-    async fn find_pgp_item(&self, account: &str, type_: &str) -> Result<Option<Vec<u8>>, KeyError> {
-        let attributes = pgp_attributes(account, type_);
-        let items = self.search(&attributes).await?;
-        let Some(item) = items.first() else {
-            return Ok(None);
-        };
-        let session = self.open_session().await?;
-        let reply: Result<(Secret,), KeyError> = self
-            .call(item.as_str(), ITEM_IFACE, "GetSecret", &(&session,))
-            .await;
-        self.close_session(&session).await;
-        let (mut secret,) = reply?;
-        Ok(Some(std::mem::take(&mut secret.value)))
     }
 }
 
