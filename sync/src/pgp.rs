@@ -1501,4 +1501,542 @@ protocol=\"application/pgp-signature\"; micalg=pgp-sha256; boundary=\"S\"\r\n\r\
             Err(PgpError::BadKey(_))
         ));
     }
+
+    // ── 7 correcciones de la revisión (PR #157) ────────────────────────
+    //
+    // Cada prueba de abajo falla sin su corrección puntual: el bloque dice cuál.
+
+    // ── A. Clave binaria con `-----BEGIN` dentro de un UID ─────────────
+
+    #[test]
+    fn una_clave_binaria_con_begin_en_el_uid_se_lee_y_no_se_toma_por_armadura() {
+        use pgp::ser::Serialize;
+        // Un UID es texto libre: nada impide que traiga la cadena de un encabezado de
+        // armadura. Una clave **binaria** así no es armadura, y el viejo `looks_armored`
+        // la mandaba por el camino armor y fallaba con `BadKey`.
+        let alice = clave_completa("Alice <-----BEGIN PGP MESSAGE-----@vasak.test>");
+        let pub_key = publica(&alice);
+        let binaria_publica = pub_key.to_bytes().unwrap();
+        let binaria_secreta = alice.to_bytes().unwrap();
+        for bytes in [&binaria_publica, &binaria_secreta] {
+            assert!(
+                bytes.windows(10).any(|w| w == b"-----BEGIN"),
+                "el fixture tiene que llevar el encabezado dentro del UID"
+            );
+        }
+
+        assert_eq!(parse_public_key(&binaria_publica).unwrap(), pub_key);
+        assert_eq!(parse_secret_key(&binaria_secreta).unwrap(), alice);
+
+        // Controles: la misma clave armada sigue leyéndose, y la basura sigue siendo
+        // `BadKey` (tampoco se traga lo que no es clave sólo por llevar `-----BEGIN`).
+        let armada = pub_key.to_armored_bytes(Default::default()).unwrap();
+        assert_eq!(parse_public_key(&armada).unwrap(), pub_key);
+        assert!(matches!(
+            parse_public_key(b"-----BEGIN basura -----"),
+            Err(PgpError::BadKey(_))
+        ));
+        assert!(matches!(
+            parse_secret_key(&binaria_publica),
+            Err(PgpError::BadKey(_))
+        ));
+    }
+
+    // ── B. Compresión anidada ──────────────────────────────────────────
+
+    /// Un paquete OpenPGP «Compressed Data» (tag 8) que envuelve `interior`. La
+    /// compresión es DEFLATE crudo con un único bloque *stored* (sin comprimir de
+    /// verdad): alcanza para anidar paquetes sin sumar una dependencia, y el
+    /// descompresor de rPGP lo lee igual que a cualquiera.
+    fn paquete_comprimido(interior: &[u8]) -> Vec<u8> {
+        let largo = u16::try_from(interior.len()).expect("el interior entra en un bloque stored");
+        let mut cuerpo = vec![1u8]; // algoritmo de compresión 1 = ZIP (DEFLATE crudo)
+        cuerpo.push(0x01); // BFINAL=1, BTYPE=00 (stored)
+        cuerpo.extend_from_slice(&largo.to_le_bytes());
+        cuerpo.extend_from_slice(&(!largo).to_le_bytes());
+        cuerpo.extend_from_slice(interior);
+        // Cabecera de formato viejo: 0x80 | (tag 8 << 2) | longitud de 4 bytes.
+        let mut paquete = vec![0x80 | (8 << 2) | 0x02];
+        paquete.extend_from_slice(&(cuerpo.len() as u32).to_be_bytes());
+        paquete.extend_from_slice(&cuerpo);
+        paquete
+    }
+
+    /// Un sobre SEIPD v1 cuyo claro es un literal envuelto en `capas` paquetes
+    /// comprimidos, uno dentro de otro. El `MessageBuilder` sólo sabe comprimir una
+    /// vez (y envuelve en literal), así que el claro se arma paquete a paquete.
+    fn cifrar_con_capas(claro: &[u8], capas: usize, para: &SignedPublicKey) -> Vec<u8> {
+        use pgp::composed::RawSessionKey;
+        use pgp::packet::{PacketTrait, PublicKeyEncryptedSessionKey, SymEncryptedProtectedData};
+
+        let mut paquetes = MessageBuilder::from_bytes("", claro.to_vec())
+            .to_vec(OsRng)
+            .expect("el paquete literal");
+        for _ in 0..capas {
+            paquetes = paquete_comprimido(&paquetes);
+        }
+
+        let alg = SymmetricKeyAlgorithm::AES256;
+        let clave = vec![0x42u8; alg.key_size()];
+        let mut sobre = Vec::new();
+        PublicKeyEncryptedSessionKey::from_session_key_v3(
+            OsRng,
+            &RawSessionKey::from(clave.clone()),
+            alg,
+            encryption_subkey(para).unwrap(),
+        )
+        .expect("el PKESK")
+        .to_writer_with_header(&mut sobre)
+        .expect("se serializa el PKESK");
+        SymEncryptedProtectedData::encrypt_seipdv1(OsRng, alg, &clave, &paquetes)
+            .expect("el SEIPD v1")
+            .to_writer_with_header(&mut sobre)
+            .expect("se serializa el SEIPD");
+        armar(&sobre)
+    }
+
+    #[test]
+    fn un_comprimido_dentro_de_otro_comprimido_abre_al_claro_final() {
+        // Sin el loop de descompresión, una sola pasada dejaba el paquete interno
+        // sin abrir y `read_capped` lo entregaba como si fuera el claro: bytes crudos.
+        let bob = clave_completa("Bob <bob@vasak.test>");
+        let publica = publica(&bob);
+        // Control: una capa (el caso normal) abre.
+        let una = cifrar_con_capas(CLARO.as_bytes(), 1, &publica);
+        assert_eq!(texto_abierto(abrir(&correo_inline(&una), &bob)), CLARO);
+        // Dos capas, y justo en el tope de capas permitidas.
+        for capas in [2, MAX_COMPRESSION_LAYERS as usize] {
+            let sobre = cifrar_con_capas(CLARO.as_bytes(), capas, &publica);
+            assert_eq!(
+                texto_abierto(abrir(&correo_inline(&sobre), &bob)),
+                CLARO,
+                "con {capas} capas tiene que abrir al claro final"
+            );
+        }
+    }
+
+    #[test]
+    fn mas_capas_de_compresion_que_el_tope_no_se_materializan() {
+        let bob = clave_completa("Bob <bob@vasak.test>");
+        let sobre = cifrar_con_capas(
+            CLARO.as_bytes(),
+            MAX_COMPRESSION_LAYERS as usize + 1,
+            &publica(&bob),
+        );
+        match abrir(&correo_inline(&sobre), &bob) {
+            Decryption::Unavailable(motivo) => {
+                assert!(motivo.contains("demasiadas capas"), "{motivo}")
+            }
+            otro => panic!("una bomba de capas no puede abrirse: {otro:?}"),
+        }
+    }
+
+    #[test]
+    fn firmar_y_despues_comprimir_sigue_abriendo() {
+        // Control del loop: el mensaje firmado y comprimido no es «comprimido
+        // anidado»; tras la primera pasada ya no hay nada que descomprimir.
+        let bob = clave_completa("Bob <bob@vasak.test>");
+        let alice = clave_completa("Alice <alice@vasak.test>");
+        let mut rng = OsRng;
+        let mut builder = MessageBuilder::from_bytes("", CLARO.as_bytes().to_vec())
+            .seipd_v1(&mut rng, SymmetricKeyAlgorithm::AES256);
+        builder.sign(&alice.primary_key, vacia(), HashAlgorithm::Sha256);
+        builder.compression(CompressionAlgorithm::ZLIB);
+        builder
+            .encrypt_to_key(&mut rng, encryption_subkey(&publica(&bob)).unwrap())
+            .unwrap();
+        let armado = builder
+            .to_armored_string(rng, Default::default())
+            .unwrap()
+            .into_bytes();
+        assert_eq!(texto_abierto(abrir(&correo_inline(&armado), &bob)), CLARO);
+    }
+
+    // ── C. Firma separada con Content-Transfer-Encoding ────────────────
+
+    fn base64_en_lineas(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD
+            .encode(bytes)
+            .as_bytes()
+            .chunks(76)
+            .map(|linea| std::str::from_utf8(linea).unwrap())
+            .collect::<Vec<_>>()
+            .join("\r\n")
+    }
+
+    /// Como `correo_firmado`, pero la parte de la firma lleva
+    /// `Content-Transfer-Encoding: <cte>` y el cuerpo que se le pasa.
+    fn correo_firmado_con_cte(contenido: &str, cte: &str, cuerpo_firma: &str) -> Vec<u8> {
+        format!(
+            "From: a@vasak.test\r\nContent-Type: multipart/signed; \
+protocol=\"application/pgp-signature\"; micalg=pgp-sha256; boundary=\"S\"\r\n\r\n\
+--S\r\n{contenido}\r\n--S\r\nContent-Type: application/pgp-signature\r\n\
+Content-Transfer-Encoding: {cte}\r\n\r\n{cuerpo_firma}\r\n--S--\r\n"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn una_firma_pgp_mime_en_base64_verifica() {
+        use pgp::ser::Serialize;
+        // Sin aplicar el CTE de la parte, el base64 no era armadura ni paquete: la
+        // firma salía «ilegible» aunque fuera buena.
+        let alice = clave_completa("Alice <alice@vasak.test>");
+        let esperado = Verification::SignedUntrusted(alice.primary_key.fingerprint().to_string());
+        let armada = sign_detached(CONTENIDO.as_bytes(), &alice, &vacia()).unwrap();
+        let (firma, _) = DetachedSignature::from_armor_single(&armada[..]).unwrap();
+
+        // La armadura recodificada en base64, y el paquete binario en base64.
+        for cuerpo in [
+            base64_en_lineas(&armada),
+            base64_en_lineas(&firma.to_bytes().unwrap()),
+        ] {
+            let correo = correo_firmado_con_cte(CONTENIDO, "base64", &cuerpo);
+            assert_eq!(verify(&correo, &[publica(&alice)]), esperado);
+        }
+
+        // Controles: `7bit` con la armadura cruda sigue verificando, y una firma en
+        // base64 de contenido adulterado sigue sin cerrar (el CTE no relaja nada).
+        let cruda = String::from_utf8(armada.clone()).unwrap();
+        assert_eq!(
+            verify(
+                &correo_firmado_con_cte(CONTENIDO, "7bit", &cruda),
+                &[publica(&alice)]
+            ),
+            esperado
+        );
+        let adulterado = CONTENIDO.replace("hola", "chau");
+        assert!(matches!(
+            verify(
+                &correo_firmado_con_cte(&adulterado, "base64", &base64_en_lineas(&armada)),
+                &[publica(&alice)]
+            ),
+            Verification::Unverified(motivo) if motivo.contains("no cierra")
+        ));
+    }
+
+    // ── D. Primaria revocada o expirada ────────────────────────────────
+
+    const UN_ANO: u32 = 365 * 24 * 3600;
+
+    fn hace_un_ano() -> Timestamp {
+        Timestamp::from_secs(Timestamp::now().as_secs() - UN_ANO)
+    }
+
+    /// Una clave completa cuya **primaria** se creó `hace_un_ano()`.
+    fn clave_vieja(uid: &str) -> SignedSecretKey {
+        let mut p = SecretKeyParamsBuilder::default();
+        p.key_type(KeyType::Ed25519Legacy)
+            .can_certify(true)
+            .can_sign(false)
+            .can_encrypt(EncryptionCaps::None)
+            .created_at(hace_un_ano())
+            .primary_user_id(uid.into())
+            .subkeys(vec![subclave_de_firma(), subclave_de_cifrado(None)]);
+        p.build()
+            .expect("params de la clave")
+            .generate(OsRng)
+            .expect("la clave se genera")
+    }
+
+    /// Una auto-firma de la primaria (`typ`) con `KeyExpirationTime` opcional.
+    fn auto_firma_con_expiracion(
+        secret: &SignedSecretKey,
+        typ: SignatureType,
+        expiracion: Option<u32>,
+        publica: &SignedPublicKey,
+    ) -> pgp::packet::Signature {
+        use pgp::types::Tag;
+        let primaria = &secret.primary_key;
+        let mut flags = KeyFlags::default();
+        flags.set_certify(true);
+        let mut config = SignatureConfig::from_key(OsRng, primaria, typ).expect("config");
+        config.hashed_subpackets = vec![
+            Subpacket::regular(SubpacketData::SignatureCreationTime(Timestamp::now())).unwrap(),
+            Subpacket::regular(SubpacketData::KeyFlags(flags)).unwrap(),
+            Subpacket::regular(SubpacketData::IssuerFingerprint(primaria.fingerprint())).unwrap(),
+        ];
+        if let Some(segundos) = expiracion {
+            config.hashed_subpackets.push(
+                Subpacket::regular(SubpacketData::KeyExpirationTime(PgpDuration::from_secs(
+                    segundos,
+                )))
+                .unwrap(),
+            );
+        }
+        match typ {
+            SignatureType::KeyRevocation | SignatureType::Key => config
+                .sign_key(primaria, &vacia(), primaria.public_key())
+                .expect("firma directa de la primaria"),
+            _ => config
+                .sign_certification(
+                    primaria,
+                    primaria.public_key(),
+                    &vacia(),
+                    Tag::UserId,
+                    &publica.details.users[0].id,
+                )
+                .expect("auto-certificación del UID"),
+        }
+    }
+
+    /// La pública con la primaria revocada.
+    fn con_primaria_revocada(secret: &SignedSecretKey) -> SignedPublicKey {
+        let mut public = publica(secret);
+        let revocacion =
+            auto_firma_con_expiracion(secret, SignatureType::KeyRevocation, None, &public);
+        public.details.revocation_signatures.push(revocacion);
+        public
+    }
+
+    /// La pública con la auto-firma del UID reemplazada por una con vencimiento
+    /// `expiracion` (segundos desde la creación de la primaria).
+    fn con_primaria_con_vencimiento_en_el_uid(
+        secret: &SignedSecretKey,
+        expiracion: u32,
+    ) -> SignedPublicKey {
+        let mut public = publica(secret);
+        let firma = auto_firma_con_expiracion(
+            secret,
+            SignatureType::CertPositive,
+            Some(expiracion),
+            &public,
+        );
+        public.details.users[0].signatures = vec![firma];
+        public
+    }
+
+    /// La pública con una firma directa de clave con vencimiento, y sin
+    /// auto-firmas de UID que empaten con ella en fecha.
+    fn con_primaria_con_vencimiento_directo(
+        secret: &SignedSecretKey,
+        expiracion: u32,
+    ) -> SignedPublicKey {
+        let mut public = publica(secret);
+        let firma =
+            auto_firma_con_expiracion(secret, SignatureType::Key, Some(expiracion), &public);
+        public.details.direct_signatures = vec![firma];
+        public.details.users[0].signatures.clear();
+        public
+    }
+
+    #[test]
+    fn una_primaria_revocada_mata_la_clave_aunque_la_subclave_este_vigente() {
+        let bob = clave_completa("Bob <bob@vasak.test>");
+        // Control: sin revocar, la misma clave cifra.
+        assert!(encryption_subkey(&publica(&bob)).is_some());
+
+        let revocada = con_primaria_revocada(&bob);
+        assert!(
+            subkey_usable(
+                &revocada.public_subkeys[1],
+                Timestamp::now().as_secs(),
+                Usage::Encrypt
+            ),
+            "la subclave sola sigue vigente: lo que la mata es la primaria"
+        );
+        assert!(encryption_subkey(&revocada).is_none());
+        assert!(matches!(
+            encrypt_to_keys(b"x", &[revocada]),
+            Err(PgpError::NoEncryptionKey(_))
+        ));
+    }
+
+    #[test]
+    fn una_primaria_expirada_mata_la_clave_aunque_la_subclave_este_vigente() {
+        let bob = clave_vieja("Bob <bob@vasak.test>");
+        // Control: la clave vieja, sin vencimiento, cifra.
+        assert!(encryption_subkey(&publica(&bob)).is_some());
+
+        // Venció hace unos 364 días, por la auto-firma del UID y por la directa.
+        for expirada in [
+            con_primaria_con_vencimiento_en_el_uid(&bob, 24 * 3600),
+            con_primaria_con_vencimiento_directo(&bob, 24 * 3600),
+        ] {
+            assert!(encryption_subkey(&expirada).is_none());
+            assert!(matches!(
+                encrypt_to_keys(b"x", &[expirada]),
+                Err(PgpError::NoEncryptionKey(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn una_primaria_con_vencimiento_futuro_o_cero_sigue_cifrando() {
+        let bob = clave_vieja("Bob <bob@vasak.test>");
+        // Vence en unos 100 días; y cero segundos = «nunca expira».
+        for vigente in [
+            con_primaria_con_vencimiento_en_el_uid(&bob, UN_ANO + 100 * 24 * 3600),
+            con_primaria_con_vencimiento_en_el_uid(&bob, 0),
+            con_primaria_con_vencimiento_directo(&bob, 0),
+        ] {
+            assert!(encryption_subkey(&vigente).is_some());
+            let armado = encrypt_to_keys(CLARO.as_bytes(), &[vigente]).unwrap();
+            assert_eq!(texto_abierto(abrir(&correo_inline(&armado), &bob)), CLARO);
+        }
+    }
+
+    // ── E. Expiración cero = nunca expira ──────────────────────────────
+
+    #[test]
+    fn una_subclave_con_vencimiento_cero_nunca_expira() {
+        // `KeyExpirationTime(0)` no es «expiró al crearse»: sin el filtro, una
+        // subclave de hace un año con vencimiento 0 contaba como muerta.
+        let bob = generar(
+            "Bob <bob@vasak.test>",
+            vec![
+                subclave_de_firma(),
+                subclave_de_cifrado(Some(hace_un_ano())),
+            ],
+        );
+        let publica = con_subclave_reatada(&bob, 1, Some(0), false);
+        let elegida = encryption_subkey(&publica).expect("vencimiento cero no expira");
+        assert_eq!(elegida.fingerprint(), bob.secret_subkeys[1].fingerprint());
+        let armado = encrypt_to_keys(CLARO.as_bytes(), &[publica]).unwrap();
+        assert_eq!(texto_abierto(abrir(&correo_inline(&armado), &bob)), CLARO);
+    }
+
+    /// La pública de `secret` con la subclave `index` reatada con **exactamente** esos
+    /// `flags`: el builder de rPGP no deja armar un flag que el algoritmo no soporta
+    /// (el caso de una clave mal marcada que llega de afuera), así que se re-firma la
+    /// binding a mano.
+    fn con_subclave_reatada_con_flags(
+        secret: &SignedSecretKey,
+        index: usize,
+        flags: KeyFlags,
+    ) -> SignedPublicKey {
+        let mut public = publica(secret);
+        let subkey = public.public_subkeys[index].clone();
+        let primaria = &secret.primary_key;
+        let mut config = SignatureConfig::from_key(OsRng, primaria, SignatureType::SubkeyBinding)
+            .expect("config");
+        config.hashed_subpackets = vec![
+            Subpacket::regular(SubpacketData::SignatureCreationTime(Timestamp::now())).unwrap(),
+            Subpacket::regular(SubpacketData::KeyFlags(flags)).unwrap(),
+            Subpacket::regular(SubpacketData::IssuerFingerprint(primaria.fingerprint())).unwrap(),
+        ];
+        public.public_subkeys[index].signatures = vec![config
+            .sign_subkey_binding(primaria, primaria.public_key(), &vacia(), &subkey.key)
+            .expect("firma de la unión")];
+        public
+    }
+
+    // ── F. Subclave sólo de autenticación ──────────────────────────────
+
+    fn solo_autenticacion() -> KeyFlags {
+        let mut flags = KeyFlags::default();
+        flags.set_authentication(true);
+        flags
+    }
+
+    #[test]
+    fn una_subclave_solo_de_autenticacion_que_podria_firmar_no_firma() {
+        // Con el flag de autenticación fuera de `any_flag`, la binding «sin flags»
+        // caía al algoritmo: una auth-only Ed25519 se elegía para firmar.
+        let ahora = Timestamp::now().as_secs();
+        let alice = generar(
+            "Alice <alice@vasak.test>",
+            vec![{
+                let mut p = SubkeyParamsBuilder::default();
+                p.key_type(KeyType::Ed25519Legacy)
+                    .can_sign(false)
+                    .can_encrypt(EncryptionCaps::None)
+                    .can_authenticate(true);
+                p.build().expect("params de la subclave de autenticación")
+            }],
+        );
+        let publica_alice = publica(&alice);
+        let auth_firma = &publica_alice.public_subkeys[0];
+        assert!(
+            auth_firma.signatures.iter().any(|s| {
+                let f = s.key_flags();
+                f.authentication() && !f.sign() && !f.encrypt_comms()
+            }),
+            "el fixture tiene que ser sólo de autenticación"
+        );
+        assert!(!subkey_usable(auth_firma, ahora, Usage::Sign));
+        assert!(!subkey_usable(auth_firma, ahora, Usage::Encrypt));
+        // Sin otra subclave de firma, firma la primaria; nunca la auth-only.
+        assert!(matches!(
+            signing_component(&alice, ahora),
+            Some(Signer::Primary)
+        ));
+    }
+
+    #[test]
+    fn una_subclave_solo_de_autenticacion_que_podria_cifrar_no_cifra() {
+        // Lo mismo para cifrar: una auth-only ECDH se elegía por su algoritmo.
+        let ahora = Timestamp::now().as_secs();
+        let bob = generar("Bob <bob@vasak.test>", vec![subclave_de_cifrado(None)]);
+        let publica_bob = con_subclave_reatada_con_flags(&bob, 0, solo_autenticacion());
+        assert!(!subkey_usable(
+            &publica_bob.public_subkeys[0],
+            ahora,
+            Usage::Encrypt
+        ));
+        assert!(encryption_subkey(&publica_bob).is_none());
+    }
+
+    // ── G. Flag erróneo + algoritmo incapaz ────────────────────────────
+
+    #[test]
+    fn una_subclave_solo_firma_con_flag_de_cifrado_se_salta_y_se_elige_la_valida() {
+        // La binding de la primera subclave dice «cifrado», pero Ed25519 no cifra.
+        // Sin exigir el algoritmo, se elegía ésa y `encrypt_to_keys` fallaba sin
+        // probar la subclave válida que viene después.
+        let bob = generar(
+            "Bob <bob@vasak.test>",
+            vec![subclave_de_firma(), subclave_de_cifrado(None)],
+        );
+        let mut cifrar_y_comunicar = KeyFlags::default();
+        cifrar_y_comunicar.set_encrypt_comms(true);
+        cifrar_y_comunicar.set_encrypt_storage(true);
+        let publica = con_subclave_reatada_con_flags(&bob, 0, cifrar_y_comunicar);
+        assert!(
+            publica.public_subkeys[0]
+                .signatures
+                .iter()
+                .any(|s| s.key_flags().encrypt_comms()),
+            "el fixture tiene que llevar el flag de cifrado en la subclave de firma"
+        );
+        let elegida = encryption_subkey(&publica).expect("queda la subclave válida");
+        assert_eq!(
+            elegida.fingerprint(),
+            bob.secret_subkeys[1].fingerprint(),
+            "tiene que ser la de cifrado real, no la sólo-firma mal marcada"
+        );
+        let armado = encrypt_to_keys(CLARO.as_bytes(), &[publica]).unwrap();
+        assert_eq!(texto_abierto(abrir(&correo_inline(&armado), &bob)), CLARO);
+    }
+
+    #[test]
+    fn una_subclave_solo_cifrado_con_flag_de_firma_no_se_elige_para_firmar() {
+        let ahora = Timestamp::now().as_secs();
+        let alice = generar("Alice <alice@vasak.test>", vec![subclave_de_cifrado(None)]);
+        let mut firmar = KeyFlags::default();
+        firmar.set_sign(true);
+        let publica = con_subclave_reatada_con_flags(&alice, 0, firmar);
+        assert!(
+            publica.public_subkeys[0]
+                .signatures
+                .iter()
+                .any(|s| s.key_flags().sign()),
+            "el fixture tiene que llevar el flag de firma en la subclave ECDH"
+        );
+        assert!(!subkey_usable(
+            &publica.public_subkeys[0],
+            ahora,
+            Usage::Sign
+        ));
+        // Cae a la primaria, y la firma que sale verifica.
+        assert!(matches!(
+            signing_component(&alice, ahora),
+            Some(Signer::Primary)
+        ));
+        let firma = sign_detached(CONTENIDO.as_bytes(), &alice, &vacia()).unwrap();
+        assert!(matches!(
+            verify(&correo_firmado(CONTENIDO, &firma), &[publica]),
+            Verification::SignedUntrusted(_)
+        ));
+    }
 }
