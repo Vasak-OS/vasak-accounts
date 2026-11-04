@@ -1870,6 +1870,64 @@ Content-Transfer-Encoding: {cte}\r\n\r\n{cuerpo_firma}\r\n--S--\r\n"
         }
     }
 
+    /// La secreta con la metadata de la primaria tomada de `muerta` (la pública
+    /// revocada o expirada): lo que `signing_component` mira vía `to_public_key()`.
+    fn con_primaria_muerta(secret: &SignedSecretKey, muerta: SignedPublicKey) -> SignedSecretKey {
+        let mut secret = secret.clone();
+        secret.details = muerta.details;
+        secret
+    }
+
+    #[test]
+    fn una_primaria_muerta_no_firma_ni_con_una_subclave_de_firma_vigente() {
+        let ahora = Timestamp::now().as_secs();
+        // Control: viva, la clave firma con la subclave de firma.
+        let vivo = clave_vieja("Alice <alice@vasak.test>");
+        assert!(matches!(
+            signing_component(&vivo, ahora),
+            Some(Signer::Subkey(0))
+        ));
+
+        let revocada = con_primaria_muerta(&vivo, con_primaria_revocada(&vivo));
+        let expirada = con_primaria_muerta(
+            &vivo,
+            con_primaria_con_vencimiento_en_el_uid(&vivo, 24 * 3600),
+        );
+        for muerta in [revocada, expirada] {
+            assert!(
+                subkey_usable(
+                    &muerta.secret_subkeys[0].signed_public_key(),
+                    ahora,
+                    Usage::Sign
+                ),
+                "la subclave sola sigue vigente: lo que la mata es la primaria"
+            );
+            assert!(signing_component(&muerta, ahora).is_none());
+            assert!(matches!(
+                sign_detached(CONTENIDO.as_bytes(), &muerta, &vacia()),
+                Err(PgpError::NoSigningKey)
+            ));
+        }
+    }
+
+    #[test]
+    fn una_primaria_muerta_sin_subclave_de_firma_no_cae_a_firmar_con_ella() {
+        let ahora = Timestamp::now().as_secs();
+        // Control: viva y sin subclaves, firma la primaria (su algoritmo puede).
+        let vivo = generar("Alice <alice@vasak.test>", vec![]);
+        assert!(primary_can_sign(&vivo));
+        assert!(matches!(
+            signing_component(&vivo, ahora),
+            Some(Signer::Primary)
+        ));
+
+        let revocada = con_primaria_muerta(&vivo, con_primaria_revocada(&vivo));
+        assert!(matches!(
+            sign_detached(CONTENIDO.as_bytes(), &revocada, &vacia()),
+            Err(PgpError::NoSigningKey)
+        ));
+    }
+
     #[test]
     fn una_primaria_con_vencimiento_futuro_o_cero_sigue_cifrando() {
         let bob = clave_vieja("Bob <bob@vasak.test>");
