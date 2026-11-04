@@ -82,6 +82,7 @@ mod mailboxes;
 mod message;
 mod notifications;
 mod outbox;
+mod pgp;
 mod preferences;
 mod query;
 mod reminders;
