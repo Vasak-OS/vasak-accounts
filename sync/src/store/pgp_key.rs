@@ -1,13 +1,19 @@
 //! La identidad OpenPGP propia en el llavero, por cuenta.
 //!
 //! La clave privada OpenPGP de una cuenta —y su contraseña (passphrase)— viven en
-//! `vasak-keyring` bajo el esquema protegido [`SCHEMA`] (`ar.net.vasak.os.PgpKey`):
-//! sólo la toca este servicio, cifrada en reposo como el resto, y a cualquier
-//! otro proceso el llavero le contesta `SearchItems` vacío. Es el mismo trato que
-//! la identidad S/MIME ([`super::smime_key`]) —el esquema y las claves de búsqueda
-//! son lo único que cambia—, así que esto reusa el cliente de Secret Service de
-//! [`super::key`] (sesión `plain`, `CreateItem replace=true`,
-//! `SearchItems`/`GetSecret`).
+//! `vasak-keyring` bajo el esquema [`SCHEMA`] (`ar.net.vasak.os.PgpKey`), cifradas
+//! en reposo como el resto. La idea es el mismo trato que la identidad S/MIME
+//! ([`super::smime_key`]) —el esquema y las claves de búsqueda son lo único que
+//! cambia—, así que esto reusa el cliente de Secret Service de [`super::key`]
+//! (sesión `plain`, `CreateItem replace=true`, `SearchItems`/`GetSecret`).
+//!
+//! **Pendiente (Vasak-OS/vasak-keyring#64):** la aislación —que sólo este servicio
+//! lo toque y a cualquier otro proceso el llavero le conteste `SearchItems` vacío—
+//! la aplica `vasak-keyring` por su lista `PROTECTED_SCHEMAS`, y `PgpKey` **todavía
+//! no está** en esa lista (sí lo está `SmimeKey`). Es **precondición dura del PR5**
+//! (import de la identidad): ninguna clave privada OpenPGP real debe guardarse acá
+//! antes de que esa puerta exista. Hoy este módulo está inerte (`dead_code`) hasta
+//! que PR5 lo enganche.
 //!
 //! Por cuenta se guardan dos ítems **secretos**: la **clave privada** (el armor o
 //! los bytes binarios de OpenPGP, como vinieron) y la **contraseña** que la abre.
