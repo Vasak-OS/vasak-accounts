@@ -457,6 +457,15 @@ enum Signer {
 /// Elige la componente de firma: una subclave de firma usable, o la primaria si
 /// puede firmar. Las subclaves expiradas o revocadas se saltan.
 fn signing_component(key: &SignedSecretKey, now: u32) -> Option<Signer> {
+    // Una primaria muerta (revocada o expirada) descarta la clave entera para
+    // firmar, igual que para cifrar: no se firma con una subclave bajo una
+    // identidad revocada, ni se cae a la primaria muerta aunque su algoritmo
+    // pueda firmar. Es la simétrica del gate de `encryption_subkey`.
+    // `to_public_key()` deriva la metadata pública soltando el material secreto,
+    // sin clonar la clave privada entera.
+    if !primary_usable(&key.to_public_key(), now) {
+        return None;
+    }
     for (index, subkey) in key.secret_subkeys.iter().enumerate() {
         if subkey_usable(&subkey.signed_public_key(), now, Usage::Sign) {
             return Some(Signer::Subkey(index));
