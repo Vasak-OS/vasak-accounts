@@ -414,7 +414,7 @@ mod tests {
     use crate::pgp::{encryption_subkey, PgpError};
     use crate::store::contacts::tests::open_store;
     use crate::store::paths::tests::TempDir;
-    use pgp::composed::SignedPublicKey;
+    use pgp::composed::{SignedPublicKey, SignedSecretKey};
     use pgp::packet::{KeyFlags, SignatureConfig, SignatureType, Subpacket, SubpacketData, UserId};
     use pgp::ser::Serialize;
     use pgp::types::{KeyDetails, PacketHeaderVersion, Tag, Timestamp};
@@ -536,9 +536,9 @@ mod tests {
 
     #[test]
     fn una_subclave_sin_ninguna_firma_de_binding_nunca_se_elige_para_cifrar() {
-        // `verify_bindings` de rPGP es vacuo sin firmas: la ingesta no la rechaza,
-        // pero sin binding el selector no la usa. Se fija ese invariante: nadie
-        // cifra a una subclave que no trae binding.
+        // rPGP 0.21 descarta al parsear las subclaves sin firmas y `verify_bindings`
+        // exige al menos una: una subclave sin binding ni se guarda ni se elige. Se
+        // fija ese invariante: nadie cifra a una subclave que no trae binding.
         let temp = TempDir::new("pgp-import-sin-binding");
         let store = open_store(&temp);
         let mut key = publica(&clave_completa("Ana <ana@example.com>"));
@@ -598,6 +598,115 @@ mod tests {
         let r = ingest_peer_key(&store, "ana@example.com", &bytes(&key), AHORA);
         assert!(es_error_de_clave(r));
         assert!(store.find_peer("ana@example.com").unwrap().is_none());
+    }
+
+    // ── Revocaciones de la primaria (H1) y no reducir la guardada (H2) ──
+
+    /// Una `KeyRevocation` sobre la primaria de `objetivo`, firmada por `firmante`.
+    fn revocacion(
+        firmante: &SignedSecretKey,
+        objetivo: &SignedSecretKey,
+    ) -> pgp::packet::Signature {
+        SignatureConfig::from_key(OsRng, &firmante.primary_key, SignatureType::KeyRevocation)
+            .unwrap()
+            .sign_key(
+                &firmante.primary_key,
+                &vacia(),
+                objetivo.primary_key.public_key(),
+            )
+            .expect("firma de revocación")
+    }
+
+    fn guardada(store: &Store, address: &str) -> SignedPublicKey {
+        let peer = store.find_peer(address).unwrap().expect("hay fila");
+        parse_public_key(&peer.public_key).unwrap()
+    }
+
+    #[test]
+    fn una_revocacion_forjada_por_otra_clave_no_inhabilita_la_primaria_de_la_victima() {
+        let temp = TempDir::new("pgp-import-revocacion-forjada");
+        let store = open_store(&temp);
+        let victima = clave_completa("Victima <victima@example.com>");
+        let atacante = clave_completa("Atacante <atacante@example.com>");
+        let mut key = publica(&victima);
+        assert!(encryption_subkey(&key).is_some(), "premisa: usable");
+        key.details
+            .revocation_signatures
+            .push(revocacion(&atacante, &victima));
+        // Premisa: sin el saneo, la mera presencia la inutilizaría.
+        assert!(encryption_subkey(&key).is_none());
+
+        let r = ingest_peer_key(&store, "victima@example.com", &bytes(&key), AHORA);
+        assert_eq!(r.unwrap(), Ingested::New);
+        let g = guardada(&store, "victima@example.com");
+        assert!(g.details.revocation_signatures.is_empty());
+        assert!(encryption_subkey(&g).is_some(), "la forjada se descartó");
+    }
+
+    #[test]
+    fn una_auto_revocacion_valida_sobrevive_al_saneo_e_inhabilita_la_clave() {
+        let temp = TempDir::new("pgp-import-autorevocacion");
+        let store = open_store(&temp);
+        let ana = clave_completa("Ana <ana@example.com>");
+        let mut key = publica(&ana);
+        key.details
+            .revocation_signatures
+            .push(revocacion(&ana, &ana));
+
+        let r = ingest_peer_key(&store, "ana@example.com", &bytes(&key), AHORA);
+        assert_eq!(r.unwrap(), Ingested::New);
+        let g = guardada(&store, "ana@example.com");
+        assert_eq!(g.details.revocation_signatures.len(), 1);
+        assert!(
+            encryption_subkey(&g).is_none(),
+            "la guardada queda revocada"
+        );
+    }
+
+    #[test]
+    fn con_una_revocacion_valida_y_una_forjada_se_conserva_solo_la_valida() {
+        let temp = TempDir::new("pgp-import-revocacion-mixta");
+        let store = open_store(&temp);
+        let ana = clave_completa("Ana <ana@example.com>");
+        let atacante = clave_completa("Atacante <atacante@example.com>");
+        let mut key = publica(&ana);
+        key.details
+            .revocation_signatures
+            .push(revocacion(&atacante, &ana));
+        key.details
+            .revocation_signatures
+            .push(revocacion(&ana, &ana));
+
+        ingest_peer_key(&store, "ana@example.com", &bytes(&key), AHORA).unwrap();
+        let g = guardada(&store, "ana@example.com");
+        assert_eq!(g.details.revocation_signatures.len(), 1);
+        assert!(g.details.revocation_signatures[0]
+            .verify_key(&g.primary_key)
+            .is_ok());
+        assert!(encryption_subkey(&g).is_none());
+    }
+
+    #[test]
+    fn la_misma_primaria_sin_la_subclave_de_cifrado_no_reduce_la_clave_guardada() {
+        let temp = TempDir::new("pgp-import-no-reduce");
+        let store = open_store(&temp);
+        let sana = publica(&clave_completa("Ana <ana@example.com>"));
+        let original = bytes(&sana);
+        ingest_peer_key(&store, "ana@example.com", &original, 100).unwrap();
+
+        let mut reducida = sana.clone();
+        reducida.public_subkeys.remove(1);
+        assert!(
+            encryption_subkey(&reducida).is_none(),
+            "premisa: sin cifrado"
+        );
+        let r = ingest_peer_key(&store, "ana@example.com", &bytes(&reducida), 200);
+        assert_eq!(r.unwrap(), Ingested::Unchanged);
+
+        let peer = store.find_peer("ana@example.com").unwrap().unwrap();
+        assert_eq!(peer.public_key, original, "la clave guardada no cambia");
+        assert!(encryption_subkey(&guardada(&store, "ana@example.com")).is_some());
+        assert_eq!((peer.first_seen, peer.updated_at), (100, 200));
     }
 
     // ── Ingesta pública: TOFU ──────────────────────────────────────────
