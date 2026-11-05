@@ -753,18 +753,24 @@ CREATE TABLE pgp_peers (
 /// Los cuerpos cacheados **antes** de la V15 quedan con estas columnas en NULL y no se
 /// reprocesan solos: `messages_without_body` sólo mira los mensajes **sin** fila de
 /// cuerpo. Un mail PGP inline cacheado bajo la V14 seguiría mostrando la armadura y
-/// reportando `pgp` NULL. Por eso se **borra la fila de cuerpo** de los que llevan una
-/// armadura PGP (texto o HTML): la próxima vuelta los vuelve a bajar y recomputa su
-/// estado PGP, y `write_body` rehace el índice FTS al reescribirlos. Sólo toca los que
-/// parecen PGP, no la caché entera.
+/// reportando `pgp` NULL. Por eso se **borra la fila de cuerpo** de los que **SON** PGP
+/// inline —su primer contenido no-blanco es el marcador `-----BEGIN PGP `, lo mismo que
+/// exigen `encrypted_payload`/`verify`—: la próxima vuelta los vuelve a bajar y recomputa
+/// su estado PGP, y `write_body` rehace el índice FTS al reescribirlos.
+///
+/// shortcut: sólo se invalidan los cuerpos que SON PGP inline, no los que apenas CITAN
+/// una armadura (una respuesta que cita, un post de lista); por eso se ancla al inicio
+/// (sin `%` inicial) tolerando espacios/tabs/saltos. Con la decisión #1 (almacén local
+/// completo) borrar un cuerpo citado sería churn y, peor, perdería el cuerpo cacheado de
+/// un mensaje offline o ya borrado del servidor.
 const V15: &str = "
 ALTER TABLE message_bodies ADD COLUMN pgp_status INTEGER;
 ALTER TABLE message_bodies ADD COLUMN pgp_signer TEXT;
 ALTER TABLE message_bodies ADD COLUMN pgp_encrypted INTEGER;
 
 DELETE FROM message_bodies
-WHERE text_body LIKE '%-----BEGIN PGP %'
-   OR html_body LIKE '%-----BEGIN PGP %';
+WHERE ltrim(text_body, char(32) || char(9) || char(10) || char(13)) LIKE '-----BEGIN PGP %'
+   OR ltrim(html_body, char(32) || char(9) || char(10) || char(13)) LIKE '-----BEGIN PGP %';
 ";
 
 /// Todas las migraciones, en orden.
