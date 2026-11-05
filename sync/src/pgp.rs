@@ -899,7 +899,7 @@ pub(crate) mod tests {
 
     // ── Armado de mensajes ─────────────────────────────────────────────
 
-    fn cifrar(claro: &[u8], para: &SignedPublicKey) -> Vec<u8> {
+    pub(crate) fn cifrar(claro: &[u8], para: &SignedPublicKey) -> Vec<u8> {
         encrypt_to_keys(claro, std::slice::from_ref(para)).expect("el cifrado sale")
     }
 
@@ -928,7 +928,7 @@ pub(crate) mod tests {
 
     /// Desarma el mensaje, aplica `cambio` a los bytes binarios y lo rearma:
     /// así se manipula el ciphertext sin romper la armadura ni su CRC.
-    fn manipular(armado: &[u8], cambio: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+    pub(crate) fn manipular(armado: &[u8], cambio: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
         let mut binario = Vec::new();
         Dearmor::new(armado)
             .read_to_end(&mut binario)
@@ -937,13 +937,13 @@ pub(crate) mod tests {
         armar(&binario)
     }
 
-    fn correo_inline(armado: &[u8]) -> Vec<u8> {
+    pub(crate) fn correo_inline(armado: &[u8]) -> Vec<u8> {
         let mut out = b"From: a@vasak.test\r\nContent-Type: text/plain\r\n\r\n".to_vec();
         out.extend_from_slice(armado);
         out
     }
 
-    fn correo_pgp_mime(armado: &[u8]) -> Vec<u8> {
+    pub(crate) fn correo_pgp_mime(armado: &[u8]) -> Vec<u8> {
         let mut out = b"From: a@vasak.test\r\nContent-Type: multipart/encrypted; \
 protocol=\"application/pgp-encrypted\"; boundary=\"B\"\r\n\r\n--B\r\n\
 Content-Type: application/pgp-encrypted\r\n\r\nVersion: 1\r\n--B\r\n\
@@ -1506,7 +1506,7 @@ protocol=\"application/pgp-signature\"; micalg=pgp-sha256; boundary=\"S\"\r\n\r\
         );
     }
 
-    fn cleartext_de(texto: &str, firmante: &impl pgp::types::SigningKey) -> String {
+    pub(crate) fn cleartext_de(texto: &str, firmante: &impl pgp::types::SigningKey) -> String {
         CleartextSignedMessage::sign(OsRng, texto, firmante, &vacia())
             .expect("firma cleartext")
             .to_armored_string(Default::default())
@@ -2188,6 +2188,233 @@ Content-Transfer-Encoding: {cte}\r\n\r\n{cuerpo_firma}\r\n--S--\r\n"
         assert!(matches!(
             verify(&correo_firmado(CONTENIDO, &firma), &[publica]),
             Verification::SignedUntrusted(_)
+        ));
+    }
+
+    // ── H. `verify` exige un componente de firma usable ────────────────
+    //
+    // Antes de PR4, `verify_*` aceptaba cualquier componente cuya firma cerrara:
+    // una subclave expirada, revocada o sin flag de firma elevaba el mensaje a
+    // «clave conocida». Estas pruebas firman **con la secreta de esa subclave** (lo
+    // que hace el atacante, o el dueño con una clave muerta) y miran qué dice `verify`.
+
+    use pgp::composed::DetachedSignature as Detached;
+    use pgp::types::SigningKey;
+
+    fn subclave_de_firma_creada(creada: Timestamp) -> SubkeyParams {
+        let mut p = SubkeyParamsBuilder::default();
+        p.key_type(KeyType::Ed25519Legacy)
+            .can_sign(true)
+            .can_encrypt(EncryptionCaps::None)
+            .can_authenticate(false)
+            .created_at(creada);
+        p.build().expect("params de la subclave de firma")
+    }
+
+    fn flags_de_firma() -> KeyFlags {
+        let mut flags = KeyFlags::default();
+        flags.set_sign(true);
+        flags
+    }
+
+    fn flags_de_cifrado() -> KeyFlags {
+        let mut flags = KeyFlags::default();
+        flags.set_encrypt_comms(true);
+        flags.set_encrypt_storage(true);
+        flags
+    }
+
+    /// Firma de unión (o de revocación) de la subclave `subkey` con `flags` y
+    /// vencimiento opcional, hecha por la primaria de `secret`.
+    fn union_con_flags(
+        secret: &SignedSecretKey,
+        subkey: &SignedPublicSubKey,
+        typ: SignatureType,
+        flags: KeyFlags,
+        expiracion: Option<u32>,
+    ) -> pgp::packet::Signature {
+        let primaria = &secret.primary_key;
+        let mut config = SignatureConfig::from_key(OsRng, primaria, typ).expect("config");
+        config.hashed_subpackets = vec![
+            Subpacket::regular(SubpacketData::SignatureCreationTime(Timestamp::now())).unwrap(),
+            Subpacket::regular(SubpacketData::KeyFlags(flags)).unwrap(),
+            Subpacket::regular(SubpacketData::IssuerFingerprint(primaria.fingerprint())).unwrap(),
+        ];
+        if let Some(segundos) = expiracion {
+            config.hashed_subpackets.push(
+                Subpacket::regular(SubpacketData::KeyExpirationTime(PgpDuration::from_secs(
+                    segundos,
+                )))
+                .unwrap(),
+            );
+        }
+        config
+            .sign_subkey_binding(primaria, primaria.public_key(), &vacia(), &subkey.key)
+            .expect("firma de la unión")
+    }
+
+    /// La pública de `secret` con la subclave 0 (la de firma) reatada con esos
+    /// `flags`, ese vencimiento y, si `revocada`, con su revocación.
+    fn firma_reatada(
+        secret: &SignedSecretKey,
+        flags: KeyFlags,
+        expiracion: Option<u32>,
+        revocada: bool,
+    ) -> SignedPublicKey {
+        let mut public = publica(secret);
+        let subkey = public.public_subkeys[0].clone();
+        let mut firmas = vec![union_con_flags(
+            secret,
+            &subkey,
+            SignatureType::SubkeyBinding,
+            flags,
+            expiracion,
+        )];
+        if revocada {
+            firmas.push(union_con_flags(
+                secret,
+                &subkey,
+                SignatureType::SubkeyRevocation,
+                KeyFlags::default(),
+                None,
+            ));
+        }
+        public.public_subkeys[0].signatures = firmas;
+        public
+    }
+
+    /// Los dos caminos de firma entrante, con la misma firmante: PGP/MIME (firma
+    /// separada) e inline (cleartext). Devuelve `(nombre, correo)`.
+    fn correos_firmados_por(firmante: &impl SigningKey) -> Vec<(&'static str, Vec<u8>)> {
+        let separada = Detached::sign_binary_data(
+            OsRng,
+            firmante,
+            &vacia(),
+            HashAlgorithm::Sha256,
+            CONTENIDO.as_bytes(),
+        )
+        .expect("firma separada")
+        .to_armored_bytes(Default::default())
+        .expect("armadura");
+        vec![
+            ("pgp/mime", correo_firmado(CONTENIDO, &separada)),
+            (
+                "cleartext",
+                correo_con(&cleartext_de("hola en claro", firmante)),
+            ),
+        ]
+    }
+
+    fn assert_no_verifica(correos: Vec<(&'static str, Vec<u8>)>, candidata: &SignedPublicKey) {
+        for (via, correo) in correos {
+            assert!(
+                matches!(
+                    verify(&correo, std::slice::from_ref(candidata)),
+                    Verification::Unverified(_)
+                ),
+                "{via}: una firma con un componente inservible no puede elevar a «clave conocida»"
+            );
+        }
+    }
+
+    #[test]
+    fn la_firma_de_una_subclave_vigente_con_flag_de_firma_verifica() {
+        // Control de las pruebas de abajo: el mismo montaje, con el componente sano,
+        // verifica. Si no, los «no verifica» serían vacíos.
+        let alice = generar(
+            "Alice <alice@vasak.test>",
+            vec![subclave_de_firma_creada(hace_un_ano())],
+        );
+        let candidata = firma_reatada(&alice, flags_de_firma(), Some(2 * UN_ANO), false);
+        for (via, correo) in correos_firmados_por(&*alice.secret_subkeys[0]) {
+            assert_eq!(
+                verify(&correo, std::slice::from_ref(&candidata)),
+                Verification::SignedUntrusted(alice.primary_key.fingerprint().to_string()),
+                "{via}"
+            );
+        }
+    }
+
+    #[test]
+    fn la_firma_de_una_subclave_expirada_no_eleva_a_clave_conocida() {
+        let alice = generar(
+            "Alice <alice@vasak.test>",
+            vec![subclave_de_firma_creada(hace_un_ano())],
+        );
+        // Creada hace un año con vencimiento a un día: murió hace ~364 días.
+        let candidata = firma_reatada(&alice, flags_de_firma(), Some(24 * 3600), false);
+        assert_no_verifica(correos_firmados_por(&*alice.secret_subkeys[0]), &candidata);
+    }
+
+    #[test]
+    fn la_firma_de_una_subclave_revocada_no_eleva_a_clave_conocida() {
+        let alice = clave_completa("Alice <alice@vasak.test>");
+        let candidata = firma_reatada(&alice, flags_de_firma(), None, true);
+        assert_no_verifica(correos_firmados_por(&*alice.secret_subkeys[0]), &candidata);
+    }
+
+    #[test]
+    fn la_firma_de_una_subclave_sin_flag_de_firma_no_eleva_a_clave_conocida() {
+        let alice = clave_completa("Alice <alice@vasak.test>");
+        // La binding la declara sólo de cifrado, o sólo de autenticación.
+        for (que, flags) in [
+            ("sólo cifrado", flags_de_cifrado()),
+            ("sólo autenticación", solo_autenticacion()),
+        ] {
+            let candidata = firma_reatada(&alice, flags, None, false);
+            for (via, correo) in correos_firmados_por(&*alice.secret_subkeys[0]) {
+                assert!(
+                    matches!(
+                        verify(&correo, std::slice::from_ref(&candidata)),
+                        Verification::Unverified(_)
+                    ),
+                    "{que} / {via}: no firma, no puede elevar"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn la_firma_de_una_primaria_revocada_o_expirada_no_eleva_a_clave_conocida() {
+        let alice = clave_vieja("Alice <alice@vasak.test>");
+        // Control: la primaria sana verifica (la firma la hace la primaria).
+        for (via, correo) in correos_firmados_por(&alice.primary_key) {
+            assert_eq!(
+                verify(&correo, &[publica(&alice)]),
+                Verification::SignedUntrusted(alice.primary_key.fingerprint().to_string()),
+                "control {via}"
+            );
+        }
+        for (que, muerta) in [
+            ("revocada", con_primaria_revocada(&alice)),
+            (
+                "expirada",
+                con_primaria_con_vencimiento_directo(&alice, 24 * 3600),
+            ),
+        ] {
+            for (via, correo) in correos_firmados_por(&alice.primary_key) {
+                assert!(
+                    matches!(
+                        verify(&correo, std::slice::from_ref(&muerta)),
+                        Verification::Unverified(_)
+                    ),
+                    "primaria {que} / {via}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn is_pgp_signed_reconoce_pgp_mime_e_inline_y_no_a_s_mime_ni_al_texto_plano() {
+        let alice = clave_completa("Alice <alice@vasak.test>");
+        for (via, correo) in correos_firmados_por(&alice.primary_key) {
+            assert!(is_pgp_signed(&correo), "{via}");
+        }
+        let smime = b"From: a@vasak.test\r\nContent-Type: multipart/signed; \
+protocol=\"application/pkcs7-signature\"; boundary=\"S\"\r\n\r\n--S\r\nx\r\n--S--\r\n";
+        assert!(!is_pgp_signed(smime), "S/MIME no es PGP");
+        assert!(!is_pgp_signed(
+            b"From: a@vasak.test\r\nContent-Type: text/plain\r\n\r\nhola\r\n"
         ));
     }
 }

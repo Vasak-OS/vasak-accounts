@@ -552,6 +552,10 @@ mod tests {
     use rand::rngs::OsRng;
 
     const AHORA: i64 = 1_000;
+    // Los topes que fija la especificación, a propósito como literales: la prueba
+    // no sigue a las constantes del código, las vigila.
+    const MIB: usize = 1024 * 1024;
+    const KIB_128: usize = 128 * 1024;
 
     fn bytes(key: &SignedPublicKey) -> Vec<u8> {
         key.to_bytes().expect("la clave serializa")
@@ -1147,6 +1151,178 @@ mod tests {
         );
         let peer = store.find_peer("ana@example.com").unwrap().unwrap();
         assert_eq!(peer.fingerprint, huella(&key));
+    }
+
+    // ── Claves que trae un mensaje entrante (`incoming_public_keys`) ────
+
+    /// Un correo `multipart/mixed` de `from` con `extra` cabeceras y, por cada
+    /// `(Content-Type, Content-Transfer-Encoding, cuerpo)`, una parte.
+    fn correo_con_partes(from: &str, extra: &str, partes: &[(&str, &str, String)]) -> Vec<u8> {
+        let mut out =
+            format!("From: {from}\r\n{extra}Content-Type: multipart/mixed; boundary=\"M\"\r\n\r\n");
+        for (tipo, cte, cuerpo) in partes {
+            out.push_str(&format!(
+                "--M\r\nContent-Type: {tipo}\r\nContent-Transfer-Encoding: {cte}\r\n\r\n{cuerpo}\r\n"
+            ));
+        }
+        out.push_str("--M--\r\n");
+        out.into_bytes()
+    }
+
+    fn adjunta(key: &SignedPublicKey) -> (&'static str, &'static str, String) {
+        ("application/pgp-keys", "base64", b64(&bytes(key)))
+    }
+
+    #[test]
+    fn un_adjunto_pgp_keys_se_extrae_atribuido_al_from_en_binario() {
+        let key = publica(&clave_completa("Ana <ana@example.com>"));
+        // base64 y armadura de 7 bits: los dos llegan decodificados.
+        let armada = String::from_utf8(key.to_armored_bytes(Default::default()).unwrap()).unwrap();
+        for (que, parte) in [
+            ("base64", adjunta(&key)),
+            ("7bit armado", ("application/pgp-keys", "7bit", armada)),
+        ] {
+            let raw = correo_con_partes("Ana <ana@example.com>", "", &[parte]);
+            let found = incoming_public_keys(&raw);
+            assert_eq!(found.len(), 1, "{que}");
+            assert_eq!(found[0].0, "ana@example.com", "{que}");
+            // Lo extraído es una clave que `ingest_peer_key` entiende.
+            let parsed = crate::pgp::parse_public_key(&found[0].1).expect(que);
+            assert_eq!(huella(&parsed), huella(&key), "{que}");
+        }
+    }
+
+    #[test]
+    fn la_cabecera_autocrypt_se_extrae_con_su_addr_y_la_clave_binaria() {
+        let key = publica(&clave_completa("Ana <ana@example.com>"));
+        let raw = format!(
+            "From: Ana <ana@example.com>\r\nAutocrypt: addr=ana@example.com; prefer-encrypt=mutual; keydata={}\r\n\
+Content-Type: text/plain\r\n\r\nhola\r\n",
+            b64(&bytes(&key))
+        );
+        let found = incoming_public_keys(raw.as_bytes());
+        assert_eq!(found, vec![("ana@example.com".to_string(), bytes(&key))]);
+    }
+
+    #[test]
+    fn un_correo_sin_claves_no_extrae_nada_ni_con_adjuntos_de_otro_tipo() {
+        assert!(incoming_public_keys(b"From: a@b.test\r\n\r\nhola\r\n").is_empty());
+        let raw = correo_con_partes(
+            "a@b.test",
+            "",
+            &[
+                ("text/plain", "7bit", "hola".into()),
+                ("application/pdf", "base64", b64(b"%PDF")),
+            ],
+        );
+        assert!(incoming_public_keys(&raw).is_empty());
+    }
+
+    #[test]
+    fn un_adjunto_de_claves_sin_from_se_omite_pero_la_cabecera_autocrypt_no() {
+        let key = publica(&clave_completa("Ana <ana@example.com>"));
+        let sin_from = correo_con_partes("", "", &[adjunta(&key)]);
+        assert!(incoming_public_keys(&sin_from).is_empty());
+        let con_autocrypt = correo_con_partes(
+            "",
+            &format!(
+                "Autocrypt: addr=ana@example.com; keydata={}\r\n",
+                b64(&bytes(&key))
+            ),
+            &[],
+        );
+        assert_eq!(incoming_public_keys(&con_autocrypt).len(), 1);
+    }
+
+    #[test]
+    fn un_adjunto_de_mas_de_un_mebibyte_se_ignora_y_uno_algo_menor_pasa() {
+        // 7bit: el cuerpo llega tal cual. El margen de 16 bytes deja afuera el CRLF
+        // que la frontera MIME agrega al cuerpo de la parte.
+        let justo = "A".repeat(MIB - 16);
+        let pasado = "A".repeat(MIB + 16);
+        let raw = |cuerpo: &String| {
+            correo_con_partes(
+                "a@b.test",
+                "",
+                &[("application/pgp-keys", "7bit", cuerpo.clone())],
+            )
+        };
+        assert_eq!(incoming_public_keys(&raw(&justo)).len(), 1, "bajo el tope");
+        assert!(
+            incoming_public_keys(&raw(&pasado)).is_empty(),
+            "pasado el tope se ignora sin parsear ni entrar en pánico"
+        );
+        // En base64 el tope se mide sobre lo codificado: un blob que decodificado
+        // cabe pero codificado se pasa tampoco entra.
+        let codificado = b64(&vec![7u8; MIB]);
+        assert!(codificado.len() > MIB);
+        let grande = correo_con_partes(
+            "a@b.test",
+            "",
+            &[("application/pgp-keys", "base64", codificado)],
+        );
+        assert!(incoming_public_keys(&grande).is_empty());
+    }
+
+    #[test]
+    fn un_keydata_autocrypt_de_mas_de_128_kibibytes_se_ignora_y_uno_normal_pasa() {
+        let normal = format!(
+            "From: a@b.test\r\nAutocrypt: addr=a@b.test; keydata={}\r\n\r\nx",
+            b64(&[1u8; 3000])
+        );
+        assert_eq!(incoming_public_keys(normal.as_bytes()).len(), 1);
+
+        // Base64 válido pero de más de 128 KiB: no se decodifica ni se devuelve.
+        let enorme = b64(&vec![1u8; KIB_128]);
+        assert!(enorme.len() > KIB_128);
+        let raw = format!("From: a@b.test\r\nAutocrypt: addr=a@b.test; keydata={enorme}\r\n\r\nx");
+        assert!(incoming_public_keys(raw.as_bytes()).is_empty());
+    }
+
+    #[test]
+    fn un_multipart_anidado_mas_alla_del_tope_de_profundidad_no_aporta_claves() {
+        let key = publica(&clave_completa("Ana <ana@example.com>"));
+        // Un adjunto de claves envuelto en `n` multiparts.
+        let anidado = |n: usize| {
+            let mut cuerpo = format!(
+                "Content-Type: application/pgp-keys\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n",
+                b64(&bytes(&key))
+            );
+            for nivel in (0..n).rev() {
+                cuerpo = format!(
+                    "Content-Type: multipart/mixed; boundary=\"N{nivel}\"\r\n\r\n--N{nivel}\r\n{cuerpo}--N{nivel}--\r\n"
+                );
+            }
+            format!("From: ana@example.com\r\n{cuerpo}").into_bytes()
+        };
+        assert_eq!(incoming_public_keys(&anidado(2)).len(), 1, "poco profundo");
+        assert!(
+            incoming_public_keys(&anidado(8 + 3)).is_empty(),
+            "más profundo que el tope se corta sin recursión sin fin"
+        );
+    }
+
+    #[test]
+    fn la_basura_en_los_adjuntos_y_cabeceras_no_entra_en_panico() {
+        for raw in [
+            &b""[..],
+            b"\xff\xfe\x00From: \x01\r\n\r\n",
+            b"From: a@b.test\r\nContent-Type: multipart/mixed\r\n\r\nsin frontera",
+            b"From: a@b.test\r\nContent-Type: multipart/mixed; boundary=\"\"\r\n\r\n----\r\n",
+            b"From: a@b.test\r\nAutocrypt: \r\n\r\n",
+            b"From: a@b.test\r\nAutocrypt: addr=;keydata=;;;=\r\n\r\n",
+        ] {
+            let _ = incoming_public_keys(raw);
+        }
+        let basura = correo_con_partes(
+            "a@b.test",
+            "",
+            &[("application/pgp-keys", "base64", "!!no es base64!!".into())],
+        );
+        // No hay pánico; lo que salga es sólo bytes que `ingest_peer_key` rechazará.
+        for (_, blob) in incoming_public_keys(&basura) {
+            assert!(parse_public_key(&blob).is_err());
+        }
     }
 
     #[test]

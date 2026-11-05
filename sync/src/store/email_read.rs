@@ -1291,6 +1291,145 @@ mod tests {
         );
     }
 
+    /// El estado OpenPGP llega a la ventana como `pgp: {signature, signer, encryption}`
+    /// con `null` donde no aplica (no firmado / no cifrado), y la clave entera es
+    /// `null` si el mensaje no traía PGP. Volver a guardar el cuerpo pisa el estado
+    /// anterior, también hacia «sin PGP». Con las columnas que escribe la ingesta de
+    /// verdad (`write_body`), no con un `MessageFull` armado a mano.
+    #[test]
+    fn el_estado_pgp_llega_a_la_ventana_con_null_donde_no_aplica_y_el_reupsert_lo_pisa() {
+        use crate::pgp::{Encryption, PgpStatus, SignatureState};
+        use serde_json::json;
+
+        let (_temp, mut store, inbox, _sent) = store_with_inbox_and_sent();
+        let mut next_uid = 0u32;
+        let mut new_message = |store: &mut Store| -> i64 {
+            next_uid += 1;
+            store
+                .apply_messages(
+                    vec![mail(
+                        inbox,
+                        next_uid,
+                        "ana@x.com",
+                        "yo@x.com",
+                        "",
+                        "s",
+                        1000,
+                    )],
+                    inbox,
+                )
+                .unwrap();
+            store
+                .connection
+                .query_row(
+                    "SELECT id FROM messages WHERE mailbox_id = ?1 AND uid = ?2",
+                    rusqlite::params![inbox, next_uid],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        let save = |store: &mut Store,
+                    id: i64,
+                    status: Option<i64>,
+                    signer: Option<&str>,
+                    encrypted: Option<i64>| {
+            store
+                .upsert_message_body(MessageBodyRow {
+                    message_id: id,
+                    text_body: Some("cuerpo".into()),
+                    html_body: None,
+                    truncated: false,
+                    smime_status: None,
+                    smime_signer: None,
+                    smime_encrypted: None,
+                    pgp_status: status,
+                    pgp_signer: signer.map(String::from),
+                    pgp_encrypted: encrypted,
+                })
+                .unwrap();
+        };
+        let wire = |store: &Store, id: i64| -> serde_json::Value {
+            // Lo que sale por el bus: `to_capped_json` del `GetMessage`.
+            let message = store.get_message(id).unwrap();
+            let text = super::to_capped_json(&message, super::MAX_MESSAGE_BYTES).unwrap();
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()["pgp"].clone()
+        };
+
+        // (estado, firmante, cifrado) guardados -> lo que sale en el JSON.
+        let casos = [
+            (None, None, None, serde_json::Value::Null),
+            (
+                Some(0),
+                Some("AABB"),
+                None,
+                json!({"signature": "known", "signer": "AABB", "encryption": null}),
+            ),
+            (
+                Some(1),
+                None,
+                None,
+                json!({"signature": "unknown", "signer": null, "encryption": null}),
+            ),
+            (
+                Some(2),
+                None,
+                None,
+                json!({"signature": "unverifiable", "signer": null, "encryption": null}),
+            ),
+            (
+                None,
+                None,
+                Some(1),
+                json!({"signature": null, "signer": null, "encryption": "opened"}),
+            ),
+            (
+                None,
+                None,
+                Some(2),
+                json!({"signature": null, "signer": null, "encryption": "unavailable"}),
+            ),
+            (
+                Some(0),
+                Some("CCDD"),
+                Some(1),
+                json!({"signature": "known", "signer": "CCDD", "encryption": "opened"}),
+            ),
+        ];
+        let mut ids = Vec::new();
+        for (status, signer, encrypted, esperado) in &casos {
+            let id = new_message(&mut store);
+            save(&mut store, id, *status, *signer, *encrypted);
+            assert_eq!(
+                &wire(&store, id),
+                esperado,
+                "{status:?}/{signer:?}/{encrypted:?}"
+            );
+            ids.push(id);
+        }
+
+        // El tipo, sin pasar por JSON.
+        assert_eq!(
+            store.get_message(ids[6]).unwrap().unwrap().pgp,
+            Some(PgpStatus {
+                signature: Some(SignatureState::Known),
+                signer: Some("CCDD".into()),
+                encryption: Some(Encryption::Opened),
+            })
+        );
+        // No toca S/MIME: la clave `smime` sigue nula.
+        let message = store.get_message(ids[1]).unwrap().unwrap();
+        assert!(message.smime.is_none());
+
+        // Volver a guardar pisa: de firmado y abierto a sin PGP, y de sin PGP a firmado.
+        save(&mut store, ids[6], None, None, None);
+        assert_eq!(wire(&store, ids[6]), serde_json::Value::Null);
+        save(&mut store, ids[0], Some(0), Some("EEFF"), None);
+        assert_eq!(
+            wire(&store, ids[0]),
+            json!({"signature": "known", "signer": "EEFF", "encryption": null})
+        );
+    }
+
     /// El estado de cifrado, de punta a punta: `opened_rows_decrypting`, se guarda y
     /// `get_message` lo devuelve como `smime.encryption` (`opened` / `unavailable`);
     /// un correo no cifrado sigue sin estado, y volver a bajar el mensaje pisa el

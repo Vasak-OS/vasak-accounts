@@ -1147,4 +1147,6 @@ pub type EmailScheduler<K> = dav_sync::DavScheduler<EmailSync<K>>;
 #[cfg(test)]
 mod decrypt_tests;
 #[cfg(test)]
+mod pgp_tests;
+#[cfg(test)]
 mod tests;

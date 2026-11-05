@@ -1500,6 +1500,134 @@ mod tests {
         assert_eq!(schema_version(&connection).unwrap(), 15);
     }
 
+    /// **v14 → v15 no pierde nada**: el cuerpo y el estado S/MIME de una base de la
+    /// v14 siguen, nacen `pgp_status`, `pgp_signer` y `pgp_encrypted` (todas `NULL`:
+    /// ni firmado ni cifrado con PGP), la base queda igual que creada de cero, y
+    /// migrar otra vez no cambia nada.
+    #[test]
+    fn de_v14_a_v15_se_conserva_el_cuerpo_y_nacen_las_columnas_pgp_nulas() {
+        let columns = |c: &Connection| -> Vec<(String, String, i64, Option<String>)> {
+            let mut statement = c
+                .prepare(
+                    "SELECT name, type, \"notnull\", dflt_value
+                       FROM pragma_table_info('message_bodies') ORDER BY cid",
+                )
+                .unwrap();
+            statement
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let pgp_columns = ["pgp_status", "pgp_signer", "pgp_encrypted"];
+
+        let mut connection = at_version(14);
+        assert_eq!(schema_version(&connection).unwrap(), 14);
+        // Sin V15 las columnas no existen: ésta es la raíz de la prueba.
+        for name in pgp_columns {
+            assert!(
+                !columns(&connection).iter().any(|c| c.0 == name),
+                "{name} no debería existir antes de la V15"
+            );
+        }
+        connection
+            .execute(
+                "INSERT INTO mailboxes (name, display_name, role, updated_at)
+                 VALUES ('INBOX', 'Bandeja', 'inbox', 'ayer')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages (mailbox_id, uid, from_addr, to_addrs, cc_addrs, bcc_addrs,
+                                       subject, date_ts, sort_key, size, updated_at)
+                 VALUES (1, 7, 'ana@x.com', 'yo@x.com', '', '', 'Hola', 100, 100, 10, 'ayer')",
+                [],
+            )
+            .unwrap();
+        let message = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO message_bodies
+                     (message_id, text_body, html_body, truncated, smime_status, smime_signer,
+                      smime_encrypted, updated_at)
+                 VALUES (?1, 'cuerpo de antes', '<p>de antes</p>', 1, 0, 'ana@x.com', 1, 'ayer')",
+                [message],
+            )
+            .unwrap();
+
+        apply(&mut connection).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 15);
+
+        #[allow(clippy::type_complexity)]
+        let row: (
+            String,
+            Option<String>,
+            i64,
+            Option<i64>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<i64>,
+        ) = connection
+            .query_row(
+                "SELECT text_body, html_body, truncated, smime_status, smime_signer,
+                        smime_encrypted, pgp_status, pgp_signer, pgp_encrypted
+                   FROM message_bodies WHERE message_id = ?1",
+                [message],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "cuerpo de antes".to_string(),
+                Some("<p>de antes</p>".to_string()),
+                1,
+                Some(0),
+                Some("ana@x.com".to_string()),
+                Some(1),
+                None,
+                None,
+                None
+            )
+        );
+
+        // Igual que creada de cero (mismo tipo, sin NOT NULL ni valor por omisión), y
+        // repetir no cambia nada.
+        let mut fresh = Connection::open_in_memory().unwrap();
+        apply(&mut fresh).unwrap();
+        assert_eq!(columns(&connection), columns(&fresh));
+        for (name, kind) in [
+            ("pgp_status", "INTEGER"),
+            ("pgp_signer", "TEXT"),
+            ("pgp_encrypted", "INTEGER"),
+        ] {
+            let added = columns(&fresh)
+                .into_iter()
+                .find(|c| c.0 == name)
+                .unwrap_or_else(|| panic!("falta la columna {name}"));
+            assert_eq!(added, (name.into(), kind.into(), 0, None));
+        }
+        let before = columns(&connection);
+        apply(&mut connection).unwrap();
+        assert_eq!(columns(&connection), before);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
+    }
+
     /// **v10 → v11 no pierde nada**: el cuerpo, la firma y el firmante de una base de
     /// la v10 siguen, `smime_encrypted` arranca en `NULL` (no cifrado), la base queda
     /// igual que creada de cero, y migrar otra vez no cambia nada.
@@ -1730,7 +1858,7 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .unwrap();
-        let all = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13];
+        let all = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14];
         Migrations::new(all[..version].iter().map(|sql| M::up(sql)).collect())
             .to_latest(&mut connection)
             .unwrap();
