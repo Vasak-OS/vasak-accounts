@@ -74,7 +74,10 @@ fn pgp_draft() -> Draft {
 fn permanent(result: Result<String, SmtpError>) -> String {
     match result {
         Err(SmtpError::Permanent(detail)) => detail,
-        other => panic!("se esperaba un fallo permanente, dio {other:?}"),
+        other => {
+            let _ = other;
+            panic!("se esperaba un fallo permanente")
+        }
     }
 }
 
@@ -133,8 +136,14 @@ async fn pedir_firma_pgp_sin_identidad_falla_con_un_error_claro() {
     let detail = permanent(compose(&keys, &pgp_draft()).await);
 
     // No se manda sin firmar: dice qué falta, y de qué cuenta.
-    assert!(detail.contains("OpenPGP"), "{detail}");
-    assert!(detail.contains(ACCOUNT), "{detail}");
+    assert!(
+        detail.contains("OpenPGP"),
+        "el detalle del error no es el esperado"
+    );
+    assert!(
+        detail.contains(ACCOUNT),
+        "el detalle del error no es el esperado"
+    );
 }
 
 #[tokio::test]
@@ -147,7 +156,10 @@ async fn la_identidad_de_otra_cuenta_no_sirve_para_firmar_desde_esta() {
 
     let detail = permanent(compose(&keys, &pgp_draft()).await);
 
-    assert!(detail.contains(ACCOUNT), "{detail}");
+    assert!(
+        detail.contains(ACCOUNT),
+        "el detalle del error no es el esperado"
+    );
 }
 
 #[tokio::test]
@@ -180,7 +192,7 @@ async fn con_identidad_el_mensaje_sale_firmado_y_la_firma_verifica() {
         head.contains(
             "multipart/signed; protocol=\"application/pgp-signature\"; micalg=\"pgp-sha256\""
         ),
-        "{head}"
+        "la cabecera no es la esperada"
     );
     let boundary = head
         .split("boundary=\"")
@@ -191,22 +203,22 @@ async fn con_identidad_el_mensaje_sale_firmado_y_la_firma_verifica() {
     let body = message.split_once("\r\n\r\n").unwrap().1;
     let parts: Vec<&str> = body.split(delimiter.as_str()).collect();
     // Antes de la 1ª frontera, las dos partes, y el cierre `--`.
-    assert_eq!(parts.len(), 4, "{parts:?}");
-    assert!(parts[3].starts_with("--"), "{:?}", parts[3]);
+    assert_eq!(parts.len(), 4, "las partes no son dos");
+    assert!(parts[3].starts_with("--"), "el cierre no es `--`");
     let content = compose::build_content_entity(&draft);
     assert_eq!(parts[1], format!("\r\n{content}\r\n"));
     let signature = parts[2];
     assert!(
         signature.contains("Content-Type: application/pgp-signature"),
-        "{signature}"
+        "la parte de la firma no es la esperada"
     );
     assert!(
         signature.contains("Content-Transfer-Encoding: 7bit"),
-        "{signature}"
+        "la parte de la firma no es la esperada"
     );
     assert!(
         !signature.to_ascii_lowercase().contains("base64"),
-        "{signature}"
+        "la parte de la firma no es la esperada"
     );
     assert!(signature.contains("-----BEGIN PGP SIGNATURE-----"));
     assert!(signature.contains("-----END PGP SIGNATURE-----"));
@@ -255,7 +267,7 @@ async fn con_la_primaria_muerta_el_envio_falla_y_no_sale_sin_firmar() {
         // Es `NoSigningKey`, no un mensaje armado a medias.
         assert!(
             detail.to_lowercase().contains("firma") || detail.contains("sign"),
-            "{what}: {detail}"
+            "{what}: el detalle del error no es el esperado"
         );
     }
 }
@@ -274,7 +286,7 @@ async fn con_el_llavero_bloqueado_el_envio_firmado_con_pgp_se_reintenta() {
     // Bloqueado no es «no hay identidad»: se desbloquea y sale.
     assert!(
         matches!(result, Err(SmtpError::Temporary(_))),
-        "dio {result:?}"
+        "no se pidió reintentar"
     );
 }
 

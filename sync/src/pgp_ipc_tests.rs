@@ -96,7 +96,7 @@ pub(crate) async fn import(
 fn short_name(result: zbus::Result<zbus::Message>) -> String {
     let (name, _) = error_of(result);
     name.strip_prefix(NAME_PREFIX)
-        .unwrap_or_else(|| panic!("el nombre {name} no es del servicio"))
+        .unwrap_or_else(|| panic!("el nombre del error no es del servicio"))
         .to_string()
 }
 
@@ -118,12 +118,67 @@ async fn assert_nothing_stored(f: &Fixture, account: &str) {
     let keys = f.keys();
     assert!(
         keys.find_pgp_secret_key(account).await.unwrap().is_none(),
-        "quedó una clave para {account}"
+        "quedó una clave guardada"
     );
     assert!(
         keys.find_pgp_passphrase(account).await.unwrap().is_none(),
-        "quedó una contraseña para {account}"
+        "quedó una contraseña guardada"
     );
+}
+
+/// La clave armada de la identidad de prueba para ese UID.
+fn key_for(uid: &str) -> Vec<u8> {
+    armored(&protected_key(uid, PASSPHRASE_STR))
+}
+
+/// Una cuenta de prueba y la clave armada que liga su dirección.
+async fn account_and_key() -> (Fixture, Vec<u8>) {
+    (account().await, key_for(UID))
+}
+
+/// La cuenta de prueba, sin identidad.
+async fn account() -> Fixture {
+    Fixture::start(&[(ACCOUNT, ADDRESS)]).await
+}
+
+/// `RemovePgpIdentity` de la cuenta de prueba, que tiene que salir bien.
+async fn remove(f: &Fixture) {
+    f.call("RemovePgpIdentity", &(ACCOUNT,)).await.unwrap();
+}
+
+/// ¿Hay identidad en la cuenta de prueba, según `GetPgpIdentity`?
+async fn is_present(f: &Fixture) -> bool {
+    identity(f, ACCOUNT).await["present"] == true
+}
+
+/// Importa la clave de prueba de ese UID en esa cuenta, con la contraseña buena.
+async fn import_identity(f: &Fixture, account: &str, uid: &str) {
+    import(f, account, &key_for(uid), PASSPHRASE).await.unwrap();
+}
+
+/// El nombre corto del error de importar la cuenta de prueba.
+async fn import_error(f: &Fixture, key: &[u8], passphrase: &[u8]) -> String {
+    short_name(import(f, ACCOUNT, key, passphrase).await)
+}
+
+/// Importar con estos descriptores se rechaza como `Malformed` y no guarda nada.
+async fn assert_fds_rejected(key: zbus::zvariant::OwnedFd, passphrase: zbus::zvariant::OwnedFd) {
+    let f = account().await;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        import_fds(&f, ACCOUNT, key, passphrase),
+    )
+    .await
+    .expect("el servicio se colgó");
+    assert_eq!(short_name(result), "Malformed");
+    assert_nothing_stored(&f, ACCOUNT).await;
+}
+
+/// Que el texto de un rechazo de envío sea `InvalidArgs` y diga `needle`.
+fn assert_invalid_args(result: zbus::Result<zbus::Message>, needle: &str) {
+    let (name, text) = error_of(result);
+    assert_eq!(name, "org.freedesktop.DBus.Error.InvalidArgs");
+    assert!(text.contains(needle), "falta lo esperado en el rechazo");
 }
 
 // ── Importar ────────────────────────────────────────────────────────────
@@ -131,15 +186,13 @@ async fn assert_nothing_stored(f: &Fixture, account: &str) {
 #[tokio::test]
 async fn importar_una_clave_que_liga_la_direccion_de_la_cuenta_la_guarda() {
     let f = Fixture::start(&[(ACCOUNT, ADDRESS), ("otra", "otra@vasak.test")]).await;
-    let key = protected_key(UID, PASSPHRASE_STR);
+    let key = key_for(UID);
 
-    import(&f, ACCOUNT, &armored(&key), PASSPHRASE)
-        .await
-        .unwrap();
+    import(&f, ACCOUNT, &key, PASSPHRASE).await.unwrap();
 
     let keys = f.keys();
     let stored = keys.find_pgp_secret_key(ACCOUNT).await.unwrap().unwrap();
-    assert_eq!(stored.as_slice(), armored(&key));
+    assert_eq!(stored.as_slice(), key);
     let pass = keys.find_pgp_passphrase(ACCOUNT).await.unwrap().unwrap();
     assert_eq!(pass.as_slice(), PASSPHRASE);
     assert_nothing_stored(&f, "otra").await;
@@ -148,42 +201,34 @@ async fn importar_una_clave_que_liga_la_direccion_de_la_cuenta_la_guarda() {
 #[tokio::test]
 async fn la_direccion_sale_de_la_cuenta_y_no_de_lo_que_mande_la_ventana() {
     let f = Fixture::start(&[(ACCOUNT, "otra@vasak.test")]).await;
-    let key = protected_key(UID, PASSPHRASE_STR);
+    let key = key_for(UID);
 
     // La clave liga `ana@…`, pero la cuenta es `otra@…`: aunque la ventana pase
     // la dirección de la clave como identificador, la cuenta no existe, y con el
     // identificador real la dirección que cuenta es la de la cuenta.
     assert_eq!(
-        short_name(import(&f, ADDRESS, &armored(&key), PASSPHRASE).await),
+        short_name(import(&f, ADDRESS, &key, PASSPHRASE).await),
         "Failed"
     );
-    assert_eq!(
-        short_name(import(&f, ACCOUNT, &armored(&key), PASSPHRASE).await),
-        "AddressMismatch"
-    );
+    assert_eq!(import_error(&f, &key, PASSPHRASE).await, "AddressMismatch");
     assert_nothing_stored(&f, ACCOUNT).await;
     assert_nothing_stored(&f, ADDRESS).await;
 }
 
 #[tokio::test]
 async fn una_clave_cuyo_uid_no_liga_la_direccion_de_la_cuenta_da_addressmismatch() {
-    let f = Fixture::start(&[(ACCOUNT, ADDRESS)]).await;
-    let key = protected_key("Beto <beto@vasak.test>", PASSPHRASE_STR);
+    let (f, _) = account_and_key().await;
+    let key = key_for("Beto <beto@vasak.test>");
 
-    let name = short_name(import(&f, ACCOUNT, &armored(&key), PASSPHRASE).await);
-
-    assert_eq!(name, "AddressMismatch");
+    assert_eq!(import_error(&f, &key, PASSPHRASE).await, "AddressMismatch");
     assert_nothing_stored(&f, ACCOUNT).await;
 }
 
 #[tokio::test]
 async fn el_correo_del_uid_se_compara_sin_distinguir_mayusculas() {
     let f = Fixture::start(&[(ACCOUNT, "Ana@VASAK.test")]).await;
-    let key = protected_key(UID, PASSPHRASE_STR);
 
-    import(&f, ACCOUNT, &armored(&key), PASSPHRASE)
-        .await
-        .unwrap();
+    import_identity(&f, ACCOUNT, UID).await;
 
     assert!(f
         .keys()
@@ -195,40 +240,40 @@ async fn el_correo_del_uid_se_compara_sin_distinguir_mayusculas() {
 
 #[tokio::test]
 async fn una_clave_ilegible_da_malformed_y_no_importa_nada() {
-    let f = Fixture::start(&[(ACCOUNT, ADDRESS)]).await;
-    let key = armored(&protected_key(UID, PASSPHRASE_STR));
+    let (f, key) = account_and_key().await;
 
     for (what, blob) in [
         ("basura", &b"esto no es una clave"[..]),
         ("vacío", &b""[..]),
         ("truncado", &key[..key.len() / 2]),
     ] {
-        let name = short_name(import(&f, ACCOUNT, blob, PASSPHRASE).await);
-        assert_eq!(name, "Malformed", "{what}");
+        assert_eq!(
+            import_error(&f, blob, PASSPHRASE).await,
+            "Malformed",
+            "{what}"
+        );
     }
     assert_nothing_stored(&f, ACCOUNT).await;
 }
 
 #[tokio::test]
 async fn una_contrasena_equivocada_da_wrongpassword_y_no_importa_nada() {
-    let f = Fixture::start(&[(ACCOUNT, ADDRESS)]).await;
-    let key = protected_key(UID, PASSPHRASE_STR);
+    let (f, key) = account_and_key().await;
 
-    let name = short_name(import(&f, ACCOUNT, &armored(&key), WRONG_PASSPHRASE).await);
-
-    assert_eq!(name, "WrongPassword");
+    assert_eq!(
+        import_error(&f, &key, WRONG_PASSPHRASE).await,
+        "WrongPassword"
+    );
     assert_nothing_stored(&f, ACCOUNT).await;
     // Y la correcta, sobre la misma clave, sí entra: la rechazada era la contraseña.
-    import(&f, ACCOUNT, &armored(&key), PASSPHRASE)
-        .await
-        .unwrap();
+    import(&f, ACCOUNT, &key, PASSPHRASE).await.unwrap();
 }
 
 #[tokio::test]
 async fn una_clave_sin_componente_de_firma_se_importa_igual() {
     // Una primaria revocada no puede firmar (`NoSigningKey`): no se puede sondear
     // la contraseña con una firma de prueba, y se acepta. Sirve para descifrar.
-    let f = Fixture::start(&[(ACCOUNT, ADDRESS)]).await;
+    let (f, _) = account_and_key().await;
     let vivo = clave_vieja(UID);
     let revocada = con_primaria_muerta(&vivo, con_primaria_revocada(&vivo));
 
@@ -246,52 +291,22 @@ async fn una_clave_sin_componente_de_firma_se_importa_igual() {
 
 #[tokio::test]
 async fn una_clave_sin_sellar_se_rechaza_aunque_sea_valida() {
-    let f = Fixture::start(&[(ACCOUNT, ADDRESS)]).await;
-    let key = armored(&protected_key(UID, PASSPHRASE_STR));
-
-    let name = short_name(import_fds(&f, ACCOUNT, unsealed_fd(&key), sealed_fd(PASSPHRASE)).await);
-
-    assert_eq!(name, "Malformed");
-    assert_nothing_stored(&f, ACCOUNT).await;
+    assert_fds_rejected(unsealed_fd(&key_for(UID)), sealed_fd(PASSPHRASE)).await;
 }
 
 #[tokio::test]
 async fn una_contrasena_sin_sellar_se_rechaza_aunque_sea_la_correcta() {
-    let f = Fixture::start(&[(ACCOUNT, ADDRESS)]).await;
-    let key = armored(&protected_key(UID, PASSPHRASE_STR));
-
-    let name = short_name(import_fds(&f, ACCOUNT, sealed_fd(&key), unsealed_fd(PASSPHRASE)).await);
-
-    assert_eq!(name, "Malformed");
-    assert_nothing_stored(&f, ACCOUNT).await;
+    assert_fds_rejected(sealed_fd(&key_for(UID)), unsealed_fd(PASSPHRASE)).await;
 }
 
 #[tokio::test]
 async fn una_clave_que_es_un_archivo_comun_no_se_acepta_aunque_sea_valida() {
-    let f = Fixture::start(&[(ACCOUNT, ADDRESS)]).await;
-    let key = armored(&protected_key(UID, PASSPHRASE_STR));
-
-    let name =
-        short_name(import_fds(&f, ACCOUNT, regular_file_fd(&key), sealed_fd(PASSPHRASE)).await);
-
-    assert_eq!(name, "Malformed");
-    assert_nothing_stored(&f, ACCOUNT).await;
+    assert_fds_rejected(regular_file_fd(&key_for(UID)), sealed_fd(PASSPHRASE)).await;
 }
 
 #[tokio::test]
 async fn un_pipe_como_clave_se_rechaza_sin_colgarse() {
-    let f = Fixture::start(&[(ACCOUNT, ADDRESS)]).await;
-    let key = armored(&protected_key(UID, PASSPHRASE_STR));
-
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        import_fds(&f, ACCOUNT, pipe_fd(&key), sealed_fd(PASSPHRASE)),
-    )
-    .await
-    .expect("el servicio se colgó con un pipe");
-
-    assert_eq!(short_name(result), "Malformed");
-    assert_nothing_stored(&f, ACCOUNT).await;
+    assert_fds_rejected(pipe_fd(&key_for(UID)), sealed_fd(PASSPHRASE)).await;
 }
 
 #[tokio::test]
@@ -305,30 +320,25 @@ async fn una_clave_de_mas_de_1_mib_da_toobig_y_una_de_justo_1_mib_se_lee() {
             "TooBig"
         );
     }
-
     // En el tope exacto se lee entera y falla después, por no ser una clave.
-    let f = Fixture::start(&[(ACCOUNT, ADDRESS)]).await;
-    let at_the_limit = vec![0u8; MAX_KEY];
+    let (f, _) = account_and_key().await;
     assert_eq!(
-        short_name(import(&f, ACCOUNT, &at_the_limit, PASSPHRASE).await),
+        import_error(&f, &vec![0u8; MAX_KEY], PASSPHRASE).await,
         "Malformed"
     );
 }
 
 #[tokio::test]
 async fn una_contrasena_de_mas_de_4096_bytes_da_toobig_y_una_de_justo_4096_se_lee() {
-    let f = Fixture::start(&[(ACCOUNT, ADDRESS)]).await;
-    let key = armored(&protected_key(UID, PASSPHRASE_STR));
+    let (f, key) = account_and_key().await;
 
-    let too_long = vec![b'x'; MAX_PASSPHRASE + 1];
     assert_eq!(
-        short_name(import(&f, ACCOUNT, &key, &too_long).await),
+        import_error(&f, &key, &vec![b'x'; MAX_PASSPHRASE + 1]).await,
         "TooBig"
     );
     // En el tope exacto se lee entera y falla después, por incorrecta.
-    let at_the_limit = vec![b'x'; MAX_PASSPHRASE];
     assert_eq!(
-        short_name(import(&f, ACCOUNT, &key, &at_the_limit).await),
+        import_error(&f, &key, &vec![b'x'; MAX_PASSPHRASE]).await,
         "WrongPassword"
     );
     assert_nothing_stored(&f, ACCOUNT).await;
@@ -337,27 +347,22 @@ async fn una_contrasena_de_mas_de_4096_bytes_da_toobig_y_una_de_justo_4096_se_le
 #[tokio::test]
 async fn el_tope_de_la_contrasena_se_mira_antes_de_buscar_la_cuenta() {
     let f = Fixture::start(&[]).await;
-    let key = armored(&protected_key(UID, PASSPHRASE_STR));
     let too_long = vec![b'x'; MAX_PASSPHRASE + 1];
 
     assert_eq!(
-        short_name(import(&f, "no-existe", &key, &too_long).await),
+        short_name(import(&f, "no-existe", &key_for(UID), &too_long).await),
         "TooBig"
     );
 }
 
 #[tokio::test]
 async fn con_el_llavero_bloqueado_importar_da_keyringlocked_y_al_desbloquear_se_reintenta() {
-    let f = Fixture::start(&[(ACCOUNT, ADDRESS)]).await;
-    let key = armored(&protected_key(UID, PASSPHRASE_STR));
+    let (f, key) = account_and_key().await;
     lock_and_announce(&f.keyring_server, &f.keyring)
         .await
         .unwrap();
 
-    assert_eq!(
-        short_name(import(&f, ACCOUNT, &key, PASSPHRASE).await),
-        "KeyringLocked"
-    );
+    assert_eq!(import_error(&f, &key, PASSPHRASE).await, "KeyringLocked");
     assert_eq!(
         short_name(f.call("GetPgpIdentity", &(ACCOUNT,)).await),
         "KeyringLocked"
@@ -366,8 +371,7 @@ async fn con_el_llavero_bloqueado_importar_da_keyringlocked_y_al_desbloquear_se_
 
 #[tokio::test]
 async fn los_tres_metodos_dan_failed_con_una_cuenta_que_no_existe() {
-    let f = Fixture::start(&[(ACCOUNT, ADDRESS)]).await;
-    let key = armored(&protected_key(UID, PASSPHRASE_STR));
+    let (f, key) = account_and_key().await;
 
     assert_eq!(
         short_name(import(&f, "borrada", &key, PASSPHRASE).await),
@@ -383,14 +387,13 @@ async fn los_tres_metodos_dan_failed_con_una_cuenta_que_no_existe() {
 
 #[tokio::test]
 async fn la_contrasena_no_aparece_en_ningun_error_ni_en_las_trazas() {
-    let f = Fixture::start(&[(ACCOUNT, ADDRESS)]).await;
-    let key = armored(&protected_key(UID, PASSPHRASE_STR));
+    let (f, key) = account_and_key().await;
     let wrong = std::str::from_utf8(WRONG_PASSPHRASE).unwrap();
 
-    let (_, text) = error_of(import(&f, ACCOUNT, &key, WRONG_PASSPHRASE).await);
-    assert!(!text.contains(wrong), "{text}");
-    let (_, text) = error_of(import(&f, ACCOUNT, b"basura", WRONG_PASSPHRASE).await);
-    assert!(!text.contains(wrong), "{text}");
+    for blob in [&key[..], b"basura"] {
+        let (_, text) = error_of(import(&f, ACCOUNT, blob, WRONG_PASSPHRASE).await);
+        assert!(!text.contains(wrong), "el error filtra la contraseña");
+    }
     assert!(!crate::test_bus::captured_logs().contains(wrong));
 }
 
@@ -398,7 +401,7 @@ async fn la_contrasena_no_aparece_en_ningun_error_ni_en_las_trazas() {
 
 #[tokio::test]
 async fn consultar_con_identidad_da_present_huella_y_uids() {
-    let f = Fixture::start(&[(ACCOUNT, ADDRESS)]).await;
+    let f = account().await;
     let key = protected_key(UID, PASSPHRASE_STR);
     import(&f, ACCOUNT, &armored(&key), PASSPHRASE)
         .await
@@ -413,7 +416,7 @@ async fn consultar_con_identidad_da_present_huella_y_uids() {
 
 #[tokio::test]
 async fn consultar_sin_identidad_da_present_false_y_vacios() {
-    let f = Fixture::start(&[(ACCOUNT, ADDRESS)]).await;
+    let f = account().await;
 
     let value = identity(&f, ACCOUNT).await;
 
@@ -425,7 +428,7 @@ async fn consultar_sin_identidad_da_present_false_y_vacios() {
 
 #[tokio::test]
 async fn consultar_nunca_devuelve_material_secreto() {
-    let f = Fixture::start(&[(ACCOUNT, ADDRESS)]).await;
+    let f = account().await;
     let key = protected_key(UID, PASSPHRASE_STR);
     import(&f, ACCOUNT, &armored(&key), PASSPHRASE)
         .await
@@ -437,49 +440,41 @@ async fn consultar_nunca_devuelve_material_secreto() {
     let mut keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
     keys.sort();
     assert_eq!(keys, ["fingerprint", "present", "uids"]);
-    assert!(!reply.contains("PRIVATE KEY"), "{reply}");
-    assert!(!reply.contains(PASSPHRASE_STR), "{reply}");
+    assert!(
+        !reply.contains("PRIVATE KEY"),
+        "el texto no cumple lo esperado"
+    );
+    assert!(
+        !reply.contains(PASSPHRASE_STR),
+        "el texto no cumple lo esperado"
+    );
     // Ni un trozo del armor de la clave guardada.
     let armor = String::from_utf8(armored(&key)).unwrap();
     let body_line = armor.lines().nth(3).unwrap();
-    assert!(!reply.contains(body_line), "{reply}");
+    assert!(!reply.contains(body_line), "el texto no cumple lo esperado");
 }
 
 #[tokio::test]
 async fn consultar_una_clave_guardada_que_no_parsea_da_present_false() {
-    let f = Fixture::start(&[(ACCOUNT, ADDRESS)]).await;
+    let f = account().await;
     f.keys()
         .store_pgp_identity(ACCOUNT, b"no es una clave", b"x")
         .await
         .unwrap();
 
-    assert_eq!(identity(&f, ACCOUNT).await["present"], false);
+    assert!(!is_present(&f).await);
 }
 
 #[tokio::test]
 async fn borrar_la_identidad_la_saca_del_llavero_y_consultar_da_present_false() {
     let f = Fixture::start(&[(ACCOUNT, ADDRESS), ("otra", "otra@vasak.test")]).await;
-    import(
-        &f,
-        ACCOUNT,
-        &armored(&protected_key(UID, PASSPHRASE_STR)),
-        PASSPHRASE,
-    )
-    .await
-    .unwrap();
-    import(
-        &f,
-        "otra",
-        &armored(&protected_key("Otra <otra@vasak.test>", PASSPHRASE_STR)),
-        PASSPHRASE,
-    )
-    .await
-    .unwrap();
-    assert_eq!(identity(&f, ACCOUNT).await["present"], true);
+    import_identity(&f, ACCOUNT, UID).await;
+    import_identity(&f, "otra", "Otra <otra@vasak.test>").await;
+    assert!(is_present(&f).await);
 
-    f.call("RemovePgpIdentity", &(ACCOUNT,)).await.unwrap();
+    remove(&f).await;
 
-    assert_eq!(identity(&f, ACCOUNT).await["present"], false);
+    assert!(!is_present(&f).await);
     assert_nothing_stored(&f, ACCOUNT).await;
     // La de la otra cuenta no se toca.
     assert_eq!(identity(&f, "otra").await["present"], true);
@@ -487,9 +482,9 @@ async fn borrar_la_identidad_la_saca_del_llavero_y_consultar_da_present_false() 
 
 #[tokio::test]
 async fn borrar_cuando_no_hay_identidad_no_es_un_error() {
-    let f = Fixture::start(&[(ACCOUNT, ADDRESS)]).await;
-    f.call("RemovePgpIdentity", &(ACCOUNT,)).await.unwrap();
-    f.call("RemovePgpIdentity", &(ACCOUNT,)).await.unwrap();
+    let f = account().await;
+    remove(&f).await;
+    remove(&f).await;
 }
 
 // ── Quién puede mutar la identidad ──────────────────────────────────────
@@ -497,7 +492,7 @@ async fn borrar_cuando_no_hay_identidad_no_es_un_error() {
 #[tokio::test]
 async fn importar_sin_permiso_da_accessdenied_y_no_guarda_nada() {
     let f = Fixture::start_with_permission(&[(ACCOUNT, ADDRESS)], Answer::Deny).await;
-    let key = armored(&protected_key(UID, PASSPHRASE_STR));
+    let key = key_for(UID);
 
     let name = short_name(import(&f, ACCOUNT, &key, PASSPHRASE).await);
 
@@ -508,16 +503,15 @@ async fn importar_sin_permiso_da_accessdenied_y_no_guarda_nada() {
 #[tokio::test]
 async fn borrar_sin_permiso_da_accessdenied_y_no_borra() {
     let f = Fixture::start_with_permission(&[(ACCOUNT, ADDRESS)], Answer::Deny).await;
-    let key = armored(&protected_key(UID, PASSPHRASE_STR));
     f.keys()
-        .store_pgp_identity(ACCOUNT, &key, PASSPHRASE)
+        .store_pgp_identity(ACCOUNT, &key_for(UID), PASSPHRASE)
         .await
         .unwrap();
 
     let name = short_name(f.call("RemovePgpIdentity", &(ACCOUNT,)).await);
 
     assert_eq!(name, "AccessDenied");
-    assert_eq!(identity(&f, ACCOUNT).await["present"], true);
+    assert!(is_present(&f).await);
 }
 
 // ── El error IPC no filtra material ─────────────────────────────────────
@@ -541,8 +535,14 @@ fn los_errores_de_pgp_se_traducen_a_nombres_estables_sin_filtrar_el_detalle() {
         PgpError::NoEncryptionKey("DETALLE-SECRETO".into()),
     ] {
         match crate::pgp_ipc_from_parse(error) {
-            E::Failed(text) => assert!(!text.contains("DETALLE-SECRETO"), "{text}"),
-            other => panic!("se esperaba Failed, dio {other:?}"),
+            E::Failed(text) => assert!(
+                !text.contains("DETALLE-SECRETO"),
+                "el texto no cumple lo esperado"
+            ),
+            other => {
+                let _ = other;
+                panic!("se esperaba Failed")
+            }
         }
     }
 }
@@ -590,28 +590,17 @@ async fn queued(f: &Fixture) -> usize {
 
 #[tokio::test]
 async fn pedir_firma_pgp_sin_identidad_se_rechaza_al_encolar_con_invalidargs() {
-    let f = Fixture::start(&[(ACCOUNT, ADDRESS)]).await;
+    let f = account().await;
 
-    let (name, text) = error_of(send(&f, None, Some("pgp")).await);
-
-    assert_eq!(name, "org.freedesktop.DBus.Error.InvalidArgs");
-    assert!(text.contains(ACCOUNT), "{text}");
-    assert!(text.contains("OpenPGP"), "{text}");
+    assert_invalid_args(send(&f, None, Some("pgp")).await, "OpenPGP");
     // No quedó nada en la cola: no hay mensaje trabado.
     assert_eq!(queued(&f).await, 0);
 }
 
 #[tokio::test]
 async fn pedir_firma_pgp_con_identidad_encola_normal() {
-    let f = Fixture::start(&[(ACCOUNT, ADDRESS)]).await;
-    import(
-        &f,
-        ACCOUNT,
-        &armored(&protected_key(UID, PASSPHRASE_STR)),
-        PASSPHRASE,
-    )
-    .await
-    .unwrap();
+    let f = account().await;
+    import_identity(&f, ACCOUNT, UID).await;
 
     let id: String = send(&f, None, Some("pgp"))
         .await
@@ -627,24 +616,15 @@ async fn pedir_firma_pgp_con_identidad_encola_normal() {
 #[tokio::test]
 async fn la_identidad_de_otra_cuenta_no_alcanza_para_firmar_con_pgp_desde_esta() {
     let f = Fixture::start(&[(ACCOUNT, ADDRESS), ("otra", "otra@vasak.test")]).await;
-    import(
-        &f,
-        "otra",
-        &armored(&protected_key("Otra <otra@vasak.test>", PASSPHRASE_STR)),
-        PASSPHRASE,
-    )
-    .await
-    .unwrap();
+    import_identity(&f, "otra", "Otra <otra@vasak.test>").await;
 
-    let (name, _) = error_of(send(&f, None, Some("pgp")).await);
-
-    assert_eq!(name, "org.freedesktop.DBus.Error.InvalidArgs");
+    assert_invalid_args(send(&f, None, Some("pgp")).await, "OpenPGP");
     assert_eq!(queued(&f).await, 0);
 }
 
 #[tokio::test]
 async fn sin_pedir_firma_se_encola_aunque_no_haya_identidad() {
-    let f = Fixture::start(&[(ACCOUNT, ADDRESS)]).await;
+    let f = account().await;
 
     send(&f, None, None).await.unwrap();
     send(&f, Some(false), None).await.unwrap();
@@ -656,42 +636,23 @@ async fn sin_pedir_firma_se_encola_aunque_no_haya_identidad() {
 
 #[tokio::test]
 async fn la_identidad_pgp_no_alcanza_para_pedir_smime_ni_al_reves() {
-    let f = Fixture::start(&[(ACCOUNT, ADDRESS)]).await;
-    import(
-        &f,
-        ACCOUNT,
-        &armored(&protected_key(UID, PASSPHRASE_STR)),
-        PASSPHRASE,
-    )
-    .await
-    .unwrap();
+    let f = account().await;
+    import_identity(&f, ACCOUNT, UID).await;
 
     // Hay PGP pero no S/MIME: el `firmar` viejo (S/MIME) se rechaza.
-    let (name, text) = error_of(send(&f, Some(true), None).await);
-    assert_eq!(name, "org.freedesktop.DBus.Error.InvalidArgs");
-    assert!(text.contains("S/MIME"), "{text}");
-    let (name, _) = error_of(send(&f, None, Some("smime")).await);
-    assert_eq!(name, "org.freedesktop.DBus.Error.InvalidArgs");
+    assert_invalid_args(send(&f, Some(true), None).await, "S/MIME");
+    assert_invalid_args(send(&f, None, Some("smime")).await, "S/MIME");
     assert_eq!(queued(&f).await, 0);
 }
 
 #[tokio::test]
 async fn borrar_la_identidad_pgp_vuelve_a_rechazar_el_envio_firmado() {
-    let f = Fixture::start(&[(ACCOUNT, ADDRESS)]).await;
-    import(
-        &f,
-        ACCOUNT,
-        &armored(&protected_key(UID, PASSPHRASE_STR)),
-        PASSPHRASE,
-    )
-    .await
-    .unwrap();
+    let f = account().await;
+    import_identity(&f, ACCOUNT, UID).await;
     send(&f, None, Some("pgp")).await.unwrap();
-    f.call("RemovePgpIdentity", &(ACCOUNT,)).await.unwrap();
+    remove(&f).await;
 
-    let (name, _) = error_of(send(&f, None, Some("pgp")).await);
-
-    assert_eq!(name, "org.freedesktop.DBus.Error.InvalidArgs");
+    assert_invalid_args(send(&f, None, Some("pgp")).await, "OpenPGP");
     assert_eq!(queued(&f).await, 1, "sólo el que se encoló con identidad");
 }
 
@@ -708,8 +669,6 @@ async fn la_identidad_smime_no_alcanza_para_pedir_pgp() {
     // Con S/MIME sí se puede firmar con S/MIME…
     send(&f, Some(true), None).await.unwrap();
     // …pero PGP pide **su** identidad, no «la que haya».
-    let (name, text) = error_of(send(&f, None, Some("pgp")).await);
-    assert_eq!(name, "org.freedesktop.DBus.Error.InvalidArgs");
-    assert!(text.contains("OpenPGP"), "{text}");
+    assert_invalid_args(send(&f, None, Some("pgp")).await, "OpenPGP");
     assert_eq!(queued(&f).await, 1);
 }
