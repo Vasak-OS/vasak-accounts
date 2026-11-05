@@ -10,6 +10,7 @@ use crate::pgp::tests::{clave_vieja, con_primaria_muerta, con_primaria_revocada}
 use crate::pgp_send_tests::{armored, fingerprint, protected_key, ACCOUNT, ADDRESS, PASSPHRASE};
 use crate::store::key::tests::lock_and_announce;
 use crate::test_bus::{error_of, Fixture};
+use pgp::types::KeyDetails as _;
 
 const NAME_PREFIX: &str = "ar.net.vasak.os.AccountsSync.";
 const WRONG_PASSPHRASE: &[u8] = b"contrasena-equivocada-9f3a-no-filtrar";
@@ -191,8 +192,15 @@ async fn importar_una_clave_que_liga_la_direccion_de_la_cuenta_la_guarda() {
     import(&f, ACCOUNT, &key, PASSPHRASE).await.unwrap();
 
     let keys = f.keys();
+    // Se guarda la clave saneada y re-serializada (binaria), no el blob armado
+    // que mandó la ventana: tiene que ser la misma identidad.
     let stored = keys.find_pgp_secret_key(ACCOUNT).await.unwrap().unwrap();
-    assert_eq!(stored.as_slice(), key);
+    let stored = crate::pgp::parse_secret_key(&stored).expect("la clave guardada se relee");
+    let sent = crate::pgp::parse_secret_key(&key).unwrap();
+    assert_eq!(
+        stored.primary_key.fingerprint().to_string(),
+        sent.primary_key.fingerprint().to_string()
+    );
     let pass = keys.find_pgp_passphrase(ACCOUNT).await.unwrap().unwrap();
     assert_eq!(pass.as_slice(), PASSPHRASE);
     assert_nothing_stored(&f, "otra").await;
@@ -670,5 +678,42 @@ async fn la_identidad_smime_no_alcanza_para_pedir_pgp() {
     send(&f, Some(true), None).await.unwrap();
     // …pero PGP pide **su** identidad, no «la que haya».
     assert_invalid_args(send(&f, None, Some("pgp")).await, "OpenPGP");
+    assert_eq!(queued(&f).await, 1);
+}
+
+#[tokio::test]
+async fn pedir_firma_pgp_con_una_clave_que_no_puede_firmar_se_rechaza_al_encolar() {
+    // Una identidad que existe pero cuya primaria está muerta (revocada o
+    // expirada) no firmaría: se rechaza al encolar, no recién al enviar.
+    let vivo = clave_vieja(UID);
+    let expirada = con_primaria_muerta(
+        &vivo,
+        crate::pgp::tests::con_primaria_con_vencimiento_en_el_uid(&vivo, 24 * 3600),
+    );
+    let revocada = con_primaria_muerta(&vivo, con_primaria_revocada(&vivo));
+
+    for (what, key) in [("revocada", revocada), ("expirada", expirada)] {
+        let f = account().await;
+        f.keys()
+            .store_pgp_identity(ACCOUNT, &armored(&key), b"")
+            .await
+            .unwrap();
+
+        assert_invalid_args(send(&f, None, Some("pgp")).await, "OpenPGP");
+        assert_eq!(queued(&f).await, 0, "{what}");
+    }
+}
+
+#[tokio::test]
+async fn pedir_firma_pgp_con_una_clave_viva_sin_contrasena_guardada_encola() {
+    // Control de la anterior: la misma clave sin matar sí encola.
+    let f = account().await;
+    f.keys()
+        .store_pgp_identity(ACCOUNT, &armored(&clave_vieja(UID)), b"")
+        .await
+        .unwrap();
+
+    send(&f, None, Some("pgp")).await.unwrap();
+
     assert_eq!(queued(&f).await, 1);
 }
