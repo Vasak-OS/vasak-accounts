@@ -848,8 +848,10 @@ fn pgp_from_row(
     });
     Some(crate::pgp::PgpStatus {
         signature,
-        // La huella sólo se guardó cuando la firma cerró contra la clave conocida.
-        signer,
+        // La huella vale sólo con firma **conocida** (estado 0): el contrato no admite
+        // firmante en «desconocida» (1) ni «no verificable» (2). Se descarta por si una
+        // fila trae una huella con otro estado, para no mostrar un firmante no ligado.
+        signer: if status == Some(0) { signer } else { None },
         encryption,
     })
 }

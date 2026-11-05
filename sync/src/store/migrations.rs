@@ -749,10 +749,22 @@ CREATE TABLE pgp_peers (
 ///   (el cuerpo guardado es el descifrado, protegido en reposo por SQLCipher como el
 ///   resto —decisión #1—), 2 «cifrado, no se pudo abrir» (sin nuestra clave,
 ///   integridad rota, cifrado no soportado; el cuerpo queda vacío, nunca «roto»).
+///
+/// Los cuerpos cacheados **antes** de la V15 quedan con estas columnas en NULL y no se
+/// reprocesan solos: `messages_without_body` sólo mira los mensajes **sin** fila de
+/// cuerpo. Un mail PGP inline cacheado bajo la V14 seguiría mostrando la armadura y
+/// reportando `pgp` NULL. Por eso se **borra la fila de cuerpo** de los que llevan una
+/// armadura PGP (texto o HTML): la próxima vuelta los vuelve a bajar y recomputa su
+/// estado PGP, y `write_body` rehace el índice FTS al reescribirlos. Sólo toca los que
+/// parecen PGP, no la caché entera.
 const V15: &str = "
 ALTER TABLE message_bodies ADD COLUMN pgp_status INTEGER;
 ALTER TABLE message_bodies ADD COLUMN pgp_signer TEXT;
 ALTER TABLE message_bodies ADD COLUMN pgp_encrypted INTEGER;
+
+DELETE FROM message_bodies
+WHERE text_body LIKE '%-----BEGIN PGP %'
+   OR html_body LIKE '%-----BEGIN PGP %';
 ";
 
 /// Todas las migraciones, en orden.

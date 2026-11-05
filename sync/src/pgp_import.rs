@@ -212,14 +212,28 @@ pub fn ingest_peer_key(
                 new_fingerprint,
             })
         }
-        Some(_) => {
-            // Misma huella: NO se reescribe `public_key`. Un blob entrante con la misma
-            // primaria pero la subclave de cifrado quitada (o una revocación) no debe
-            // **reducir** la clave ya guardada —TOFU conservador, decisión 3—; sólo se
-            // refresca `updated_at`.
-            store
-                .touch_peer(&address, now)
-                .map_err(IngestError::Store)?;
+        Some(previous) => {
+            // Misma huella: NO se **reemplaza** la clave guardada —un blob con la
+            // subclave de cifrado quitada no debe reducir la ya guardada (TOFU
+            // conservador, decisión 3)—, pero sí se **fusionan** las revocaciones y
+            // bindings autenticados que traiga la actualización: sin esto, una subclave
+            // que el contacto revocó se seguiría aceptando como firmante. Si no hay nada
+            // nuevo autenticado, sólo se refresca `updated_at`.
+            let mut stored = parse_public_key(&previous.public_key).map_err(IngestError::Key)?;
+            if merge_authenticated_updates(&mut stored, &key) {
+                let bytes = stored.to_bytes().map_err(|e| {
+                    IngestError::Key(PgpError::BadKey(format!(
+                        "no se pudo re-serializar la clave fusionada: {e}"
+                    )))
+                })?;
+                store
+                    .upsert_peer(&address, &bytes, &new_fingerprint, now)
+                    .map_err(IngestError::Store)?;
+            } else {
+                store
+                    .touch_peer(&address, now)
+                    .map_err(IngestError::Store)?;
+            }
             Ok(Ingested::Unchanged)
         }
         None => {
@@ -234,6 +248,53 @@ pub fn ingest_peer_key(
             Ok(Ingested::New)
         }
     }
+}
+
+/// Fusiona en la clave guardada (`stored`) las revocaciones de primaria y las firmas
+/// de subclave (bindings y revocaciones) **autenticadas** que trae una actualización
+/// `incoming` con la **misma** primaria. No quita material (anti-degradación de la
+/// decisión 3: se mezcla, no se reemplaza). Devuelve `true` si agregó algo.
+///
+/// Sólo se mezcla lo que **verifica contra la primaria guardada**: así una
+/// actualización con el `From` spoofeado no puede inyectar una revocación forjada
+/// (el mismo criterio que `strip_forged_revocations` y `verify_key_bindings`).
+///
+/// shortcut: no se agregan subclaves **nuevas** del blob entrante (rotación de
+/// subclave), sólo se honran las revocaciones/bindings de las ya conocidas; subir a
+/// soportar rotación si un contacto rota su subclave de cifrado y hay que adoptarla.
+fn merge_authenticated_updates(stored: &mut SignedPublicKey, incoming: &SignedPublicKey) -> bool {
+    let primary = stored.primary_key.clone();
+    let mut changed = false;
+
+    // Revocaciones de primaria autenticadas que falten.
+    for sig in &incoming.details.revocation_signatures {
+        if sig.verify_key(&primary).is_ok() && !stored.details.revocation_signatures.contains(sig) {
+            stored.details.revocation_signatures.push(sig.clone());
+            changed = true;
+        }
+    }
+
+    // Firmas de subclave (binding/revocación) autenticadas que falten, cotejando la
+    // subclave por huella: sólo se tocan subclaves ya conocidas.
+    for inc_sub in &incoming.public_subkeys {
+        let inc_fp = inc_sub.key.fingerprint();
+        let Some(stored_sub) = stored
+            .public_subkeys
+            .iter_mut()
+            .find(|s| s.key.fingerprint() == inc_fp)
+        else {
+            continue;
+        };
+        for sig in &inc_sub.signatures {
+            if sig.verify_subkey_binding(&primary, &inc_sub.key).is_ok()
+                && !stored_sub.signatures.contains(sig)
+            {
+                stored_sub.signatures.push(sig.clone());
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 // ── Verificación criptográfica del binding (el hallazgo de PR2) ─────────
@@ -385,6 +446,12 @@ const MAX_AUTOCRYPT_KEYDATA: usize = 128 * 1024;
 /// ante un `multipart` patológicamente profundo.
 const MAX_MIME_DEPTH: usize = 8;
 
+/// Tope de partes `application/pgp-keys` que se juntan de un mensaje. Un mensaje
+/// legítimo trae una o dos claves; cientos de partes es un abuso que haría parsear
+/// (y verificar bindings de) una clave por cada una. Corta además del tope por blob
+/// ([`MAX_KEY_BLOB`]).
+const MAX_KEY_PARTS: usize = 16;
+
 /// Las claves públicas que trae un mensaje entrante para ingerir al peerstate: la de
 /// la cabecera `Autocrypt:` (atribuida a su `addr`, **sólo si coincide con el `From`**
 /// —Autocrypt L1 ignora la cabecera cuyo `addr` no es el del remitente—) y las de los
@@ -412,16 +479,20 @@ pub fn incoming_public_keys(raw: &[u8]) -> Vec<(String, Vec<u8>)> {
     // L1 además manda **ignorar** la cabecera si su `addr` no es el del remitente: sin
     // esto, un `From` spoofeado sembraría en el peerstate TOFU la clave del atacante
     // bajo la dirección de la víctima. Se compara normalizado.
-    if let Some(value) = headers.get("autocrypt") {
-        if value.len() <= MAX_AUTOCRYPT_KEYDATA {
-            if let Some(header) = parse_autocrypt_header(value) {
-                if header.key.len() <= MAX_AUTOCRYPT_KEYDATA
-                    && normalize_address(&header.addr) == from_normalized
-                {
-                    found.push((header.addr, header.key));
-                }
-            }
-        }
+    // Autocrypt L1: se consideran todas las cabeceras `Autocrypt` válidas (parseables,
+    // dentro del tope y con `addr` == `From`). Si queda **más de una**, es un error y se
+    // ignoran TODAS; sólo se siembra la clave cuando hay **exactamente una**.
+    let valid_autocrypt: Vec<AutocryptHeader> = headers
+        .get_all("autocrypt")
+        .filter(|value| value.len() <= MAX_AUTOCRYPT_KEYDATA)
+        .filter_map(parse_autocrypt_header)
+        .filter(|header| {
+            header.key.len() <= MAX_AUTOCRYPT_KEYDATA
+                && normalize_address(&header.addr) == from_normalized
+        })
+        .collect();
+    if let [header] = valid_autocrypt.as_slice() {
+        found.push((header.addr.clone(), header.key.clone()));
     }
 
     // Adjuntos `application/pgp-keys`, atribuidos al `From` del mensaje. Sin `From`
@@ -443,7 +514,7 @@ fn collect_key_attachments(
     from: &str,
     out: &mut Vec<(String, Vec<u8>)>,
 ) {
-    if depth > MAX_MIME_DEPTH {
+    if depth > MAX_MIME_DEPTH || out.len() >= MAX_KEY_PARTS {
         return;
     }
     let content_type = headers

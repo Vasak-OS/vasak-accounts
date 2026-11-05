@@ -41,13 +41,13 @@
 use std::io::Read;
 
 use pgp::composed::{
-    CleartextSignedMessage, DecryptionOptions, Deserializable, DetachedSignature, Message,
+    CleartextSignedMessage, DecryptionOptions, Deserializable, DetachedSignature, Esk, Message,
     MessageBuilder, SignedPublicKey, SignedPublicSubKey, SignedSecretKey, TheRing,
 };
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
 use pgp::packet::SignatureType;
-use pgp::types::{KeyDetails, Password, Seipdv1ReadMode, Timestamp};
+use pgp::types::{KeyDetails, Password, Seipdv1ReadMode, Tag, Timestamp};
 use rand::rngs::OsRng;
 use serde::Serialize;
 use zeroize::Zeroizing;
@@ -79,6 +79,14 @@ const MAX_DECRYPTED: usize = 64 * 1024 * 1024;
 /// de otro). Un mensaje legítimo lleva una sola; más allá de esto es una bomba de
 /// capas y se trata como [`Decryption::Unavailable`], nunca se materializa.
 const MAX_COMPRESSION_LAYERS: u32 = 4;
+
+/// Tope de PKESK **dirigidos a nuestra clave** (o wildcard) en un sobre. Sólo esos
+/// disparan una operación de clave privada en `decrypt_the_ring`; un mensaje legítimo
+/// trae uno (unos pocos si tenemos varias subclaves de descifrado). Miles es una bomba
+/// de CPU que bloquearía la task async (el descifrado corre síncrono en ella): se corta
+/// **antes** de intentar descifrar. No cuenta los PKESK de otros destinatarios (no nos
+/// matchean y rPGP los saltea barato), así que un cifrado a mucha gente no se penaliza.
+const MAX_TARGETED_PKESK: usize = 16;
 
 // ── Estado expuesto a la ventana (calcado de smime_sign) ───────────────
 
@@ -260,6 +268,29 @@ pub fn decrypt(raw: &[u8], secret_key: &SignedSecretKey, passphrase: &Password) 
         return Decryption::Unavailable("el bloque PGP no es un sobre cifrado".into());
     }
 
+    // Antes de descifrar (síncrono en la task async), se cortan los sobres con una
+    // cantidad abusiva de PKESK dirigidos a nuestra clave: cada uno es un intento de
+    // clave privada y, sin cota, un mail cargado con miles bloquea la task.
+    if let Message::Encrypted { esk, .. } = &message {
+        let targeted = esk
+            .iter()
+            .filter_map(|e| match e {
+                Esk::PublicKeyEncryptedSessionKey(k) => Some(k),
+                _ => None,
+            })
+            .filter(|k| {
+                k.match_identity(secret_key.primary_key.public_key())
+                    || secret_key
+                        .secret_subkeys
+                        .iter()
+                        .any(|sub| k.match_identity(sub.public_key()))
+            })
+            .count();
+        if targeted > MAX_TARGETED_PKESK {
+            return Decryption::Unavailable("demasiados PKESK dirigidos a la clave".into());
+        }
+    }
+
     // Para SEIPD v1, rPGP corre en modo `CheckFirst`, que bufferiza en RAM el
     // contenido descifrado entero antes de verificarlo y soltarlo; su techo por
     // defecto es 1 GiB. Se iguala a `MAX_DECRYPTED` para que esa bufferización no
@@ -348,12 +379,27 @@ fn encrypted_payload(raw: &[u8]) -> Option<Vec<u8>> {
             .iter()
             .find(|part| part_media_type(part) == "application/octet-stream")
             .or_else(|| parts.last())?;
-        let (_part_headers, part_body) = split_headers(payload_part);
-        return Some(from_latin1(part_body));
+        let (part_headers, part_body) = split_headers(payload_part);
+        // Se aplica el `Content-Transfer-Encoding` de la parte antes de parsear: si el
+        // sobre viene en base64, pasarle base64 a rPGP lo deja ilegible y el mail se
+        // guarda como no disponible con cuerpo vacío. Igual que `parse_detached_signature`.
+        let encoding = part_headers
+            .get("content-transfer-encoding")
+            .unwrap_or("7bit");
+        return Some(decode_transfer(&from_latin1(part_body), encoding));
     }
 
-    // Inline: un bloque `-----BEGIN PGP MESSAGE-----` dentro del cuerpo.
-    extract_armor_block(&view, BEGIN_PGP_MESSAGE, END_PGP_MESSAGE).map(|block| from_latin1(&block))
+    // Inline: un bloque `-----BEGIN PGP MESSAGE-----`. Se escanea el **cuerpo propio**
+    // (no el raw entero) y se exige que el bloque sea todo el cuerpo: un mail que sólo
+    // CITA un bloque armado (p. ej. una respuesta) no es un sobre cifrado y no debe
+    // vaciarse. shortcut: un inline legítimo con texto alrededor del bloque se trata
+    // como no cifrado (se muestra la armadura); subir a un walk del árbol MIME si hace falta.
+    let block = extract_armor_block(body, BEGIN_PGP_MESSAGE, END_PGP_MESSAGE)?;
+    let (before, after) = body.split_once(block.as_str())?;
+    if !before.trim().is_empty() || !after.trim().is_empty() {
+        return None;
+    }
+    Some(from_latin1(&block))
 }
 
 /// Parsea un mensaje OpenPGP, detectando solo si es armado o binario.
@@ -403,8 +449,33 @@ pub fn verify(raw: &[u8], candidate_keys: &[SignedPublicKey]) -> Verification {
         return verify_detached(&signature, &signed_content, candidate_keys);
     }
 
-    // Inline: un cleartext firmado (`-----BEGIN PGP SIGNED MESSAGE-----`).
-    if let Some(block) = extract_armor_block(&view, BEGIN_PGP_SIGNED, END_PGP_SIGNATURE) {
+    // Inline: un cleartext firmado (`-----BEGIN PGP SIGNED MESSAGE-----`). Se escanea el
+    // **cuerpo propio**, no el raw —así un mail que sólo CITA un bloque no se marca
+    // firmado—. Salvo que el contenido sea una armadura **pelada** (el interior de un
+    // sign-then-encrypt, sin cabeceras MIME): ahí `split_headers` se come el marcador y
+    // el `Hash:`, así que el cuerpo a escanear es el contenido entero.
+    let trimmed = view.trim_start();
+    let scan: &str = if trimmed.starts_with(BEGIN_PGP_SIGNED) {
+        trimmed
+    } else {
+        body
+    };
+    if let Some(block) = extract_armor_block(scan, BEGIN_PGP_SIGNED, END_PGP_SIGNATURE) {
+        // La firma inline sólo cubre su bloque, pero la vista muestra todo el cuerpo:
+        // si hay texto fuera del bloque (antes o después), un atacante lo anteponría a
+        // un bloque firmado real y aparecería como «firmado». Se exige que el bloque
+        // sea todo el cuerpo; si no, no se marca firmado.
+        let (before, after) = scan.split_once(block.as_str()).unwrap_or(("x", "x"));
+        if !before.trim().is_empty() || !after.trim().is_empty() {
+            return Verification::Unverified(
+                "hay contenido fuera del bloque firmado inline".into(),
+            );
+        }
+        // El bloque viene de la vista latin-1: se reconstruyen los bytes originales y
+        // se interpretan como UTF-8 antes de verificar. Sin esto, para contenido UTF-8
+        // no-ASCII rPGP hashea bytes distintos a los que firmó el emisor y una firma
+        // válida se guarda como no verificable.
+        let block = String::from_utf8_lossy(&from_latin1(&block)).into_owned();
         return verify_cleartext(&block, candidate_keys);
     }
 
@@ -446,6 +517,12 @@ fn verify_detached(
 ) -> Verification {
     let now = Timestamp::now().as_secs();
     for key in candidate_keys {
+        // Primaria muerta (revocada/expirada) → la clave entera no liga identidad: no
+        // se acepta una firma de subclave bajo una primaria revocada (mostraría la
+        // identidad revocada como firmante). Mismo gate que `encryption_subkey`.
+        if !primary_usable(key, now) {
+            continue;
+        }
         if primary_signing_usable(key, now) && signature.verify(&key.primary_key, content).is_ok() {
             return Verification::SignedUntrusted(key.primary_key.fingerprint().to_string());
         }
@@ -474,6 +551,11 @@ fn verify_cleartext(block: &str, candidate_keys: &[SignedPublicKey]) -> Verifica
     };
     let now = Timestamp::now().as_secs();
     for key in candidate_keys {
+        // Primaria muerta (revocada/expirada) → la clave entera no liga identidad,
+        // tampoco por una subclave bajo ella. Igual que en `verify_detached`.
+        if !primary_usable(key, now) {
+            continue;
+        }
         if primary_signing_usable(key, now) && message.verify(&key.primary_key).is_ok() {
             return Verification::SignedUntrusted(key.primary_key.fingerprint().to_string());
         }
@@ -624,9 +706,13 @@ pub fn encryption_subkey(key: &SignedPublicKey) -> Option<&SignedPublicSubKey> {
 /// revocada o expirada mata la clave entera para cifrar, igual que una subclave
 /// muerta. La revocación se toma por **presencia** de una `KeyRevocation`: es seguro
 /// porque el gate de import ya descartó las forjadas y guardó sólo las que verifican
-/// contra la primaria (`crate::pgp_import::ingest_peer_key`). La expiración sale de la self-signature
-/// más reciente (firma directa de clave o auto-certificación de UID), relativa a la
-/// creación de la primaria; un vencimiento de cero segundos significa «nunca expira».
+/// contra la primaria (`crate::pgp_import::ingest_peer_key`). La expiración sale de la
+/// self-signature más reciente **que verifica contra la primaria** (firma directa de
+/// clave o auto-certificación de UID): el import no descarta certificaciones forjadas
+/// (sólo revocaciones y bindings), así que sin este filtro una certificación forjada
+/// con `created` futuro reviviría una clave expirada o expiraría una viva. La
+/// expiración es relativa a la creación de la primaria; cero segundos significa «nunca
+/// expira».
 fn primary_usable(key: &SignedPublicKey, now: u32) -> bool {
     if key
         .details
@@ -637,16 +723,20 @@ fn primary_usable(key: &SignedPublicKey, now: u32) -> bool {
         return false;
     }
 
-    let latest_self_sig = key
+    let primary = &key.primary_key;
+    let direct = key
         .details
         .direct_signatures
         .iter()
-        .chain(
-            key.details
-                .users
-                .iter()
-                .flat_map(|user| user.signatures.iter()),
-        )
+        .filter(|sig| sig.verify_key(primary).is_ok());
+    let uid = key.details.users.iter().flat_map(|user| {
+        user.signatures.iter().filter(move |sig| {
+            sig.verify_certification(primary, Tag::UserId, &user.id)
+                .is_ok()
+        })
+    });
+    let latest_self_sig = direct
+        .chain(uid)
         .filter_map(|sig| sig.created().map(|t| (t.as_secs(), sig)))
         .max_by_key(|(created, _)| *created)
         .map(|(_, sig)| sig);
@@ -704,6 +794,19 @@ fn subkey_usable(subkey: &SignedPublicSubKey, now: u32, usage: Usage) -> bool {
     if let Some(expiration) = binding.key_expiration_time().filter(|d| d.as_secs() != 0) {
         let created = subkey.created_at().as_secs();
         if created.saturating_add(expiration.as_secs()) < now {
+            return false;
+        }
+    }
+
+    // La **firma de binding** puede tener su propia expiración (distinta de la de
+    // clave); rPGP 0.21 no la aplica. Vencida → el binding ya no vale → subclave
+    // muerta. Es relativa a la creación de la firma, cero = «nunca expira».
+    if let Some(sig_expiration) = binding
+        .signature_expiration_time()
+        .filter(|d| d.as_secs() != 0)
+    {
+        let sig_created = binding.created().map(|t| t.as_secs()).unwrap_or(0);
+        if sig_created.saturating_add(sig_expiration.as_secs()) < now {
             return false;
         }
     }

@@ -509,7 +509,10 @@ pub fn opened_rows_decrypting(
     //    honestidad es la de S/MIME: nunca «firmado por Fulano», sólo clave conocida /
     //    desconocida / no verificable. Si el sobre se abrió (sign-then-encrypt), la
     //    firma va sobre el contenido de adentro; si sólo venía firmado, sobre `raw`.
-    let pgp_target: &[u8] = if pgp_decrypted.is_some() { inner } else { raw };
+    // Se usa el `decrypted` compartido (S/MIME o PGP), no sólo `pgp_decrypted`: si un
+    // sobre S/MIME se abrió y adentro hay una firma PGP/MIME, va sobre el contenido de
+    // adentro (`inner`), no sobre el sobre crudo —si no, nunca se chequearía.
+    let pgp_target: &[u8] = if decrypted.is_some() { inner } else { raw };
     let (pgp_status, pgp_signer) = match crate::pgp::verify(pgp_target, pgp_candidates) {
         crate::pgp::Verification::SignedUntrusted(fingerprint) => (Some(0), Some(fingerprint)),
         crate::pgp::Verification::Unverified(reason) => {
@@ -526,18 +529,27 @@ pub fn opened_rows_decrypting(
         crate::pgp::Verification::NotSigned => (None, None),
     };
 
-    let attachments = crate::attachments::list(display)
-        .into_iter()
-        .map(|a| MessageAttachmentRow {
-            message_id,
-            part_number: a.part,
-            name: Some(a.name),
-            content_type: a.content_type,
-            size: 0,
-            inline: false,
-            content_id: None,
-        })
-        .collect();
+    // shortcut: en un sobre PGP abierto los números de parte salen del árbol MIME
+    // DESCIFRADO y NO son secciones IMAP (`BODY[...]` direcciona el árbol cifrado), así
+    // que servir esas filas devolvería bytes equivocados o vacío. Hasta tener el fetch
+    // con descifrado (get_attachment bajando y descifrando el mensaje entero), no se
+    // listan. Un mensaje sólo firmado o en claro sí: su árbol es el que ve IMAP.
+    let attachments = if pgp_decrypted.is_some() {
+        Vec::new()
+    } else {
+        crate::attachments::list(display)
+            .into_iter()
+            .map(|a| MessageAttachmentRow {
+                message_id,
+                part_number: a.part,
+                name: Some(a.name),
+                content_type: a.content_type,
+                size: 0,
+                inline: false,
+                content_id: None,
+            })
+            .collect()
+    };
     (
         MessageBodyRow {
             message_id,

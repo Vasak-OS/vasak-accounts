@@ -155,6 +155,17 @@ impl Headers {
     pub fn decoded(&self, name: &str) -> String {
         self.get(name).map(decode_words).unwrap_or_default()
     }
+
+    /// Todos los valores de una cabecera repetida, en orden. Lo usa Autocrypt, que
+    /// trata como error (ignora la cabecera entera) un mensaje con más de una `Autocrypt`
+    /// válida: para detectarlo hay que verlas todas, no sólo la primera de [`get`].
+    pub fn get_all<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a str> + 'a {
+        let wanted = name.to_ascii_lowercase();
+        self.0
+            .iter()
+            .filter(move |(n, _)| *n == wanted)
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 /// Deshace las «palabras codificadas» de una cabecera.
