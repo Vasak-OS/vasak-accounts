@@ -363,7 +363,11 @@ fn merge_authenticated_updates(stored: &mut SignedPublicKey, incoming: &SignedPu
 /// común en una clave adjunta exportada por GnuPG. Acá se tolera eso —alcanza con
 /// que **una** auto-firma de la primaria cierre— sin bajar la guardia donde
 /// importa: los bindings de subclave, que son el vector del hallazgo de PR2.
-fn verify_key_bindings(key: &SignedPublicKey) -> Result<(), PgpError> {
+///
+/// `pub(crate)` para que el cliente WKD (PR6) valide una clave descargada con el
+/// **mismo** molde que un adjunto: una clave traída por HTTPS es tan hostil como una
+/// adjunta, y pasa por acá antes de guardarse o usarse.
+pub(crate) fn verify_key_bindings(key: &SignedPublicKey) -> Result<(), PgpError> {
     for subkey in &key.public_subkeys {
         subkey
             .verify_bindings(&key.primary_key)

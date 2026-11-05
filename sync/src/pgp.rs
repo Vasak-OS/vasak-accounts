@@ -789,6 +789,31 @@ fn primary_usable(key: &SignedPublicKey, now: u32) -> bool {
     true
 }
 
+/// Si la clave primaria está **revocada** y si está **expirada**, por separado, para
+/// que la resolución de destinatario (`crate::wkd`, método `ResolveRecipientKey`)
+/// informe **por qué** una clave guardada no es usable. Reusa el mismo criterio que
+/// [`primary_usable`]: revocada es la presencia de una `KeyRevocation`; expirada es
+/// «no usable y no revocada» —el único otro motivo por el que la primaria deja de
+/// serlo—. No distingue más casos porque la ventana sólo pinta «revocada» o
+/// «vencida».
+/// La huella de la primaria de una clave pública, recomputada desde la clave. El
+/// detalle de que `fingerprint()` viene del trait `KeyDetails` queda en este módulo —el
+/// límite de la cripto—, así que quien resuelve destinatarios (`crate::wkd`, el método
+/// `ResolveRecipientKey`) la obtiene sin importar el trait.
+pub fn fingerprint(key: &SignedPublicKey) -> String {
+    key.primary_key.fingerprint().to_string()
+}
+
+pub fn primary_liveness(key: &SignedPublicKey) -> (bool, bool) {
+    let revoked = key
+        .details
+        .revocation_signatures
+        .iter()
+        .any(|sig| sig.typ() == Some(SignatureType::KeyRevocation));
+    let expired = !revoked && !primary_usable(key, Timestamp::now().as_secs());
+    (revoked, expired)
+}
+
 /// Para qué se busca una subclave.
 #[derive(Clone, Copy)]
 enum Usage {
