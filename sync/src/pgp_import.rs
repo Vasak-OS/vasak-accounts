@@ -1685,4 +1685,161 @@ Content-Type: text/plain\r\n\r\nhola\r\n",
             vec![("ana@example.com".to_string(), bytes(&ana))]
         );
     }
+
+    /// Una clave completa cuya primaria se creó hace un año.
+    fn clave_de_hace_un_ano(uid: &str) -> SignedSecretKey {
+        use crate::pgp::tests::{subclave_de_cifrado, subclave_de_firma};
+        use pgp::composed::{EncryptionCaps, KeyType, SecretKeyParamsBuilder};
+        let hace_un_ano = Timestamp::from_secs(Timestamp::now().as_secs() - UN_ANO);
+        let mut p = SecretKeyParamsBuilder::default();
+        p.key_type(KeyType::Ed25519Legacy)
+            .can_certify(true)
+            .can_sign(false)
+            .can_encrypt(EncryptionCaps::None)
+            .created_at(hace_un_ano)
+            .primary_user_id(uid.into())
+            .subkeys(vec![subclave_de_firma(), subclave_de_cifrado(None)]);
+        p.build().unwrap().generate(OsRng).unwrap()
+    }
+
+    const UN_ANO: u32 = 365 * 24 * 3600;
+
+    /// Una auto-firma de la primaria (`Key` directa o `CertPositive` del primer UID),
+    /// creada en `ahora + desfase` segundos y con `KeyExpirationTime` = `plazo`
+    /// (relativo a la creación de la primaria).
+    fn auto_firma_con_plazo(
+        secret: &SignedSecretKey,
+        typ: SignatureType,
+        desfase: u32,
+        plazo: u32,
+    ) -> pgp::packet::Signature {
+        use pgp::types::Duration as PgpDuration;
+        let primaria = &secret.primary_key;
+        let mut flags = KeyFlags::default();
+        flags.set_certify(true);
+        let creada = Timestamp::from_secs(Timestamp::now().as_secs() + desfase);
+        let mut config = SignatureConfig::from_key(OsRng, primaria, typ).unwrap();
+        config.hashed_subpackets = vec![
+            Subpacket::regular(SubpacketData::SignatureCreationTime(creada)).unwrap(),
+            Subpacket::regular(SubpacketData::KeyFlags(flags)).unwrap(),
+            Subpacket::regular(SubpacketData::IssuerFingerprint(primaria.fingerprint())).unwrap(),
+            Subpacket::regular(SubpacketData::KeyExpirationTime(PgpDuration::from_secs(
+                plazo,
+            )))
+            .unwrap(),
+        ];
+        match typ {
+            SignatureType::Key => config
+                .sign_key(primaria, &vacia(), primaria.public_key())
+                .unwrap(),
+            _ => config
+                .sign_certification(
+                    primaria,
+                    primaria.public_key(),
+                    &vacia(),
+                    Tag::UserId,
+                    &publica(secret).details.users[0].id,
+                )
+                .unwrap(),
+        }
+    }
+
+    /// La pública con la auto-firma (`typ`) de `plazo`, agregada o —para el UID—
+    /// reemplazando la de generación.
+    fn con_auto_firma(
+        secret: &SignedSecretKey,
+        base: &SignedPublicKey,
+        typ: SignatureType,
+        desfase: u32,
+        plazo: u32,
+    ) -> SignedPublicKey {
+        let mut key = base.clone();
+        let firma = auto_firma_con_plazo(secret, typ, desfase, plazo);
+        match typ {
+            SignatureType::Key => key.details.direct_signatures.push(firma),
+            _ => key.details.users[0].signatures.push(firma),
+        }
+        key
+    }
+
+    #[test]
+    fn reingerir_la_misma_primaria_con_una_renovacion_de_expiracion_la_adopta() {
+        let ana = clave_de_hace_un_ano("Ana <ana@example.com>");
+        // La renovación llega como certificación de UID o como firma directa: dos loops.
+        for (que, typ) in [
+            ("certificación de UID", SignatureType::CertPositive),
+            ("firma directa", SignatureType::Key),
+        ] {
+            let temp = TempDir::new("pgp-import-renovacion");
+            let store = open_store(&temp);
+            // Vencida desde hace ~364 días (plazo de un día desde la creación).
+            let vencida = con_auto_firma(&ana, &publica(&ana), typ, 100, 24 * 3600);
+            ingest_peer_key(&store, "ana@example.com", &bytes(&vencida), 100).unwrap();
+            assert!(
+                encryption_subkey(&guardada(&store, "ana@example.com")).is_none(),
+                "{que}: premisa, la guardada está vencida"
+            );
+
+            // Renovación: la misma primaria con una auto-firma más nueva que extiende
+            // el plazo a dos años. (Trae también la vieja.)
+            let renovada = con_auto_firma(&ana, &vencida, typ, 200, 2 * UN_ANO);
+            let r = ingest_peer_key(&store, "ana@example.com", &bytes(&renovada), 200);
+            assert_eq!(r.unwrap(), Ingested::Unchanged, "{que}");
+
+            let g = guardada(&store, "ana@example.com");
+            assert!(
+                encryption_subkey(&g).is_some(),
+                "{que}: la renovación autenticada se adopta y la clave vuelve a servir"
+            );
+            // No se degrada: siguen las dos subclaves y la huella.
+            assert_eq!(g.public_subkeys.len(), 2, "{que}");
+            assert_eq!(huella(&g), huella(&vencida), "{que}");
+        }
+    }
+
+    #[test]
+    fn una_renovacion_forjada_por_otra_clave_no_revive_la_guardada_vencida() {
+        let ana = clave_de_hace_un_ano("Ana <ana@example.com>");
+        let atacante = clave_de_hace_un_ano("Atacante <atacante@example.com>");
+        let temp = TempDir::new("pgp-import-renovacion-forjada");
+        let store = open_store(&temp);
+        let vencida = con_auto_firma(
+            &ana,
+            &publica(&ana),
+            SignatureType::CertPositive,
+            100,
+            24 * 3600,
+        );
+        ingest_peer_key(&store, "ana@example.com", &bytes(&vencida), 100).unwrap();
+
+        // Firmas del atacante (sobre su clave) pegadas a la de ana: no verifican contra
+        // la primaria guardada y no se adoptan.
+        let mut forjada = vencida.clone();
+        forjada.details.users[0]
+            .signatures
+            .push(auto_firma_con_plazo(
+                &atacante,
+                SignatureType::CertPositive,
+                200,
+                2 * UN_ANO,
+            ));
+        forjada.details.direct_signatures.push(auto_firma_con_plazo(
+            &atacante,
+            SignatureType::Key,
+            200,
+            2 * UN_ANO,
+        ));
+        ingest_peer_key(&store, "ana@example.com", &bytes(&forjada), 200).unwrap();
+        let g = guardada(&store, "ana@example.com");
+        assert!(encryption_subkey(&g).is_none());
+        // Y ni siquiera se guardan: la fusión sólo adopta lo que verifica contra la primaria.
+        assert_eq!(
+            g.details.direct_signatures.len(),
+            vencida.details.direct_signatures.len()
+        );
+        assert_eq!(
+            g.details.users[0].signatures.len(),
+            vencida.details.users[0].signatures.len()
+        );
+    }
 }
