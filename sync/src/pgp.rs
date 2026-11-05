@@ -539,8 +539,9 @@ pub fn encryption_subkey(key: &SignedPublicKey) -> Option<&SignedPublicSubKey> {
 
 /// Si la clave **primaria** sigue viva: no revocada y no expirada. Una primaria
 /// revocada o expirada mata la clave entera para cifrar, igual que una subclave
-/// muerta. La revocación se toma por presencia de una firma de revocación directa
-/// (verificarla es el gate de import, PR3). La expiración sale de la self-signature
+/// muerta. La revocación se toma por **presencia** de una `KeyRevocation`: es seguro
+/// porque el gate de import ya descartó las forjadas y guardó sólo las que verifican
+/// contra la primaria (`crate::pgp_import::ingest_peer_key`). La expiración sale de la self-signature
 /// más reciente (firma directa de clave o auto-certificación de UID), relativa a la
 /// creación de la primaria; un vencimiento de cero segundos significa «nunca expira».
 fn primary_usable(key: &SignedPublicKey, now: u32) -> bool {
@@ -688,7 +689,7 @@ fn strip_one_trailing_crlf(mut bytes: Vec<u8>) -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     //! Pruebas del núcleo OpenPGP. Las claves y los mensajes se generan acá con el
     //! propio `pgp`: nada de binarios externos ni fixtures opacos. Lo que más
     //! importa es **fallar cerrado**: un ciphertext manipulado nunca puede
@@ -706,13 +707,13 @@ mod tests {
     const CLARO: &str =
         "Content-Type: text/plain; charset=utf-8\r\n\r\nSECRETO-DEL-TEST: el lince cena a las ocho";
 
-    fn vacia() -> Password {
+    pub(crate) fn vacia() -> Password {
         Password::empty()
     }
 
     // ── Fixtures generadas con rPGP ────────────────────────────────────
 
-    fn subclave_de_firma() -> SubkeyParams {
+    pub(crate) fn subclave_de_firma() -> SubkeyParams {
         let mut p = SubkeyParamsBuilder::default();
         p.key_type(KeyType::Ed25519Legacy)
             .can_sign(true)
@@ -721,7 +722,7 @@ mod tests {
         p.build().expect("params de la subclave de firma")
     }
 
-    fn subclave_de_cifrado(creada: Option<Timestamp>) -> SubkeyParams {
+    pub(crate) fn subclave_de_cifrado(creada: Option<Timestamp>) -> SubkeyParams {
         let mut p = SubkeyParamsBuilder::default();
         p.key_type(KeyType::ECDH(ECCCurve::Curve25519Legacy))
             .can_sign(false)
@@ -733,7 +734,7 @@ mod tests {
         p.build().expect("params de la subclave de cifrado")
     }
 
-    fn generar(uid: &str, subclaves: Vec<SubkeyParams>) -> SignedSecretKey {
+    pub(crate) fn generar(uid: &str, subclaves: Vec<SubkeyParams>) -> SignedSecretKey {
         let mut p = SecretKeyParamsBuilder::default();
         p.key_type(KeyType::Ed25519Legacy)
             .can_certify(true)
@@ -748,15 +749,15 @@ mod tests {
     }
 
     /// Una clave completa: primaria, subclave de firma y subclave de cifrado.
-    fn clave_completa(uid: &str) -> SignedSecretKey {
+    pub(crate) fn clave_completa(uid: &str) -> SignedSecretKey {
         generar(uid, vec![subclave_de_firma(), subclave_de_cifrado(None)])
     }
 
-    fn publica(secret: &SignedSecretKey) -> SignedPublicKey {
+    pub(crate) fn publica(secret: &SignedSecretKey) -> SignedPublicKey {
         SignedPublicKey::from(secret.clone())
     }
 
-    fn firmar_union(
+    pub(crate) fn firmar_union(
         secret: &SignedSecretKey,
         subkey: &SignedPublicSubKey,
         typ: SignatureType,
@@ -787,7 +788,7 @@ mod tests {
 
     /// La pública de `secret` con la subclave `index` reatada: con vencimiento
     /// (`expiracion`, segundos desde su creación) y/o revocada.
-    fn con_subclave_reatada(
+    pub(crate) fn con_subclave_reatada(
         secret: &SignedSecretKey,
         index: usize,
         expiracion: Option<u32>,
