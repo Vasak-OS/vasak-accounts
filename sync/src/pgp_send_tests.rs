@@ -88,34 +88,81 @@ async fn compose(
     crate::compose_outgoing(keys, draft, ACCOUNT, MESSAGE_ID, DATE).await
 }
 
+type Keyring = (
+    crate::store::key::SecretServiceKeys,
+    zbus::Connection,
+    crate::store::key::tests::Shared,
+);
+
+/// Un llavero falso con la identidad PGP protegida de la cuenta de prueba.
+async fn keyring_with_identity() -> (Keyring, SignedSecretKey) {
+    let keyring = fake_keyring().await;
+    let key = protected_key("Ana <ana@vasak.test>", "frase-de-paso-de-prueba");
+    store_identity(&keyring.0, &key).await;
+    (keyring, key)
+}
+
+async fn store_identity(keys: &crate::store::key::SecretServiceKeys, key: &SignedSecretKey) {
+    keys.store_pgp_identity(ACCOUNT, &armored(key), PASSPHRASE)
+        .await
+        .unwrap();
+}
+
+/// Dos claves de la misma persona con la primaria muerta: revocada y expirada.
+pub(crate) fn dead_keys(uid: &str) -> [(&'static str, SignedSecretKey); 2] {
+    let vivo = clave_vieja(uid);
+    let revocada = con_primaria_muerta(&vivo, con_primaria_revocada(&vivo));
+    let expirada = con_primaria_muerta(
+        &vivo,
+        con_primaria_con_vencimiento_en_el_uid(&vivo, 24 * 3600),
+    );
+    [("revocada", revocada), ("expirada", expirada)]
+}
+
+fn parse_draft(json: &str) -> Draft {
+    serde_json::from_str(json).unwrap()
+}
+
+fn assert_detail(detail: &str, needle: &str) {
+    assert!(
+        detail.contains(needle),
+        "el detalle del error no es el esperado"
+    );
+}
+
+fn assert_part(part: &str, needle: &str) {
+    assert!(
+        part.contains(needle),
+        "la parte de la firma no es la esperada"
+    );
+}
+
 // ── Qué método pide el borrador ─────────────────────────────────────────
 
 #[test]
 fn un_borrador_viejo_con_firmar_y_sin_metodo_firma_con_smime() {
-    let viejo: Draft = serde_json::from_str(r#"{"para": [], "firmar": true}"#).unwrap();
+    let viejo = parse_draft(r#"{"para": [], "firmar": true}"#);
     assert_eq!(viejo.sign_method, None);
     assert_eq!(viejo.effective_sign_method(), SignMethod::Smime);
 }
 
 #[test]
 fn un_borrador_sin_firmar_ni_metodo_no_firma() {
-    let plano: Draft = serde_json::from_str(r#"{"para": []}"#).unwrap();
+    let plano = parse_draft(r#"{"para": []}"#);
     assert_eq!(plano.effective_sign_method(), SignMethod::None);
 }
 
 #[test]
 fn el_metodo_explicito_manda_sobre_el_firmar_viejo() {
-    let pgp: Draft = serde_json::from_str(r#"{"para": [], "metodo_firma": "pgp"}"#).unwrap();
+    let pgp = parse_draft(r#"{"para": [], "metodo_firma": "pgp"}"#);
     assert_eq!(pgp.effective_sign_method(), SignMethod::Pgp);
     // Con el viejo `firmar` en true, el campo nuevo gana.
-    let pgp: Draft =
-        serde_json::from_str(r#"{"para": [], "firmar": true, "metodo_firma": "pgp"}"#).unwrap();
+    let pgp = parse_draft(r#"{"para": [], "firmar": true, "metodo_firma": "pgp"}"#);
     assert_eq!(pgp.effective_sign_method(), SignMethod::Pgp);
     // «none» explícito es no firmar, aunque `firmar` diga que sí.
-    let none: Draft =
-        serde_json::from_str(r#"{"para": [], "firmar": true, "metodo_firma": "none"}"#).unwrap();
+    let none = parse_draft(r#"{"para": [], "firmar": true, "metodo_firma": "none"}"#);
     assert_eq!(none.effective_sign_method(), SignMethod::None);
-    let smime: Draft = serde_json::from_str(r#"{"para": [], "metodo_firma": "smime"}"#).unwrap();
+    let smime = parse_draft(r#"{"para": [], "metodo_firma": "smime"}"#);
     assert_eq!(smime.effective_sign_method(), SignMethod::Smime);
 }
 
@@ -136,14 +183,8 @@ async fn pedir_firma_pgp_sin_identidad_falla_con_un_error_claro() {
     let detail = permanent(compose(&keys, &pgp_draft()).await);
 
     // No se manda sin firmar: dice qué falta, y de qué cuenta.
-    assert!(
-        detail.contains("OpenPGP"),
-        "el detalle del error no es el esperado"
-    );
-    assert!(
-        detail.contains(ACCOUNT),
-        "el detalle del error no es el esperado"
-    );
+    assert_detail(&detail, "OpenPGP");
+    assert_detail(&detail, ACCOUNT);
 }
 
 #[tokio::test]
@@ -156,19 +197,12 @@ async fn la_identidad_de_otra_cuenta_no_sirve_para_firmar_desde_esta() {
 
     let detail = permanent(compose(&keys, &pgp_draft()).await);
 
-    assert!(
-        detail.contains(ACCOUNT),
-        "el detalle del error no es el esperado"
-    );
+    assert_detail(&detail, ACCOUNT);
 }
 
 #[tokio::test]
 async fn con_identidad_el_mensaje_sale_firmado_y_la_firma_verifica() {
-    let (keys, _server, _shared) = fake_keyring().await;
-    let key = protected_key("Ana <ana@vasak.test>", "frase-de-paso-de-prueba");
-    keys.store_pgp_identity(ACCOUNT, &armored(&key), PASSPHRASE)
-        .await
-        .unwrap();
+    let ((keys, _server, _shared), key) = keyring_with_identity().await;
 
     let draft = pgp_draft();
     let message = compose(&keys, &draft).await.unwrap();
@@ -208,29 +242,19 @@ async fn con_identidad_el_mensaje_sale_firmado_y_la_firma_verifica() {
     let content = compose::build_content_entity(&draft);
     assert_eq!(parts[1], format!("\r\n{content}\r\n"));
     let signature = parts[2];
-    assert!(
-        signature.contains("Content-Type: application/pgp-signature"),
-        "la parte de la firma no es la esperada"
-    );
-    assert!(
-        signature.contains("Content-Transfer-Encoding: 7bit"),
-        "la parte de la firma no es la esperada"
-    );
+    assert_part(signature, "Content-Type: application/pgp-signature");
+    assert_part(signature, "Content-Transfer-Encoding: 7bit");
     assert!(
         !signature.to_ascii_lowercase().contains("base64"),
         "la parte de la firma no es la esperada"
     );
-    assert!(signature.contains("-----BEGIN PGP SIGNATURE-----"));
-    assert!(signature.contains("-----END PGP SIGNATURE-----"));
+    assert_part(signature, "-----BEGIN PGP SIGNATURE-----");
+    assert_part(signature, "-----END PGP SIGNATURE-----");
 }
 
 #[tokio::test]
 async fn la_firma_pgp_no_verifica_contra_otra_clave_ni_con_el_contenido_cambiado() {
-    let (keys, _server, _shared) = fake_keyring().await;
-    let key = protected_key("Ana <ana@vasak.test>", "frase-de-paso-de-prueba");
-    keys.store_pgp_identity(ACCOUNT, &armored(&key), PASSPHRASE)
-        .await
-        .unwrap();
+    let ((keys, _server, _shared), key) = keyring_with_identity().await;
     let message = compose(&keys, &pgp_draft()).await.unwrap();
 
     let otra = clave_completa("Mallory <mallory@vasak.test>");
@@ -249,14 +273,7 @@ async fn la_firma_pgp_no_verifica_contra_otra_clave_ni_con_el_contenido_cambiado
 
 #[tokio::test]
 async fn con_la_primaria_muerta_el_envio_falla_y_no_sale_sin_firmar() {
-    let vivo = clave_vieja("Ana <ana@vasak.test>");
-    let revocada = con_primaria_muerta(&vivo, con_primaria_revocada(&vivo));
-    let expirada = con_primaria_muerta(
-        &vivo,
-        con_primaria_con_vencimiento_en_el_uid(&vivo, 24 * 3600),
-    );
-
-    for (what, key) in [("revocada", revocada), ("expirada", expirada)] {
+    for (what, key) in dead_keys("Ana <ana@vasak.test>") {
         let (keys, _server, _shared) = fake_keyring().await;
         keys.store_pgp_identity(ACCOUNT, &armored(&key), b"")
             .await
@@ -274,11 +291,7 @@ async fn con_la_primaria_muerta_el_envio_falla_y_no_sale_sin_firmar() {
 
 #[tokio::test]
 async fn con_el_llavero_bloqueado_el_envio_firmado_con_pgp_se_reintenta() {
-    let (keys, server, shared) = fake_keyring().await;
-    let key = protected_key("Ana <ana@vasak.test>", "frase-de-paso-de-prueba");
-    keys.store_pgp_identity(ACCOUNT, &armored(&key), PASSPHRASE)
-        .await
-        .unwrap();
+    let ((keys, server, shared), _key) = keyring_with_identity().await;
     lock_and_announce(&server, &shared).await.unwrap();
 
     let result = compose(&keys, &pgp_draft()).await;
@@ -300,10 +313,7 @@ async fn sin_pedir_firma_el_mensaje_sale_como_siempre_haya_o_no_identidad() {
     let (empty, _server, _shared) = fake_keyring().await;
     let (loaded, _server2, _shared2) = fake_keyring().await;
     let key = protected_key("Ana <ana@vasak.test>", "frase-de-paso-de-prueba");
-    loaded
-        .store_pgp_identity(ACCOUNT, &armored(&key), PASSPHRASE)
-        .await
-        .unwrap();
+    store_identity(&loaded, &key).await;
     import_pkcs12(&loaded, ADDRESS, RSA_P12, SMIME_PASSWORD)
         .await
         .unwrap();

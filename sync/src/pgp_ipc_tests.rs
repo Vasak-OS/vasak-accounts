@@ -7,7 +7,9 @@
 
 use crate::access::tests::Answer;
 use crate::pgp::tests::{clave_vieja, con_primaria_muerta, con_primaria_revocada};
-use crate::pgp_send_tests::{armored, fingerprint, protected_key, ACCOUNT, ADDRESS, PASSPHRASE};
+use crate::pgp_send_tests::{
+    armored, dead_keys, fingerprint, protected_key, ACCOUNT, ADDRESS, PASSPHRASE,
+};
 use crate::store::key::tests::lock_and_announce;
 use crate::test_bus::{error_of, Fixture};
 use pgp::types::KeyDetails as _;
@@ -135,6 +137,16 @@ fn key_for(uid: &str) -> Vec<u8> {
 /// Una cuenta de prueba y la clave armada que liga su dirección.
 async fn account_and_key() -> (Fixture, Vec<u8>) {
     (account().await, key_for(UID))
+}
+
+/// La cuenta de prueba con la identidad de `UID` ya importada, y su clave.
+async fn account_with_identity() -> (Fixture, pgp::composed::SignedSecretKey) {
+    let f = account().await;
+    let key = protected_key(UID, PASSPHRASE_STR);
+    import(&f, ACCOUNT, &armored(&key), PASSPHRASE)
+        .await
+        .unwrap();
+    (f, key)
 }
 
 /// La cuenta de prueba, sin identidad.
@@ -409,11 +421,7 @@ async fn la_contrasena_no_aparece_en_ningun_error_ni_en_las_trazas() {
 
 #[tokio::test]
 async fn consultar_con_identidad_da_present_huella_y_uids() {
-    let f = account().await;
-    let key = protected_key(UID, PASSPHRASE_STR);
-    import(&f, ACCOUNT, &armored(&key), PASSPHRASE)
-        .await
-        .unwrap();
+    let (f, key) = account_with_identity().await;
 
     let value = identity(&f, ACCOUNT).await;
 
@@ -436,11 +444,7 @@ async fn consultar_sin_identidad_da_present_false_y_vacios() {
 
 #[tokio::test]
 async fn consultar_nunca_devuelve_material_secreto() {
-    let f = account().await;
-    let key = protected_key(UID, PASSPHRASE_STR);
-    import(&f, ACCOUNT, &armored(&key), PASSPHRASE)
-        .await
-        .unwrap();
+    let (f, key) = account_with_identity().await;
 
     let reply = identity_reply(&f, ACCOUNT).await;
 
@@ -685,14 +689,7 @@ async fn la_identidad_smime_no_alcanza_para_pedir_pgp() {
 async fn pedir_firma_pgp_con_una_clave_que_no_puede_firmar_se_rechaza_al_encolar() {
     // Una identidad que existe pero cuya primaria está muerta (revocada o
     // expirada) no firmaría: se rechaza al encolar, no recién al enviar.
-    let vivo = clave_vieja(UID);
-    let expirada = con_primaria_muerta(
-        &vivo,
-        crate::pgp::tests::con_primaria_con_vencimiento_en_el_uid(&vivo, 24 * 3600),
-    );
-    let revocada = con_primaria_muerta(&vivo, con_primaria_revocada(&vivo));
-
-    for (what, key) in [("revocada", revocada), ("expirada", expirada)] {
+    for (what, key) in dead_keys(UID) {
         let f = account().await;
         f.keys()
             .store_pgp_identity(ACCOUNT, &armored(&key), b"")
