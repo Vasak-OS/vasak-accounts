@@ -1946,7 +1946,7 @@ Content-Transfer-Encoding: {cte}\r\n\r\n{cuerpo_firma}\r\n--S--\r\n"
     }
 
     /// Una clave completa cuya **primaria** se creó `hace_un_ano()`.
-    fn clave_vieja(uid: &str) -> SignedSecretKey {
+    pub(crate) fn clave_vieja(uid: &str) -> SignedSecretKey {
         let mut p = SecretKeyParamsBuilder::default();
         p.key_type(KeyType::Ed25519Legacy)
             .can_certify(true)
@@ -2003,7 +2003,7 @@ Content-Transfer-Encoding: {cte}\r\n\r\n{cuerpo_firma}\r\n--S--\r\n"
     }
 
     /// La pública con la primaria revocada.
-    fn con_primaria_revocada(secret: &SignedSecretKey) -> SignedPublicKey {
+    pub(crate) fn con_primaria_revocada(secret: &SignedSecretKey) -> SignedPublicKey {
         let mut public = publica(secret);
         let revocacion =
             auto_firma_con_expiracion(secret, SignatureType::KeyRevocation, None, &public);
@@ -2013,7 +2013,7 @@ Content-Transfer-Encoding: {cte}\r\n\r\n{cuerpo_firma}\r\n--S--\r\n"
 
     /// La pública con la auto-firma del UID reemplazada por una con vencimiento
     /// `expiracion` (segundos desde la creación de la primaria).
-    fn con_primaria_con_vencimiento_en_el_uid(
+    pub(crate) fn con_primaria_con_vencimiento_en_el_uid(
         secret: &SignedSecretKey,
         expiracion: u32,
     ) -> SignedPublicKey {
@@ -2085,7 +2085,10 @@ Content-Transfer-Encoding: {cte}\r\n\r\n{cuerpo_firma}\r\n--S--\r\n"
 
     /// La secreta con la metadata de la primaria tomada de `muerta` (la pública
     /// revocada o expirada): lo que `signing_component` mira vía `to_public_key()`.
-    fn con_primaria_muerta(secret: &SignedSecretKey, muerta: SignedPublicKey) -> SignedSecretKey {
+    pub(crate) fn con_primaria_muerta(
+        secret: &SignedSecretKey,
+        muerta: SignedPublicKey,
+    ) -> SignedSecretKey {
         let mut secret = secret.clone();
         secret.details = muerta.details;
         secret

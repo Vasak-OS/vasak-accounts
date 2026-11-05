@@ -478,3 +478,44 @@ fn un_sobre_pgp_abierto_no_lista_adjuntos_con_numeros_del_arbol_descifrado() {
         );
     }
 }
+
+// ── La identidad que se importa es la que lee el descifrado ─────────────
+
+/// **Regresión load-bearing.** `ImportPgpIdentity` guarda por `account_id` y
+/// `pgp_material` lee por `account_id`: si una de las dos puntas cambiara de
+/// clave (la dirección, por ejemplo), la identidad quedaría partida —firmar la
+/// vería y descifrar no, o al revés— sin ningún síntoma. Se importa por D-Bus, de
+/// verdad, y se lee con la función real del descifrado.
+#[tokio::test]
+async fn lo_que_importa_el_import_es_lo_que_lee_el_descifrado_por_el_mismo_account_id() {
+    use crate::pgp_ipc_tests::{import, sealed_fd};
+    use crate::pgp_send_tests::{armored, fingerprint, protected_key};
+    let _ = sealed_fd;
+
+    let f = crate::test_bus::Fixture::start(&[("cta", "ana@vasak.test")]).await;
+    let key = protected_key("Ana <ana@vasak.test>", "frase-de-paso-de-prueba");
+    import(&f, "cta", &armored(&key), b"frase-de-paso-de-prueba")
+        .await
+        .unwrap();
+
+    // `pgp_material` abre el bus de sesión: se lo apunta al bus privado de la
+    // prueba (el mismo donde vive el llavero falso). El `Fixture` serializa las
+    // pruebas que lo usan.
+    std::env::set_var(
+        "DBUS_SESSION_BUS_ADDRESS",
+        std::env::var("DBUS_SYSTEM_BUS_ADDRESS").unwrap(),
+    );
+    let material = pgp_material("cta")
+        .await
+        .expect("el descifrado no ve la identidad que se importó");
+
+    assert_eq!(
+        material.secret_key.primary_key.fingerprint().to_string(),
+        fingerprint(&key)
+    );
+    // La contraseña que leyó abre la clave: firma con ella.
+    crate::pgp::sign_detached(b"x", &material.secret_key, &material.passphrase)
+        .expect("la contraseña que lee el descifrado no abre la clave");
+    // Y bajo la dirección no hay identidad: no hay una segunda copia escondida.
+    assert!(pgp_material("ana@vasak.test").await.is_none());
+}
