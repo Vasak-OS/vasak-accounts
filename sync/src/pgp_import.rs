@@ -40,6 +40,7 @@
 
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use pgp::composed::{SignedPublicKey, SignedSecretKey};
+use pgp::packet::SignatureType;
 use pgp::ser::Serialize;
 use pgp::types::{KeyDetails, Tag};
 
@@ -80,16 +81,34 @@ pub fn parse_identity_secret_key(
     bytes: &[u8],
     account_address: &str,
 ) -> Result<SignedSecretKey, PgpError> {
-    let key = parse_secret_key(bytes)?;
+    let mut key = parse_secret_key(bytes)?;
     let wanted = normalize_address(account_address);
     if wanted.is_empty() {
         return Err(PgpError::BadKey(
             "la dirección de la cuenta está vacía".into(),
         ));
     }
+    // Descarta las revocaciones de primaria forjadas, igual que el camino de pares
+    // (`ingest_peer_key` → `strip_forged_revocations`), pero sobre la secreta: la
+    // revocación vive en el mismo `details.revocation_signatures`. `to_public_key`
+    // **clona** `details`, así que sanear la pública derivada no tocaría la secreta
+    // que devolvemos. `crate::pgp::primary_usable` trata cualquier `KeyRevocation`
+    // por **presencia**, de modo que una revocación que un `From` spoofeado adjuntó
+    // dejaría la identidad guardada sin poder firmar (`NoSigningKey`). Las
+    // auto-revocaciones válidas se conservan (y la clave quedará correctamente
+    // inutilizada). `public_key()` deriva la primaria pública para verificar.
+    let primary_public = key.primary_key.public_key();
+    key.details
+        .revocation_signatures
+        .retain(|sig| sig.verify_key(&primary_public).is_ok());
+
     // `to_public_key` deriva la metadata pública (UIDs y sus firmas) soltando el
-    // material secreto; alcanza para ligar el UID sin clonar la clave privada.
+    // material secreto; alcanza para validar sin clonar la clave privada. Se valida
+    // lo mismo que para un par: los bindings de subclave cierran
+    // (`verify_key_bindings`, el hallazgo de PR2) y un UID **no revocado** liga el
+    // `From`.
     let public = key.to_public_key();
+    verify_key_bindings(&public)?;
     if self_signed_emails(&public)
         .iter()
         .any(|email| email == &wanted)
@@ -306,9 +325,10 @@ fn strip_forged_revocations(
         .map_err(|e| PgpError::BadKey(format!("no se pudo re-serializar la clave saneada: {e}")))
 }
 
-/// Los correos de los UIDs **con auto-certificación válida** de una clave,
-/// normalizados. Sólo cuentan los UIDs cuya firma cierra contra la primaria: un
-/// UID sin firmar o firmado por otro no liga identidad. Se usa para ligar la
+/// Los correos de los UIDs **con auto-certificación válida y vigente** de una clave,
+/// normalizados. Sólo cuentan los UIDs cuya firma cierra contra la primaria y cuya
+/// auto-certificación aplicable **más reciente no es una revocación**: un UID sin
+/// firmar, firmado por otro, o **revocado** no liga identidad. Se usa para ligar la
 /// identidad propia al `From` en [`parse_identity_secret_key`].
 fn self_signed_emails(key: &SignedPublicKey) -> Vec<String> {
     let primary = &key.primary_key;
@@ -316,10 +336,20 @@ fn self_signed_emails(key: &SignedPublicKey) -> Vec<String> {
         .users
         .iter()
         .filter(|user| {
-            user.signatures.iter().any(|sig| {
-                sig.verify_certification(primary, Tag::UserId, &user.id)
-                    .is_ok()
-            })
+            // Gana la auto-certificación aplicable **más reciente** (por `created()`):
+            // rPGP conserva las `CertRevocation` del UID en `signatures` y
+            // `verify_certification` las acepta (la revocación de UID es una
+            // certificación tipo 0x30, RFC 9580), así que mirar «alguna firma verifica»
+            // aceptaría un UID revocado. El UID liga sólo si la más nueva de sus
+            // auto-certificaciones que verifican NO es una revocación.
+            user.signatures
+                .iter()
+                .filter(|sig| {
+                    sig.verify_certification(primary, Tag::UserId, &user.id)
+                        .is_ok()
+                })
+                .max_by_key(|sig| sig.created().map(|t| t.as_secs()).unwrap_or(0))
+                .is_some_and(|sig| sig.typ() != Some(SignatureType::CertRevocation))
         })
         .filter_map(|user| user.id.as_str())
         .map(|uid| {
