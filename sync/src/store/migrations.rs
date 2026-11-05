@@ -758,15 +758,33 @@ CREATE TABLE pgp_peers (
 /// exigen `encrypted_payload`/`verify`—: la próxima vuelta los vuelve a bajar y recomputa
 /// su estado PGP, y `write_body` rehace el índice FTS al reescribirlos.
 ///
+/// El índice `messages_fts` se mantiene **por código** (`write_body` hace DELETE+INSERT
+/// por `rowid = message_id`); el único trigger de borrado del FTS es `AFTER DELETE ON
+/// messages`, que este borrado de `message_bodies` **no** dispara. Así que primero se
+/// borran a mano las filas del FTS de esos mismos cuerpos (por `rowid`, con el mismo
+/// criterio, **antes** del `DELETE` de `message_bodies` para que la subconsulta todavía
+/// los vea): si no, el texto de la armadura vieja quedaría buscable apuntando a un
+/// mensaje sin cuerpo.
+///
 /// shortcut: sólo se invalidan los cuerpos que SON PGP inline, no los que apenas CITAN
 /// una armadura (una respuesta que cita, un post de lista); por eso se ancla al inicio
 /// (sin `%` inicial) tolerando espacios/tabs/saltos. Con la decisión #1 (almacén local
 /// completo) borrar un cuerpo citado sería churn y, peor, perdería el cuerpo cacheado de
-/// un mensaje offline o ya borrado del servidor.
+/// un mensaje offline o ya borrado del servidor. Además, de los invalidados sólo se
+/// reprocesan los que `messages_without_body` vuelve a bajar: los más viejos que
+/// `BODY_PREFETCH`, o los que ya no están en el servidor, quedan para un backfill
+/// posterior (follow-up, tradeoff de caché de la decisión #1).
 const V15: &str = "
 ALTER TABLE message_bodies ADD COLUMN pgp_status INTEGER;
 ALTER TABLE message_bodies ADD COLUMN pgp_signer TEXT;
 ALTER TABLE message_bodies ADD COLUMN pgp_encrypted INTEGER;
+
+DELETE FROM messages_fts
+WHERE rowid IN (
+    SELECT message_id FROM message_bodies
+    WHERE ltrim(text_body, char(32) || char(9) || char(10) || char(13)) LIKE '-----BEGIN PGP %'
+       OR ltrim(html_body, char(32) || char(9) || char(10) || char(13)) LIKE '-----BEGIN PGP %'
+);
 
 DELETE FROM message_bodies
 WHERE ltrim(text_body, char(32) || char(9) || char(10) || char(13)) LIKE '-----BEGIN PGP %'
