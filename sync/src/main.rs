@@ -1907,9 +1907,10 @@ impl Service {
     ) -> Result<(), SmimeIpcError> {
         // Leer y capar ambos fds antes de resolver la cuenta (igual que S/MIME):
         // el tope se mira antes que nada, y el leído del memfd va en
-        // `spawn_blocking`. La contraseña y su buffer se borran solos.
+        // `spawn_blocking`. La clave y la contraseña (y sus buffers) se borran
+        // solos: las dos son material sensible, así que van en `Zeroizing`.
         let (key_bytes, passphrase) = tokio::task::spawn_blocking(move || {
-            let key = read_sealed_fd(key, MAX_PGP_KEY_BYTES)?;
+            let key = Zeroizing::new(read_sealed_fd(key, MAX_PGP_KEY_BYTES)?);
             let passphrase = Zeroizing::new(read_sealed_fd(passphrase, MAX_SMIME_PASSWORD_BYTES)?);
             Ok::<_, SmimeIpcError>((key, passphrase))
         })
@@ -1948,16 +1949,18 @@ impl Service {
             // propia aparecería revocada → no podría firmar ni descifrar. Las
             // auto-revocaciones **válidas** sí sobreviven al saneo, así que una
             // clave genuinamente revocada se guarda revocada.
-            let sanitized = secret_key.to_bytes().map_err(|e| {
+            // La clave saneada re-serializada también es material sensible: en
+            // `Zeroizing` para que se borre al soltarla.
+            let sanitized = Zeroizing::new(secret_key.to_bytes().map_err(|e| {
                 SmimeIpcError::Failed(format!("no se pudo re-serializar la clave PGP: {e}"))
-            })?;
+            })?);
             Ok::<_, SmimeIpcError>((sanitized, passphrase))
         })
         .await
         .map_err(|_| SmimeIpcError::Failed("la validación de la clave PGP se cortó".into()))??;
 
         let keys = store::key::SecretServiceKeys::on_session_bus(connection.clone());
-        keys.store_pgp_identity(&account_id, &sanitized_key, passphrase.as_slice())
+        keys.store_pgp_identity(&account_id, sanitized_key.as_slice(), passphrase.as_slice())
             .await
             .map_err(smime_ipc_from_keyring)?;
         Ok(())
