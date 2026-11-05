@@ -2981,4 +2981,48 @@ Content-Type: application/octet-stream\r\nContent-Transfer-Encoding: {cte}\r\n\r
             Verification::Unverified(_)
         ));
     }
+
+    // ── Huella y vida de la primaria (ResolveRecipientKey) ─────────────
+
+    #[test]
+    fn la_huella_se_recomputa_de_la_primaria_en_hexadecimal() {
+        let secret = clave_completa("Ana <ana@vasak.test>");
+        let publica = publica(&secret);
+        let huella = fingerprint(&publica);
+        assert_eq!(huella, secret.primary_key.fingerprint().to_string());
+        // v4: SHA-1, 40 dígitos hexadecimales.
+        assert_eq!(huella.len(), 40, "{huella}");
+        assert!(huella.chars().all(|c| c.is_ascii_hexdigit()), "{huella}");
+        // Claves distintas, huellas distintas.
+        let otra = self::publica(&clave_completa("Beto <beto@vasak.test>"));
+        assert_ne!(huella, fingerprint(&otra));
+    }
+
+    #[test]
+    fn la_vida_de_la_primaria_distingue_viva_revocada_y_expirada() {
+        let vivo = clave_vieja("Ana <ana@vasak.test>");
+        assert_eq!(primary_liveness(&publica(&vivo)), (false, false));
+
+        assert_eq!(
+            primary_liveness(&con_primaria_revocada(&vivo)),
+            (true, false),
+            "revocada"
+        );
+        assert_eq!(
+            primary_liveness(&con_primaria_con_vencimiento_en_el_uid(&vivo, 24 * 3600)),
+            (false, true),
+            "expirada"
+        );
+    }
+
+    #[test]
+    fn una_primaria_revocada_y_con_vencimiento_se_informa_revocada_no_expirada() {
+        // Revocada manda: la ventana pinta una sola razón.
+        let vivo = clave_vieja("Ana <ana@vasak.test>");
+        let mut key = con_primaria_con_vencimiento_en_el_uid(&vivo, 24 * 3600);
+        key.details.revocation_signatures = con_primaria_revocada(&vivo)
+            .details
+            .revocation_signatures;
+        assert_eq!(primary_liveness(&key), (true, false));
+    }
 }

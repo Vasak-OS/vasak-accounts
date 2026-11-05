@@ -115,6 +115,8 @@ mod ipc_test_support;
 mod pgp_ipc_tests;
 #[cfg(test)]
 mod pgp_send_tests;
+#[cfg(test)]
+mod wkd_ipc_tests;
 #[allow(dead_code)]
 mod serialize;
 #[cfg(test)]

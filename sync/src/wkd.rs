@@ -277,3 +277,161 @@ fn ip_allowed(ip: IpAddr) -> bool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    // El vector del draft WKD: SHA-1 de `joe.doe` en z-base32. Literal a propósito: la
+    // prueba no sigue al código, lo vigila.
+    const Z_JOE_DOE: &str = "iy9q119eutrkn8s1mk4r39qejnbu3n5q";
+
+    fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    fn v6(s: &str) -> IpAddr {
+        IpAddr::V6(s.parse::<Ipv6Addr>().unwrap())
+    }
+
+    #[test]
+    fn el_hash_del_localpart_coincide_con_el_vector_del_draft() {
+        use sha1::{Digest, Sha1};
+        let digest = Sha1::digest(b"joe.doe");
+        assert_eq!(zbase32(&digest), Z_JOE_DOE);
+    }
+
+    #[test]
+    fn z_base32_usa_el_alfabeto_propio_y_alinea_los_bits_sobrantes() {
+        // Cero bytes → todo `y` (el símbolo 0 del alfabeto, no `a` como en base32).
+        assert_eq!(zbase32(&[0u8; 20]), "y".repeat(32));
+        // 0xff × 20 → todo el último símbolo (`9`).
+        assert_eq!(zbase32(&[0xffu8; 20]), "9".repeat(32));
+        // Un byte: 8 bits → 2 símbolos, el segundo con 3 bits alineados a la izquierda.
+        assert_eq!(zbase32(&[0x01]), "yr");
+    }
+
+    #[test]
+    fn la_url_advanced_lleva_el_hash_en_minusculas_y_el_localpart_original_en_l() {
+        let url = build_url("Joe.Doe", "example.org", Method::Advanced).unwrap();
+        assert_eq!(
+            url.as_str(),
+            format!(
+                "https://openpgpkey.example.org/.well-known/openpgpkey/example.org/hu/{Z_JOE_DOE}?l=Joe.Doe"
+            )
+        );
+    }
+
+    #[test]
+    fn la_url_direct_no_usa_el_subdominio_openpgpkey() {
+        let url = build_url("Joe.Doe", "example.org", Method::Direct).unwrap();
+        assert_eq!(
+            url.as_str(),
+            format!("https://example.org/.well-known/openpgpkey/hu/{Z_JOE_DOE}?l=Joe.Doe")
+        );
+    }
+
+    #[test]
+    fn el_localpart_con_caracteres_raros_va_codificado_en_el_query() {
+        let url = build_url("a b&c", "example.org", Method::Direct).unwrap();
+        // Ni un `&` ni un espacio crudos: no se puede inyectar otro parámetro.
+        let query = url.query().unwrap();
+        assert!(!query.contains(' '));
+        assert_eq!(query.matches('&').count(), 0, "{query}");
+        assert_eq!(url.query_pairs().count(), 1);
+        assert_eq!(url.query_pairs().next().unwrap().1, "a b&c");
+    }
+
+    #[test]
+    fn la_direccion_se_parte_en_el_ultimo_arroba_y_el_dominio_va_en_minusculas() {
+        let (local, domain) = split_address("Joe.Doe@Example.ORG").unwrap();
+        assert_eq!(local, "Joe.Doe");
+        assert_eq!(domain, "example.org");
+    }
+
+    #[test]
+    fn una_direccion_mal_formada_es_bad_address() {
+        for malo in ["", "sin-arroba", "@example.org", "joe@"] {
+            assert!(
+                matches!(split_address(malo), Err(WkdError::BadAddress)),
+                "{malo:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn las_ips_internas_se_vetan() {
+        let internas = [
+            v4(127, 0, 0, 1),
+            v4(127, 255, 255, 254),
+            v4(10, 0, 0, 1),
+            v4(172, 16, 0, 1),
+            v4(172, 31, 255, 255),
+            v4(192, 168, 1, 1),
+            v4(169, 254, 169, 254),
+            v4(0, 0, 0, 0),
+            v4(224, 0, 0, 1),
+            v4(255, 255, 255, 255),
+            v6("::1"),
+            v6("::"),
+            v6("fe80::1"),
+            v6("febf::1"),
+            v6("fc00::1"),
+            v6("fd12:3456::1"),
+            v6("ff02::1"),
+            // IPv4 mapeada en IPv6: se desmapea y se revalida.
+            v6("::ffff:127.0.0.1"),
+            v6("::ffff:10.1.2.3"),
+            v6("::ffff:192.168.0.1"),
+        ];
+        for ip in internas {
+            assert!(!ip_allowed(ip), "{ip} debería vetarse");
+        }
+    }
+
+    #[test]
+    fn las_ips_publicas_pasan() {
+        let publicas = [
+            v4(93, 184, 216, 34),
+            v4(8, 8, 8, 8),
+            // Fronteras de las privadas: 172.15 y 172.32 no son RFC1918.
+            v4(172, 15, 0, 1),
+            v4(172, 32, 0, 1),
+            v6("2606:2800:220:1:248:1893:25c8:1946"),
+            v6("::ffff:8.8.8.8"),
+            // `fec0::/10` (site-local, obsoleta) queda fuera de `fe80::/10`.
+            v6("fec0::1"),
+        ];
+        for ip in publicas {
+            assert!(ip_allowed(ip), "{ip} debería pasar");
+        }
+    }
+
+    // El camino de red real: el host se resuelve y se veta ANTES de conectar. `localhost`
+    // resuelve a loopback sin tocar la red; si el veto faltara, el connect a :443 daría
+    // `Network` (rechazado) o, peor, conectaría a un servicio interno.
+    #[tokio::test]
+    async fn un_dominio_que_resuelve_a_loopback_se_veta_sin_conectar() {
+        let r = fetch_key("joe@localhost").await;
+        assert!(matches!(r, Err(WkdError::Blocked)), "{r:?}", r = r.err());
+    }
+
+    #[tokio::test]
+    async fn una_ip_privada_literal_como_dominio_se_veta() {
+        for dominio in ["127.0.0.1", "10.0.0.1", "192.168.1.1", "169.254.169.254"] {
+            let r = fetch_key(&format!("joe@{dominio}")).await;
+            assert!(
+                matches!(r, Err(WkdError::Blocked)),
+                "{dominio}: {r:?}",
+                r = r.err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn una_direccion_mal_formada_no_llega_a_la_red() {
+        let r = fetch_key("sin-arroba").await;
+        assert!(matches!(r, Err(WkdError::BadAddress)));
+    }
+}
