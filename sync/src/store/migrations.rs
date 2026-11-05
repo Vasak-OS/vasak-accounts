@@ -1646,13 +1646,13 @@ mod tests {
         assert_eq!(schema_version(&connection).unwrap(), 15);
     }
 
-    /// **v14 → v15 invalida los cuerpos cacheados con armadura PGP**: bajo la V14 un mail
+    /// **v14 → v15 invalida los cuerpos PGP inline cacheados** (marcador al inicio, con o sin blancos antes): bajo la V14 un mail
     /// PGP inline se guardó con la armadura como texto y `pgp_*` quedaría `NULL` para
     /// siempre (`messages_without_body` sólo mira los mensajes **sin** fila de cuerpo).
     /// La V15 borra esas filas para que se vuelvan a bajar y reprocesar; el resto de la
     /// caché no se toca.
     #[test]
-    fn de_v14_a_v15_se_invalidan_los_cuerpos_con_armadura_pgp_y_solo_esos() {
+    fn de_v14_a_v15_se_invalidan_solo_los_cuerpos_pgp_inline_y_no_los_que_citan_una_armadura() {
         let mut connection = at_version(14);
         connection
             .execute(
@@ -1662,7 +1662,8 @@ mod tests {
             )
             .unwrap();
         // (uid, text_body, html_body)
-        let cuerpos: [(i64, Option<&str>, Option<&str>); 5] = [
+        let cuerpos: [(i64, Option<&str>, Option<&str>); 8] = [
+            // PGP inline real: el marcador es lo primero (se invalidan).
             (
                 1,
                 Some("-----BEGIN PGP MESSAGE-----\n\nhQEMA...\n-----END PGP MESSAGE-----"),
@@ -1670,16 +1671,32 @@ mod tests {
             ),
             (
                 2,
-                Some(""),
-                Some("<pre>-----BEGIN PGP MESSAGE-----\nhQEMA...</pre>"),
+                Some(" \t\r\n  -----BEGIN PGP MESSAGE-----\n\nhQEMA..."),
+                None,
             ),
             (
                 3,
+                Some(""),
+                Some("\n  -----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\nhola"),
+            ),
+            (
+                4,
                 Some("-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\nhola"),
                 None,
             ),
-            (4, Some("un correo común"), Some("<p>sin armadura</p>")),
-            (5, Some("hablamos de PGP sin armadura"), None),
+            // Sólo CITAN una armadura (respuesta, post de lista, HTML con <pre>): sobreviven.
+            (
+                5,
+                Some("respondo:\n> -----BEGIN PGP MESSAGE-----\n> hQEMA..."),
+                None,
+            ),
+            (
+                6,
+                Some(""),
+                Some("<pre>-----BEGIN PGP MESSAGE-----\nhQEMA...</pre>"),
+            ),
+            (7, Some("un correo común"), Some("<p>sin armadura</p>")),
+            (8, Some("hablamos de PGP sin armadura"), None),
         ];
         let mut ids = Vec::new();
         for (uid, text, html) in cuerpos {
@@ -1705,7 +1722,7 @@ mod tests {
         apply(&mut connection).unwrap();
         assert_eq!(schema_version(&connection).unwrap(), 15);
 
-        // Quedan con cuerpo sólo los dos sin armadura...
+        // Quedan con cuerpo los que no son PGP inline (incluidos los que sólo citan)...
         let con_cuerpo: Vec<i64> = connection
             .prepare("SELECT message_id FROM message_bodies ORDER BY message_id")
             .unwrap()
@@ -1713,8 +1730,8 @@ mod tests {
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        assert_eq!(con_cuerpo, vec![ids[3], ids[4]]);
-        // ...y los otros tres quedan «sin cuerpo»: lo que `messages_without_body` vuelve a bajar.
+        assert_eq!(con_cuerpo, vec![ids[4], ids[5], ids[6], ids[7]]);
+        // ...y los PGP inline quedan «sin cuerpo»: lo que `messages_without_body` vuelve a bajar.
         let sin_cuerpo: Vec<i64> = connection
             .prepare(
                 "SELECT m.id FROM messages m
@@ -1726,14 +1743,14 @@ mod tests {
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        assert_eq!(sin_cuerpo, vec![ids[0], ids[1], ids[2]]);
+        assert_eq!(sin_cuerpo, vec![ids[0], ids[1], ids[2], ids[3]]);
 
         // Y migrar otra vez no borra nada más.
         apply(&mut connection).unwrap();
         let restantes: i64 = connection
             .query_row("SELECT COUNT(*) FROM message_bodies", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(restantes, 2);
+        assert_eq!(restantes, 4);
     }
 
     /// **v10 → v11 no pierde nada**: el cuerpo, la firma y el firmante de una base de
