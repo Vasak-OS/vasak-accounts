@@ -2883,4 +2883,52 @@ Content-Type: application/octet-stream\r\nContent-Transfer-Encoding: {cte}\r\n\r
         // Control: el mismo bloque como único contenido sí es un sobre.
         assert!(is_pgp_encrypted(&correo_texto(&bloque)));
     }
+
+    #[test]
+    fn is_pgp_signed_no_toma_por_firmado_lo_que_verify_no_ve_como_bloque_propio() {
+        let alice = clave_completa("Alice <alice@vasak.test>");
+        let bloque = cleartext_de("pago 100 pesos", &*alice.secret_subkeys[0]);
+        let candidatas = [publica(&alice)];
+
+        // El marcador está en el raw pero no en la región que `verify` escanea: sin
+        // bloque propio completo, los dos coinciden en «no firmado».
+        let sin_fin = bloque
+            .split("-----BEGIN PGP SIGNATURE-----")
+            .next()
+            .unwrap();
+        for (que, raw) in [
+            // Sin línea en blanco de por medio, el texto y el marcador quedan como
+            // «cabeceras» y el cuerpo no trae el bloque.
+            (
+                "texto pegado antes del marcador",
+                format!("Mirá esto:\r\n{bloque}").into_bytes(),
+            ),
+            (
+                "bloque sin fin, citado",
+                correo_texto(&format!("mirá este mensaje:\r\n{sin_fin}")),
+            ),
+            (
+                "marcador suelto en el texto",
+                correo_texto("la armadura empieza con -----BEGIN PGP SIGNED MESSAGE-----"),
+            ),
+        ] {
+            assert!(!is_pgp_signed(&raw), "{que}");
+            assert_eq!(verify(&raw, &candidatas), Verification::NotSigned, "{que}");
+        }
+
+        // Controles positivos: el cuerpo ES el bloque (con cabeceras o pelado) y PGP/MIME.
+        assert!(is_pgp_signed(&correo_texto(&bloque)));
+        assert!(is_pgp_signed(bloque.as_bytes()));
+        let firma = sign_detached(CONTENIDO.as_bytes(), &alice, &vacia()).unwrap();
+        assert!(is_pgp_signed(&correo_firmado(CONTENIDO, &firma)));
+
+        // Un bloque completo con texto alrededor sí «parece firmado» para ambos: `verify`
+        // lo rechaza como no verificable (no como no firmado), y es el mismo criterio.
+        let con_texto = correo_texto(&format!("Escribiste:\r\n{bloque}\r\nOk.\r\n"));
+        assert!(is_pgp_signed(&con_texto));
+        assert!(matches!(
+            verify(&con_texto, &candidatas),
+            Verification::Unverified(_)
+        ));
+    }
 }
