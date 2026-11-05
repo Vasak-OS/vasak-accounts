@@ -663,6 +663,16 @@ fn primary_can_sign(key: &SignedSecretKey) -> bool {
     key.primary_key.algorithm().can_sign()
 }
 
+/// Si la clave tiene **ahora** una componente capaz de firmar: primaria no muerta
+/// (ni revocada ni expirada) y una subclave de firma usable, o la primaria si su
+/// algoritmo firma. Reusa el mismo selector que usa [`sign_detached`]
+/// ([`signing_component`]), para que la validación al encolar coincida exactamente
+/// con lo que firmará el despachador: una clave muerta o sólo-de-cifrado se rechaza
+/// al encolar en vez de fallar permanente recién al enviar.
+pub fn can_sign_now(key: &SignedSecretKey) -> bool {
+    signing_component(key, Timestamp::now().as_secs()).is_some()
+}
+
 /// El resumen **público** de una identidad OpenPGP para mostrar su estado SIN
 /// material secreto: la huella de la primaria y los correos de sus UIDs con
 /// auto-firma válida y vigente. Reusa el mismo criterio que liga la identidad al

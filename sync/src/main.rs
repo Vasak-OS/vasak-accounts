@@ -1654,18 +1654,27 @@ impl Service {
                 }
             }
             compose::SignMethod::Pgp => {
+                // No alcanza con que la identidad **esté**: tiene que poder firmar
+                // **ahora**. Una clave muerta (primaria revocada/expirada) o
+                // sólo-de-cifrado (sin componente de firma) existe pero haría
+                // fallar la firma permanente recién en el despachador, dejando el
+                // mensaje trabado. Se carga y se comprueba con el mismo selector que
+                // usará el envío (`pgp::can_sign_now`), y se rechaza al encolar.
                 let keys =
                     store::key::SecretServiceKeys::on_session_bus(emitter.connection().clone());
-                let has_identity = keys
+                let can_sign = keys
                     .find_pgp_secret_key(&account_id)
                     .await
                     .map_err(|e| {
                         zbus::fdo::Error::Failed(format!("no se pudo leer el llavero: {e}"))
                     })?
-                    .is_some();
-                if !has_identity {
+                    .as_deref()
+                    .and_then(|bytes| crate::pgp::parse_secret_key(bytes).ok())
+                    .is_some_and(|key| crate::pgp::can_sign_now(&key));
+                if !can_sign {
                     return Err(zbus::fdo::Error::InvalidArgs(format!(
-                        "no hay identidad OpenPGP para «{account_id}»: importala antes de firmar"
+                        "no hay una identidad OpenPGP que pueda firmar para «{account_id}»: \
+                         importá una clave con componente de firma vigente antes de firmar"
                     )));
                 }
             }
@@ -1915,7 +1924,8 @@ impl Service {
         // Parsear (liga un UID al `From`) y confirmar que la contraseña abre la
         // clave con una firma de prueba: parseo y cripto son CPU, fuera del worker
         // de Tokio. La contraseña se borra al terminar el hilo.
-        let (key_bytes, passphrase) = tokio::task::spawn_blocking(move || {
+        let (sanitized_key, passphrase) = tokio::task::spawn_blocking(move || {
+            use ::pgp::ser::Serialize as _;
             let secret_key = pgp_import::parse_identity_secret_key(&key_bytes, &address)
                 .map_err(pgp_ipc_from_parse)?;
             let probe = ::pgp::types::Password::from(passphrase.as_slice());
@@ -1928,13 +1938,24 @@ impl Service {
                 Err(crate::pgp::PgpError::Crypto(_)) => return Err(SmimeIpcError::WrongPassword),
                 Err(other) => return Err(pgp_ipc_from_parse(other)),
             }
-            Ok::<_, SmimeIpcError>((key_bytes, passphrase))
+            // Se guardan los bytes **saneados**, no el blob original: al parsear,
+            // `parse_identity_secret_key` descarta las revocaciones de primaria
+            // forjadas (un `From` spoofeado que adjunta una revocación firmada por
+            // otro). Si se guardara el original, al releer la identidad
+            // (`email_sync::pgp_material`) esas revocaciones volverían y la clave
+            // propia aparecería revocada → no podría firmar ni descifrar. Las
+            // auto-revocaciones **válidas** sí sobreviven al saneo, así que una
+            // clave genuinamente revocada se guarda revocada.
+            let sanitized = secret_key.to_bytes().map_err(|e| {
+                SmimeIpcError::Failed(format!("no se pudo re-serializar la clave PGP: {e}"))
+            })?;
+            Ok::<_, SmimeIpcError>((sanitized, passphrase))
         })
         .await
         .map_err(|_| SmimeIpcError::Failed("la validación de la clave PGP se cortó".into()))??;
 
         let keys = store::key::SecretServiceKeys::on_session_bus(connection.clone());
-        keys.store_pgp_identity(&account_id, &key_bytes, passphrase.as_slice())
+        keys.store_pgp_identity(&account_id, &sanitized_key, passphrase.as_slice())
             .await
             .map_err(smime_ipc_from_keyring)?;
         Ok(())
@@ -1957,12 +1978,19 @@ impl Service {
 
         // La clave guardada → su metadata pública (huella + UIDs), sin exponer el
         // material secreto. Si no parsea, se trata como ausente: el resumen es
-        // estado, no un lugar para filtrar errores de material.
-        let summary = secret.as_deref().and_then(|bytes| {
-            crate::pgp::parse_secret_key(bytes)
-                .ok()
-                .map(|key| crate::pgp::identity_summary(&key.to_public_key()))
-        });
+        // estado, no un lugar para filtrar errores de material. El parseo es CPU:
+        // va en `spawn_blocking`, como el import y el camino de firma, para no
+        // bloquear el runtime.
+        let summary = match secret {
+            Some(bytes) => tokio::task::spawn_blocking(move || {
+                crate::pgp::parse_secret_key(&bytes)
+                    .ok()
+                    .map(|key| crate::pgp::identity_summary(&key.to_public_key()))
+            })
+            .await
+            .map_err(|_| SmimeIpcError::Failed("el parseo de la clave PGP se cortó".into()))?,
+            None => None,
+        };
         let value = match summary {
             Some((fingerprint, uids)) => serde_json::json!({
                 "present": true,
