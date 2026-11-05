@@ -463,8 +463,23 @@ pub fn opened_rows_decrypting(
     //    su eContent. (El `multipart/signed` ya trae el contenido como parte normal.)
     let unwrapped = crate::smime_sign::opaque_signed_content(inner);
     let display: &[u8] = unwrapped.as_deref().unwrap_or(inner);
-    let text = crate::message::plain_text(display);
-    let html = crate::message::html_part(display).map(|h| crate::html::sanitize(&h).html);
+    // Un sobre cifrado que no se pudo abrir (`*_encrypted == Some(2)`, sin contenido
+    // descifrado) no deja cuerpo: en S/MIME y PGP/MIME el sobre no es una parte de
+    // texto y el cuerpo ya sale vacío, pero en PGP **inline** la armadura
+    // `-----BEGIN PGP MESSAGE-----…` es el propio `text/plain`. Se vacía en todos los
+    // casos para cumplir el contrato de la V15 (cuerpo vacío, nunca roto). Un mensaje
+    // sólo firmado (cifrado `None`) es cleartext legible y no se toca.
+    let unopened = decrypted.is_none() && (smime_encrypted == Some(2) || pgp_encrypted == Some(2));
+    let text = if unopened {
+        String::new()
+    } else {
+        crate::message::plain_text(display)
+    };
+    let html = if unopened {
+        None
+    } else {
+        crate::message::html_part(display).map(|h| crate::html::sanitize(&h).html)
+    };
 
     // 3) Firma S/MIME: sólo se marca «firmado» (estado 0 + firmante) cuando la firma
     //    criptográfica, el digest y el binding al From cerraron —falta sólo la

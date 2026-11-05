@@ -386,9 +386,10 @@ const MAX_AUTOCRYPT_KEYDATA: usize = 128 * 1024;
 const MAX_MIME_DEPTH: usize = 8;
 
 /// Las claves públicas que trae un mensaje entrante para ingerir al peerstate: la de
-/// la cabecera `Autocrypt:` (atribuida a su `addr`) y las de los adjuntos
-/// `application/pgp-keys` (atribuidas al `From`). Devuelve `(dirección, bytes)` para
-/// pasar tal cual a [`ingest_peer_key`]; la normalización de la dirección y la
+/// la cabecera `Autocrypt:` (atribuida a su `addr`, **sólo si coincide con el `From`**
+/// —Autocrypt L1 ignora la cabecera cuyo `addr` no es el del remitente—) y las de los
+/// adjuntos `application/pgp-keys` (atribuidas al `From`). Devuelve `(dirección, bytes)`
+/// para pasar tal cual a [`ingest_peer_key`]; la normalización de la dirección y la
 /// validación del material las hace esa función (un solo lugar).
 ///
 /// Parseo puro, sin red y sin pánico sobre entrada hostil. Respeta los topes de
@@ -400,13 +401,23 @@ pub fn incoming_public_keys(raw: &[u8]) -> Vec<(String, Vec<u8>)> {
     let (headers, body) = split_headers(&view);
     let mut found = Vec::new();
 
+    // El `From` del mensaje (sólo la dirección): liga tanto los adjuntos como la
+    // cabecera Autocrypt. El mismo parser que `smime_sign::message_from`.
+    let from = parse_sender(headers.get("from").unwrap_or_default()).1;
+    let from_normalized = normalize_address(&from);
+
     // Cabecera Autocrypt: el valor acotado antes de decodificar, y la clave binaria
     // acotada después. `split_headers` da un solo valor por nombre; tomar sólo ése es
-    // conservador (Autocrypt L1 ignora el mensaje con cabeceras repetidas).
+    // conservador (Autocrypt L1 ignora el mensaje con cabeceras repetidas). Autocrypt
+    // L1 además manda **ignorar** la cabecera si su `addr` no es el del remitente: sin
+    // esto, un `From` spoofeado sembraría en el peerstate TOFU la clave del atacante
+    // bajo la dirección de la víctima. Se compara normalizado.
     if let Some(value) = headers.get("autocrypt") {
         if value.len() <= MAX_AUTOCRYPT_KEYDATA {
             if let Some(header) = parse_autocrypt_header(value) {
-                if header.key.len() <= MAX_AUTOCRYPT_KEYDATA {
+                if header.key.len() <= MAX_AUTOCRYPT_KEYDATA
+                    && normalize_address(&header.addr) == from_normalized
+                {
                     found.push((header.addr, header.key));
                 }
             }
@@ -416,7 +427,6 @@ pub fn incoming_public_keys(raw: &[u8]) -> Vec<(String, Vec<u8>)> {
     // Adjuntos `application/pgp-keys`, atribuidos al `From` del mensaje. Sin `From`
     // no hay dirección bajo la cual ingerirlos: se omiten (`ingest_peer_key` también
     // rechazaría la dirección vacía).
-    let from = parse_sender(headers.get("from").unwrap_or_default()).1;
     if !from.is_empty() {
         collect_key_attachments(&headers, body, 0, &from, &mut found);
     }
