@@ -99,9 +99,23 @@ enum Method {
 /// - `Err(_)` ante un fallo de red o un destino vetado (SSRF).
 pub async fn fetch_key(address: &str) -> Result<Option<WkdKey>, WkdError> {
     let (localpart, domain) = split_address(address)?;
+    try_methods(|method| fetch_and_validate(&localpart, &domain, method)).await
+}
+
+/// El respaldo advanced→direct: prueba cada método en orden y devuelve la primera
+/// clave usable; un `Ok(None)` pasa al siguiente método, y un `Err` se recuerda pero
+/// no corta (un método puede fallar la red y el otro traer la clave). Si ningún método
+/// trae clave, devuelve el último error, o `Ok(None)` si todos dieron «sin clave».
+/// `attempt` queda inyectable para probar el respaldo sin red (en producción es
+/// [`fetch_and_validate`], que pasa por el veto SSRF y el GET).
+async fn try_methods<F, Fut>(mut attempt: F) -> Result<Option<WkdKey>, WkdError>
+where
+    F: FnMut(Method) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<WkdKey>, WkdError>>,
+{
     let mut last_err: Option<WkdError> = None;
     for method in [Method::Advanced, Method::Direct] {
-        match fetch_and_validate(&localpart, &domain, method).await {
+        match attempt(method).await {
             Ok(Some(key)) => return Ok(Some(key)),
             Ok(None) => {}
             Err(e) => last_err = Some(e),
