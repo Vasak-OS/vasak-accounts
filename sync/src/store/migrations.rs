@@ -1771,6 +1771,74 @@ mod tests {
         assert_eq!(restantes, 4);
     }
 
+    /// **La V15 también borra el índice FTS** de los cuerpos que invalida: `messages_fts`
+    /// es contentless y `write_body` lo rehace por código, así que borrar sólo la fila de
+    /// `message_bodies` dejaría un término de la armadura vieja encontrando un mensaje sin
+    /// cuerpo. Un cuerpo que sólo cita PGP conserva su fila de FTS.
+    #[test]
+    fn de_v14_a_v15_se_borra_el_indice_fts_de_los_cuerpos_invalidados_y_no_el_de_los_que_citan() {
+        let mut connection = at_version(14);
+        connection
+            .execute(
+                "INSERT INTO mailboxes (name, display_name, role, updated_at)
+                 VALUES ('INBOX', 'Bandeja', 'inbox', 'ayer')",
+                [],
+            )
+            .unwrap();
+        let mut sembrar = |uid: i64, texto: &str| -> i64 {
+            connection
+                .execute(
+                    "INSERT INTO messages (mailbox_id, uid, from_addr, to_addrs, cc_addrs, bcc_addrs,
+                                           subject, date_ts, sort_key, size, updated_at)
+                     VALUES (1, ?1, 'ana@x.com', 'yo@x.com', '', '', 'Hola', 100, 100, 10, 'ayer')",
+                    [uid],
+                )
+                .unwrap();
+            let id = connection.last_insert_rowid();
+            connection
+                .execute(
+                    "INSERT INTO message_bodies (message_id, text_body, truncated, updated_at)
+                     VALUES (?1, ?2, 0, 'ayer')",
+                    rusqlite::params![id, texto],
+                )
+                .unwrap();
+            // Lo que haría `write_body`: indexar el texto bajo el id del mensaje.
+            connection
+                .execute(
+                    "INSERT INTO messages_fts (rowid, subject, from_addr, to_addrs, cc_addrs, text_body)
+                     SELECT ?1, subject, from_addr, to_addrs, cc_addrs, ?2 FROM messages WHERE id = ?1",
+                    rusqlite::params![id, texto],
+                )
+                .unwrap();
+            id
+        };
+        let inline = sembrar(
+            1,
+            "-----BEGIN PGP MESSAGE-----\n\nARMADURAVIEJA\n-----END PGP MESSAGE-----",
+        );
+        let citado = sembrar(2, "respondo:\n> -----BEGIN PGP MESSAGE-----\n> CITADOVIEJO");
+
+        let buscar = |c: &Connection, termino: &str| -> Vec<i64> {
+            c.prepare("SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?1")
+                .unwrap()
+                .query_map([termino], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        // Premisa: antes de migrar los dos términos se encuentran.
+        assert_eq!(buscar(&connection, "ARMADURAVIEJA"), vec![inline]);
+        assert_eq!(buscar(&connection, "CITADOVIEJO"), vec![citado]);
+
+        apply(&mut connection).unwrap();
+
+        assert!(
+            buscar(&connection, "ARMADURAVIEJA").is_empty(),
+            "el término de la armadura invalidada no puede seguir encontrando un mensaje sin cuerpo"
+        );
+        assert_eq!(buscar(&connection, "CITADOVIEJO"), vec![citado]);
+    }
+
     /// **v10 → v11 no pierde nada**: el cuerpo, la firma y el firmante de una base de
     /// la v10 siguen, `smime_encrypted` arranca en `NULL` (no cifrado), la base queda
     /// igual que creada de cero, y migrar otra vez no cambia nada.
