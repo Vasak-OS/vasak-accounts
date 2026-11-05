@@ -15,8 +15,12 @@ use crate::pgp::tests::{
     generar, publica, subclave_de_firma,
 };
 use crate::pgp_send_tests::{ACCOUNT, ADDRESS};
+use crate::store::key::fake::FakeKeys;
+use crate::store::lifecycle::{AccountListing, ListedAccount, Locations, StoreManager, EMAIL_AREA};
+use crate::store::paths::tests::TempDir;
 use crate::test_bus::{error_of, Fixture};
-use crate::{pgp_key_state, resolve_key_json, PgpKeyState};
+use crate::wkd::{WkdError, WkdKey};
+use crate::{pgp_key_state, resolve_key_json, resolve_key_with, PgpKeyState};
 use pgp::ser::Serialize;
 
 const DESTINATARIO: &str = "beto@vasak.test";
@@ -205,4 +209,197 @@ fn la_clave_guardada_por_wkd_se_relee_del_peerstate_con_la_misma_huella() {
     assert_eq!(v["source"], "peerstate");
     assert_eq!(v["present"], true);
     assert_eq!(v["fingerprint"], crate::pgp::fingerprint(&key));
+}
+
+// ── La cadena peerstate → WKD con un almacén real y un WKD falso ────────
+
+const CUENTA: &str = "cuenta";
+
+/// Un administrador de almacenes de verdad (llavero falso, disco temporal) con la base
+/// de `CUENTA` abierta.
+async fn manager(label: &str) -> (TempDir, StoreManager<FakeKeys>) {
+    let temp = TempDir::new(label);
+    let manager = StoreManager::new(
+        FakeKeys::default(),
+        Ok(Locations {
+            stores: temp.0.join("stores"),
+            settings: temp.0.join("stores.json"),
+        }),
+    );
+    let account = ListedAccount {
+        id: CUENTA.into(),
+        display_name: "Cuenta".into(),
+        capabilities: vec!["email".into()],
+        needs_reauth: false,
+    };
+    manager
+        .accounts_listed(
+            AccountListing::Listed(vec![account]),
+            std::time::Instant::now(),
+        )
+        .await;
+    assert!(manager.prepare_for_sync(EMAIL_AREA, CUENTA).await);
+    (temp, manager)
+}
+
+fn wkd_key(key: &pgp::composed::SignedPublicKey) -> WkdKey {
+    WkdKey {
+        bytes: bytes_of(key),
+        fingerprint: crate::pgp::fingerprint(key),
+    }
+}
+
+/// Un cliente WKD falso que cuenta cuántas veces lo llamaron.
+fn fake_wkd(
+    result: Result<Option<WkdKey>, WkdError>,
+    calls: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> impl FnOnce(String) -> std::future::Ready<Result<Option<WkdKey>, WkdError>> {
+    let calls = calls.clone();
+    move |_| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::future::ready(result)
+    }
+}
+
+fn calls() -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0))
+}
+
+fn n(c: &std::sync::Arc<std::sync::atomic::AtomicUsize>) -> usize {
+    c.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[tokio::test]
+async fn un_acierto_de_peerstate_no_consulta_wkd() {
+    let (_t, m) = manager("wkd-chain-hit").await;
+    let key = publica(&clave_completa("Beto <beto@vasak.test>"));
+    let bytes = bytes_of(&key);
+    m.with_store(CUENTA, move |s| {
+        crate::pgp_import::ingest_peer_key(s, DESTINATARIO, &bytes, 1_000).unwrap();
+        Ok::<(), crate::store::StoreError>(())
+    })
+    .await
+    .unwrap();
+
+    let c = calls();
+    let (source, state) = resolve_key_with(&m, CUENTA, DESTINATARIO, fake_wkd(Ok(None), &c))
+        .await
+        .unwrap();
+    assert_eq!(source, "peerstate");
+    assert!(state.present);
+    assert_eq!(state.fingerprint, Some(crate::pgp::fingerprint(&key)));
+    assert_eq!(n(&c), 0, "no se va a la red si el peerstate ya la tiene");
+}
+
+#[tokio::test]
+async fn una_clave_guardada_hoy_expirada_se_informa_expirada_desde_el_peerstate() {
+    let (_t, m) = manager("wkd-chain-expired").await;
+    let vivo = clave_vieja("Beto <beto@vasak.test>");
+    let bytes = bytes_of(&con_primaria_con_vencimiento_en_el_uid(&vivo, 24 * 3600));
+    m.with_store(CUENTA, move |s| {
+        crate::pgp_import::ingest_peer_key(s, DESTINATARIO, &bytes, 1_000).unwrap();
+        Ok::<(), crate::store::StoreError>(())
+    })
+    .await
+    .unwrap();
+
+    let c = calls();
+    let (source, state) = resolve_key_with(&m, CUENTA, DESTINATARIO, fake_wkd(Ok(None), &c))
+        .await
+        .unwrap();
+    assert_eq!(source, "peerstate");
+    assert!(!state.present && state.expired && !state.revoked);
+    assert_eq!(n(&c), 0);
+}
+
+#[tokio::test]
+async fn un_acierto_de_wkd_se_guarda_y_la_segunda_llamada_lo_ve_como_peerstate() {
+    let (_t, m) = manager("wkd-chain-upsert").await;
+    let key = publica(&clave_completa("Beto <beto@vasak.test>"));
+    let huella = crate::pgp::fingerprint(&key);
+
+    let c = calls();
+    let (source, state) = resolve_key_with(
+        &m,
+        CUENTA,
+        DESTINATARIO,
+        fake_wkd(Ok(Some(wkd_key(&key))), &c),
+    )
+    .await
+    .unwrap();
+    assert_eq!(source, "wkd");
+    assert!(state.present && !state.expired && !state.revoked);
+    assert_eq!(state.fingerprint.as_deref(), Some(huella.as_str()));
+    assert_eq!(n(&c), 1);
+
+    // Quedó upserteada en el peerstate, con la misma huella...
+    let peer = m
+        .with_store(CUENTA, |s| s.find_peer(DESTINATARIO))
+        .await
+        .unwrap()
+        .expect("la clave de WKD quedó guardada");
+    assert_eq!(peer.fingerprint, huella);
+
+    // ...y la segunda llamada ya no sale a la red.
+    let c2 = calls();
+    let (source, state) = resolve_key_with(&m, CUENTA, DESTINATARIO, fake_wkd(Ok(None), &c2))
+        .await
+        .unwrap();
+    assert_eq!(source, "peerstate");
+    assert_eq!(state.fingerprint.as_deref(), Some(huella.as_str()));
+    assert_eq!(n(&c2), 0);
+}
+
+#[tokio::test]
+async fn sin_clave_en_wkd_la_fuente_es_none_y_no_se_guarda_nada() {
+    let (_t, m) = manager("wkd-chain-none").await;
+    let c = calls();
+    let (source, state) = resolve_key_with(&m, CUENTA, DESTINATARIO, fake_wkd(Ok(None), &c))
+        .await
+        .unwrap();
+    assert_eq!(source, "none");
+    assert!(!state.present && state.fingerprint.is_none());
+    assert_eq!(n(&c), 1);
+    let peer = m
+        .with_store(CUENTA, |s| s.find_peer(DESTINATARIO))
+        .await
+        .unwrap();
+    assert!(peer.is_none());
+}
+
+#[tokio::test]
+async fn un_fallo_de_wkd_es_none_sin_filtrar_el_motivo() {
+    for error in [
+        WkdError::Blocked,
+        WkdError::Network("detalle-secreto-de-red".into()),
+        WkdError::TooLarge,
+        WkdError::BadAddress,
+    ] {
+        let (_t, m) = manager("wkd-chain-error").await;
+        let c = calls();
+        let (source, state) = resolve_key_with(&m, CUENTA, DESTINATARIO, fake_wkd(Err(error), &c))
+            .await
+            .unwrap();
+        // Lo único que ve la ventana es el JSON: sin motivo, sin huella.
+        let v: serde_json::Value =
+            serde_json::from_str(&resolve_key_json(source, state).unwrap()).unwrap();
+        assert_eq!(v["source"], "none");
+        assert_eq!(v["present"], false);
+        assert!(v["fingerprint"].is_null());
+        assert!(!v.to_string().contains("secreto"));
+        assert!(m
+            .with_store(CUENTA, |s| s.find_peer(DESTINATARIO))
+            .await
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[tokio::test]
+async fn una_cuenta_sin_almacen_da_failed_y_no_consulta_wkd() {
+    let (_t, m) = manager("wkd-chain-sin-almacen").await;
+    let c = calls();
+    let r = resolve_key_with(&m, "no-existe", DESTINATARIO, fake_wkd(Ok(None), &c)).await;
+    assert!(matches!(r, Err(crate::SmimeIpcError::Failed(_))));
+    assert_eq!(n(&c), 0);
 }

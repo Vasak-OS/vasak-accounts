@@ -459,4 +459,230 @@ mod tests {
         let r = fetch_key("sin-arroba").await;
         assert!(matches!(r, Err(WkdError::BadAddress)));
     }
+
+    // ── validate_key_bytes: el borde de entrada no confiable ────────────
+
+    use crate::pgp::tests::{
+        clave_completa, clave_vieja, con_primaria_con_vencimiento_en_el_uid, con_primaria_revocada,
+        generar, publica, subclave_de_firma,
+    };
+    use pgp::composed::SignedPublicKey;
+    use pgp::ser::Serialize;
+
+    fn bytes_of(key: &SignedPublicKey) -> Vec<u8> {
+        key.to_bytes().unwrap()
+    }
+
+    #[test]
+    fn una_clave_valida_con_subclave_de_cifrado_se_acepta_con_la_huella_recomputada() {
+        let key = publica(&clave_completa("Beto <beto@vasak.test>"));
+        let bytes = bytes_of(&key);
+        let found = validate_key_bytes(&bytes).unwrap().expect("es usable");
+        assert_eq!(found.bytes, bytes);
+        assert_eq!(found.fingerprint, crate::pgp::fingerprint(&key));
+    }
+
+    #[test]
+    fn una_subclave_de_cifrado_con_binding_forjado_se_trata_como_sin_clave() {
+        // La primaria real de la víctima con la subclave de cifrado del atacante: su
+        // binding no verifica contra la primaria de la víctima. El caso adversario.
+        let victima = publica(&clave_completa("Victima <victima@vasak.test>"));
+        let atacante = publica(&clave_completa("Atacante <atacante@vasak.test>"));
+        let mut forjada = victima.clone();
+        forjada.public_subkeys[1] = atacante.public_subkeys[1].clone();
+        // Premisa: el selector sí la elegiría; sólo el binding la frena.
+        assert!(crate::pgp::encryption_subkey(&forjada).is_some());
+
+        assert!(validate_key_bytes(&bytes_of(&forjada)).unwrap().is_none());
+    }
+
+    #[test]
+    fn una_clave_revocada_o_expirada_se_trata_como_sin_clave() {
+        let vivo = clave_vieja("Beto <beto@vasak.test>");
+        let revocada = con_primaria_revocada(&vivo);
+        let expirada = con_primaria_con_vencimiento_en_el_uid(&vivo, 24 * 3600);
+        for (que, key) in [("revocada", revocada), ("expirada", expirada)] {
+            assert!(
+                validate_key_bytes(&bytes_of(&key)).unwrap().is_none(),
+                "{que}"
+            );
+        }
+    }
+
+    #[test]
+    fn una_clave_solo_de_firma_se_trata_como_sin_clave() {
+        let key = publica(&generar(
+            "Beto <beto@vasak.test>",
+            vec![subclave_de_firma()],
+        ));
+        assert!(validate_key_bytes(&bytes_of(&key)).unwrap().is_none());
+    }
+
+    #[test]
+    fn bytes_que_no_son_una_clave_se_tratan_como_sin_clave() {
+        assert!(validate_key_bytes(b"<html>404</html>").unwrap().is_none());
+        assert!(validate_key_bytes(b"").unwrap().is_none());
+    }
+
+    // ── get_capped contra un servidor HTTP de loopback ──────────────────
+
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Qué contesta el servidor de prueba a cada pedido.
+    #[derive(Clone)]
+    enum Reply {
+        /// Estado y cuerpo, con `Content-Length` honesto.
+        Plain(u16, Vec<u8>),
+        /// 200 con el cuerpo por trozos y SIN `Content-Length`: el servidor no promete
+        /// tamaño alguno, así que sólo el tope de `read_capped` puede frenarlo.
+        Chunked(Vec<u8>),
+        /// Un redirect a otro lado (que no se debe seguir).
+        Redirect,
+        /// Acepta y no contesta nunca.
+        Silent,
+    }
+
+    /// Levanta el servidor en loopback y devuelve su dirección y cuántos pedidos vio.
+    async fn serve(reply: Reply) -> (SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let reply = reply.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let response: Vec<u8> = match reply {
+                        Reply::Silent => {
+                            // Retiene el socket abierto sin contestar.
+                            tokio::time::sleep(Duration::from_secs(3600)).await;
+                            return;
+                        }
+                        Reply::Plain(status, body) => {
+                            let mut r = format!(
+                                "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            )
+                            .into_bytes();
+                            r.extend_from_slice(&body);
+                            r
+                        }
+                        Reply::Redirect => b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+                        Reply::Chunked(body) => {
+                            let mut r = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
+                            for chunk in body.chunks(64 * 1024) {
+                                r.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+                                r.extend_from_slice(chunk);
+                                r.extend_from_slice(b"\r\n");
+                            }
+                            r.extend_from_slice(b"0\r\n\r\n");
+                            r
+                        }
+                    };
+                    let _ = socket.write_all(&response).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (addr, seen)
+    }
+
+    /// `get_capped` contra ese servidor: URL `http://` (el veto SSRF no interviene: eso
+    /// es `resolve_and_screen`) y la IP de loopback como pin.
+    async fn get(addr: SocketAddr) -> Result<Option<Vec<u8>>, WkdError> {
+        let url = Url::parse(&format!(
+            "http://wkd.vasak.test:{}/.well-known/openpgpkey/hu/x?l=joe",
+            addr.port()
+        ))
+        .unwrap();
+        get_capped(url, &[addr]).await
+    }
+
+    #[tokio::test]
+    async fn un_200_devuelve_los_bytes() {
+        let (addr, _) = serve(Reply::Plain(200, b"clave".to_vec())).await;
+        assert_eq!(get(addr).await.unwrap().unwrap(), b"clave");
+    }
+
+    #[tokio::test]
+    async fn un_404_o_un_500_es_sin_clave_no_un_error() {
+        for status in [404, 500] {
+            let (addr, _) = serve(Reply::Plain(status, b"no".to_vec())).await;
+            assert!(get(addr).await.unwrap().is_none(), "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn una_redireccion_no_se_sigue_y_es_sin_clave() {
+        let (addr, seen) = serve(Reply::Redirect).await;
+        assert!(get(addr).await.unwrap().is_none());
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn un_cuerpo_de_exactamente_el_tope_se_acepta() {
+        let (addr, _) = serve(Reply::Plain(200, vec![7u8; MAX_WKD_KEY_BYTES])).await;
+        assert_eq!(get(addr).await.unwrap().unwrap().len(), MAX_WKD_KEY_BYTES);
+    }
+
+    #[tokio::test]
+    async fn un_cuerpo_que_pasa_el_tope_es_too_large_aunque_no_prometa_tamano() {
+        let (addr, _) = serve(Reply::Chunked(vec![7u8; MAX_WKD_KEY_BYTES + 1])).await;
+        let r = get(addr).await;
+        assert!(matches!(r, Err(WkdError::TooLarge)), "{:?}", r.err());
+    }
+
+    #[tokio::test]
+    async fn un_content_length_gigante_es_too_large() {
+        let (addr, _) = serve(Reply::Plain(200, vec![7u8; MAX_WKD_KEY_BYTES * 2])).await;
+        let r = get(addr).await;
+        assert!(matches!(r, Err(WkdError::TooLarge)), "{:?}", r.err());
+    }
+
+    // Reloj de tokio pausado: el plazo de 60 s corre sin esperar de verdad.
+    #[tokio::test(start_paused = true)]
+    async fn un_servidor_que_no_contesta_da_network_por_el_plazo() {
+        let (addr, _) = serve(Reply::Silent).await;
+        let r = get(addr).await;
+        assert!(matches!(r, Err(WkdError::Network(_))), "{:?}", r.err());
+    }
+
+    #[tokio::test]
+    async fn un_servidor_que_no_existe_da_network_y_el_error_no_lleva_la_url() {
+        // Puerto cerrado: se bindea y se suelta.
+        let addr = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let Err(WkdError::Network(detalle)) = get(addr).await else {
+            panic!("tenía que ser Network");
+        };
+        assert!(!detalle.contains("wkd.vasak.test"), "{detalle}");
+        assert!(!detalle.contains("joe"), "{detalle}");
+    }
+
+    #[tokio::test]
+    async fn el_veto_corre_antes_que_el_get_y_no_conecta() {
+        // Un servidor en loopback jamás recibe el pedido si pasa por el veto.
+        let (addr, seen) = serve(Reply::Plain(200, b"clave".to_vec())).await;
+        let r = resolve_and_screen("127.0.0.1", addr.port()).await;
+        assert!(matches!(r, Err(WkdError::Blocked)));
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
 }
