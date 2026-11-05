@@ -169,10 +169,11 @@ fn build_url(localpart: &str, domain: &str, method: Method) -> Result<Url, WkdEr
     Ok(url)
 }
 
-/// Descarga y valida la clave en un método. La red va capada en plazo y tamaño; la
-/// clave se valida como un adjunto hostil. `Ok(None)` = sin clave usable acá (se
-/// prueba el otro método o se devuelve «sin clave»); `Err` = fallo de red o destino
-/// vetado.
+/// Descarga y valida la clave en un método, en tres pasos separados para poder
+/// probarlos sueltos: vetar el destino ([`resolve_and_screen`]), descargar
+/// ([`get_capped`]) y validar ([`validate_key_bytes`]). `Ok(None)` = sin clave usable
+/// acá (se prueba el otro método o se devuelve «sin clave»); `Err` = fallo de red o
+/// destino vetado.
 async fn fetch_and_validate(
     localpart: &str,
     domain: &str,
@@ -186,33 +187,51 @@ async fn fetch_and_validate(
     let host = url.host_str().ok_or(WkdError::BadAddress)?.to_string();
     let port = url.port_or_known_default().unwrap_or(443);
 
-    // Resolver el host nosotros y vetar los destinos internos ANTES de conectar: una
-    // URL WKD a un dominio que resuelve a la red interna es el vector SSRF propio de
-    // WKD. Se falla cerrado si cualquiera de las IPs es interna (registro mixto de
-    // rebinding).
+    let pinned = resolve_and_screen(&host, port).await?;
+    if pinned.is_empty() {
+        return Ok(None);
+    }
+    match get_capped(url, &pinned).await? {
+        Some(bytes) => validate_key_bytes(&bytes),
+        None => Ok(None),
+    }
+}
+
+/// Resuelve el host y **veta los destinos internos ANTES de conectar**: una URL WKD a
+/// un dominio que resuelve a la red interna es el vector SSRF propio de WKD. Falla
+/// cerrado si **cualquiera** de las IPs es interna (registro mixto de rebinding).
+/// Devuelve las IPs validadas (todas externas), que el GET fija como pin. Separada del
+/// GET para que el camino HTTP se pueda ejercer contra un servidor de prueba en
+/// loopback sin tocar el veto.
+async fn resolve_and_screen(host: &str, port: u16) -> Result<Vec<SocketAddr>, WkdError> {
     let resolved: Vec<SocketAddr> = tokio::time::timeout(
         graph::CONNECT_TIMEOUT,
-        tokio::net::lookup_host((host.as_str(), port)),
+        tokio::net::lookup_host((host, port)),
     )
     .await
     .map_err(|_| WkdError::Network("la resolución del host expiró".into()))?
     .map_err(|_| WkdError::Network("no se pudo resolver el host".into()))?
     .collect();
-    if resolved.is_empty() {
-        return Ok(None);
-    }
     for addr in &resolved {
         if !ip_allowed(addr.ip()) {
             return Err(WkdError::Blocked);
         }
     }
+    Ok(resolved)
+}
 
-    // Fijar las IPs ya validadas: el connect va a ellas y no vuelve a resolver, lo que
-    // cierra el DNS-rebinding/TOCTOU. El certificado y el SNI siguen contra `host`.
+/// Hace el GET endurecido a `url` **fijando las IPs ya validadas** (`pinned`): el
+/// connect va a ellas y no vuelve a resolver, lo que cierra el DNS-rebinding/TOCTOU; el
+/// certificado y el SNI siguen contra el host de la URL. No sigue redirecciones, acota
+/// el plazo y capa el cuerpo ([`MAX_WKD_KEY_BYTES`], contra una clave bomba). Devuelve
+/// los bytes, o `None` si no hay clave acá (cualquier no-2xx, incluido un 3xx que no
+/// seguimos). Separada del veto para ejercer el camino HTTP contra un fake en loopback.
+async fn get_capped(url: Url, pinned: &[SocketAddr]) -> Result<Option<Vec<u8>>, WkdError> {
+    let host = url.host_str().ok_or(WkdError::BadAddress)?;
     let client = reqwest::Client::builder()
         .connect_timeout(graph::CONNECT_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
-        .resolve_to_addrs(&host, &resolved)
+        .resolve_to_addrs(host, pinned)
         .build()
         .map_err(|e| WkdError::Network(e.without_url().to_string()))?;
 
@@ -220,21 +239,25 @@ async fn fetch_and_validate(
         .await
         .map_err(|_| WkdError::Network("la descarga expiró".into()))?
         .map_err(|e| WkdError::Network(e.without_url().to_string()))?;
-    // Un 404 (o cualquier no-2xx, incluido un 3xx que no seguimos) es «sin clave acá».
     if !response.status().is_success() {
         return Ok(None);
     }
-    let bytes = graph::read_capped(response, MAX_WKD_KEY_BYTES)
+    graph::read_capped(response, MAX_WKD_KEY_BYTES)
         .await
+        .map(Some)
         .map_err(|e| match e {
             graph::CappedReadError::TooLarge => WkdError::TooLarge,
             graph::CappedReadError::Network(n) => WkdError::Network(n),
-        })?;
+        })
+}
 
-    // La clave es dato de red hostil: mismo trato que un adjunto. Si no parsea, el
-    // binding no verifica, o no tiene subclave de cifrado usable → se trata como sin
-    // clave (no como error de red): se prueba el otro método.
-    let Ok(key) = crate::pgp::parse_public_key(&bytes) else {
+/// Valida unos bytes de clave **como un adjunto hostil** (es dato de red no confiable):
+/// parsea, verifica el binding ([`crate::pgp_import::verify_key_bindings`]), recomputa la
+/// huella y exige subclave de cifrado usable. Si algo de eso falla, se trata como **sin
+/// clave** (`Ok(None)`), no como error. Función pura sobre bytes, sin red: es el borde de
+/// entrada no confiable, y por eso es `pub(crate)` —se prueba suelta—.
+pub(crate) fn validate_key_bytes(bytes: &[u8]) -> Result<Option<WkdKey>, WkdError> {
+    let Ok(key) = crate::pgp::parse_public_key(bytes) else {
         return Ok(None);
     };
     if crate::pgp_import::verify_key_bindings(&key).is_err() {
@@ -243,8 +266,10 @@ async fn fetch_and_validate(
     if crate::pgp::encryption_subkey(&key).is_none() {
         return Ok(None);
     }
-    let fingerprint = crate::pgp::fingerprint(&key);
-    Ok(Some(WkdKey { bytes, fingerprint }))
+    Ok(Some(WkdKey {
+        bytes: bytes.to_vec(),
+        fingerprint: crate::pgp::fingerprint(&key),
+    }))
 }
 
 /// Si una IP resuelta es un destino **externo** válido para WKD. Rechaza loopback,
