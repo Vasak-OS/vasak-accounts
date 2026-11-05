@@ -699,4 +699,72 @@ mod tests {
         assert!(matches!(r, Err(WkdError::Blocked)));
         assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
+
+    // ── try_methods: el respaldo advanced → direct, sin red ─────────────
+
+    type Attempt = Result<Option<WkdKey>, WkdError>;
+
+    fn key() -> WkdKey {
+        WkdKey {
+            bytes: vec![1, 2, 3],
+            fingerprint: "AB".repeat(20),
+        }
+    }
+
+    /// Corre `try_methods` con un intento falso que contesta lo del guion, en orden, y
+    /// devuelve el resultado y los métodos que se probaron (`true` = advanced).
+    async fn run(script: Vec<Attempt>) -> (Attempt, Vec<bool>) {
+        let mut script = script.into_iter();
+        let mut tried = Vec::new();
+        let result = try_methods(|method| {
+            tried.push(matches!(method, Method::Advanced));
+            let next = script.next().expect("se probó más veces que las previstas");
+            std::future::ready(next)
+        })
+        .await;
+        (result, tried)
+    }
+
+    #[tokio::test]
+    async fn si_advanced_trae_clave_no_se_prueba_direct() {
+        let (r, tried) = run(vec![Ok(Some(key()))]).await;
+        assert_eq!(r.unwrap().unwrap().bytes, vec![1, 2, 3]);
+        assert_eq!(tried, [true], "sólo advanced");
+    }
+
+    #[tokio::test]
+    async fn si_advanced_no_tiene_clave_se_prueba_direct_y_se_usa_su_clave() {
+        let (r, tried) = run(vec![Ok(None), Ok(Some(key()))]).await;
+        assert!(r.unwrap().is_some());
+        assert_eq!(tried, [true, false], "advanced y después direct");
+    }
+
+    #[tokio::test]
+    async fn si_ninguno_tiene_clave_es_sin_clave() {
+        let (r, tried) = run(vec![Ok(None), Ok(None)]).await;
+        assert!(r.unwrap().is_none());
+        assert_eq!(tried.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn el_error_de_un_metodo_no_tapa_la_clave_del_otro() {
+        for error in [WkdError::Blocked, WkdError::Network("x".into())] {
+            let (r, tried) = run(vec![Err(error), Ok(Some(key()))]).await;
+            assert!(r.unwrap().is_some());
+            assert_eq!(tried.len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn un_error_seguido_de_sin_clave_sigue_siendo_error() {
+        let (r, _) = run(vec![Err(WkdError::Blocked), Ok(None)]).await;
+        assert!(matches!(r, Err(WkdError::Blocked)));
+    }
+
+    #[tokio::test]
+    async fn si_los_dos_fallan_se_devuelve_el_ultimo_error() {
+        let (r, tried) = run(vec![Err(WkdError::Blocked), Err(WkdError::TooLarge)]).await;
+        assert!(matches!(r, Err(WkdError::TooLarge)), "{:?}", r.err());
+        assert_eq!(tried.len(), 2);
+    }
 }
