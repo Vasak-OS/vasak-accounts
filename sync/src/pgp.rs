@@ -231,12 +231,29 @@ pub fn is_pgp_encrypted(raw: &[u8]) -> bool {
     encrypted_payload(raw).is_some()
 }
 
+/// La región donde buscar una armadura firmada inline, compartida por [`verify`] e
+/// [`is_pgp_signed`] para que detecten **lo mismo**: la armadura **pelada** (todo el
+/// contenido, cuando empieza por el marcador —el interior de un sign-then-encrypt sin
+/// cabeceras MIME, que `split_headers` mal-parsea) o, si no, el **cuerpo propio**
+/// (post-cabeceras). Escanear el raw entero marcaría como firmado un mail que sólo CITA
+/// un bloque (en el cuerpo o en una cabecera).
+fn inline_signed_region<'a>(view: &'a str, body: &'a str) -> &'a str {
+    let trimmed = view.trim_start();
+    if trimmed.starts_with(BEGIN_PGP_SIGNED) {
+        trimmed
+    } else {
+        body
+    }
+}
+
 /// Si un mensaje trae una firma PGP (PGP/MIME `multipart/signed` con el protocolo
 /// de PGP, o un cleartext firmado inline), **sin** verificarla. Barato: decide si
-/// vale la pena resolver el peerstate del firmante en el camino de sync.
+/// vale la pena resolver el peerstate del firmante en el camino de sync. Usa la misma
+/// región que [`verify`] ([`inline_signed_region`]), así no señala «firmado» un bloque
+/// que `verify` después trataría como no firmado.
 pub fn is_pgp_signed(raw: &[u8]) -> bool {
     let view = as_latin1(raw);
-    let (headers, _body) = split_headers(&view);
+    let (headers, body) = split_headers(&view);
     let content_type = headers
         .get("content-type")
         .map(parse_content_type)
@@ -246,7 +263,12 @@ pub fn is_pgp_signed(raw: &[u8]) -> bool {
     {
         return true;
     }
-    view.contains(BEGIN_PGP_SIGNED)
+    extract_armor_block(
+        inline_signed_region(&view, body),
+        BEGIN_PGP_SIGNED,
+        END_PGP_SIGNATURE,
+    )
+    .is_some()
 }
 
 /// Descifra un mensaje PGP entrante con **nuestra** clave privada y su
@@ -450,16 +472,8 @@ pub fn verify(raw: &[u8], candidate_keys: &[SignedPublicKey]) -> Verification {
     }
 
     // Inline: un cleartext firmado (`-----BEGIN PGP SIGNED MESSAGE-----`). Se escanea el
-    // **cuerpo propio**, no el raw —así un mail que sólo CITA un bloque no se marca
-    // firmado—. Salvo que el contenido sea una armadura **pelada** (el interior de un
-    // sign-then-encrypt, sin cabeceras MIME): ahí `split_headers` se come el marcador y
-    // el `Hash:`, así que el cuerpo a escanear es el contenido entero.
-    let trimmed = view.trim_start();
-    let scan: &str = if trimmed.starts_with(BEGIN_PGP_SIGNED) {
-        trimmed
-    } else {
-        body
-    };
+    // cuerpo propio (o la armadura pelada), no el raw: ver [`inline_signed_region`].
+    let scan = inline_signed_region(&view, body);
     if let Some(block) = extract_armor_block(scan, BEGIN_PGP_SIGNED, END_PGP_SIGNATURE) {
         // La firma inline sólo cubre su bloque, pero la vista muestra todo el cuerpo:
         // si hay texto fuera del bloque (antes o después), un atacante lo anteponría a
