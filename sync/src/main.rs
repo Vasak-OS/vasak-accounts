@@ -109,12 +109,12 @@ mod graph_write;
 // El lado de la escritura conservadora de iCalendar y vCard. La superficie
 // D-Bus que arma los parches y encola es el PR siguiente de este hito
 // (`vasak-accounts#23`); por ahora lo ejercitan sus pruebas y la cola.
-#[allow(dead_code)]
-mod serialize;
 #[cfg(test)]
 mod pgp_ipc_tests;
 #[cfg(test)]
 mod pgp_send_tests;
+#[allow(dead_code)]
+mod serialize;
 #[cfg(test)]
 mod smime_ipc_tests;
 #[cfg(test)]
