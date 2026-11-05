@@ -69,6 +69,21 @@ const MAX_REFERENCES: usize = 20;
 /// «Para» puede hacer que el proveedor cierre la cuenta por spam.
 const MAX_RECIPIENTS: usize = 100;
 
+/// Con qué método se firma el mensaje al enviarlo. El motor de S/MIME
+/// ([`crate::smime_sign`]) y el de PGP/MIME ([`crate::pgp_sign`]) están acá; la
+/// ventana elige el método. Por omisión no se firma.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignMethod {
+    /// No firmar.
+    #[default]
+    None,
+    /// Firmar con S/MIME (PKCS#7, `multipart/signed`).
+    Smime,
+    /// Firmar con PGP/MIME (RFC 3156, `multipart/signed`).
+    Pgp,
+}
+
 /// Lo que la persona escribió.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Draft {
@@ -112,6 +127,20 @@ pub struct Draft {
     /// idéntica y el campo sólo aparece cuando de verdad se pidió firmar.
     #[serde(default, skip_serializing_if = "is_false", rename = "firmar")]
     pub sign: bool,
+    /// El método de firma, cuando la ventana lo manda explícito. Reemplaza al
+    /// viejo `sign: bool` (que sólo distinguía S/MIME de no firmar). Es `Option`
+    /// a propósito: hay que distinguir **ausente** (deriva de `sign`, ver
+    /// [`Draft::effective_sign_method`]) de **presente y `none`** (no firmar
+    /// aunque `sign` sea `true`). Cuando está ausente **no se serializa**, así la
+    /// cola ya escrita —y el proxy actual de vasak-mail, que sólo manda `sign`—
+    /// se vuelven a escribir idénticos y el campo sólo aparece cuando de verdad
+    /// se eligió un método.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "metodo_firma"
+    )]
+    pub sign_method: Option<SignMethod>,
     /// Si al enviar hay que recordar un seguimiento: el instante (epoch
     /// segundos) en que avisar si para entonces nadie respondió. Lo pone la
     /// ventana con el toggle de seguimiento (PR5); por omisión no hay
@@ -156,6 +185,18 @@ impl Draft {
     /// es el error que hace que una copia nunca llegue.
     pub fn recipients(&self) -> Vec<String> {
         self.to.iter().chain(self.cc.iter()).cloned().collect()
+    }
+
+    /// El método de firma efectivo: el explícito si la ventana lo mandó, y si no
+    /// el que implica el viejo `sign` (`true`→S/MIME, `false`→ninguno). Un solo
+    /// lugar decide, así la validación al encolar y el armado al enviar no
+    /// divergen.
+    pub fn effective_sign_method(&self) -> SignMethod {
+        match self.sign_method {
+            Some(method) => method,
+            None if self.sign => SignMethod::Smime,
+            None => SignMethod::None,
+        }
     }
 }
 

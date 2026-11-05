@@ -7,13 +7,13 @@
 //! cambia—, así que esto reusa el cliente de Secret Service de [`super::key`]
 //! (sesión `plain`, `CreateItem replace=true`, `SearchItems`/`GetSecret`).
 //!
-//! **Pendiente (Vasak-OS/vasak-keyring#64):** la aislación —que sólo este servicio
-//! lo toque y a cualquier otro proceso el llavero le conteste `SearchItems` vacío—
-//! la aplica `vasak-keyring` por su lista `PROTECTED_SCHEMAS`, y `PgpKey` **todavía
-//! no está** en esa lista (sí lo está `SmimeKey`). Es **precondición dura del PR5**
-//! (import de la identidad): ninguna clave privada OpenPGP real debe guardarse acá
-//! antes de que esa puerta exista. Hoy este módulo está inerte (`dead_code`) hasta
-//! que PR5 lo enganche.
+//! **Precondición (Vasak-OS/vasak-keyring#64):** la aislación —que sólo este
+//! servicio lo toque y a cualquier otro proceso el llavero le conteste
+//! `SearchItems` vacío— la aplica `vasak-keyring` por su lista `PROTECTED_SCHEMAS`.
+//! `PgpKey` ya está en esa lista (igual que `SmimeKey`), así que el import del PR5
+//! guarda la clave privada tras esa puerta. **Exige un `vasak-keyring` publicado
+//! que incluya #64**: sin él, la clave privada OpenPGP quedaría legible por
+//! cualquier proceso del usuario.
 //!
 //! Por cuenta se guardan dos ítems **secretos**: la **clave privada** (el armor o
 //! los bytes binarios de OpenPGP, como vinieron) y la **contraseña** que la abre.
@@ -24,11 +24,6 @@
 //! Esta capa es sólo almacenamiento: guardar, leer y borrar. El **parseo y la
 //! validación** de la clave (ligar la UID al `From`, rechazos honestos) es PR3, y
 //! el import por D-Bus con memfd sellado es PR5; los dos consumen esto después.
-// PR2 es sólo almacenamiento: lo consumen el parseo/import (PR3) y la firma/
-// descifrado (PR4/PR5), que todavía no están. Hasta que lo llamen, el chequeo de
-// código muerto lo marcaría entero; se saca al engancharlo. Mismo criterio que
-// `smime_key` y el núcleo `pgp.rs` del PR1.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::HashMap;
 

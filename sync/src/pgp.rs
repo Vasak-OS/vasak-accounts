@@ -663,6 +663,18 @@ fn primary_can_sign(key: &SignedSecretKey) -> bool {
     key.primary_key.algorithm().can_sign()
 }
 
+/// El resumen **público** de una identidad OpenPGP para mostrar su estado SIN
+/// material secreto: la huella de la primaria y los correos de sus UIDs con
+/// auto-firma válida y vigente. Reusa el mismo criterio que liga la identidad al
+/// `From` ([`crate::pgp_import::self_signed_emails`]), así el resumen no muestra un
+/// UID que no ligaría. Lo consume `GetPgpIdentity` sobre la clave pública derivada
+/// de la guardada.
+pub fn identity_summary(public: &SignedPublicKey) -> (String, Vec<String>) {
+    let fingerprint = public.primary_key.fingerprint().to_string();
+    let uids = crate::pgp_import::self_signed_emails(public);
+    (fingerprint, uids)
+}
+
 // ── Cifrar ─────────────────────────────────────────────────────────────
 
 /// Cifra `plaintext` a las claves de los destinatarios (que **deben incluir la

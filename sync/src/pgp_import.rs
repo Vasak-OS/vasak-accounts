@@ -433,8 +433,9 @@ fn strip_forged_revocations(
 /// normalizados. Sólo cuentan los UIDs cuya firma cierra contra la primaria y cuya
 /// auto-certificación aplicable **más reciente no es una revocación**: un UID sin
 /// firmar, firmado por otro, o **revocado** no liga identidad. Se usa para ligar la
-/// identidad propia al `From` en [`parse_identity_secret_key`].
-fn self_signed_emails(key: &SignedPublicKey) -> Vec<String> {
+/// identidad propia al `From` en [`parse_identity_secret_key`], y para el resumen
+/// de la identidad que expone `GetPgpIdentity` ([`crate::pgp::identity_summary`]).
+pub(crate) fn self_signed_emails(key: &SignedPublicKey) -> Vec<String> {
     let primary = &key.primary_key;
     key.details
         .users
