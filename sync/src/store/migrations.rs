@@ -733,6 +733,28 @@ CREATE TABLE pgp_peers (
 ) STRICT;
 ";
 
+/// v15 (PR 4 de `vasak-accounts#21`, OpenPGP): el estado PGP de un mensaje,
+/// calculado al bajarlo (con nuestra clave y el peerstate en mano; al leer no están)
+/// y guardado acá para responder desde la caché sin re-descifrar ni re-verificar, en
+/// espejo exacto de las columnas S/MIME (V10/V11).
+///
+/// - **`pgp_status`**: la firma. NULL si no venía firmado, 0 «firmado con clave
+///   conocida» (la huella del firmante está en el peerstate del `From`, TOFU), 1
+///   «firmado con clave desconocida» (no teníamos clave para ese `From`), 2
+///   «firmado, no verificable» (teníamos una clave pero la firma no cierra). Nunca se
+///   afirma «válido» en el sentido fuerte: la verificación por huella es follow-up.
+/// - **`pgp_signer`**: la huella del firmante, **sólo** cuando `pgp_status` es 0
+///   (clave conocida); NULL si no. No se nombra a un firmante que no liga.
+/// - **`pgp_encrypted`**: el cifrado. NULL si no venía cifrado, 1 «cifrado y abierto»
+///   (el cuerpo guardado es el descifrado, protegido en reposo por SQLCipher como el
+///   resto —decisión #1—), 2 «cifrado, no se pudo abrir» (sin nuestra clave,
+///   integridad rota, cifrado no soportado; el cuerpo queda vacío, nunca «roto»).
+const V15: &str = "
+ALTER TABLE message_bodies ADD COLUMN pgp_status INTEGER;
+ALTER TABLE message_bodies ADD COLUMN pgp_signer TEXT;
+ALTER TABLE message_bodies ADD COLUMN pgp_encrypted INTEGER;
+";
+
 /// Todas las migraciones, en orden.
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
@@ -750,6 +772,7 @@ pub fn migrations() -> Migrations<'static> {
         M::up(V12),
         M::up(V13),
         M::up(V14),
+        M::up(V15),
     ])
 }
 
@@ -786,7 +809,7 @@ mod tests {
         let mut connection = Connection::open_in_memory().unwrap();
         apply(&mut connection).unwrap();
         let version = schema_version(&connection).unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
 
         let tables = |c: &Connection| -> Vec<String> {
             let mut statement = c
@@ -916,7 +939,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
 
         // Lo que había sigue, y la marca nueva es NULL.
         let object_mark: Option<String> = connection
@@ -959,7 +982,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
 
         // La op sigue, en conflicto, y las columnas nuevas son NULL.
         let (state, server_etag, server_raw): (String, Option<String>, Option<Vec<u8>>) =
@@ -1018,7 +1041,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
 
         // El contacto sigue, y la tabla nueva arranca vacía.
         let contacts: i64 = connection
@@ -1130,7 +1153,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
 
         // El enlace sigue, y las columnas nuevas arrancan nulas.
         let (resource, photo, media): (String, Option<Vec<u8>>, Option<String>) = connection
@@ -1194,7 +1217,7 @@ mod tests {
 
         apply(&mut connection).unwrap();
         assert_eq!(columns(&connection), before);
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
     }
 
     /// **v11 → v12 no pierde nada**: un enlace con su foto de una base de la v11
@@ -1230,7 +1253,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
 
         // Lo que había sigue, y las columnas nuevas traen sus defaults.
         let row: (String, Option<Vec<u8>>, String, i64) = connection
@@ -1288,7 +1311,7 @@ mod tests {
         let object = insert_object(&connection, calendar, "https://x/c/1.ics");
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
 
         // Lo que había sigue.
         assert_eq!(
@@ -1386,7 +1409,7 @@ mod tests {
 
         apply(&mut fresh).unwrap();
         assert_eq!(columns(&fresh), before);
-        assert_eq!(schema_version(&fresh).unwrap(), 14);
+        assert_eq!(schema_version(&fresh).unwrap(), 15);
 
         let mut from_v8 = at_version(8);
         apply(&mut from_v8).unwrap();
@@ -1443,7 +1466,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
 
         // Lo que había sigue, y las columnas nuevas son NULL.
         let row: (String, Option<String>, i64, Option<i64>, Option<String>) = connection
@@ -1474,7 +1497,7 @@ mod tests {
         let before = columns(&connection);
         apply(&mut connection).unwrap();
         assert_eq!(columns(&connection), before);
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
     }
 
     /// **v10 → v11 no pierde nada**: el cuerpo, la firma y el firmante de una base de
@@ -1527,7 +1550,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
 
         let row: (String, Option<String>, i64, Option<i64>, Option<String>, Option<i64>) =
             connection
@@ -1563,7 +1586,7 @@ mod tests {
         let before = columns(&connection);
         apply(&mut connection).unwrap();
         assert_eq!(columns(&connection), before);
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
     }
 
     /// La marca `pending_op` sólo acepta los dos valores conocidos, o `NULL`.
@@ -1735,7 +1758,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
 
         let count = |sql: &str| -> i64 { connection.query_row(sql, [], |r| r.get(0)).unwrap() };
         assert_eq!(count("SELECT count(*) FROM mailboxes"), 1);
@@ -1805,7 +1828,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
 
         let count = |sql: &str| -> i64 { connection.query_row(sql, [], |r| r.get(0)).unwrap() };
         assert_eq!(count("SELECT count(*) FROM mailboxes"), 1);
@@ -1839,7 +1862,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
         let message: String = connection
             .query_row("SELECT message FROM sync_log", [], |row| row.get(0))
             .unwrap();
@@ -2140,7 +2163,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
         assert_eq!(found(&connection, "jose"), vec![id]);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_emails"), 1);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_phones"), 1);
@@ -2311,7 +2334,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
         assert_eq!(found(&connection, "jose"), vec![id]);
         assert_eq!(count(&connection, "SELECT count(*) FROM occurrences"), 2);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_emails"), 1);

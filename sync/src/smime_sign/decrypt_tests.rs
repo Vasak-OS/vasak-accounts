@@ -333,7 +333,9 @@ fn el_motivo_del_fallo_nunca_llega_a_lo_que_se_guarda_ni_a_la_ventana() {
     let material = crate::email_sync::SmimeMaterial { key, cert };
     let rows: Vec<_> = [bad_rsa_unpad(), bad_cbc_unpad(), OTHER_RECIPIENT.to_vec()]
         .iter()
-        .map(|raw| crate::email_sync::opened_rows_decrypting(1, raw, false, Some(&material)))
+        .map(|raw| {
+            crate::email_sync::opened_rows_decrypting(1, raw, false, Some(&material), None, &[])
+        })
         .collect();
     assert_eq!(rows[0].0.smime_encrypted, Some(2));
     assert_eq!(rows[0].0, rows[1].0);
@@ -448,8 +450,14 @@ fn un_ciphertext_cbc_con_un_byte_cambiado_abre_a_basura_y_no_rompe_nada() {
     assert_eq!(garbage.len(), original.len(), "mismo largo");
 
     // Lo que se guarda: abierto, y lo que sale como HTML pasó por el saneador.
-    let (body, _) =
-        crate::email_sync::opened_rows_decrypting(1, &tampered, false, Some(&material()));
+    let (body, _) = crate::email_sync::opened_rows_decrypting(
+        1,
+        &tampered,
+        false,
+        Some(&material()),
+        None,
+        &[],
+    );
     assert_eq!(body.smime_encrypted, Some(1));
     if let Some(html) = body.html_body {
         assert!(!html.contains(" src="), "{html}");
@@ -506,7 +514,8 @@ fn el_ataque_efail_sobre_cbc_descifra_lo_inyectado_pero_sale_saneado_sin_carga_r
 
     // Lo que llega a la ventana: el HTML pasa por el saneador, que deja la imagen
     // sin `src` cargable (la dirección queda en `data-vsk-src`, inerte).
-    let (body, _) = crate::email_sync::opened_rows_decrypting(1, &attack, false, Some(&material()));
+    let (body, _) =
+        crate::email_sync::opened_rows_decrypting(1, &attack, false, Some(&material()), None, &[]);
     assert_eq!(body.smime_encrypted, Some(1));
     let html = body
         .html_body

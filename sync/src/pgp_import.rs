@@ -44,7 +44,10 @@ use pgp::packet::SignatureType;
 use pgp::ser::Serialize;
 use pgp::types::{KeyDetails, Tag};
 
-use crate::message::parse_sender;
+use crate::message::{
+    as_latin1, decode_transfer, from_latin1, parse_content_type, parse_sender, split_headers,
+    split_parts, Headers,
+};
 use crate::pgp::{parse_public_key, parse_secret_key, PgpError};
 use crate::store::{Store, StoreError};
 
@@ -360,6 +363,104 @@ fn self_signed_emails(key: &SignedPublicKey) -> Vec<String> {
         })
         .filter(|email| !email.is_empty())
         .collect()
+}
+
+// ── Claves públicas que trae un mensaje entrante ────────────────────────
+
+/// Tope del blob de una clave pública adjunta (`application/pgp-keys`), medido sobre
+/// los bytes **codificados** de la parte (cota superior holgada del binario). Una
+/// clave normal pesa pocos KiB; más de 1 MiB es una clave con miles de firmas de UID
+/// —una bomba de CPU/memoria al parsear— y se ignora, no se intenta parsear. Es el
+/// follow-up de security de PR3 contra un adjunto gigante.
+const MAX_KEY_BLOB: usize = 1024 * 1024;
+
+/// Tope del `keydata` de una cabecera `Autocrypt:`, medido sobre el valor de la
+/// cabecera (mayormente base64) y sobre el binario decodificado. 128 KiB es muy
+/// holgado para una clave Autocrypt legítima (pocos KiB) y corta en seco una
+/// cabecera gigante antes de gastar CPU decodificando base64. Mismo follow-up.
+const MAX_AUTOCRYPT_KEYDATA: usize = 128 * 1024;
+
+/// Profundidad máxima de anidado MIME al buscar claves adjuntas, igual criterio que
+/// [`crate::attachments`]: un mensaje legítimo no anida tanto, y acota el trabajo
+/// ante un `multipart` patológicamente profundo.
+const MAX_MIME_DEPTH: usize = 8;
+
+/// Las claves públicas que trae un mensaje entrante para ingerir al peerstate: la de
+/// la cabecera `Autocrypt:` (atribuida a su `addr`) y las de los adjuntos
+/// `application/pgp-keys` (atribuidas al `From`). Devuelve `(dirección, bytes)` para
+/// pasar tal cual a [`ingest_peer_key`]; la normalización de la dirección y la
+/// validación del material las hace esa función (un solo lugar).
+///
+/// Parseo puro, sin red y sin pánico sobre entrada hostil. Respeta los topes de
+/// tamaño ([`MAX_KEY_BLOB`], [`MAX_AUTOCRYPT_KEYDATA`]) **antes** de parsear, para
+/// que un adjunto o una cabecera gigantes no sean una bomba de CPU/memoria. El
+/// wiring de sync (PR4) llama a esto y luego a [`ingest_peer_key`] por cada par.
+pub fn incoming_public_keys(raw: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let view = as_latin1(raw);
+    let (headers, body) = split_headers(&view);
+    let mut found = Vec::new();
+
+    // Cabecera Autocrypt: el valor acotado antes de decodificar, y la clave binaria
+    // acotada después. `split_headers` da un solo valor por nombre; tomar sólo ése es
+    // conservador (Autocrypt L1 ignora el mensaje con cabeceras repetidas).
+    if let Some(value) = headers.get("autocrypt") {
+        if value.len() <= MAX_AUTOCRYPT_KEYDATA {
+            if let Some(header) = parse_autocrypt_header(value) {
+                if header.key.len() <= MAX_AUTOCRYPT_KEYDATA {
+                    found.push((header.addr, header.key));
+                }
+            }
+        }
+    }
+
+    // Adjuntos `application/pgp-keys`, atribuidos al `From` del mensaje. Sin `From`
+    // no hay dirección bajo la cual ingerirlos: se omiten (`ingest_peer_key` también
+    // rechazaría la dirección vacía).
+    let from = parse_sender(headers.get("from").unwrap_or_default()).1;
+    if !from.is_empty() {
+        collect_key_attachments(&headers, body, 0, &from, &mut found);
+    }
+    found
+}
+
+/// Baja por el árbol MIME juntando los blobs de las partes `application/pgp-keys`,
+/// decodificados según su `Content-Transfer-Encoding`, atribuidos a `from`. Acota la
+/// profundidad y el tamaño; una parte que se pasa del tope se ignora.
+fn collect_key_attachments(
+    headers: &Headers,
+    body: &str,
+    depth: usize,
+    from: &str,
+    out: &mut Vec<(String, Vec<u8>)>,
+) {
+    if depth > MAX_MIME_DEPTH {
+        return;
+    }
+    let content_type = headers
+        .get("content-type")
+        .map(parse_content_type)
+        .unwrap_or_default();
+
+    if let Some(boundary) = &content_type.boundary {
+        for part in split_parts(body, boundary) {
+            let (part_headers, part_body) = split_headers(part);
+            collect_key_attachments(&part_headers, part_body, depth + 1, from, out);
+        }
+        return;
+    }
+
+    if content_type.media_type == "application/pgp-keys" {
+        // Cota sobre lo codificado antes de decodificar: un adjunto gigante no gasta
+        // CPU/memoria en base64.
+        if body.len() > MAX_KEY_BLOB {
+            return;
+        }
+        let encoding = headers.get("content-transfer-encoding").unwrap_or("7bit");
+        let decoded = decode_transfer(&from_latin1(body), encoding);
+        if !decoded.is_empty() && decoded.len() <= MAX_KEY_BLOB {
+            out.push((from.to_string(), decoded));
+        }
+    }
 }
 
 // ── Parseo de la cabecera Autocrypt entrante ────────────────────────────

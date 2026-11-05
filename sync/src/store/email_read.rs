@@ -171,6 +171,9 @@ pub struct MessageFull {
     /// El estado S/MIME: `None` si no venía firmado, si no «firmado» con si la
     /// firma se verificó y quién firma. Ver `smime_sign`.
     pub smime: Option<crate::smime_sign::SmimeStatus>,
+    /// El estado OpenPGP: `None` si no venía ni firmado ni cifrado con PGP; si no, la
+    /// firma (clave conocida/desconocida/no verificable) y el cifrado. Ver `pgp`.
+    pub pgp: Option<crate::pgp::PgpStatus>,
     pub attachments: Vec<AttachmentSummary>,
     pub flags: Vec<String>,
 }
@@ -569,7 +572,8 @@ impl Store {
                         m.flags_flagged, m.flags_draft, m.flags_deleted,
                         m.has_attachments, m.size,
                         b.text_body, b.html_body, b.truncated,
-                        b.smime_status, b.smime_signer, b.smime_encrypted
+                        b.smime_status, b.smime_signer, b.smime_encrypted,
+                        b.pgp_status, b.pgp_signer, b.pgp_encrypted
                  FROM messages m
                  JOIN mailboxes mb ON m.mailbox_id = mb.id
                  LEFT JOIN message_bodies b ON m.id = b.message_id
@@ -790,6 +794,11 @@ fn message_full_from_row(row: &Row) -> Result<MessageFull, StoreError> {
             row.get::<_, Option<String>>(23).map_err(classify)?,
             row.get::<_, Option<i64>>(24).map_err(classify)?,
         ),
+        pgp: pgp_from_row(
+            row.get::<_, Option<i64>>(25).map_err(classify)?,
+            row.get::<_, Option<String>>(26).map_err(classify)?,
+            row.get::<_, Option<i64>>(27).map_err(classify)?,
+        ),
         attachments: Vec::new(),
         flags: Vec::new(),
     })
@@ -813,6 +822,33 @@ fn smime_from_row(
         valid: status == Some(1),
         // El firmante va tanto en «firmado, no verificado» (estado 0) como en el
         // futuro «válido» (estado 1): sólo se guardó cuando la firma ligó el From.
+        signer,
+        encryption,
+    })
+}
+
+/// Arma el estado PGP de las tres columnas: `None` si no venía ni firmado ni
+/// cifrado. Espeja a [`smime_from_row`]; los códigos los fija la migración V15.
+fn pgp_from_row(
+    status: Option<i64>,
+    signer: Option<String>,
+    encrypted: Option<i64>,
+) -> Option<crate::pgp::PgpStatus> {
+    if status.is_none() && encrypted.is_none() {
+        return None;
+    }
+    let signature = status.map(|s| match s {
+        0 => crate::pgp::SignatureState::Known,
+        1 => crate::pgp::SignatureState::Unknown,
+        _ => crate::pgp::SignatureState::Unverifiable,
+    });
+    let encryption = encrypted.map(|e| match e {
+        1 => crate::pgp::Encryption::Opened,
+        _ => crate::pgp::Encryption::Unavailable,
+    });
+    Some(crate::pgp::PgpStatus {
+        signature,
+        // La huella sólo se guardó cuando la firma cerró contra la clave conocida.
         signer,
         encryption,
     })
@@ -1061,6 +1097,9 @@ mod tests {
                     smime_status: None,
                     smime_signer: None,
                     smime_encrypted: None,
+                    pgp_status: None,
+                    pgp_signer: None,
+                    pgp_encrypted: None,
                 })
                 .unwrap();
         }
@@ -1141,6 +1180,9 @@ mod tests {
                 smime_status: None,
                 smime_signer: None,
                 smime_encrypted: None,
+                pgp_status: None,
+                pgp_signer: None,
+                pgp_encrypted: None,
             })
             .unwrap();
         store
@@ -1205,8 +1247,14 @@ mod tests {
             );
         }
         let ingest = |store: &mut Store, id: i64, raw: &str| {
-            let (body, _) =
-                crate::email_sync::opened_rows_decrypting(id, raw.as_bytes(), false, None);
+            let (body, _) = crate::email_sync::opened_rows_decrypting(
+                id,
+                raw.as_bytes(),
+                false,
+                None,
+                None,
+                &[],
+            );
             store.upsert_message_body(body).unwrap();
         };
         let smime = |store: &Store, id: i64| store.get_message(id).unwrap().unwrap().smime;
@@ -1285,7 +1333,7 @@ mod tests {
             );
         }
         let ingest = |store: &mut Store, id: i64, raw: &[u8]| {
-            let (body, _) = opened_rows_decrypting(id, raw, false, Some(&material));
+            let (body, _) = opened_rows_decrypting(id, raw, false, Some(&material), None, &[]);
             store.upsert_message_body(body).unwrap();
         };
         let message = |store: &Store, id: i64| store.get_message(id).unwrap().unwrap();
@@ -1344,7 +1392,7 @@ mod tests {
 
         // Volver a bajar pisa el estado: de abierto a no disponible (la clave ya no
         // está), de no disponible a abierto (ya hay clave) y de abierto a no cifrado.
-        let (body, _) = opened_rows_decrypting(ids[0], encrypted, false, None);
+        let (body, _) = opened_rows_decrypting(ids[0], encrypted, false, None, None, &[]);
         store.upsert_message_body(body).unwrap();
         assert_eq!(
             smime(&store, ids[0]).and_then(|s| s.encryption),
@@ -1448,6 +1496,9 @@ mod tests {
                     smime_status: None,
                     smime_signer: None,
                     smime_encrypted: None,
+                    pgp_status: None,
+                    pgp_signer: None,
+                    pgp_encrypted: None,
                 })
                 .unwrap();
         }
@@ -1830,6 +1881,9 @@ mod tests {
                 smime_status: None,
                 smime_signer: None,
                 smime_encrypted: None,
+                pgp_status: None,
+                pgp_signer: None,
+                pgp_encrypted: None,
             })
             .unwrap();
         let items = store.messages_with("ana@x.com", 10).unwrap();

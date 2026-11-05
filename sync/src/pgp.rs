@@ -49,6 +49,7 @@ use pgp::crypto::sym::SymmetricKeyAlgorithm;
 use pgp::packet::SignatureType;
 use pgp::types::{KeyDetails, Password, Seipdv1ReadMode, Timestamp};
 use rand::rngs::OsRng;
+use serde::Serialize;
 use zeroize::Zeroizing;
 
 use crate::message::{
@@ -109,6 +110,53 @@ pub enum Verification {
     /// Firmado, pero la firma no se pudo comprobar: rota, o el firmante es una
     /// clave desconocida (no está en el peerstate). El motivo es para el diario.
     Unverified(String),
+}
+
+// ── Estado que viaja a la ventana (por `GetMessage`, calcado de smime_sign) ──
+
+/// El estado OpenPGP de un mensaje, como lo ve quien lo lee. `None` (el campo
+/// entero) quiere decir que no venía ni firmado ni cifrado con PGP. Espeja a
+/// [`crate::smime_sign::SmimeStatus`] y mantiene la **misma honestidad**: nunca se
+/// afirma «firmado por Fulano» con tilde verde; a lo sumo «firmado con una clave
+/// conocida» (TOFU). La verificación explícita por huella queda fuera de v1.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PgpStatus {
+    /// Estado de la firma, o `None` si no venía firmado. Ver [`SignatureState`].
+    pub signature: Option<SignatureState>,
+    /// La **huella** del firmante **sólo** cuando la firma cerró contra la clave
+    /// **conocida** del `From` ([`SignatureState::Known`]); `None` en los demás
+    /// casos. Igual que S/MIME, no se nombra a un firmante que no liga.
+    pub signer: Option<String>,
+    /// Estado de cifrado, o `None` si no venía cifrado. Ver [`Encryption`].
+    pub encryption: Option<Encryption>,
+}
+
+/// Cómo quedó la **firma** de un mensaje entrante, con la confianza TOFU del
+/// peerstate. Nunca «válido» en el sentido fuerte (verificación por huella fuera
+/// de banda): eso es follow-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignatureState {
+    /// La firma cerró contra la clave **conocida** del `From` (su huella está en el
+    /// peerstate, TOFU). Lo más alto que se afirma en v1.
+    Known,
+    /// Firmado, pero **no teníamos ninguna clave** para ese `From` (primer contacto
+    /// sin clave adjunta ni Autocrypt): no se puede comprobar quién firmó.
+    Unknown,
+    /// Firmado, teníamos una clave para el `From`, pero la firma **no cierra** contra
+    /// ella (rota, o firmada por otra clave): no verificable.
+    Unverifiable,
+}
+
+/// Cómo quedó un mensaje **cifrado** después de intentar abrirlo al bajarlo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Encryption {
+    /// Cifrado y abierto: el cuerpo que se muestra es el descifrado.
+    Opened,
+    /// Cifrado pero no se pudo abrir (sin nuestra clave, integridad rota, cifrado no
+    /// soportado). El cuerpo no está disponible; nunca «roto».
+    Unavailable,
 }
 
 /// Lo que puede salir mal al firmar o cifrar.
@@ -173,6 +221,24 @@ pub fn parse_public_key(bytes: &[u8]) -> Result<SignedPublicKey, PgpError> {
 /// «cifrado, no se pudo abrir» cuando no tenemos la clave. Calca `is_enveloped`.
 pub fn is_pgp_encrypted(raw: &[u8]) -> bool {
     encrypted_payload(raw).is_some()
+}
+
+/// Si un mensaje trae una firma PGP (PGP/MIME `multipart/signed` con el protocolo
+/// de PGP, o un cleartext firmado inline), **sin** verificarla. Barato: decide si
+/// vale la pena resolver el peerstate del firmante en el camino de sync.
+pub fn is_pgp_signed(raw: &[u8]) -> bool {
+    let view = as_latin1(raw);
+    let (headers, _body) = split_headers(&view);
+    let content_type = headers
+        .get("content-type")
+        .map(parse_content_type)
+        .unwrap_or_default();
+    if content_type.media_type == "multipart/signed"
+        && content_type.protocol.as_deref() == Some(PGP_SIGNATURE_PROTOCOL)
+    {
+        return true;
+    }
+    view.contains(BEGIN_PGP_SIGNED)
 }
 
 /// Descifra un mensaje PGP entrante con **nuestra** clave privada y su
@@ -365,23 +431,39 @@ fn parse_detached_signature(part: &str) -> Option<DetachedSignature> {
 /// de cada candidata. La primaria **no siempre** es la de verificación (lo avisa
 /// rPGP), así que se prueban todas y gana la que cierre. Se devuelve la huella de
 /// la clave **primaria** de la candidata que verificó: es la identidad del
-/// firmante (ligarla al `From` es PR4).
+/// firmante (ligada al `From` por el llamador, que pasa como candidatas sólo las
+/// claves del peerstate de ese `From`).
+///
+/// **Sólo se acepta un componente de firma usable** (el follow-up de la revisión de
+/// PR1): la primaria viva (no revocada/expirada) y con algoritmo de firma, o una
+/// subclave de firma con su flag de firma, binding vigente y no revocada/expirada
+/// ([`subkey_usable`]). Así no se eleva a «clave conocida» una firma hecha con una
+/// subclave muerta o sin capacidad de firma.
 fn verify_detached(
     signature: &DetachedSignature,
     content: &[u8],
     candidate_keys: &[SignedPublicKey],
 ) -> Verification {
+    let now = Timestamp::now().as_secs();
     for key in candidate_keys {
-        if signature.verify(&key.primary_key, content).is_ok() {
+        if primary_signing_usable(key, now) && signature.verify(&key.primary_key, content).is_ok() {
             return Verification::SignedUntrusted(key.primary_key.fingerprint().to_string());
         }
         for subkey in &key.public_subkeys {
-            if signature.verify(subkey, content).is_ok() {
+            if subkey_usable(subkey, now, Usage::Sign) && signature.verify(subkey, content).is_ok()
+            {
                 return Verification::SignedUntrusted(key.primary_key.fingerprint().to_string());
             }
         }
     }
     unknown_signer(candidate_keys)
+}
+
+/// Si la **primaria** de una clave pública sirve para firmar: viva (no
+/// revocada/expirada, [`primary_usable`]) y con un algoritmo capaz de firmar. Es la
+/// simétrica pública de [`signing_component`] para el camino de verificación.
+fn primary_signing_usable(key: &SignedPublicKey, now: u32) -> bool {
+    primary_usable(key, now) && key.primary_key.algorithm().can_sign()
 }
 
 /// Verifica un cleartext firmado inline contra las claves candidatas.
@@ -390,12 +472,13 @@ fn verify_cleartext(block: &str, candidate_keys: &[SignedPublicKey]) -> Verifica
         Ok((message, _headers)) => message,
         Err(e) => return Verification::Unverified(format!("cleartext PGP ilegible: {e}")),
     };
+    let now = Timestamp::now().as_secs();
     for key in candidate_keys {
-        if message.verify(&key.primary_key).is_ok() {
+        if primary_signing_usable(key, now) && message.verify(&key.primary_key).is_ok() {
             return Verification::SignedUntrusted(key.primary_key.fingerprint().to_string());
         }
         for subkey in &key.public_subkeys {
-            if message.verify(subkey).is_ok() {
+            if subkey_usable(subkey, now, Usage::Sign) && message.verify(subkey).is_ok() {
                 return Verification::SignedUntrusted(key.primary_key.fingerprint().to_string());
             }
         }
