@@ -831,6 +831,100 @@ mod tests {
         assert_eq!(r.unwrap(), Ingested::New);
     }
 
+    // ── Endurecimiento del import de la clave propia ────────────────────
+
+    #[test]
+    fn un_uid_revocado_mas_recientemente_no_liga_la_direccion_de_la_cuenta() {
+        let mut key = clave_completa("Ana <ana@example.com>");
+        let primaria = key.primary_key.clone();
+        let positiva = key.details.users[0].signatures[0].created().unwrap();
+        // Control: sin la revocación, el UID liga.
+        assert!(parse_identity_secret_key(&key.to_bytes().unwrap(), "ana@example.com").is_ok());
+
+        // La revocación del UID es estrictamente posterior a la auto-certificación.
+        let mut config =
+            SignatureConfig::from_key(OsRng, &primaria, SignatureType::CertRevocation).unwrap();
+        config.hashed_subpackets = vec![
+            Subpacket::regular(SubpacketData::SignatureCreationTime(Timestamp::from_secs(
+                positiva.as_secs() + 100,
+            )))
+            .unwrap(),
+            Subpacket::regular(SubpacketData::IssuerFingerprint(primaria.fingerprint())).unwrap(),
+        ];
+        let revocada = config
+            .sign_certification(
+                &primaria,
+                primaria.public_key(),
+                &vacia(),
+                Tag::UserId,
+                &key.details.users[0].id,
+            )
+            .expect("revocación del UID");
+        key.details.users[0].signatures.push(revocada);
+
+        let r = parse_identity_secret_key(&key.to_bytes().unwrap(), "ana@example.com");
+        assert!(es_bad_key(r), "un UID revocado no liga identidad");
+    }
+
+    #[test]
+    fn una_revocacion_forjada_en_la_identidad_se_descarta_y_la_clave_sigue_firmando() {
+        let victima = clave_completa("Ana <ana@example.com>");
+        let atacante = clave_completa("Atacante <atacante@example.com>");
+        let mut key = victima.clone();
+        key.details
+            .revocation_signatures
+            .push(revocacion(&atacante, &victima));
+        // Premisa: sin el saneo, la mera presencia la deja sin poder firmar.
+        assert!(matches!(
+            crate::pgp::sign_detached(b"hola", &key, &vacia()),
+            Err(PgpError::NoSigningKey)
+        ));
+
+        let sana = parse_identity_secret_key(&key.to_bytes().unwrap(), "ana@example.com")
+            .expect("la forjada no impide importar");
+        assert!(sana.details.revocation_signatures.is_empty());
+        assert!(crate::pgp::sign_detached(b"hola", &sana, &vacia()).is_ok());
+    }
+
+    #[test]
+    fn una_auto_revocacion_valida_en_la_identidad_la_inutiliza_para_firmar() {
+        let ana = clave_completa("Ana <ana@example.com>");
+        let mut key = ana.clone();
+        key.details
+            .revocation_signatures
+            .push(revocacion(&ana, &ana));
+
+        let importada = parse_identity_secret_key(&key.to_bytes().unwrap(), "ana@example.com")
+            .expect("importa");
+        assert_eq!(importada.details.revocation_signatures.len(), 1);
+        assert!(matches!(
+            crate::pgp::sign_detached(b"hola", &importada, &vacia()),
+            Err(PgpError::NoSigningKey)
+        ));
+    }
+
+    #[test]
+    fn la_identidad_con_una_subclave_de_binding_forjado_se_rechaza() {
+        let ana = clave_completa("Ana <ana@example.com>");
+        let atacante = clave_completa("Atacante <atacante@example.com>");
+        // Control: la clave sana se importa.
+        assert!(parse_identity_secret_key(&ana.to_bytes().unwrap(), "ana@example.com").is_ok());
+
+        // La subclave de cifrado de Ana queda atada con un binding firmado por el
+        // atacante: no cierra contra la primaria de Ana.
+        let mut key = ana.clone();
+        let subkey = publica(&ana).public_subkeys[1].clone();
+        key.secret_subkeys[1].signatures = vec![crate::pgp::tests::firmar_union(
+            &atacante,
+            &subkey,
+            SignatureType::SubkeyBinding,
+            None,
+        )];
+
+        let r = parse_identity_secret_key(&key.to_bytes().unwrap(), "ana@example.com");
+        assert!(es_bad_key(r), "el binding forjado debe rechazarse");
+    }
+
     #[test]
     fn un_remitente_vacio_se_rechaza_y_no_guarda() {
         let temp = TempDir::new("pgp-import-sin-remitente");
