@@ -3201,6 +3201,9 @@ mod tests {
                     smime_status: None,
                     smime_signer: None,
                     smime_encrypted: None,
+                    pgp_status: None,
+                    pgp_signer: None,
+                    pgp_encrypted: None,
                 })?;
                 Ok(())
             })
@@ -6337,6 +6340,9 @@ mod tests {
                     smime_status: None,
                     smime_signer: None,
                     smime_encrypted: None,
+                    pgp_status: None,
+                    pgp_signer: None,
+                    pgp_encrypted: None,
                 })?;
                 Ok(id)
             })

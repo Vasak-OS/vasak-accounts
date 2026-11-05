@@ -31,7 +31,7 @@ fn material() -> SmimeMaterial {
 }
 
 fn rows(raw: &[u8], smime: Option<&SmimeMaterial>) -> MessageBodyRow {
-    opened_rows_decrypting(1, raw, false, smime).0
+    opened_rows_decrypting(1, raw, false, smime, None, &[]).0
 }
 
 fn text(body: &MessageBodyRow) -> String {

@@ -459,7 +459,7 @@ datos\r\n\
 /// ninguna aplicación que lea del almacén tenga que acordarse de hacerlo.
 #[test]
 fn un_mensaje_abierto_se_guarda_con_el_html_saneado_y_sus_adjuntos() {
-    let (body, attachments) = opened_rows_decrypting(31, OPENED.as_bytes(), true, None);
+    let (body, attachments) = opened_rows_decrypting(31, OPENED.as_bytes(), true, None, None, &[]);
 
     assert_eq!(body.message_id, 31);
     assert!(body.truncated);
@@ -480,7 +480,7 @@ fn un_mensaje_abierto_se_guarda_con_el_html_saneado_y_sus_adjuntos() {
 #[test]
 fn un_mensaje_de_texto_solo_no_tiene_html_ni_adjuntos() {
     let raw = b"From: ana@x.com\r\nContent-Type: text/plain\r\n\r\nSolo texto\r\n";
-    let (body, attachments) = opened_rows_decrypting(1, raw, false, None);
+    let (body, attachments) = opened_rows_decrypting(1, raw, false, None, None, &[]);
     assert!(!body.truncated);
     assert!(body.text_body.as_deref().unwrap().contains("Solo texto"));
     assert_eq!(body.html_body, None);
@@ -538,7 +538,7 @@ impl Fixture {
     ) -> (EmailReport, Vec<String>) {
         let (mut session, task) =
             with_server_caps("* OK listo", &["IMAP4REV1", "CONDSTORE"], script);
-        let report = sync_session(&self.manager, ACCOUNT, &mut session, None)
+        let report = sync_session(&self.manager, ACCOUNT, &mut session, None, None)
             .await
             .unwrap_or_else(|e| panic!("la vuelta no terminó: {e:?}"));
         drop(session);
@@ -907,7 +907,7 @@ async fn un_corte_a_mitad_de_la_vuelta_la_corta() {
             ("EXAMINE \"INBOX\" (CONDSTORE)", vec![]),
         ],
     );
-    let result = sync_session(&fixture.manager, ACCOUNT, &mut session, None).await;
+    let result = sync_session(&fixture.manager, ACCOUNT, &mut session, None, None).await;
     let received = task.await.unwrap();
     assert!(
         matches!(result, Err(RoundError::Imap(ImapError::Failed(_)))),
@@ -1023,4 +1023,271 @@ async fn un_destino_rechazado_se_saltea_y_las_demas_siguen() {
         received[2].ends_with("UID STORE 8 +FLAGS (\\Seen)"),
         "{received:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// OpenPGP: la ingesta al peerstate y la firma, con el almacén de verdad
+// ---------------------------------------------------------------------------
+
+mod pgp_ingest {
+    use super::super::pgp_tests::firmado_mime_de;
+    use super::*;
+    use crate::pgp::tests::{clave_completa, publica};
+    use base64::Engine as _;
+    use pgp::composed::SignedSecretKey;
+    use pgp::ser::Serialize as _;
+    use pgp::types::KeyDetails;
+
+    fn b64(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn key_bytes(secret: &SignedSecretKey) -> Vec<u8> {
+        publica(secret).to_bytes().unwrap()
+    }
+
+    fn fingerprint(secret: &SignedSecretKey) -> String {
+        secret.primary_key.fingerprint().to_string()
+    }
+
+    const TEXTO: &str = "Content-Type: text/plain; charset=utf-8\r\n\r\nhola";
+
+    /// Firmado por `firmante`, con la clave de `adjunta` como parte de lo firmado.
+    fn firmado_con_clave_adjunta(
+        from: &str,
+        firmante: &SignedSecretKey,
+        adjunta: &SignedSecretKey,
+    ) -> Vec<u8> {
+        let contenido = format!(
+            "Content-Type: multipart/mixed; boundary=\"I\"\r\n\r\n\
+--I\r\n{TEXTO}\r\n--I\r\nContent-Type: application/pgp-keys\r\n\
+Content-Transfer-Encoding: base64\r\n\r\n{}\r\n--I--",
+            b64(&key_bytes(adjunta))
+        );
+        firmado_mime_de(from, "", firmante, &contenido)
+    }
+
+    fn firmado_con_autocrypt(
+        from: &str,
+        addr: &str,
+        firmante: &SignedSecretKey,
+        clave: &SignedSecretKey,
+    ) -> Vec<u8> {
+        let extra = format!(
+            "Autocrypt: addr={addr}; prefer-encrypt=mutual; keydata={}\r\n",
+            b64(&key_bytes(clave))
+        );
+        firmado_mime_de(from, &extra, firmante, TEXTO)
+    }
+
+    async fn peers(fixture: &Fixture) -> Vec<(String, String)> {
+        fixture
+            .manager
+            .with_store(ACCOUNT, |store| {
+                Ok(crate::store::pgp_peer::list_peers(store.connection())?
+                    .into_iter()
+                    .map(|p| (p.address, p.fingerprint))
+                    .collect())
+            })
+            .await
+            .unwrap()
+    }
+
+    /// Lo que se guardaría de `raw`: las candidatas que resuelve el sync (con su
+    /// ingesta al peerstate) y la fila resultante.
+    async fn stored(fixture: &Fixture, raw: &[u8]) -> MessageBodyRow {
+        let candidates = pgp_peer_candidates(&fixture.manager, ACCOUNT, raw).await;
+        opened_rows_decrypting(1, raw, false, None, None, &candidates).0
+    }
+
+    #[tokio::test]
+    async fn una_clave_adjunta_entra_al_peerstate_y_verifica_la_firma_de_su_propio_mensaje() {
+        let fixture = Fixture::new("pgp-adjunta").await;
+        let ana = clave_completa("Ana <ana@vasak.test>");
+        let raw = firmado_con_clave_adjunta("Ana <ana@vasak.test>", &ana, &ana);
+
+        let body = stored(&fixture, &raw).await;
+        // Primer contacto, sin clave previa: la que vino adjunta verifica el mensaje.
+        assert_eq!(body.pgp_status, Some(0));
+        assert_eq!(body.pgp_signer, Some(fingerprint(&ana)));
+        assert_eq!(
+            peers(&fixture).await,
+            vec![("ana@vasak.test".to_string(), fingerprint(&ana))]
+        );
+    }
+
+    #[tokio::test]
+    async fn la_cabecera_autocrypt_entra_al_peerstate_y_verifica_la_firma() {
+        let fixture = Fixture::new("pgp-autocrypt").await;
+        let ana = clave_completa("Ana <ana@vasak.test>");
+        let raw = firmado_con_autocrypt("Ana <Ana@Vasak.test>", "ana@vasak.test", &ana, &ana);
+
+        let body = stored(&fixture, &raw).await;
+        assert_eq!(body.pgp_status, Some(0));
+        assert_eq!(body.pgp_signer, Some(fingerprint(&ana)));
+        // La dirección se normalizó (el From venía con mayúsculas).
+        assert_eq!(
+            peers(&fixture).await,
+            vec![("ana@vasak.test".to_string(), fingerprint(&ana))]
+        );
+    }
+
+    #[tokio::test]
+    async fn firmado_sin_clave_adjunta_ni_en_el_peerstate_queda_desconocido() {
+        let fixture = Fixture::new("pgp-desconocida").await;
+        let ana = clave_completa("Ana <ana@vasak.test>");
+        let raw = firmado_mime_de("ana@vasak.test", "", &ana, TEXTO);
+
+        let body = stored(&fixture, &raw).await;
+        assert_eq!((body.pgp_status, body.pgp_signer), (Some(1), None));
+        assert!(peers(&fixture).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn la_clave_conocida_del_from_no_se_pisa_y_una_firma_de_otra_clave_no_verifica() {
+        let fixture = Fixture::new("pgp-tofu").await;
+        let ana = clave_completa("Ana <ana@vasak.test>");
+        let mallory = clave_completa("Mallory <mallory@vasak.test>");
+
+        // Primer contacto: se queda con la clave de ana (TOFU).
+        stored(
+            &fixture,
+            &firmado_con_clave_adjunta("ana@vasak.test", &ana, &ana),
+        )
+        .await;
+
+        // Después llega un mensaje con el From de ana, firmado por mallory, que trae
+        // **su** clave como si fuera la de ana: no reemplaza a la conocida, y la
+        // firma no cierra contra ella.
+        let falso = firmado_con_clave_adjunta("ana@vasak.test", &mallory, &mallory);
+        let body = stored(&fixture, &falso).await;
+        assert_eq!((body.pgp_status, body.pgp_signer), (Some(2), None));
+        assert_eq!(
+            peers(&fixture).await,
+            vec![("ana@vasak.test".to_string(), fingerprint(&ana))],
+            "el peerstate conserva la primera clave vista"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_from_spoofeado_firmado_por_otro_queda_no_verificable() {
+        let fixture = Fixture::new("pgp-spoof").await;
+        let ana = clave_completa("Ana <ana@vasak.test>");
+        let mallory = clave_completa("Mallory <mallory@vasak.test>");
+        stored(
+            &fixture,
+            &firmado_con_clave_adjunta("ana@vasak.test", &ana, &ana),
+        )
+        .await;
+
+        // Sin traer clave alguna: dice ser ana, lo firmó mallory.
+        let spoof = firmado_mime_de("ana@vasak.test", "", &mallory, TEXTO);
+        let body = stored(&fixture, &spoof).await;
+        assert_eq!((body.pgp_status, body.pgp_signer), (Some(2), None));
+    }
+
+    #[tokio::test]
+    async fn un_adjunto_de_claves_basura_o_gigante_no_rompe_ni_entra_al_peerstate() {
+        let fixture = Fixture::new("pgp-hostil").await;
+        let ana = clave_completa("Ana <ana@vasak.test>");
+        let parte = |cuerpo: &str, cte: &str| {
+            format!(
+                "Content-Type: multipart/mixed; boundary=\"I\"\r\n\r\n--I\r\n{TEXTO}\r\n--I\r\n\
+Content-Type: application/pgp-keys\r\nContent-Transfer-Encoding: {cte}\r\n\r\n{cuerpo}\r\n--I--"
+            )
+        };
+        for (que, contenido) in [
+            ("basura", parte("esto no es una clave", "7bit")),
+            ("base64 ilegible", parte("!!!!", "base64")),
+            ("más de 1 MiB", parte(&"A".repeat(1024 * 1024 + 64), "7bit")),
+        ] {
+            let raw = firmado_mime_de("ana@vasak.test", "", &ana, &contenido);
+            let body = stored(&fixture, &raw).await;
+            assert_eq!((body.pgp_status, body.pgp_signer), (Some(1), None), "{que}");
+        }
+        assert!(peers(&fixture).await.is_empty());
+    }
+
+    /// Hallazgo de QA sobre PR4: `incoming_public_keys` atribuye la clave de la
+    /// cabecera `Autocrypt` a su `addr` **sin exigir que coincida con el `From`**
+    /// (Autocrypt L1 manda ignorar la cabecera si no coincide). Un remitente
+    /// cualquiera puede sembrar en el peerstate TOFU una clave suya bajo la dirección
+    /// de otra persona; cuando después llegue el correo legítimo, ya habrá una clave
+    /// «conocida» distinta.
+    #[tokio::test]
+    async fn una_cabecera_autocrypt_con_un_addr_que_no_es_el_from_no_siembra_el_peerstate() {
+        let fixture = Fixture::new("pgp-autocrypt-ajeno").await;
+        let atacante = clave_completa("Atacante <atacante@vasak.test>");
+        let raw = firmado_con_autocrypt(
+            "atacante@vasak.test",
+            "victima@vasak.test",
+            &atacante,
+            &atacante,
+        );
+        stored(&fixture, &raw).await;
+        let peers = peers(&fixture).await;
+        assert!(
+            peers
+                .iter()
+                .all(|(address, _)| address != "victima@vasak.test"),
+            "el peerstate de la víctima quedó sembrado por otro remitente: {peers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn el_correo_comun_y_el_smime_no_hacen_ninguna_vuelta_al_almacen() {
+        // Con el llavero bloqueado, cualquier `with_store` cierra el almacén de la
+        // cuenta: es la huella observable de «tocó el almacén».
+        let comun = b"From: ana@vasak.test\r\nContent-Type: text/plain\r\n\r\nhola\r\n";
+        let smime = crate::smime_sign::test_support::sign(
+            crate::smime_sign::test_support::RSA_P12,
+            &crate::smime_sign::test_support::draft(
+                crate::smime_sign::test_support::RSA_ADDRESS,
+                "firmado S/MIME",
+            ),
+        )
+        .message
+        .into_bytes();
+        let ana = clave_completa("Ana <ana@vasak.test>");
+        let pgp = firmado_mime_de("ana@vasak.test", "", &ana, TEXTO);
+
+        for (que, raw, toca) in [
+            ("texto plano", comun.to_vec(), false),
+            ("S/MIME firmado", smime, false),
+            ("PGP firmado", pgp, true),
+        ] {
+            let fixture = Fixture::new("pgp-sin-vuelta").await;
+            fixture.keys.state().locked = true;
+            let candidates = pgp_peer_candidates(&fixture.manager, ACCOUNT, &raw).await;
+            assert!(candidates.is_empty(), "{que}");
+            fixture.keys.state().locked = false;
+            let abierto = fixture
+                .manager
+                .with_store(ACCOUNT, |_| Ok(()))
+                .await
+                .is_ok();
+            assert_eq!(
+                abierto,
+                !toca,
+                "{que}: {}",
+                if toca {
+                    "un mensaje PGP sí debe consultar el almacén"
+                } else {
+                    "el correo que no es PGP no puede tocar el almacén"
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sin_almacen_disponible_las_candidatas_son_vacias_y_no_corta_la_vuelta() {
+        let fixture = Fixture::new("pgp-sin-almacen").await;
+        let ana = clave_completa("Ana <ana@vasak.test>");
+        let raw = firmado_con_clave_adjunta("ana@vasak.test", &ana, &ana);
+        // Llavero bloqueado: `with_store` falla; la verificación degrada a
+        // «desconocida», sin pánico.
+        fixture.keys.state().locked = true;
+        let body = stored(&fixture, &raw).await;
+        assert_eq!((body.pgp_status, body.pgp_signer), (Some(1), None));
+    }
 }

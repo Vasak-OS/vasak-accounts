@@ -733,6 +733,64 @@ CREATE TABLE pgp_peers (
 ) STRICT;
 ";
 
+/// v15 (PR 4 de `vasak-accounts#21`, OpenPGP): el estado PGP de un mensaje,
+/// calculado al bajarlo (con nuestra clave y el peerstate en mano; al leer no están)
+/// y guardado acá para responder desde la caché sin re-descifrar ni re-verificar, en
+/// espejo exacto de las columnas S/MIME (V10/V11).
+///
+/// - **`pgp_status`**: la firma. NULL si no venía firmado, 0 «firmado con clave
+///   conocida» (la huella del firmante está en el peerstate del `From`, TOFU), 1
+///   «firmado con clave desconocida» (no teníamos clave para ese `From`), 2
+///   «firmado, no verificable» (teníamos una clave pero la firma no cierra). Nunca se
+///   afirma «válido» en el sentido fuerte: la verificación por huella es follow-up.
+/// - **`pgp_signer`**: la huella del firmante, **sólo** cuando `pgp_status` es 0
+///   (clave conocida); NULL si no. No se nombra a un firmante que no liga.
+/// - **`pgp_encrypted`**: el cifrado. NULL si no venía cifrado, 1 «cifrado y abierto»
+///   (el cuerpo guardado es el descifrado, protegido en reposo por SQLCipher como el
+///   resto —decisión #1—), 2 «cifrado, no se pudo abrir» (sin nuestra clave,
+///   integridad rota, cifrado no soportado; el cuerpo queda vacío, nunca «roto»).
+///
+/// Los cuerpos cacheados **antes** de la V15 quedan con estas columnas en NULL y no se
+/// reprocesan solos: `messages_without_body` sólo mira los mensajes **sin** fila de
+/// cuerpo. Un mail PGP inline cacheado bajo la V14 seguiría mostrando la armadura y
+/// reportando `pgp` NULL. Por eso se **borra la fila de cuerpo** de los que **SON** PGP
+/// inline —su primer contenido no-blanco es el marcador `-----BEGIN PGP `, lo mismo que
+/// exigen `encrypted_payload`/`verify`—: la próxima vuelta los vuelve a bajar y recomputa
+/// su estado PGP, y `write_body` rehace el índice FTS al reescribirlos.
+///
+/// El índice `messages_fts` se mantiene **por código** (`write_body` hace DELETE+INSERT
+/// por `rowid = message_id`); el único trigger de borrado del FTS es `AFTER DELETE ON
+/// messages`, que este borrado de `message_bodies` **no** dispara. Así que primero se
+/// borran a mano las filas del FTS de esos mismos cuerpos (por `rowid`, con el mismo
+/// criterio, **antes** del `DELETE` de `message_bodies` para que la subconsulta todavía
+/// los vea): si no, el texto de la armadura vieja quedaría buscable apuntando a un
+/// mensaje sin cuerpo.
+///
+/// shortcut: sólo se invalidan los cuerpos que SON PGP inline, no los que apenas CITAN
+/// una armadura (una respuesta que cita, un post de lista); por eso se ancla al inicio
+/// (sin `%` inicial) tolerando espacios/tabs/saltos. Con la decisión #1 (almacén local
+/// completo) borrar un cuerpo citado sería churn y, peor, perdería el cuerpo cacheado de
+/// un mensaje offline o ya borrado del servidor. Además, de los invalidados sólo se
+/// reprocesan los que `messages_without_body` vuelve a bajar: los más viejos que
+/// `BODY_PREFETCH`, o los que ya no están en el servidor, quedan para un backfill
+/// posterior (follow-up, tradeoff de caché de la decisión #1).
+const V15: &str = "
+ALTER TABLE message_bodies ADD COLUMN pgp_status INTEGER;
+ALTER TABLE message_bodies ADD COLUMN pgp_signer TEXT;
+ALTER TABLE message_bodies ADD COLUMN pgp_encrypted INTEGER;
+
+DELETE FROM messages_fts
+WHERE rowid IN (
+    SELECT message_id FROM message_bodies
+    WHERE ltrim(text_body, char(32) || char(9) || char(10) || char(13)) LIKE '-----BEGIN PGP %'
+       OR ltrim(html_body, char(32) || char(9) || char(10) || char(13)) LIKE '-----BEGIN PGP %'
+);
+
+DELETE FROM message_bodies
+WHERE ltrim(text_body, char(32) || char(9) || char(10) || char(13)) LIKE '-----BEGIN PGP %'
+   OR ltrim(html_body, char(32) || char(9) || char(10) || char(13)) LIKE '-----BEGIN PGP %';
+";
+
 /// Todas las migraciones, en orden.
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
@@ -750,6 +808,7 @@ pub fn migrations() -> Migrations<'static> {
         M::up(V12),
         M::up(V13),
         M::up(V14),
+        M::up(V15),
     ])
 }
 
@@ -786,7 +845,7 @@ mod tests {
         let mut connection = Connection::open_in_memory().unwrap();
         apply(&mut connection).unwrap();
         let version = schema_version(&connection).unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
 
         let tables = |c: &Connection| -> Vec<String> {
             let mut statement = c
@@ -916,7 +975,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
 
         // Lo que había sigue, y la marca nueva es NULL.
         let object_mark: Option<String> = connection
@@ -959,7 +1018,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
 
         // La op sigue, en conflicto, y las columnas nuevas son NULL.
         let (state, server_etag, server_raw): (String, Option<String>, Option<Vec<u8>>) =
@@ -1018,7 +1077,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
 
         // El contacto sigue, y la tabla nueva arranca vacía.
         let contacts: i64 = connection
@@ -1130,7 +1189,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
 
         // El enlace sigue, y las columnas nuevas arrancan nulas.
         let (resource, photo, media): (String, Option<Vec<u8>>, Option<String>) = connection
@@ -1194,7 +1253,7 @@ mod tests {
 
         apply(&mut connection).unwrap();
         assert_eq!(columns(&connection), before);
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
     }
 
     /// **v11 → v12 no pierde nada**: un enlace con su foto de una base de la v11
@@ -1230,7 +1289,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
 
         // Lo que había sigue, y las columnas nuevas traen sus defaults.
         let row: (String, Option<Vec<u8>>, String, i64) = connection
@@ -1288,7 +1347,7 @@ mod tests {
         let object = insert_object(&connection, calendar, "https://x/c/1.ics");
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
 
         // Lo que había sigue.
         assert_eq!(
@@ -1386,7 +1445,7 @@ mod tests {
 
         apply(&mut fresh).unwrap();
         assert_eq!(columns(&fresh), before);
-        assert_eq!(schema_version(&fresh).unwrap(), 14);
+        assert_eq!(schema_version(&fresh).unwrap(), 15);
 
         let mut from_v8 = at_version(8);
         apply(&mut from_v8).unwrap();
@@ -1443,7 +1502,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
 
         // Lo que había sigue, y las columnas nuevas son NULL.
         let row: (String, Option<String>, i64, Option<i64>, Option<String>) = connection
@@ -1474,7 +1533,310 @@ mod tests {
         let before = columns(&connection);
         apply(&mut connection).unwrap();
         assert_eq!(columns(&connection), before);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
+    }
+
+    /// **v14 → v15 no pierde nada**: el cuerpo y el estado S/MIME de una base de la
+    /// v14 siguen, nacen `pgp_status`, `pgp_signer` y `pgp_encrypted` (todas `NULL`:
+    /// ni firmado ni cifrado con PGP), la base queda igual que creada de cero, y
+    /// migrar otra vez no cambia nada.
+    #[test]
+    fn de_v14_a_v15_se_conserva_el_cuerpo_y_nacen_las_columnas_pgp_nulas() {
+        let columns = |c: &Connection| -> Vec<(String, String, i64, Option<String>)> {
+            let mut statement = c
+                .prepare(
+                    "SELECT name, type, \"notnull\", dflt_value
+                       FROM pragma_table_info('message_bodies') ORDER BY cid",
+                )
+                .unwrap();
+            statement
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let pgp_columns = ["pgp_status", "pgp_signer", "pgp_encrypted"];
+
+        let mut connection = at_version(14);
         assert_eq!(schema_version(&connection).unwrap(), 14);
+        // Sin V15 las columnas no existen: ésta es la raíz de la prueba.
+        for name in pgp_columns {
+            assert!(
+                !columns(&connection).iter().any(|c| c.0 == name),
+                "{name} no debería existir antes de la V15"
+            );
+        }
+        connection
+            .execute(
+                "INSERT INTO mailboxes (name, display_name, role, updated_at)
+                 VALUES ('INBOX', 'Bandeja', 'inbox', 'ayer')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages (mailbox_id, uid, from_addr, to_addrs, cc_addrs, bcc_addrs,
+                                       subject, date_ts, sort_key, size, updated_at)
+                 VALUES (1, 7, 'ana@x.com', 'yo@x.com', '', '', 'Hola', 100, 100, 10, 'ayer')",
+                [],
+            )
+            .unwrap();
+        let message = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO message_bodies
+                     (message_id, text_body, html_body, truncated, smime_status, smime_signer,
+                      smime_encrypted, updated_at)
+                 VALUES (?1, 'cuerpo de antes', '<p>de antes</p>', 1, 0, 'ana@x.com', 1, 'ayer')",
+                [message],
+            )
+            .unwrap();
+
+        apply(&mut connection).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 15);
+
+        #[allow(clippy::type_complexity)]
+        let row: (
+            String,
+            Option<String>,
+            i64,
+            Option<i64>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<i64>,
+        ) = connection
+            .query_row(
+                "SELECT text_body, html_body, truncated, smime_status, smime_signer,
+                        smime_encrypted, pgp_status, pgp_signer, pgp_encrypted
+                   FROM message_bodies WHERE message_id = ?1",
+                [message],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "cuerpo de antes".to_string(),
+                Some("<p>de antes</p>".to_string()),
+                1,
+                Some(0),
+                Some("ana@x.com".to_string()),
+                Some(1),
+                None,
+                None,
+                None
+            )
+        );
+
+        // Igual que creada de cero (mismo tipo, sin NOT NULL ni valor por omisión), y
+        // repetir no cambia nada.
+        let mut fresh = Connection::open_in_memory().unwrap();
+        apply(&mut fresh).unwrap();
+        assert_eq!(columns(&connection), columns(&fresh));
+        for (name, kind) in [
+            ("pgp_status", "INTEGER"),
+            ("pgp_signer", "TEXT"),
+            ("pgp_encrypted", "INTEGER"),
+        ] {
+            let added = columns(&fresh)
+                .into_iter()
+                .find(|c| c.0 == name)
+                .unwrap_or_else(|| panic!("falta la columna {name}"));
+            assert_eq!(added, (name.into(), kind.into(), 0, None));
+        }
+        let before = columns(&connection);
+        apply(&mut connection).unwrap();
+        assert_eq!(columns(&connection), before);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
+    }
+
+    /// **v14 → v15 invalida los cuerpos PGP inline cacheados** (marcador al inicio, con o sin blancos antes): bajo la V14 un mail
+    /// PGP inline se guardó con la armadura como texto y `pgp_*` quedaría `NULL` para
+    /// siempre (`messages_without_body` sólo mira los mensajes **sin** fila de cuerpo).
+    /// La V15 borra esas filas para que se vuelvan a bajar y reprocesar; el resto de la
+    /// caché no se toca.
+    #[test]
+    fn de_v14_a_v15_se_invalidan_solo_los_cuerpos_pgp_inline_y_no_los_que_citan_una_armadura() {
+        let mut connection = at_version(14);
+        connection
+            .execute(
+                "INSERT INTO mailboxes (name, display_name, role, updated_at)
+                 VALUES ('INBOX', 'Bandeja', 'inbox', 'ayer')",
+                [],
+            )
+            .unwrap();
+        // (uid, text_body, html_body)
+        let cuerpos: [(i64, Option<&str>, Option<&str>); 8] = [
+            // PGP inline real: el marcador es lo primero (se invalidan).
+            (
+                1,
+                Some("-----BEGIN PGP MESSAGE-----\n\nhQEMA...\n-----END PGP MESSAGE-----"),
+                None,
+            ),
+            (
+                2,
+                Some(" \t\r\n  -----BEGIN PGP MESSAGE-----\n\nhQEMA..."),
+                None,
+            ),
+            (
+                3,
+                Some(""),
+                Some("\n  -----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\nhola"),
+            ),
+            (
+                4,
+                Some("-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\nhola"),
+                None,
+            ),
+            // Sólo CITAN una armadura (respuesta, post de lista, HTML con <pre>): sobreviven.
+            (
+                5,
+                Some("respondo:\n> -----BEGIN PGP MESSAGE-----\n> hQEMA..."),
+                None,
+            ),
+            (
+                6,
+                Some(""),
+                Some("<pre>-----BEGIN PGP MESSAGE-----\nhQEMA...</pre>"),
+            ),
+            (7, Some("un correo común"), Some("<p>sin armadura</p>")),
+            (8, Some("hablamos de PGP sin armadura"), None),
+        ];
+        let mut ids = Vec::new();
+        for (uid, text, html) in cuerpos {
+            connection
+                .execute(
+                    "INSERT INTO messages (mailbox_id, uid, from_addr, to_addrs, cc_addrs, bcc_addrs,
+                                           subject, date_ts, sort_key, size, updated_at)
+                     VALUES (1, ?1, 'ana@x.com', 'yo@x.com', '', '', 'Hola', 100, 100, 10, 'ayer')",
+                    [uid],
+                )
+                .unwrap();
+            let id = connection.last_insert_rowid();
+            connection
+                .execute(
+                    "INSERT INTO message_bodies (message_id, text_body, html_body, truncated, updated_at)
+                     VALUES (?1, ?2, ?3, 0, 'ayer')",
+                    rusqlite::params![id, text, html],
+                )
+                .unwrap();
+            ids.push(id);
+        }
+
+        apply(&mut connection).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 15);
+
+        // Quedan con cuerpo los que no son PGP inline (incluidos los que sólo citan)...
+        let con_cuerpo: Vec<i64> = connection
+            .prepare("SELECT message_id FROM message_bodies ORDER BY message_id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(con_cuerpo, vec![ids[4], ids[5], ids[6], ids[7]]);
+        // ...y los PGP inline quedan «sin cuerpo»: lo que `messages_without_body` vuelve a bajar.
+        let sin_cuerpo: Vec<i64> = connection
+            .prepare(
+                "SELECT m.id FROM messages m
+                 LEFT JOIN message_bodies b ON b.message_id = m.id
+                 WHERE b.message_id IS NULL ORDER BY m.id",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(sin_cuerpo, vec![ids[0], ids[1], ids[2], ids[3]]);
+
+        // Y migrar otra vez no borra nada más.
+        apply(&mut connection).unwrap();
+        let restantes: i64 = connection
+            .query_row("SELECT COUNT(*) FROM message_bodies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(restantes, 4);
+    }
+
+    /// **La V15 también borra el índice FTS** de los cuerpos que invalida: `messages_fts`
+    /// es contentless y `write_body` lo rehace por código, así que borrar sólo la fila de
+    /// `message_bodies` dejaría un término de la armadura vieja encontrando un mensaje sin
+    /// cuerpo. Un cuerpo que sólo cita PGP conserva su fila de FTS.
+    #[test]
+    fn de_v14_a_v15_se_borra_el_indice_fts_de_los_cuerpos_invalidados_y_no_el_de_los_que_citan() {
+        let mut connection = at_version(14);
+        connection
+            .execute(
+                "INSERT INTO mailboxes (name, display_name, role, updated_at)
+                 VALUES ('INBOX', 'Bandeja', 'inbox', 'ayer')",
+                [],
+            )
+            .unwrap();
+        let mut sembrar = |uid: i64, texto: &str| -> i64 {
+            connection
+                .execute(
+                    "INSERT INTO messages (mailbox_id, uid, from_addr, to_addrs, cc_addrs, bcc_addrs,
+                                           subject, date_ts, sort_key, size, updated_at)
+                     VALUES (1, ?1, 'ana@x.com', 'yo@x.com', '', '', 'Hola', 100, 100, 10, 'ayer')",
+                    [uid],
+                )
+                .unwrap();
+            let id = connection.last_insert_rowid();
+            connection
+                .execute(
+                    "INSERT INTO message_bodies (message_id, text_body, truncated, updated_at)
+                     VALUES (?1, ?2, 0, 'ayer')",
+                    rusqlite::params![id, texto],
+                )
+                .unwrap();
+            // Lo que haría `write_body`: indexar el texto bajo el id del mensaje.
+            connection
+                .execute(
+                    "INSERT INTO messages_fts (rowid, subject, from_addr, to_addrs, cc_addrs, text_body)
+                     SELECT ?1, subject, from_addr, to_addrs, cc_addrs, ?2 FROM messages WHERE id = ?1",
+                    rusqlite::params![id, texto],
+                )
+                .unwrap();
+            id
+        };
+        let inline = sembrar(
+            1,
+            "-----BEGIN PGP MESSAGE-----\n\nARMADURAVIEJA\n-----END PGP MESSAGE-----",
+        );
+        let citado = sembrar(2, "respondo:\n> -----BEGIN PGP MESSAGE-----\n> CITADOVIEJO");
+
+        let buscar = |c: &Connection, termino: &str| -> Vec<i64> {
+            c.prepare("SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?1")
+                .unwrap()
+                .query_map([termino], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        // Premisa: antes de migrar los dos términos se encuentran.
+        assert_eq!(buscar(&connection, "ARMADURAVIEJA"), vec![inline]);
+        assert_eq!(buscar(&connection, "CITADOVIEJO"), vec![citado]);
+
+        apply(&mut connection).unwrap();
+
+        assert!(
+            buscar(&connection, "ARMADURAVIEJA").is_empty(),
+            "el término de la armadura invalidada no puede seguir encontrando un mensaje sin cuerpo"
+        );
+        assert_eq!(buscar(&connection, "CITADOVIEJO"), vec![citado]);
     }
 
     /// **v10 → v11 no pierde nada**: el cuerpo, la firma y el firmante de una base de
@@ -1527,7 +1889,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
 
         let row: (String, Option<String>, i64, Option<i64>, Option<String>, Option<i64>) =
             connection
@@ -1563,7 +1925,7 @@ mod tests {
         let before = columns(&connection);
         apply(&mut connection).unwrap();
         assert_eq!(columns(&connection), before);
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
     }
 
     /// La marca `pending_op` sólo acepta los dos valores conocidos, o `NULL`.
@@ -1707,7 +2069,7 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .unwrap();
-        let all = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13];
+        let all = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14];
         Migrations::new(all[..version].iter().map(|sql| M::up(sql)).collect())
             .to_latest(&mut connection)
             .unwrap();
@@ -1735,7 +2097,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
 
         let count = |sql: &str| -> i64 { connection.query_row(sql, [], |r| r.get(0)).unwrap() };
         assert_eq!(count("SELECT count(*) FROM mailboxes"), 1);
@@ -1805,7 +2167,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
 
         let count = |sql: &str| -> i64 { connection.query_row(sql, [], |r| r.get(0)).unwrap() };
         assert_eq!(count("SELECT count(*) FROM mailboxes"), 1);
@@ -1839,7 +2201,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
         let message: String = connection
             .query_row("SELECT message FROM sync_log", [], |row| row.get(0))
             .unwrap();
@@ -2140,7 +2502,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
         assert_eq!(found(&connection, "jose"), vec![id]);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_emails"), 1);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_phones"), 1);
@@ -2311,7 +2673,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 14);
+        assert_eq!(schema_version(&connection).unwrap(), 15);
         assert_eq!(found(&connection, "jose"), vec![id]);
         assert_eq!(count(&connection, "SELECT count(*) FROM occurrences"), 2);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_emails"), 1);

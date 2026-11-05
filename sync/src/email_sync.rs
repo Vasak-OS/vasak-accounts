@@ -395,6 +395,15 @@ pub struct SmimeMaterial {
     pub cert: Vec<u8>,
 }
 
+/// Nuestra clave privada OpenPGP ya parseada y la contraseña que la abre, para
+/// descifrar el correo cifrado a nuestra dirección. Sale del llavero una vez por
+/// vuelta de cuenta (análogo de [`SmimeMaterial`]). La clave queda cerrada; se abre
+/// con `passphrase` recién al descifrar.
+pub struct PgpMaterial {
+    pub secret_key: pgp::composed::SignedSecretKey,
+    pub passphrase: pgp::types::Password,
+}
+
 /// Lo que se guarda de un mensaje abierto: el texto, el HTML **saneado** y los
 /// adjuntos. Si viene cifrado y tenemos la clave (`smime`), se descifra acá —con
 /// el crudo en mano; al leer no está— y se guarda el cuerpo **descifrado**
@@ -405,10 +414,13 @@ pub fn opened_rows_decrypting(
     raw: &[u8],
     truncated: bool,
     smime: Option<&SmimeMaterial>,
+    pgp: Option<&PgpMaterial>,
+    pgp_candidates: &[pgp::composed::SignedPublicKey],
 ) -> (MessageBodyRow, Vec<MessageAttachmentRow>) {
-    // 1) Descifrado. `decrypted` tiene el contenido interno si se abrió; el estado
-    //    de cifrado distingue abierto (1) de «no se pudo abrir» (2).
-    let (decrypted, smime_encrypted): (Option<zeroize::Zeroizing<Vec<u8>>>, Option<i64>) =
+    // 1) Descifrado. Se intenta S/MIME y PGP; en la práctica un mensaje usa uno u
+    //    otro. El estado de cifrado de cada esquema distingue abierto (1) de «no se
+    //    pudo abrir» (2); `None` es «no venía cifrado con ese esquema».
+    let (smime_decrypted, smime_encrypted): (Option<zeroize::Zeroizing<Vec<u8>>>, Option<i64>) =
         match smime {
             Some(material) => {
                 match crate::smime_sign::decrypt_message(raw, &material.key, &material.cert) {
@@ -425,19 +437,51 @@ pub fn opened_rows_decrypting(
             None if crate::smime_sign::is_enveloped(raw) => (None, Some(2)),
             None => (None, None),
         };
-    // El contenido sobre el que se muestra y se verifica: el descifrado si se
-    // abrió (sign-then-encrypt se resuelve solo: verificamos lo de adentro), si no
-    // el crudo.
-    let inner: &[u8] = decrypted.as_ref().map(|c| c.as_slice()).unwrap_or(raw);
+    let (pgp_decrypted, pgp_encrypted): (Option<zeroize::Zeroizing<Vec<u8>>>, Option<i64>) =
+        match pgp {
+            Some(material) => {
+                match crate::pgp::decrypt(raw, &material.secret_key, &material.passphrase) {
+                    crate::pgp::Decryption::Opened(content) => (Some(content), Some(1)),
+                    crate::pgp::Decryption::Unavailable(reason) => {
+                        tracing::debug!(reason, "cifrado PGP no se pudo abrir");
+                        (None, Some(2))
+                    }
+                    crate::pgp::Decryption::NotEncrypted => (None, None),
+                }
+            }
+            None if crate::pgp::is_pgp_encrypted(raw) => (None, Some(2)),
+            None => (None, None),
+        };
+
+    // El contenido sobre el que se muestra y se verifica: el descifrado si alguno
+    // de los dos esquemas abrió el sobre (a lo sumo uno lo hace), si no el crudo. El
+    // sign-then-encrypt se resuelve solo: verificamos lo de adentro.
+    let decrypted = smime_decrypted.as_ref().or(pgp_decrypted.as_ref());
+    let inner: &[u8] = decrypted.map(|c| c.as_slice()).unwrap_or(raw);
 
     // 2) S/MIME opaque firmado: el contenido real va dentro del PKCS#7; se muestra
     //    su eContent. (El `multipart/signed` ya trae el contenido como parte normal.)
     let unwrapped = crate::smime_sign::opaque_signed_content(inner);
     let display: &[u8] = unwrapped.as_deref().unwrap_or(inner);
-    let text = crate::message::plain_text(display);
-    let html = crate::message::html_part(display).map(|h| crate::html::sanitize(&h).html);
+    // Un sobre cifrado que no se pudo abrir (`*_encrypted == Some(2)`, sin contenido
+    // descifrado) no deja cuerpo: en S/MIME y PGP/MIME el sobre no es una parte de
+    // texto y el cuerpo ya sale vacío, pero en PGP **inline** la armadura
+    // `-----BEGIN PGP MESSAGE-----…` es el propio `text/plain`. Se vacía en todos los
+    // casos para cumplir el contrato de la V15 (cuerpo vacío, nunca roto). Un mensaje
+    // sólo firmado (cifrado `None`) es cleartext legible y no se toca.
+    let unopened = decrypted.is_none() && (smime_encrypted == Some(2) || pgp_encrypted == Some(2));
+    let text = if unopened {
+        String::new()
+    } else {
+        crate::message::plain_text(display)
+    };
+    let html = if unopened {
+        None
+    } else {
+        crate::message::html_part(display).map(|h| crate::html::sanitize(&h).html)
+    };
 
-    // 3) Firma: sólo se marca «firmado» (estado 0 + firmante) cuando la firma
+    // 3) Firma S/MIME: sólo se marca «firmado» (estado 0 + firmante) cuando la firma
     //    criptográfica, el digest y el binding al From cerraron —falta sólo la
     //    validación de confianza X.509—; cualquier otra cosa queda sin estado, para
     //    no mostrar «firmado» algo cuya firma no verifica.
@@ -458,18 +502,54 @@ pub fn opened_rows_decrypting(
         }
         crate::smime_sign::Verification::NotSigned => (None, None),
     };
-    let attachments = crate::attachments::list(display)
-        .into_iter()
-        .map(|a| MessageAttachmentRow {
-            message_id,
-            part_number: a.part,
-            name: Some(a.name),
-            content_type: a.content_type,
-            size: 0,
-            inline: false,
-            content_id: None,
-        })
-        .collect();
+
+    // 4) Firma PGP. Las candidatas (`pgp_candidates`) son las claves del peerstate
+    //    para el `From` **normalizado** (las resolvió el llamador): que la firma cierre
+    //    contra una de ellas es, por construcción, el binding firmante→From. La
+    //    honestidad es la de S/MIME: nunca «firmado por Fulano», sólo clave conocida /
+    //    desconocida / no verificable. Si el sobre se abrió (sign-then-encrypt), la
+    //    firma va sobre el contenido de adentro; si sólo venía firmado, sobre `raw`.
+    // Se usa el `decrypted` compartido (S/MIME o PGP), no sólo `pgp_decrypted`: si un
+    // sobre S/MIME se abrió y adentro hay una firma PGP/MIME, va sobre el contenido de
+    // adentro (`inner`), no sobre el sobre crudo —si no, nunca se chequearía.
+    let pgp_target: &[u8] = if decrypted.is_some() { inner } else { raw };
+    let (pgp_status, pgp_signer) = match crate::pgp::verify(pgp_target, pgp_candidates) {
+        crate::pgp::Verification::SignedUntrusted(fingerprint) => (Some(0), Some(fingerprint)),
+        crate::pgp::Verification::Unverified(reason) => {
+            tracing::debug!(reason, "firma PGP no verificada");
+            // Sin ninguna clave para el `From` es «clave desconocida» (1); con una
+            // clave que no cierra, «no verificable» (2). Distinguirlo es honesto: no
+            // es lo mismo no tener la clave que tenerla y que la firma no ligue.
+            if pgp_candidates.is_empty() {
+                (Some(1), None)
+            } else {
+                (Some(2), None)
+            }
+        }
+        crate::pgp::Verification::NotSigned => (None, None),
+    };
+
+    // shortcut: en un sobre PGP abierto los números de parte salen del árbol MIME
+    // DESCIFRADO y NO son secciones IMAP (`BODY[...]` direcciona el árbol cifrado), así
+    // que servir esas filas devolvería bytes equivocados o vacío. Hasta tener el fetch
+    // con descifrado (get_attachment bajando y descifrando el mensaje entero), no se
+    // listan. Un mensaje sólo firmado o en claro sí: su árbol es el que ve IMAP.
+    let attachments = if pgp_decrypted.is_some() {
+        Vec::new()
+    } else {
+        crate::attachments::list(display)
+            .into_iter()
+            .map(|a| MessageAttachmentRow {
+                message_id,
+                part_number: a.part,
+                name: Some(a.name),
+                content_type: a.content_type,
+                size: 0,
+                inline: false,
+                content_id: None,
+            })
+            .collect()
+    };
     (
         MessageBodyRow {
             message_id,
@@ -479,6 +559,9 @@ pub fn opened_rows_decrypting(
             smime_status,
             smime_signer,
             smime_encrypted,
+            pgp_status,
+            pgp_signer,
+            pgp_encrypted,
         },
         attachments,
     )
@@ -555,11 +638,24 @@ impl<K: KeySource> EmailSync<K> {
         // se pudo abrir», nunca rotos.
         let smime = smime_material(account_id).await;
 
+        // Nuestra identidad OpenPGP, también una vez por vuelta, para descifrar el
+        // correo PGP cifrado a nuestra dirección. `None` si la cuenta no tiene
+        // identidad PGP o no hay llavero. La verificación de firmas entrantes y la
+        // ingesta de claves al peerstate no dependen de esto: andan igual sin nuestra
+        // clave (sólo necesitan las públicas de terceros).
+        let pgp = pgp_material(account_id).await;
+
         // Con plazo: la vuelta de las cuentas es una por vez, y un servidor que
         // contesta lento no puede dejar sin correo al resto.
         let outcome = match tokio::time::timeout(
             ROUND_DEADLINE,
-            sync_session(&self.manager, account_id, &mut session, smime.as_ref()),
+            sync_session(
+                &self.manager,
+                account_id,
+                &mut session,
+                smime.as_ref(),
+                pgp.as_ref(),
+            ),
         )
         .await
         {
@@ -634,12 +730,84 @@ async fn smime_material(account_id: &str) -> Option<SmimeMaterial> {
     Some(SmimeMaterial { key, cert })
 }
 
+/// Nuestra identidad OpenPGP (clave privada + contraseña) del llavero, por cuenta.
+/// `None` si no hay identidad PGP, no hay llavero, o la clave no parsea: sin esto, el
+/// correo PGP cifrado a nuestra dirección queda «no se pudo abrir». La clave privada
+/// se guarda por `account_id` (ver `store::pgp_key`), no por dirección.
+async fn pgp_material(account_id: &str) -> Option<PgpMaterial> {
+    let connection = zbus::Connection::session().await.ok()?;
+    let keys = crate::store::key::SecretServiceKeys::on_session_bus(connection);
+    let secret_bytes = keys.find_pgp_secret_key(account_id).await.ok()??;
+    let passphrase_bytes = keys.find_pgp_passphrase(account_id).await.ok()??;
+    let secret_key = crate::pgp::parse_secret_key(&secret_bytes).ok()?;
+    let passphrase = pgp::types::Password::from(passphrase_bytes.as_slice());
+    Some(PgpMaterial {
+        secret_key,
+        passphrase,
+    })
+}
+
+/// Las claves públicas candidatas para **verificar** la firma de un mensaje
+/// entrante: las del peerstate TOFU para su `From` normalizado. De paso **ingiere**
+/// al peerstate las claves que el mensaje trae (adjuntos `application/pgp-keys` y
+/// cabecera `Autocrypt`), así una clave adjunta puede verificar la firma de su propio
+/// mensaje (el fin de Autocrypt).
+///
+/// Sólo toca el almacén cuando el mensaje **tiene algo PGP** (clave entrante, o viene
+/// firmado/cifrado): el correo común —la enorme mayoría— no paga ninguna vuelta al
+/// almacén. Todo fallo degrada a «sin candidatas» (verificación honesta: desconocida/
+/// no verificable), nunca corta la vuelta ni entra en pánico.
+async fn pgp_peer_candidates<K: KeySource>(
+    manager: &StoreManager<K>,
+    account_id: &str,
+    raw: &[u8],
+) -> Vec<pgp::composed::SignedPublicKey> {
+    let incoming = crate::pgp_import::incoming_public_keys(raw);
+    // Sin clave entrante ni firma/cifrado PGP no hay nada que ingerir ni que
+    // verificar: no se toca el almacén.
+    if incoming.is_empty() && !crate::pgp::is_pgp_signed(raw) && !crate::pgp::is_pgp_encrypted(raw)
+    {
+        return Vec::new();
+    }
+    let from = crate::pgp_import::normalize_address(&crate::smime_sign::message_from(raw));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+
+    // Una sola vuelta al almacén por mensaje: ingiere todo lo entrante y devuelve la
+    // clave conocida del `From`. La cripto (parseo + verificación de binding de cada
+    // clave) corre en el hilo bloqueante de `with_store`, fuera del runtime.
+    let peer = manager
+        .with_store(account_id, move |s| {
+            for (addr, blob) in &incoming {
+                if let Err(e) = crate::pgp_import::ingest_peer_key(s, addr, blob, now) {
+                    tracing::debug!("ingesta de clave PGP al peerstate: {e}");
+                }
+            }
+            s.find_peer(&from)
+        })
+        .await;
+
+    match peer {
+        Ok(Some(peer)) => crate::pgp::parse_public_key(&peer.public_key)
+            .ok()
+            .into_iter()
+            .collect(),
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            tracing::debug!("peerstate PGP no disponible: {e}");
+            Vec::new()
+        }
+    }
+}
+
 /// Todas las casillas de una sesión ya abierta.
 async fn sync_session<K, F>(
     manager: &StoreManager<K>,
     account_id: &str,
     session: &mut Session<F>,
     smime: Option<&SmimeMaterial>,
+    pgp: Option<&PgpMaterial>,
 ) -> Result<EmailReport, RoundError>
 where
     K: KeySource,
@@ -697,6 +865,7 @@ where
             role,
             &mut report,
             smime,
+            pgp,
             &names,
             trash.as_deref(),
         )
@@ -730,6 +899,7 @@ async fn sync_mailbox<K, F>(
     role: MailboxRole,
     report: &mut EmailReport,
     smime: Option<&SmimeMaterial>,
+    pgp: Option<&PgpMaterial>,
     known_mailboxes: &HashSet<String>,
     trash: Option<&str>,
 ) -> Result<(), RoundError>
@@ -760,7 +930,7 @@ where
         MailboxAction::Skip => {
             report.unchanged += 1;
             if inbox {
-                prefetch_bodies(manager, account_id, session, id, report, smime).await?;
+                prefetch_bodies(manager, account_id, session, id, report, smime, pgp).await?;
             }
             return Ok(());
         }
@@ -854,7 +1024,7 @@ where
         .await?;
 
     if inbox {
-        prefetch_bodies(manager, account_id, session, id, report, smime).await?;
+        prefetch_bodies(manager, account_id, session, id, report, smime, pgp).await?;
     }
     Ok(())
 }
@@ -928,6 +1098,7 @@ async fn prefetch_bodies<K, F>(
     mailbox_id: i64,
     report: &mut EmailReport,
     smime: Option<&SmimeMaterial>,
+    pgp: Option<&PgpMaterial>,
 ) -> Result<(), RoundError>
 where
     K: KeySource,
@@ -948,7 +1119,19 @@ where
         };
         match session.fetch_body(uid).await {
             Ok((raw, truncated)) => {
-                opened.push(opened_rows_decrypting(message_id, &raw, truncated, smime))
+                // Las candidatas de verificación salen del peerstate del `From`, y de
+                // paso se ingiere al peerstate lo que el mensaje trae (adjuntos/
+                // Autocrypt). Perezoso: sólo toca el almacén si el mensaje tiene algo
+                // PGP.
+                let candidates = pgp_peer_candidates(manager, account_id, &raw).await;
+                opened.push(opened_rows_decrypting(
+                    message_id,
+                    &raw,
+                    truncated,
+                    smime,
+                    pgp,
+                    &candidates,
+                ))
             }
             // Uno que el servidor no da —se borró recién— no frena a los demás.
             Err(ImapError::Refused(e)) => {
@@ -990,5 +1173,7 @@ pub type EmailScheduler<K> = dav_sync::DavScheduler<EmailSync<K>>;
 
 #[cfg(test)]
 mod decrypt_tests;
+#[cfg(test)]
+mod pgp_tests;
 #[cfg(test)]
 mod tests;

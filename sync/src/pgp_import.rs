@@ -44,7 +44,10 @@ use pgp::packet::SignatureType;
 use pgp::ser::Serialize;
 use pgp::types::{KeyDetails, Tag};
 
-use crate::message::parse_sender;
+use crate::message::{
+    as_latin1, decode_transfer, from_latin1, parse_content_type, parse_sender, split_headers,
+    split_parts, Headers,
+};
 use crate::pgp::{parse_public_key, parse_secret_key, PgpError};
 use crate::store::{Store, StoreError};
 
@@ -209,14 +212,28 @@ pub fn ingest_peer_key(
                 new_fingerprint,
             })
         }
-        Some(_) => {
-            // Misma huella: NO se reescribe `public_key`. Un blob entrante con la misma
-            // primaria pero la subclave de cifrado quitada (o una revocación) no debe
-            // **reducir** la clave ya guardada —TOFU conservador, decisión 3—; sólo se
-            // refresca `updated_at`.
-            store
-                .touch_peer(&address, now)
-                .map_err(IngestError::Store)?;
+        Some(previous) => {
+            // Misma huella: NO se **reemplaza** la clave guardada —un blob con la
+            // subclave de cifrado quitada no debe reducir la ya guardada (TOFU
+            // conservador, decisión 3)—, pero sí se **fusionan** las revocaciones y
+            // bindings autenticados que traiga la actualización: sin esto, una subclave
+            // que el contacto revocó se seguiría aceptando como firmante. Si no hay nada
+            // nuevo autenticado, sólo se refresca `updated_at`.
+            let mut stored = parse_public_key(&previous.public_key).map_err(IngestError::Key)?;
+            if merge_authenticated_updates(&mut stored, &key) {
+                let bytes = stored.to_bytes().map_err(|e| {
+                    IngestError::Key(PgpError::BadKey(format!(
+                        "no se pudo re-serializar la clave fusionada: {e}"
+                    )))
+                })?;
+                store
+                    .upsert_peer(&address, &bytes, &new_fingerprint, now)
+                    .map_err(IngestError::Store)?;
+            } else {
+                store
+                    .touch_peer(&address, now)
+                    .map_err(IngestError::Store)?;
+            }
             Ok(Ingested::Unchanged)
         }
         None => {
@@ -231,6 +248,93 @@ pub fn ingest_peer_key(
             Ok(Ingested::New)
         }
     }
+}
+
+/// Fusiona en la clave guardada (`stored`) las revocaciones de primaria, las auto-firmas
+/// de la primaria (directas y certificaciones de UID) y las firmas de subclave (bindings
+/// y revocaciones) **autenticadas** que trae una actualización `incoming` con la **misma**
+/// primaria. No quita material (anti-degradación de la decisión 3: se mezcla, no se
+/// reemplaza). Devuelve `true` si agregó algo.
+///
+/// Sólo se mezcla lo que **verifica contra la primaria guardada**: así una
+/// actualización con el `From` spoofeado no puede inyectar una revocación ni una
+/// auto-firma forjada (el mismo criterio que `strip_forged_revocations` y
+/// `verify_key_bindings`). Fusionar las auto-firmas importa porque llevan el
+/// `KeyExpirationTime` de la primaria: cuando un contacto **renueva** el plazo reenvía
+/// la misma huella con una auto-firma más nueva, y sin adoptarla la copia guardada
+/// vencería para siempre tras el plazo original (`primary_usable` daría `false` y no se
+/// podría ni verificar ni cifrar). `primary_usable` ya elige la auto-firma verificada
+/// más nueva, así que una certificación forjada sigue sin poder cambiar la expiración.
+///
+/// shortcut: sí se adopta la **renovación de expiración** de la primaria; lo que **no**
+/// se adopta son subclaves **nuevas** del blob (rotación de subclave): sólo se honran las
+/// revocaciones/bindings de las ya conocidas. Subir a soportar rotación si un contacto
+/// rota su subclave de cifrado y hay que adoptarla.
+fn merge_authenticated_updates(stored: &mut SignedPublicKey, incoming: &SignedPublicKey) -> bool {
+    let primary = stored.primary_key.clone();
+    let mut changed = false;
+
+    // Revocaciones de primaria autenticadas que falten.
+    for sig in &incoming.details.revocation_signatures {
+        if sig.verify_key(&primary).is_ok() && !stored.details.revocation_signatures.contains(sig) {
+            stored.details.revocation_signatures.push(sig.clone());
+            changed = true;
+        }
+    }
+
+    // Auto-firmas directas de la primaria autenticadas que falten: llevan el plazo de la
+    // primaria, así que sin esto una renovación de expiración nunca se adoptaría.
+    for sig in &incoming.details.direct_signatures {
+        if sig.verify_key(&primary).is_ok() && !stored.details.direct_signatures.contains(sig) {
+            stored.details.direct_signatures.push(sig.clone());
+            changed = true;
+        }
+    }
+
+    // Certificaciones de UID autenticadas que falten, por UID ya conocido (mismo `id`):
+    // también llevan el plazo de la primaria en su auto-certificación.
+    for inc_user in &incoming.details.users {
+        let Some(stored_user) = stored
+            .details
+            .users
+            .iter_mut()
+            .find(|u| u.id == inc_user.id)
+        else {
+            continue;
+        };
+        for sig in &inc_user.signatures {
+            if sig
+                .verify_certification(&primary, Tag::UserId, &inc_user.id)
+                .is_ok()
+                && !stored_user.signatures.contains(sig)
+            {
+                stored_user.signatures.push(sig.clone());
+                changed = true;
+            }
+        }
+    }
+
+    // Firmas de subclave (binding/revocación) autenticadas que falten, cotejando la
+    // subclave por huella: sólo se tocan subclaves ya conocidas.
+    for inc_sub in &incoming.public_subkeys {
+        let inc_fp = inc_sub.key.fingerprint();
+        let Some(stored_sub) = stored
+            .public_subkeys
+            .iter_mut()
+            .find(|s| s.key.fingerprint() == inc_fp)
+        else {
+            continue;
+        };
+        for sig in &inc_sub.signatures {
+            if sig.verify_subkey_binding(&primary, &inc_sub.key).is_ok()
+                && !stored_sub.signatures.contains(sig)
+            {
+                stored_sub.signatures.push(sig.clone());
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 // ── Verificación criptográfica del binding (el hallazgo de PR2) ─────────
@@ -362,6 +466,124 @@ fn self_signed_emails(key: &SignedPublicKey) -> Vec<String> {
         .collect()
 }
 
+// ── Claves públicas que trae un mensaje entrante ────────────────────────
+
+/// Tope del blob de una clave pública adjunta (`application/pgp-keys`), medido sobre
+/// los bytes **codificados** de la parte (cota superior holgada del binario). Una
+/// clave normal pesa pocos KiB; más de 1 MiB es una clave con miles de firmas de UID
+/// —una bomba de CPU/memoria al parsear— y se ignora, no se intenta parsear. Es el
+/// follow-up de security de PR3 contra un adjunto gigante.
+const MAX_KEY_BLOB: usize = 1024 * 1024;
+
+/// Tope del `keydata` de una cabecera `Autocrypt:`, medido sobre el valor de la
+/// cabecera (mayormente base64) y sobre el binario decodificado. 128 KiB es muy
+/// holgado para una clave Autocrypt legítima (pocos KiB) y corta en seco una
+/// cabecera gigante antes de gastar CPU decodificando base64. Mismo follow-up.
+const MAX_AUTOCRYPT_KEYDATA: usize = 128 * 1024;
+
+/// Profundidad máxima de anidado MIME al buscar claves adjuntas, igual criterio que
+/// [`crate::attachments`]: un mensaje legítimo no anida tanto, y acota el trabajo
+/// ante un `multipart` patológicamente profundo.
+const MAX_MIME_DEPTH: usize = 8;
+
+/// Tope de partes `application/pgp-keys` que se juntan de un mensaje. Un mensaje
+/// legítimo trae una o dos claves; cientos de partes es un abuso que haría parsear
+/// (y verificar bindings de) una clave por cada una. Corta además del tope por blob
+/// ([`MAX_KEY_BLOB`]).
+const MAX_KEY_PARTS: usize = 16;
+
+/// Las claves públicas que trae un mensaje entrante para ingerir al peerstate: la de
+/// la cabecera `Autocrypt:` (atribuida a su `addr`, **sólo si coincide con el `From`**
+/// —Autocrypt L1 ignora la cabecera cuyo `addr` no es el del remitente—) y las de los
+/// adjuntos `application/pgp-keys` (atribuidas al `From`). Devuelve `(dirección, bytes)`
+/// para pasar tal cual a [`ingest_peer_key`]; la normalización de la dirección y la
+/// validación del material las hace esa función (un solo lugar).
+///
+/// Parseo puro, sin red y sin pánico sobre entrada hostil. Respeta los topes de
+/// tamaño ([`MAX_KEY_BLOB`], [`MAX_AUTOCRYPT_KEYDATA`]) **antes** de parsear, para
+/// que un adjunto o una cabecera gigantes no sean una bomba de CPU/memoria. El
+/// wiring de sync (PR4) llama a esto y luego a [`ingest_peer_key`] por cada par.
+pub fn incoming_public_keys(raw: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let view = as_latin1(raw);
+    let (headers, body) = split_headers(&view);
+    let mut found = Vec::new();
+
+    // El `From` del mensaje (sólo la dirección): liga tanto los adjuntos como la
+    // cabecera Autocrypt. El mismo parser que `smime_sign::message_from`.
+    let from = parse_sender(headers.get("from").unwrap_or_default()).1;
+    let from_normalized = normalize_address(&from);
+
+    // Cabecera Autocrypt: el valor acotado antes de decodificar, y la clave binaria
+    // acotada después. `split_headers` da un solo valor por nombre; tomar sólo ése es
+    // conservador (Autocrypt L1 ignora el mensaje con cabeceras repetidas). Autocrypt
+    // L1 además manda **ignorar** la cabecera si su `addr` no es el del remitente: sin
+    // esto, un `From` spoofeado sembraría en el peerstate TOFU la clave del atacante
+    // bajo la dirección de la víctima. Se compara normalizado.
+    // Autocrypt L1: se consideran todas las cabeceras `Autocrypt` válidas (parseables,
+    // dentro del tope y con `addr` == `From`). Si queda **más de una**, es un error y se
+    // ignoran TODAS; sólo se siembra la clave cuando hay **exactamente una**.
+    let valid_autocrypt: Vec<AutocryptHeader> = headers
+        .get_all("autocrypt")
+        .filter(|value| value.len() <= MAX_AUTOCRYPT_KEYDATA)
+        .filter_map(parse_autocrypt_header)
+        .filter(|header| {
+            header.key.len() <= MAX_AUTOCRYPT_KEYDATA
+                && normalize_address(&header.addr) == from_normalized
+        })
+        .collect();
+    if let [header] = valid_autocrypt.as_slice() {
+        found.push((header.addr.clone(), header.key.clone()));
+    }
+
+    // Adjuntos `application/pgp-keys`, atribuidos al `From` del mensaje. Sin `From`
+    // no hay dirección bajo la cual ingerirlos: se omiten (`ingest_peer_key` también
+    // rechazaría la dirección vacía).
+    if !from.is_empty() {
+        collect_key_attachments(&headers, body, 0, &from, &mut found);
+    }
+    found
+}
+
+/// Baja por el árbol MIME juntando los blobs de las partes `application/pgp-keys`,
+/// decodificados según su `Content-Transfer-Encoding`, atribuidos a `from`. Acota la
+/// profundidad y el tamaño; una parte que se pasa del tope se ignora.
+fn collect_key_attachments(
+    headers: &Headers,
+    body: &str,
+    depth: usize,
+    from: &str,
+    out: &mut Vec<(String, Vec<u8>)>,
+) {
+    if depth > MAX_MIME_DEPTH || out.len() >= MAX_KEY_PARTS {
+        return;
+    }
+    let content_type = headers
+        .get("content-type")
+        .map(parse_content_type)
+        .unwrap_or_default();
+
+    if let Some(boundary) = &content_type.boundary {
+        for part in split_parts(body, boundary) {
+            let (part_headers, part_body) = split_headers(part);
+            collect_key_attachments(&part_headers, part_body, depth + 1, from, out);
+        }
+        return;
+    }
+
+    if content_type.media_type == "application/pgp-keys" {
+        // Cota sobre lo codificado antes de decodificar: un adjunto gigante no gasta
+        // CPU/memoria en base64.
+        if body.len() > MAX_KEY_BLOB {
+            return;
+        }
+        let encoding = headers.get("content-transfer-encoding").unwrap_or("7bit");
+        let decoded = decode_transfer(&from_latin1(body), encoding);
+        if !decoded.is_empty() && decoded.len() <= MAX_KEY_BLOB {
+            out.push((from.to_string(), decoded));
+        }
+    }
+}
+
 // ── Parseo de la cabecera Autocrypt entrante ────────────────────────────
 
 /// La clave pública y la dirección de una cabecera `Autocrypt:`.
@@ -451,6 +673,10 @@ mod tests {
     use rand::rngs::OsRng;
 
     const AHORA: i64 = 1_000;
+    // Los topes que fija la especificación, a propósito como literales: la prueba
+    // no sigue a las constantes del código, las vigila.
+    const MIB: usize = 1024 * 1024;
+    const KIB_128: usize = 128 * 1024;
 
     fn bytes(key: &SignedPublicKey) -> Vec<u8> {
         key.to_bytes().expect("la clave serializa")
@@ -1048,8 +1274,572 @@ mod tests {
         assert_eq!(peer.fingerprint, huella(&key));
     }
 
+    // ── Claves que trae un mensaje entrante (`incoming_public_keys`) ────
+
+    /// Un correo `multipart/mixed` de `from` con `extra` cabeceras y, por cada
+    /// `(Content-Type, Content-Transfer-Encoding, cuerpo)`, una parte.
+    fn correo_con_partes(from: &str, extra: &str, partes: &[(&str, &str, String)]) -> Vec<u8> {
+        let mut out =
+            format!("From: {from}\r\n{extra}Content-Type: multipart/mixed; boundary=\"M\"\r\n\r\n");
+        for (tipo, cte, cuerpo) in partes {
+            out.push_str(&format!(
+                "--M\r\nContent-Type: {tipo}\r\nContent-Transfer-Encoding: {cte}\r\n\r\n{cuerpo}\r\n"
+            ));
+        }
+        out.push_str("--M--\r\n");
+        out.into_bytes()
+    }
+
+    fn adjunta(key: &SignedPublicKey) -> (&'static str, &'static str, String) {
+        ("application/pgp-keys", "base64", b64(&bytes(key)))
+    }
+
+    #[test]
+    fn un_adjunto_pgp_keys_se_extrae_atribuido_al_from_en_binario() {
+        let key = publica(&clave_completa("Ana <ana@example.com>"));
+        // base64 y armadura de 7 bits: los dos llegan decodificados.
+        let armada = String::from_utf8(key.to_armored_bytes(Default::default()).unwrap()).unwrap();
+        for (que, parte) in [
+            ("base64", adjunta(&key)),
+            ("7bit armado", ("application/pgp-keys", "7bit", armada)),
+        ] {
+            let raw = correo_con_partes("Ana <ana@example.com>", "", &[parte]);
+            let found = incoming_public_keys(&raw);
+            assert_eq!(found.len(), 1, "{que}");
+            assert_eq!(found[0].0, "ana@example.com", "{que}");
+            // Lo extraído es una clave que `ingest_peer_key` entiende.
+            let parsed = crate::pgp::parse_public_key(&found[0].1).expect(que);
+            assert_eq!(huella(&parsed), huella(&key), "{que}");
+        }
+    }
+
+    #[test]
+    fn la_cabecera_autocrypt_se_extrae_con_su_addr_y_la_clave_binaria() {
+        let key = publica(&clave_completa("Ana <ana@example.com>"));
+        let raw = format!(
+            "From: Ana <ana@example.com>\r\nAutocrypt: addr=ana@example.com; prefer-encrypt=mutual; keydata={}\r\n\
+Content-Type: text/plain\r\n\r\nhola\r\n",
+            b64(&bytes(&key))
+        );
+        let found = incoming_public_keys(raw.as_bytes());
+        assert_eq!(found, vec![("ana@example.com".to_string(), bytes(&key))]);
+    }
+
+    #[test]
+    fn un_correo_sin_claves_no_extrae_nada_ni_con_adjuntos_de_otro_tipo() {
+        assert!(incoming_public_keys(b"From: a@b.test\r\n\r\nhola\r\n").is_empty());
+        let raw = correo_con_partes(
+            "a@b.test",
+            "",
+            &[
+                ("text/plain", "7bit", "hola".into()),
+                ("application/pdf", "base64", b64(b"%PDF")),
+            ],
+        );
+        assert!(incoming_public_keys(&raw).is_empty());
+    }
+
+    #[test]
+    fn un_correo_sin_from_no_siembra_claves_ni_por_adjunto_ni_por_autocrypt() {
+        let key = publica(&clave_completa("Ana <ana@example.com>"));
+        let sin_from = correo_con_partes("", "", &[adjunta(&key)]);
+        assert!(incoming_public_keys(&sin_from).is_empty());
+        // Sin remitente no hay contra qué cotejar el `addr` (Autocrypt L1): se ignora.
+        let cabecera = format!(
+            "Autocrypt: addr=ana@example.com; keydata={}\r\n",
+            b64(&bytes(&key))
+        );
+        let con_autocrypt = correo_con_partes("", &cabecera, &[]);
+        assert!(incoming_public_keys(&con_autocrypt).is_empty());
+        // Control: con un `From` que coincide con el `addr`, la cabecera sí entra.
+        let con_from = correo_con_partes("Ana <ana@example.com>", &cabecera, &[]);
+        assert_eq!(incoming_public_keys(&con_from).len(), 1);
+        // Y con un `From` ajeno, no.
+        let ajeno = correo_con_partes("Mallory <mallory@example.com>", &cabecera, &[]);
+        assert!(incoming_public_keys(&ajeno).is_empty());
+    }
+
+    #[test]
+    fn un_adjunto_de_mas_de_un_mebibyte_se_ignora_y_uno_algo_menor_pasa() {
+        // 7bit: el cuerpo llega tal cual. El margen de 16 bytes deja afuera el CRLF
+        // que la frontera MIME agrega al cuerpo de la parte.
+        let justo = "A".repeat(MIB - 16);
+        let pasado = "A".repeat(MIB + 16);
+        let raw = |cuerpo: &String| {
+            correo_con_partes(
+                "a@b.test",
+                "",
+                &[("application/pgp-keys", "7bit", cuerpo.clone())],
+            )
+        };
+        assert_eq!(incoming_public_keys(&raw(&justo)).len(), 1, "bajo el tope");
+        assert!(
+            incoming_public_keys(&raw(&pasado)).is_empty(),
+            "pasado el tope se ignora sin parsear ni entrar en pánico"
+        );
+        // En base64 el tope se mide sobre lo codificado: un blob que decodificado
+        // cabe pero codificado se pasa tampoco entra.
+        let codificado = b64(&vec![7u8; MIB]);
+        assert!(codificado.len() > MIB);
+        let grande = correo_con_partes(
+            "a@b.test",
+            "",
+            &[("application/pgp-keys", "base64", codificado)],
+        );
+        assert!(incoming_public_keys(&grande).is_empty());
+    }
+
+    #[test]
+    fn un_keydata_autocrypt_de_mas_de_128_kibibytes_se_ignora_y_uno_normal_pasa() {
+        let normal = format!(
+            "From: a@b.test\r\nAutocrypt: addr=a@b.test; keydata={}\r\n\r\nx",
+            b64(&[1u8; 3000])
+        );
+        assert_eq!(incoming_public_keys(normal.as_bytes()).len(), 1);
+
+        // Base64 válido pero de más de 128 KiB: no se decodifica ni se devuelve.
+        let enorme = b64(&vec![1u8; KIB_128]);
+        assert!(enorme.len() > KIB_128);
+        let raw = format!("From: a@b.test\r\nAutocrypt: addr=a@b.test; keydata={enorme}\r\n\r\nx");
+        assert!(incoming_public_keys(raw.as_bytes()).is_empty());
+    }
+
+    #[test]
+    fn un_multipart_anidado_mas_alla_del_tope_de_profundidad_no_aporta_claves() {
+        let key = publica(&clave_completa("Ana <ana@example.com>"));
+        // Un adjunto de claves envuelto en `n` multiparts.
+        let anidado = |n: usize| {
+            let mut cuerpo = format!(
+                "Content-Type: application/pgp-keys\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n",
+                b64(&bytes(&key))
+            );
+            for nivel in (0..n).rev() {
+                cuerpo = format!(
+                    "Content-Type: multipart/mixed; boundary=\"N{nivel}\"\r\n\r\n--N{nivel}\r\n{cuerpo}--N{nivel}--\r\n"
+                );
+            }
+            format!("From: ana@example.com\r\n{cuerpo}").into_bytes()
+        };
+        assert_eq!(incoming_public_keys(&anidado(2)).len(), 1, "poco profundo");
+        assert!(
+            incoming_public_keys(&anidado(8 + 3)).is_empty(),
+            "más profundo que el tope se corta sin recursión sin fin"
+        );
+    }
+
+    #[test]
+    fn la_basura_en_los_adjuntos_y_cabeceras_no_entra_en_panico() {
+        for raw in [
+            &b""[..],
+            b"\xff\xfe\x00From: \x01\r\n\r\n",
+            b"From: a@b.test\r\nContent-Type: multipart/mixed\r\n\r\nsin frontera",
+            b"From: a@b.test\r\nContent-Type: multipart/mixed; boundary=\"\"\r\n\r\n----\r\n",
+            b"From: a@b.test\r\nAutocrypt: \r\n\r\n",
+            b"From: a@b.test\r\nAutocrypt: addr=;keydata=;;;=\r\n\r\n",
+        ] {
+            let _ = incoming_public_keys(raw);
+        }
+        let basura = correo_con_partes(
+            "a@b.test",
+            "",
+            &[("application/pgp-keys", "base64", "!!no es base64!!".into())],
+        );
+        // No hay pánico; lo que salga es sólo bytes que `ingest_peer_key` rechazará.
+        for (_, blob) in incoming_public_keys(&basura) {
+            assert!(parse_public_key(&blob).is_err());
+        }
+    }
+
     #[test]
     fn la_normalizacion_recorta_y_pasa_a_minusculas() {
         assert_eq!(normalize_address("  Ana@Example.COM \n"), "ana@example.com");
+    }
+
+    // ── Hallazgos de revisión (PR4): fusionar lo autenticado, topes y Autocrypt ──
+
+    /// Una firma `SubkeyRevocation` de `firmante` sobre la subclave `index` de
+    /// `objetivo`. Con `firmante` distinto del dueño, no verifica contra su primaria.
+    fn revocacion_de_subclave(
+        firmante: &SignedSecretKey,
+        objetivo: &SignedPublicKey,
+        index: usize,
+    ) -> pgp::packet::Signature {
+        SignatureConfig::from_key(
+            OsRng,
+            &firmante.primary_key,
+            SignatureType::SubkeyRevocation,
+        )
+        .unwrap()
+        .sign_subkey_binding(
+            &firmante.primary_key,
+            firmante.primary_key.public_key(),
+            &vacia(),
+            &objetivo.public_subkeys[index].key,
+        )
+        .expect("firma de revocación de subclave")
+    }
+
+    /// Si un cleartext firmado con la subclave de firma de `secret` (la 0) se reporta
+    /// como firma de clave conocida contra `candidata`.
+    fn firma_de_la_subclave_es_conocida(
+        candidata: &SignedPublicKey,
+        secret: &SignedSecretKey,
+    ) -> bool {
+        let bloque = crate::pgp::tests::cleartext_de("hola", &*secret.secret_subkeys[0]);
+        let correo = format!("From: a@example.com\r\nContent-Type: text/plain\r\n\r\n{bloque}");
+        matches!(
+            crate::pgp::verify(correo.as_bytes(), std::slice::from_ref(candidata)),
+            crate::pgp::Verification::SignedUntrusted(_)
+        )
+    }
+
+    #[test]
+    fn reingerir_la_misma_primaria_con_una_subclave_revocada_la_deja_de_aceptar_como_firmante() {
+        let temp = TempDir::new("pgp-import-merge-revocacion-subclave");
+        let store = open_store(&temp);
+        let ana = clave_completa("Ana <ana@example.com>");
+        let sana = publica(&ana);
+        ingest_peer_key(&store, "ana@example.com", &bytes(&sana), 100).unwrap();
+        // Premisa: antes de la revocación la subclave de firma cuenta como conocida.
+        assert!(firma_de_la_subclave_es_conocida(
+            &guardada(&store, "ana@example.com"),
+            &ana
+        ));
+
+        let mut revocada = sana.clone();
+        let revocacion = revocacion_de_subclave(&ana, &revocada, 0);
+        revocada.public_subkeys[0].signatures.push(revocacion);
+        let r = ingest_peer_key(&store, "ana@example.com", &bytes(&revocada), 200);
+        assert_eq!(r.unwrap(), Ingested::Unchanged);
+
+        let g = guardada(&store, "ana@example.com");
+        assert!(
+            !firma_de_la_subclave_es_conocida(&g, &ana),
+            "la subclave revocada no puede seguir elevando a «clave conocida»"
+        );
+        // Lo demás sigue: misma huella, la subclave de cifrado sirve, primera vez intacta.
+        assert!(encryption_subkey(&g).is_some());
+        let peer = store.find_peer("ana@example.com").unwrap().unwrap();
+        assert_eq!(peer.fingerprint, huella(&sana));
+        assert_eq!((peer.first_seen, peer.updated_at), (100, 200));
+    }
+
+    #[test]
+    fn una_revocacion_de_subclave_ya_guardada_no_se_pierde_con_un_blob_con_menos_material() {
+        let temp = TempDir::new("pgp-import-merge-no-degrada");
+        let store = open_store(&temp);
+        let ana = clave_completa("Ana <ana@example.com>");
+        let sana = publica(&ana);
+        let mut revocada = sana.clone();
+        let revocacion = revocacion_de_subclave(&ana, &revocada, 0);
+        revocada.public_subkeys[0].signatures.push(revocacion);
+        ingest_peer_key(&store, "ana@example.com", &bytes(&revocada), 100).unwrap();
+        assert!(!firma_de_la_subclave_es_conocida(
+            &guardada(&store, "ana@example.com"),
+            &ana
+        ));
+
+        // Un blob viejo (sin la revocación) y uno sin subclaves no revierten ni quitan nada.
+        let mut sin_subclaves = sana.clone();
+        sin_subclaves.public_subkeys.clear();
+        for (que, entrante) in [
+            ("sin la revocación", sana.clone()),
+            ("sin subclaves", sin_subclaves),
+        ] {
+            let r = ingest_peer_key(&store, "ana@example.com", &bytes(&entrante), 200);
+            assert_eq!(r.unwrap(), Ingested::Unchanged, "{que}");
+            let g = guardada(&store, "ana@example.com");
+            assert_eq!(g.public_subkeys.len(), 2, "{que}: no se quitan subclaves");
+            assert!(
+                !firma_de_la_subclave_es_conocida(&g, &ana),
+                "{que}: la revocación guardada se conserva"
+            );
+            assert!(encryption_subkey(&g).is_some(), "{que}");
+        }
+    }
+
+    #[test]
+    fn una_revocacion_forjada_en_una_reingesta_no_se_fusiona() {
+        let temp = TempDir::new("pgp-import-merge-forjada");
+        let store = open_store(&temp);
+        let ana = clave_completa("Ana <ana@example.com>");
+        let atacante = clave_completa("Atacante <atacante@example.com>");
+        let sana = publica(&ana);
+        ingest_peer_key(&store, "ana@example.com", &bytes(&sana), 100).unwrap();
+
+        // El `From` spoofeado trae una revocación de la primaria hecha por el atacante:
+        // no verifica contra la primaria guardada y no se fusiona.
+        let mut forjada = sana.clone();
+        forjada
+            .details
+            .revocation_signatures
+            .push(revocacion(&atacante, &ana));
+        ingest_peer_key(&store, "ana@example.com", &bytes(&forjada), 200).unwrap();
+        let g = guardada(&store, "ana@example.com");
+        assert!(g.details.revocation_signatures.is_empty());
+        assert!(encryption_subkey(&g).is_some());
+
+        // Y una revocación de subclave del atacante ni siquiera pasa el gate de bindings:
+        // el blob entero se rechaza y lo guardado no cambia.
+        let mut con_subclave_forjada = sana.clone();
+        let sobre_subclave = revocacion_de_subclave(&atacante, &con_subclave_forjada, 0);
+        con_subclave_forjada.public_subkeys[0]
+            .signatures
+            .push(sobre_subclave);
+        let r = ingest_peer_key(
+            &store,
+            "ana@example.com",
+            &bytes(&con_subclave_forjada),
+            300,
+        );
+        assert!(es_error_de_clave(r));
+        assert!(firma_de_la_subclave_es_conocida(
+            &guardada(&store, "ana@example.com"),
+            &ana
+        ));
+    }
+
+    #[test]
+    fn reingerir_la_misma_primaria_con_una_auto_revocacion_valida_inhabilita_la_guardada() {
+        let temp = TempDir::new("pgp-import-merge-revocacion-primaria");
+        let store = open_store(&temp);
+        let ana = clave_completa("Ana <ana@example.com>");
+        let sana = publica(&ana);
+        ingest_peer_key(&store, "ana@example.com", &bytes(&sana), 100).unwrap();
+        assert!(encryption_subkey(&guardada(&store, "ana@example.com")).is_some());
+
+        let mut revocada = sana.clone();
+        revocada
+            .details
+            .revocation_signatures
+            .push(revocacion(&ana, &ana));
+        let r = ingest_peer_key(&store, "ana@example.com", &bytes(&revocada), 200);
+        assert_eq!(r.unwrap(), Ingested::Unchanged);
+
+        let g = guardada(&store, "ana@example.com");
+        assert_eq!(g.details.revocation_signatures.len(), 1);
+        assert!(encryption_subkey(&g).is_none(), "la revocación se fusionó");
+    }
+
+    #[test]
+    fn mas_de_16_partes_pgp_keys_se_cortan_en_16() {
+        let key = publica(&clave_completa("Ana <ana@example.com>"));
+        let con = |n: usize| {
+            let partes: Vec<_> = (0..n).map(|_| adjunta(&key)).collect();
+            incoming_public_keys(&correo_con_partes("Ana <ana@example.com>", "", &partes)).len()
+        };
+        assert_eq!(con(15), 15, "control: debajo del tope entran todas");
+        assert_eq!(con(16), 16);
+        assert_eq!(con(40), 16, "el resto se corta");
+    }
+
+    #[test]
+    fn con_dos_cabeceras_autocrypt_validas_no_se_siembra_ninguna_clave() {
+        let ana = publica(&clave_completa("Ana <ana@example.com>"));
+        let otra = publica(&clave_completa("Ana <ana@example.com>"));
+        let cabecera = |key: &SignedPublicKey, addr: &str| {
+            format!("Autocrypt: addr={addr}; keydata={}\r\n", b64(&bytes(key)))
+        };
+        let from = "Ana <ana@example.com>";
+
+        // Una sola válida: se siembra.
+        let una = correo_con_partes(from, &cabecera(&ana, "ana@example.com"), &[]);
+        assert_eq!(
+            incoming_public_keys(&una),
+            vec![("ana@example.com".to_string(), bytes(&ana))]
+        );
+
+        // Dos válidas (claves distintas, o la misma repetida): Autocrypt L1 manda
+        // ignorarlas todas, ni siquiera la primera.
+        for (que, extra) in [
+            (
+                "dos claves distintas",
+                format!(
+                    "{}{}",
+                    cabecera(&ana, "ana@example.com"),
+                    cabecera(&otra, "ana@example.com")
+                ),
+            ),
+            (
+                "la misma repetida",
+                format!(
+                    "{}{}",
+                    cabecera(&ana, "ana@example.com"),
+                    cabecera(&ana, "ana@example.com")
+                ),
+            ),
+        ] {
+            let raw = correo_con_partes(from, &extra, &[]);
+            assert!(incoming_public_keys(&raw).is_empty(), "{que}");
+        }
+
+        // Una válida y otra con `addr` ajeno al `From` (inválida para este remitente):
+        // sólo cuenta la válida, así que se siembra esa.
+        let mixta = format!(
+            "{}{}",
+            cabecera(&otra, "otro@example.com"),
+            cabecera(&ana, "ana@example.com")
+        );
+        assert_eq!(
+            incoming_public_keys(&correo_con_partes(from, &mixta, &[])),
+            vec![("ana@example.com".to_string(), bytes(&ana))]
+        );
+    }
+
+    /// Una clave completa cuya primaria se creó hace un año.
+    fn clave_de_hace_un_ano(uid: &str) -> SignedSecretKey {
+        use crate::pgp::tests::{subclave_de_cifrado, subclave_de_firma};
+        use pgp::composed::{EncryptionCaps, KeyType, SecretKeyParamsBuilder};
+        let hace_un_ano = Timestamp::from_secs(Timestamp::now().as_secs() - UN_ANO);
+        let mut p = SecretKeyParamsBuilder::default();
+        p.key_type(KeyType::Ed25519Legacy)
+            .can_certify(true)
+            .can_sign(false)
+            .can_encrypt(EncryptionCaps::None)
+            .created_at(hace_un_ano)
+            .primary_user_id(uid.into())
+            .subkeys(vec![subclave_de_firma(), subclave_de_cifrado(None)]);
+        p.build().unwrap().generate(OsRng).unwrap()
+    }
+
+    const UN_ANO: u32 = 365 * 24 * 3600;
+
+    /// Una auto-firma de la primaria (`Key` directa o `CertPositive` del primer UID),
+    /// creada en `ahora + desfase` segundos y con `KeyExpirationTime` = `plazo`
+    /// (relativo a la creación de la primaria).
+    fn auto_firma_con_plazo(
+        secret: &SignedSecretKey,
+        typ: SignatureType,
+        desfase: u32,
+        plazo: u32,
+    ) -> pgp::packet::Signature {
+        use pgp::types::Duration as PgpDuration;
+        let primaria = &secret.primary_key;
+        let mut flags = KeyFlags::default();
+        flags.set_certify(true);
+        let creada = Timestamp::from_secs(Timestamp::now().as_secs() + desfase);
+        let mut config = SignatureConfig::from_key(OsRng, primaria, typ).unwrap();
+        config.hashed_subpackets = vec![
+            Subpacket::regular(SubpacketData::SignatureCreationTime(creada)).unwrap(),
+            Subpacket::regular(SubpacketData::KeyFlags(flags)).unwrap(),
+            Subpacket::regular(SubpacketData::IssuerFingerprint(primaria.fingerprint())).unwrap(),
+            Subpacket::regular(SubpacketData::KeyExpirationTime(PgpDuration::from_secs(
+                plazo,
+            )))
+            .unwrap(),
+        ];
+        match typ {
+            SignatureType::Key => config
+                .sign_key(primaria, &vacia(), primaria.public_key())
+                .unwrap(),
+            _ => config
+                .sign_certification(
+                    primaria,
+                    primaria.public_key(),
+                    &vacia(),
+                    Tag::UserId,
+                    &publica(secret).details.users[0].id,
+                )
+                .unwrap(),
+        }
+    }
+
+    /// La pública con la auto-firma (`typ`) de `plazo`, agregada o —para el UID—
+    /// reemplazando la de generación.
+    fn con_auto_firma(
+        secret: &SignedSecretKey,
+        base: &SignedPublicKey,
+        typ: SignatureType,
+        desfase: u32,
+        plazo: u32,
+    ) -> SignedPublicKey {
+        let mut key = base.clone();
+        let firma = auto_firma_con_plazo(secret, typ, desfase, plazo);
+        match typ {
+            SignatureType::Key => key.details.direct_signatures.push(firma),
+            _ => key.details.users[0].signatures.push(firma),
+        }
+        key
+    }
+
+    #[test]
+    fn reingerir_la_misma_primaria_con_una_renovacion_de_expiracion_la_adopta() {
+        let ana = clave_de_hace_un_ano("Ana <ana@example.com>");
+        // La renovación llega como certificación de UID o como firma directa: dos loops.
+        for (que, typ) in [
+            ("certificación de UID", SignatureType::CertPositive),
+            ("firma directa", SignatureType::Key),
+        ] {
+            let temp = TempDir::new("pgp-import-renovacion");
+            let store = open_store(&temp);
+            // Vencida desde hace ~364 días (plazo de un día desde la creación).
+            let vencida = con_auto_firma(&ana, &publica(&ana), typ, 100, 24 * 3600);
+            ingest_peer_key(&store, "ana@example.com", &bytes(&vencida), 100).unwrap();
+            assert!(
+                encryption_subkey(&guardada(&store, "ana@example.com")).is_none(),
+                "{que}: premisa, la guardada está vencida"
+            );
+
+            // Renovación: la misma primaria con una auto-firma más nueva que extiende
+            // el plazo a dos años. (Trae también la vieja.)
+            let renovada = con_auto_firma(&ana, &vencida, typ, 200, 2 * UN_ANO);
+            let r = ingest_peer_key(&store, "ana@example.com", &bytes(&renovada), 200);
+            assert_eq!(r.unwrap(), Ingested::Unchanged, "{que}");
+
+            let g = guardada(&store, "ana@example.com");
+            assert!(
+                encryption_subkey(&g).is_some(),
+                "{que}: la renovación autenticada se adopta y la clave vuelve a servir"
+            );
+            // No se degrada: siguen las dos subclaves y la huella.
+            assert_eq!(g.public_subkeys.len(), 2, "{que}");
+            assert_eq!(huella(&g), huella(&vencida), "{que}");
+        }
+    }
+
+    #[test]
+    fn una_renovacion_forjada_por_otra_clave_no_revive_la_guardada_vencida() {
+        let ana = clave_de_hace_un_ano("Ana <ana@example.com>");
+        let atacante = clave_de_hace_un_ano("Atacante <atacante@example.com>");
+        let temp = TempDir::new("pgp-import-renovacion-forjada");
+        let store = open_store(&temp);
+        let vencida = con_auto_firma(
+            &ana,
+            &publica(&ana),
+            SignatureType::CertPositive,
+            100,
+            24 * 3600,
+        );
+        ingest_peer_key(&store, "ana@example.com", &bytes(&vencida), 100).unwrap();
+
+        // Firmas del atacante (sobre su clave) pegadas a la de ana: no verifican contra
+        // la primaria guardada y no se adoptan.
+        let mut forjada = vencida.clone();
+        forjada.details.users[0]
+            .signatures
+            .push(auto_firma_con_plazo(
+                &atacante,
+                SignatureType::CertPositive,
+                200,
+                2 * UN_ANO,
+            ));
+        forjada.details.direct_signatures.push(auto_firma_con_plazo(
+            &atacante,
+            SignatureType::Key,
+            200,
+            2 * UN_ANO,
+        ));
+        ingest_peer_key(&store, "ana@example.com", &bytes(&forjada), 200).unwrap();
+        let g = guardada(&store, "ana@example.com");
+        assert!(encryption_subkey(&g).is_none());
+        // Y ni siquiera se guardan: la fusión sólo adopta lo que verifica contra la primaria.
+        assert_eq!(
+            g.details.direct_signatures.len(),
+            vencida.details.direct_signatures.len()
+        );
+        assert_eq!(
+            g.details.users[0].signatures.len(),
+            vencida.details.users[0].signatures.len()
+        );
     }
 }

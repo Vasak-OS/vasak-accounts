@@ -120,6 +120,14 @@ pub struct MessageBodyRow {
     /// Estado de cifrado: `None` no cifrado, `Some(1)` cifrado y abierto (el
     /// cuerpo guardado es el descifrado), `Some(2)` cifrado, no se pudo abrir.
     pub smime_encrypted: Option<i64>,
+    /// Estado PGP de la firma: `None` no firmado, `Some(0)` «clave conocida» (TOFU),
+    /// `Some(1)` «clave desconocida», `Some(2)` «no verificable». Ver migración V15.
+    pub pgp_status: Option<i64>,
+    /// La huella del firmante PGP cuando `pgp_status` es `Some(0)` (clave conocida).
+    pub pgp_signer: Option<String>,
+    /// Estado de cifrado PGP: `None` no cifrado, `Some(1)` cifrado y abierto (el
+    /// cuerpo guardado es el descifrado), `Some(2)` cifrado, no se pudo abrir.
+    pub pgp_encrypted: Option<i64>,
 }
 
 /// Un adjunto de un mensaje.
@@ -199,8 +207,8 @@ fn write_body(transaction: &Transaction, body: MessageBodyRow) -> Result<(), Sto
         .execute(
             "INSERT INTO message_bodies
                  (message_id, text_body, html_body, truncated, smime_status, smime_signer,
-                  smime_encrypted, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                  smime_encrypted, pgp_status, pgp_signer, pgp_encrypted, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT (message_id) DO UPDATE SET
                      text_body = excluded.text_body,
                      html_body = excluded.html_body,
@@ -208,6 +216,9 @@ fn write_body(transaction: &Transaction, body: MessageBodyRow) -> Result<(), Sto
                      smime_status = excluded.smime_status,
                      smime_signer = excluded.smime_signer,
                      smime_encrypted = excluded.smime_encrypted,
+                     pgp_status = excluded.pgp_status,
+                     pgp_signer = excluded.pgp_signer,
+                     pgp_encrypted = excluded.pgp_encrypted,
                      updated_at = excluded.updated_at",
             rusqlite::params![
                 body.message_id,
@@ -217,6 +228,9 @@ fn write_body(transaction: &Transaction, body: MessageBodyRow) -> Result<(), Sto
                 body.smime_status,
                 body.smime_signer,
                 body.smime_encrypted,
+                body.pgp_status,
+                body.pgp_signer,
+                body.pgp_encrypted,
                 now(),
             ],
         )
@@ -1051,6 +1065,9 @@ mod tests {
                 smime_status: None,
                 smime_signer: None,
                 smime_encrypted: None,
+                pgp_status: None,
+                pgp_signer: None,
+                pgp_encrypted: None,
             })
             .unwrap();
 
@@ -1189,6 +1206,9 @@ mod tests {
                 smime_status: None,
                 smime_signer: None,
                 smime_encrypted: None,
+                pgp_status: None,
+                pgp_signer: None,
+                pgp_encrypted: None,
             })
             .unwrap();
 
@@ -1407,6 +1427,9 @@ mod tests {
                 smime_status: None,
                 smime_signer: None,
                 smime_encrypted: None,
+                pgp_status: None,
+                pgp_signer: None,
+                pgp_encrypted: None,
             })
             .unwrap();
 
@@ -1576,6 +1599,9 @@ mod tests {
                 smime_status: None,
                 smime_signer: None,
                 smime_encrypted: None,
+                pgp_status: None,
+                pgp_signer: None,
+                pgp_encrypted: None,
             })
             .unwrap();
 
@@ -1607,6 +1633,9 @@ mod tests {
                     smime_status: None,
                     smime_signer: None,
                     smime_encrypted: None,
+                    pgp_status: None,
+                    pgp_signer: None,
+                    pgp_encrypted: None,
                 },
                 vec![MessageAttachmentRow {
                     message_id: id,
