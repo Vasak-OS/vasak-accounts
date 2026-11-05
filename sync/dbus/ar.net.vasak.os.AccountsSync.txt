@@ -24,6 +24,7 @@ interface ar.net.vasak.os.AccountsSync
   method RemovePgpIdentity(in s account_id)
   method RemoveSmimeIdentity(in s account_id)
   method ReorderRules(in s account_id, in s ids_json)
+  method ResolveRecipientKey(in s account_id, in s address, out s)
   method SearchMessages(in s account_id, in s mailbox, in s query, out s)
   method SendMessage(in s account_id, in s draft, in s not_before, out s)
   method SnoozeMessage(in s account_id, in s mailbox, in u uid, in x return_at, out s)
