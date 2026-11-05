@@ -84,6 +84,7 @@ mod notifications;
 mod outbox;
 mod pgp;
 mod pgp_import;
+mod pgp_sign;
 mod preferences;
 mod query;
 mod reminders;
@@ -108,6 +109,12 @@ mod graph_write;
 // El lado de la escritura conservadora de iCalendar y vCard. La superficie
 // D-Bus que arma los parches y encola es el PR siguiente de este hito
 // (`vasak-accounts#23`); por ahora lo ejercitan sus pruebas y la cola.
+#[cfg(test)]
+mod ipc_test_support;
+#[cfg(test)]
+mod pgp_ipc_tests;
+#[cfg(test)]
+mod pgp_send_tests;
 #[allow(dead_code)]
 mod serialize;
 #[cfg(test)]
@@ -788,8 +795,20 @@ impl Reader {
 const MAX_SMIME_PKCS12_BYTES: usize = 8 * 1024 * 1024;
 
 /// Tope de la contraseña del `.p12`: una frase de paso, no un archivo. Capa la
-/// lectura del memfd de la contraseña igual que el del `.p12`.
+/// lectura del memfd de la contraseña igual que el del `.p12`. También capa la
+/// contraseña (passphrase) de la clave OpenPGP, del mismo tamaño.
 const MAX_SMIME_PASSWORD_BYTES: usize = 4096;
+
+/// Tope de la clave OpenPGP que entra por el bus: una clave privada armada son
+/// pocos KB; 1 MiB sobra y corta una clave patológica con miles de firmas antes
+/// de intentar parsearla.
+const MAX_PGP_KEY_BYTES: usize = 1024 * 1024;
+
+/// El buffer corto que firma la **prueba de contraseña** al importar una identidad
+/// OpenPGP. Su contenido no importa: sólo fuerza a rPGP a abrir la clave con la
+/// contraseña, para que una contraseña equivocada falle en el import y no tarde en
+/// el despachador.
+const PGP_PASSPHRASE_PROBE: &[u8] = b"vasak-pgp-passphrase-probe";
 
 /// Errores de la gestión de identidad S/MIME por IPC, con **nombres de error
 /// D-Bus estables** que la ventana traduce (no la prosa, que está en español y
@@ -841,6 +860,26 @@ fn smime_ipc_from_keyring(error: store::key::KeyError) -> SmimeIpcError {
     match error {
         store::key::KeyError::Locked => SmimeIpcError::KeyringLocked,
         other => SmimeIpcError::Failed(format!("el llavero falló: {other}")),
+    }
+}
+
+/// `PgpError` del parseo/validación de la clave OpenPGP → el error IPC, **sin**
+/// filtrar material. Reusa el mismo enum que S/MIME (no hay prefijo propio): el
+/// único `BadKey` que liga una dirección —el de `parse_identity_secret_key`,
+/// «…no liga ningún UID a …»— es `AddressMismatch`; el resto de `BadKey` es
+/// material que no parsea (`Malformed`); la cripto y la falta de componente de
+/// firma caen en `Failed` con un texto sin secretos. La contraseña equivocada la
+/// detecta la firma de prueba del import, no acá.
+fn pgp_ipc_from_parse(error: crate::pgp::PgpError) -> SmimeIpcError {
+    use crate::pgp::PgpError;
+    match error {
+        PgpError::BadKey(reason) if reason.contains("no liga") => SmimeIpcError::AddressMismatch,
+        PgpError::BadKey(_) => SmimeIpcError::Malformed,
+        PgpError::Crypto(_) => SmimeIpcError::Failed("la operación criptográfica PGP falló".into()),
+        PgpError::NoSigningKey => SmimeIpcError::Failed("la clave PGP no puede firmar".into()),
+        PgpError::NoEncryptionKey(_) => {
+            SmimeIpcError::Failed("la clave PGP no puede cifrar".into())
+        }
     }
 }
 
@@ -1592,22 +1631,54 @@ impl Service {
 
         compose::validate(&draft).map_err(zbus::fdo::Error::InvalidArgs)?;
 
-        // Si se pidió firmar, tiene que haber identidad S/MIME para el `From`
+        // Si se pidió firmar, tiene que haber identidad para el método elegido
         // **ahora**, al encolar: si no, la firma fallaría tarde en el despachador
         // y el mensaje quedaría trabado sin que la ventana se entere. Se rechaza
-        // con `InvalidArgs`, como una dirección mal escrita.
-        if draft.sign {
-            let keys = store::key::SecretServiceKeys::on_session_bus(emitter.connection().clone());
-            let has_identity = keys
-                .find_smime_private_key(&draft.from)
-                .await
-                .map_err(|e| zbus::fdo::Error::Failed(format!("no se pudo leer el llavero: {e}")))?
-                .is_some();
-            if !has_identity {
-                return Err(zbus::fdo::Error::InvalidArgs(format!(
-                    "no hay certificado S/MIME para {}: importalo antes de firmar",
-                    draft.from
-                )));
+        // con `InvalidArgs`, como una dirección mal escrita. S/MIME se indexa por
+        // dirección (`From`); PGP por `account_id`.
+        match draft.effective_sign_method() {
+            compose::SignMethod::None => {}
+            compose::SignMethod::Smime => {
+                let keys =
+                    store::key::SecretServiceKeys::on_session_bus(emitter.connection().clone());
+                let has_identity = keys
+                    .find_smime_private_key(&draft.from)
+                    .await
+                    .map_err(|e| {
+                        zbus::fdo::Error::Failed(format!("no se pudo leer el llavero: {e}"))
+                    })?
+                    .is_some();
+                if !has_identity {
+                    return Err(zbus::fdo::Error::InvalidArgs(format!(
+                        "no hay certificado S/MIME para {}: importalo antes de firmar",
+                        draft.from
+                    )));
+                }
+            }
+            compose::SignMethod::Pgp => {
+                // No alcanza con que la identidad **esté**: tiene que poder firmar
+                // **ahora**. Una clave muerta (primaria revocada/expirada) o
+                // sólo-de-cifrado (sin componente de firma) existe pero haría
+                // fallar la firma permanente recién en el despachador, dejando el
+                // mensaje trabado. Se carga y se comprueba con el mismo selector que
+                // usará el envío (`pgp::can_sign_now`), y se rechaza al encolar.
+                let keys =
+                    store::key::SecretServiceKeys::on_session_bus(emitter.connection().clone());
+                let can_sign = keys
+                    .find_pgp_secret_key(&account_id)
+                    .await
+                    .map_err(|e| {
+                        zbus::fdo::Error::Failed(format!("no se pudo leer el llavero: {e}"))
+                    })?
+                    .as_deref()
+                    .and_then(|bytes| crate::pgp::parse_secret_key(bytes).ok())
+                    .is_some_and(|key| crate::pgp::can_sign_now(&key));
+                if !can_sign {
+                    return Err(zbus::fdo::Error::InvalidArgs(format!(
+                        "no hay una identidad OpenPGP que pueda firmar para «{account_id}»: \
+                         importá una clave con componente de firma vigente antes de firmar"
+                    )));
+                }
             }
         }
 
@@ -1796,6 +1867,163 @@ impl Service {
             .await?;
         let keys = store::key::SecretServiceKeys::on_session_bus(connection.clone());
         keys.delete_smime_identity(&address)
+            .await
+            .map_err(smime_ipc_from_keyring)
+    }
+
+    /// Importa la identidad OpenPGP de una cuenta desde una clave secreta (armor
+    /// ASCII o binaria) y su contraseña.
+    ///
+    /// **La identidad PGP se indexa por `account_id`, no por dirección** (a
+    /// diferencia de S/MIME): así la guarda [`store::pgp_key`] y así la lee el
+    /// descifrado/firma (`email_sync::pgp_material`, `sign_message_pgp`). Igual se
+    /// resuelve la dirección de la cuenta ([`Service::account_address`]) para
+    /// **validar** que un UID con auto-firma válida ligue el `From`
+    /// ([`pgp_import::parse_identity_secret_key`], el mismo endurecimiento que ya
+    /// descarta revocaciones forjadas y bindings de subclave inválidos); una clave
+    /// que no liga la dirección no serviría para firmar → `AddressMismatch`.
+    ///
+    /// La clave y la contraseña entran cada una por un **memfd sellado** (firma
+    /// `h`, no `ay`): los bytes no transitan el `dbus-daemon`, y el sello contra
+    /// escritura evita cambiarlos después de validados (ver [`read_sealed_fd`]). La
+    /// contraseña vive en memoria que se borra sola y no va a ningún lado.
+    ///
+    /// Tras parsear, una **firma de prueba** con la contraseña confirma que de
+    /// verdad abre la clave: una contraseña equivocada falla acá (`WrongPassword`)
+    /// y no tarde en el despachador. Una identidad sólo-de-cifrado no tiene
+    /// componente de firma y no se puede sondear así: se acepta igual.
+    ///
+    /// Gateada como la de S/MIME (`store.email` de quien llama sobre la cuenta,
+    /// `vasak-accounts#135`): el permiso se pide **después** de capar los fds y
+    /// **antes** de parsear o tocar el llavero; sin permiso contesta `AccessDenied`
+    /// y no escribe nada.
+    async fn import_pgp_identity(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        account_id: String,
+        key: zbus::zvariant::OwnedFd,
+        passphrase: zbus::zvariant::OwnedFd,
+    ) -> Result<(), SmimeIpcError> {
+        // Leer y capar ambos fds antes de resolver la cuenta (igual que S/MIME):
+        // el tope se mira antes que nada, y el leído del memfd va en
+        // `spawn_blocking`. La clave y la contraseña (y sus buffers) se borran
+        // solos: las dos son material sensible, así que van en `Zeroizing`.
+        let (key_bytes, passphrase) = tokio::task::spawn_blocking(move || {
+            let key = Zeroizing::new(read_sealed_fd(key, MAX_PGP_KEY_BYTES)?);
+            let passphrase = Zeroizing::new(read_sealed_fd(passphrase, MAX_SMIME_PASSWORD_BYTES)?);
+            Ok::<_, SmimeIpcError>((key, passphrase))
+        })
+        .await
+        .map_err(|_| SmimeIpcError::Failed("la lectura de los descriptores se cortó".into()))??;
+
+        let address = self.account_address(&account_id).await?;
+
+        // El permiso de quien llama, después de capar los fds y antes de parsear la
+        // clave o tocar el llavero: nada se escribe sin permiso.
+        self.authorize_smime(header.sender().map(|s| s.as_str()), &address)
+            .await?;
+
+        // Parsear (liga un UID al `From`) y confirmar que la contraseña abre la
+        // clave con una firma de prueba: parseo y cripto son CPU, fuera del worker
+        // de Tokio. La contraseña se borra al terminar el hilo.
+        let (sanitized_key, passphrase) = tokio::task::spawn_blocking(move || {
+            use ::pgp::ser::Serialize as _;
+            let secret_key = pgp_import::parse_identity_secret_key(&key_bytes, &address)
+                .map_err(pgp_ipc_from_parse)?;
+            let probe = ::pgp::types::Password::from(passphrase.as_slice());
+            match crate::pgp::sign_detached(PGP_PASSPHRASE_PROBE, &secret_key, &probe) {
+                // Firmó (contraseña correcta) o la clave no tiene componente de
+                // firma (sólo-de-cifrado): no se puede sondear la contraseña así,
+                // se acepta igual.
+                Ok(_) | Err(crate::pgp::PgpError::NoSigningKey) => {}
+                // La cripto falló al abrir la clave: la contraseña no abre.
+                Err(crate::pgp::PgpError::Crypto(_)) => return Err(SmimeIpcError::WrongPassword),
+                Err(other) => return Err(pgp_ipc_from_parse(other)),
+            }
+            // Se guardan los bytes **saneados**, no el blob original: al parsear,
+            // `parse_identity_secret_key` descarta las revocaciones de primaria
+            // forjadas (un `From` spoofeado que adjunta una revocación firmada por
+            // otro). Si se guardara el original, al releer la identidad
+            // (`email_sync::pgp_material`) esas revocaciones volverían y la clave
+            // propia aparecería revocada → no podría firmar ni descifrar. Las
+            // auto-revocaciones **válidas** sí sobreviven al saneo, así que una
+            // clave genuinamente revocada se guarda revocada.
+            // La clave saneada re-serializada también es material sensible: en
+            // `Zeroizing` para que se borre al soltarla.
+            let sanitized = Zeroizing::new(secret_key.to_bytes().map_err(|e| {
+                SmimeIpcError::Failed(format!("no se pudo re-serializar la clave PGP: {e}"))
+            })?);
+            Ok::<_, SmimeIpcError>((sanitized, passphrase))
+        })
+        .await
+        .map_err(|_| SmimeIpcError::Failed("la validación de la clave PGP se cortó".into()))??;
+
+        let keys = store::key::SecretServiceKeys::on_session_bus(connection.clone());
+        keys.store_pgp_identity(&account_id, sanitized_key.as_slice(), passphrase.as_slice())
+            .await
+            .map_err(smime_ipc_from_keyring)?;
+        Ok(())
+    }
+
+    /// El estado de la identidad OpenPGP de una cuenta, en JSON
+    /// `{present, fingerprint, uids}`. **Nunca** devuelve material secreto. Se lee
+    /// por `account_id` (la identidad PGP se indexa por cuenta). Sirve para el
+    /// formulario y para gatear el toggle de firma PGP de la ventana.
+    async fn get_pgp_identity(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        account_id: String,
+    ) -> Result<String, SmimeIpcError> {
+        let keys = store::key::SecretServiceKeys::on_session_bus(connection.clone());
+        let secret = keys
+            .find_pgp_secret_key(&account_id)
+            .await
+            .map_err(smime_ipc_from_keyring)?;
+
+        // La clave guardada → su metadata pública (huella + UIDs), sin exponer el
+        // material secreto. Si no parsea, se trata como ausente: el resumen es
+        // estado, no un lugar para filtrar errores de material. El parseo es CPU:
+        // va en `spawn_blocking`, como el import y el camino de firma, para no
+        // bloquear el runtime.
+        let summary = match secret {
+            Some(bytes) => tokio::task::spawn_blocking(move || {
+                crate::pgp::parse_secret_key(&bytes)
+                    .ok()
+                    .map(|key| crate::pgp::identity_summary(&key.to_public_key()))
+            })
+            .await
+            .map_err(|_| SmimeIpcError::Failed("el parseo de la clave PGP se cortó".into()))?,
+            None => None,
+        };
+        let value = match summary {
+            Some((fingerprint, uids)) => serde_json::json!({
+                "present": true,
+                "fingerprint": fingerprint,
+                "uids": uids,
+            }),
+            None => serde_json::json!({ "present": false, "fingerprint": null, "uids": [] }),
+        };
+        serde_json::to_string(&value)
+            .map_err(|e| SmimeIpcError::Failed(format!("no se pudo serializar: {e}")))
+    }
+
+    /// Borra la identidad OpenPGP de una cuenta, para deshacer una importación
+    /// equivocada. Gateada como la importación (`store.email` de quien llama sobre
+    /// la cuenta): borrar la clave de firma es una mutación, así que pide permiso
+    /// antes de tocar el llavero. El borrado es por `account_id`; la dirección se
+    /// resuelve sólo para el diálogo de permisos.
+    async fn remove_pgp_identity(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        account_id: String,
+    ) -> Result<(), SmimeIpcError> {
+        let address = self.account_address(&account_id).await?;
+        self.authorize_smime(header.sender().map(|s| s.as_str()), &address)
+            .await?;
+        let keys = store::key::SecretServiceKeys::on_session_bus(connection.clone());
+        keys.delete_pgp_identity(&account_id)
             .await
             .map_err(smime_ipc_from_keyring)
     }
@@ -2185,8 +2413,14 @@ async fn send_one(
         broker::smtp_endpoint(&config, Some(token)).map_err(smtp::SmtpError::Permanent)?;
 
     let keys = store::key::SecretServiceKeys::on_session_bus(connection.clone());
-    let message =
-        compose_outgoing(&keys, &outgoing.draft, &outgoing.message_id, &outgoing.date).await?;
+    let message = compose_outgoing(
+        &keys,
+        &outgoing.draft,
+        &outgoing.account_id,
+        &outgoing.message_id,
+        &outgoing.date,
+    )
+    .await?;
 
     let mut session = smtp::Session::open(&destination).await?;
     let result = session
@@ -2196,19 +2430,25 @@ async fn send_one(
     result
 }
 
-/// El mensaje tal como sale: firmado si el borrador lo pidió, tal cual si no.
-/// Separado de `send_one` para poder probar que pedir firma y no poder firmar
-/// **falla** en vez de mandar sin firmar.
+/// El mensaje tal como sale: firmado con el método que pidió el borrador (S/MIME
+/// por `From`, PGP por `account_id`), tal cual si no se pidió firma. Separado de
+/// `send_one` para poder probar que pedir firma y no poder firmar **falla** en vez
+/// de mandar sin firmar.
 async fn compose_outgoing(
     keys: &store::key::SecretServiceKeys,
     draft: &compose::Draft,
+    account_id: &str,
     message_id: &str,
     date: &str,
 ) -> Result<String, smtp::SmtpError> {
-    if draft.sign {
-        sign_message(keys, draft, message_id, date).await
-    } else {
-        compose::build_message(draft, message_id, date).map_err(smtp::SmtpError::Permanent)
+    match draft.effective_sign_method() {
+        compose::SignMethod::Smime => sign_message(keys, draft, message_id, date).await,
+        compose::SignMethod::Pgp => {
+            sign_message_pgp(keys, draft, account_id, message_id, date).await
+        }
+        compose::SignMethod::None => {
+            compose::build_message(draft, message_id, date).map_err(smtp::SmtpError::Permanent)
+        }
     }
 }
 
@@ -2246,6 +2486,50 @@ async fn sign_message(
     Ok(smime_sign::build_signed_message(
         &headers, &content, &signature,
     ))
+}
+
+/// Arma el mensaje firmado con PGP/MIME (RFC 3156). La clave privada y su
+/// contraseña salen del llavero **por `account_id`** (no por dirección: la
+/// identidad PGP se indexa por cuenta, a diferencia de S/MIME). Si no hay
+/// identidad para la cuenta y se pidió firmar, el envío **falla** —no se manda sin
+/// firmar en silencio—, igual que S/MIME.
+async fn sign_message_pgp(
+    keys: &store::key::SecretServiceKeys,
+    draft: &compose::Draft,
+    account_id: &str,
+    message_id: &str,
+    date: &str,
+) -> Result<String, smtp::SmtpError> {
+    let secret_bytes = keys
+        .find_pgp_secret_key(account_id)
+        .await
+        .map_err(|e| smtp::SmtpError::Temporary(e.to_string()))?
+        .ok_or_else(|| {
+            smtp::SmtpError::Permanent(format!("no hay identidad OpenPGP para «{account_id}»"))
+        })?;
+    let passphrase = keys
+        .find_pgp_passphrase(account_id)
+        .await
+        .map_err(|e| smtp::SmtpError::Temporary(e.to_string()))?
+        .ok_or_else(|| {
+            smtp::SmtpError::Permanent(format!(
+                "no hay contraseña de la identidad OpenPGP para «{account_id}»"
+            ))
+        })?;
+
+    let secret_key = crate::pgp::parse_secret_key(&secret_bytes)
+        .map_err(|e| smtp::SmtpError::Permanent(e.to_string()))?;
+    let password = ::pgp::types::Password::from(passphrase.as_slice());
+
+    let headers = compose::build_message_headers(draft, message_id, date)
+        .map_err(smtp::SmtpError::Permanent)?;
+    let content = compose::build_content_entity(draft);
+    let signature = crate::pgp::sign_detached(content.as_bytes(), &secret_key, &password)
+        .map_err(|e| smtp::SmtpError::Permanent(e.to_string()))?;
+    // El armor de `sign_detached` es ASCII; aun así se valida al pasarlo a `String`.
+    let armored = String::from_utf8(signature)
+        .map_err(|e| smtp::SmtpError::Permanent(format!("la firma PGP no es ASCII: {e}")))?;
+    Ok(pgp_sign::build_signed_message(&headers, &content, &armored))
 }
 
 /// Abre la sesión de una cuenta: token, configuración y conexión.

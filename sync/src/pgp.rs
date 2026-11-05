@@ -663,6 +663,28 @@ fn primary_can_sign(key: &SignedSecretKey) -> bool {
     key.primary_key.algorithm().can_sign()
 }
 
+/// Si la clave tiene **ahora** una componente capaz de firmar: primaria no muerta
+/// (ni revocada ni expirada) y una subclave de firma usable, o la primaria si su
+/// algoritmo firma. Reusa el mismo selector que usa [`sign_detached`]
+/// ([`signing_component`]), para que la validación al encolar coincida exactamente
+/// con lo que firmará el despachador: una clave muerta o sólo-de-cifrado se rechaza
+/// al encolar en vez de fallar permanente recién al enviar.
+pub fn can_sign_now(key: &SignedSecretKey) -> bool {
+    signing_component(key, Timestamp::now().as_secs()).is_some()
+}
+
+/// El resumen **público** de una identidad OpenPGP para mostrar su estado SIN
+/// material secreto: la huella de la primaria y los correos de sus UIDs con
+/// auto-firma válida y vigente. Reusa el mismo criterio que liga la identidad al
+/// `From` ([`crate::pgp_import::self_signed_emails`]), así el resumen no muestra un
+/// UID que no ligaría. Lo consume `GetPgpIdentity` sobre la clave pública derivada
+/// de la guardada.
+pub fn identity_summary(public: &SignedPublicKey) -> (String, Vec<String>) {
+    let fingerprint = public.primary_key.fingerprint().to_string();
+    let uids = crate::pgp_import::self_signed_emails(public);
+    (fingerprint, uids)
+}
+
 // ── Cifrar ─────────────────────────────────────────────────────────────
 
 /// Cifra `plaintext` a las claves de los destinatarios (que **deben incluir la
@@ -1934,7 +1956,7 @@ Content-Transfer-Encoding: {cte}\r\n\r\n{cuerpo_firma}\r\n--S--\r\n"
     }
 
     /// Una clave completa cuya **primaria** se creó `hace_un_ano()`.
-    fn clave_vieja(uid: &str) -> SignedSecretKey {
+    pub(crate) fn clave_vieja(uid: &str) -> SignedSecretKey {
         let mut p = SecretKeyParamsBuilder::default();
         p.key_type(KeyType::Ed25519Legacy)
             .can_certify(true)
@@ -1991,7 +2013,7 @@ Content-Transfer-Encoding: {cte}\r\n\r\n{cuerpo_firma}\r\n--S--\r\n"
     }
 
     /// La pública con la primaria revocada.
-    fn con_primaria_revocada(secret: &SignedSecretKey) -> SignedPublicKey {
+    pub(crate) fn con_primaria_revocada(secret: &SignedSecretKey) -> SignedPublicKey {
         let mut public = publica(secret);
         let revocacion =
             auto_firma_con_expiracion(secret, SignatureType::KeyRevocation, None, &public);
@@ -2001,7 +2023,7 @@ Content-Transfer-Encoding: {cte}\r\n\r\n{cuerpo_firma}\r\n--S--\r\n"
 
     /// La pública con la auto-firma del UID reemplazada por una con vencimiento
     /// `expiracion` (segundos desde la creación de la primaria).
-    fn con_primaria_con_vencimiento_en_el_uid(
+    pub(crate) fn con_primaria_con_vencimiento_en_el_uid(
         secret: &SignedSecretKey,
         expiracion: u32,
     ) -> SignedPublicKey {
@@ -2073,7 +2095,10 @@ Content-Transfer-Encoding: {cte}\r\n\r\n{cuerpo_firma}\r\n--S--\r\n"
 
     /// La secreta con la metadata de la primaria tomada de `muerta` (la pública
     /// revocada o expirada): lo que `signing_component` mira vía `to_public_key()`.
-    fn con_primaria_muerta(secret: &SignedSecretKey, muerta: SignedPublicKey) -> SignedSecretKey {
+    pub(crate) fn con_primaria_muerta(
+        secret: &SignedSecretKey,
+        muerta: SignedPublicKey,
+    ) -> SignedSecretKey {
         let mut secret = secret.clone();
         secret.details = muerta.details;
         secret

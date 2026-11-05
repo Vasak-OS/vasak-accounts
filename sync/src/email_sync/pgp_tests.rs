@@ -478,3 +478,121 @@ fn un_sobre_pgp_abierto_no_lista_adjuntos_con_numeros_del_arbol_descifrado() {
         );
     }
 }
+
+// ── La identidad que se importa es la que lee el descifrado ─────────────
+
+/// **Regresión load-bearing.** `ImportPgpIdentity` guarda por `account_id` y
+/// `pgp_material` lee por `account_id`: si una de las dos puntas cambiara de
+/// clave (la dirección, por ejemplo), la identidad quedaría partida —firmar la
+/// vería y descifrar no, o al revés— sin ningún síntoma. Se importa por D-Bus, de
+/// verdad, y se lee con la función real del descifrado.
+#[tokio::test]
+async fn lo_que_importa_el_import_es_lo_que_lee_el_descifrado_por_el_mismo_account_id() {
+    use crate::pgp_ipc_tests::import;
+    use crate::pgp_send_tests::{armored, fingerprint, protected_key};
+
+    let f = crate::test_bus::Fixture::start(&[("cta", "ana@vasak.test")]).await;
+    let key = protected_key("Ana <ana@vasak.test>", "frase-de-paso-de-prueba");
+    import(&f, "cta", &armored(&key), b"frase-de-paso-de-prueba")
+        .await
+        .unwrap();
+
+    // `pgp_material` abre el bus de sesión: se lo apunta al bus privado de la
+    // prueba (el mismo donde vive el llavero falso). El `Fixture` serializa las
+    // pruebas que lo usan.
+    std::env::set_var(
+        "DBUS_SESSION_BUS_ADDRESS",
+        std::env::var("DBUS_SYSTEM_BUS_ADDRESS").unwrap(),
+    );
+    let material = pgp_material("cta")
+        .await
+        .expect("el descifrado no ve la identidad que se importó");
+
+    assert_eq!(
+        material.secret_key.primary_key.fingerprint().to_string(),
+        fingerprint(&key)
+    );
+    // La contraseña que leyó abre la clave: firma con ella.
+    crate::pgp::sign_detached(b"x", &material.secret_key, &material.passphrase)
+        .expect("la contraseña que lee el descifrado no abre la clave");
+    // Y bajo la dirección no hay identidad: no hay una segunda copia escondida.
+    assert!(pgp_material("ana@vasak.test").await.is_none());
+}
+
+// ── La clave que se guarda es la saneada ────────────────────────────────
+
+/// Importa `key` (armada, sin contraseña) por D-Bus en la cuenta `cta` y devuelve
+/// el material que lee el descifrado, o `None` si no lo ve.
+async fn material_after_import(key: &[u8]) -> Option<PgpMaterial> {
+    use crate::pgp_ipc_tests::import;
+    let f = crate::test_bus::Fixture::start(&[("cta", "ana@vasak.test")]).await;
+    import(&f, "cta", key, b"").await.unwrap();
+    std::env::set_var(
+        "DBUS_SESSION_BUS_ADDRESS",
+        std::env::var("DBUS_SYSTEM_BUS_ADDRESS").unwrap(),
+    );
+    pgp_material("cta").await
+}
+
+fn can_sign(material: &PgpMaterial) -> bool {
+    crate::pgp::sign_detached(b"x", &material.secret_key, &material.passphrase).is_ok()
+}
+
+#[tokio::test]
+async fn una_revocacion_de_primaria_forjada_no_vuelve_al_leer_la_identidad_importada() {
+    use crate::pgp::tests::{clave_vieja, con_primaria_revocada};
+    use crate::pgp_send_tests::armored;
+    let alice = clave_vieja("Ana <ana@vasak.test>");
+    let mallory = clave_vieja("Mallory <mallory@vasak.test>");
+    // La revocación de la primaria de Mallory pegada a la clave de Ana: no cierra
+    // contra la primaria de Ana, es forjada.
+    let mut forged = alice.clone();
+    forged.details.revocation_signatures.extend(
+        con_primaria_revocada(&mallory)
+            .details
+            .revocation_signatures,
+    );
+    let blob = armored(&forged);
+
+    // Sin sanear, la clave parece revocada y no firmaría: el escenario es real.
+    let unsanitized = crate::pgp::parse_secret_key(&blob).unwrap();
+    assert!(!crate::pgp::can_sign_now(&unsanitized));
+
+    // Importada y releída por el camino del descifrado, firma.
+    let material = material_after_import(&blob)
+        .await
+        .expect("el descifrado no ve la identidad");
+    assert!(can_sign(&material));
+}
+
+#[tokio::test]
+async fn una_auto_revocacion_valida_de_la_primaria_sobrevive_al_saneo() {
+    use crate::pgp::tests::{clave_vieja, con_primaria_muerta, con_primaria_revocada};
+    use crate::pgp_send_tests::armored;
+    let vivo = clave_vieja("Ana <ana@vasak.test>");
+    let revocada = con_primaria_muerta(&vivo, con_primaria_revocada(&vivo));
+
+    let material = material_after_import(&armored(&revocada))
+        .await
+        .expect("el descifrado no ve la identidad");
+
+    // Genuinamente revocada: se guarda revocada y no firma.
+    assert!(!can_sign(&material));
+}
+
+#[tokio::test]
+async fn los_bytes_saneados_que_se_guardan_se_releen_como_la_misma_clave() {
+    use crate::pgp::tests::clave_vieja;
+    use crate::pgp_send_tests::armored;
+    let key = clave_vieja("Ana <ana@vasak.test>");
+
+    let material = material_after_import(&armored(&key))
+        .await
+        .expect("el descifrado no ve la identidad");
+
+    assert_eq!(
+        material.secret_key.primary_key.fingerprint().to_string(),
+        key.primary_key.fingerprint().to_string()
+    );
+    assert!(can_sign(&material));
+}
