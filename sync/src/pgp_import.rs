@@ -250,18 +250,26 @@ pub fn ingest_peer_key(
     }
 }
 
-/// Fusiona en la clave guardada (`stored`) las revocaciones de primaria y las firmas
-/// de subclave (bindings y revocaciones) **autenticadas** que trae una actualización
-/// `incoming` con la **misma** primaria. No quita material (anti-degradación de la
-/// decisión 3: se mezcla, no se reemplaza). Devuelve `true` si agregó algo.
+/// Fusiona en la clave guardada (`stored`) las revocaciones de primaria, las auto-firmas
+/// de la primaria (directas y certificaciones de UID) y las firmas de subclave (bindings
+/// y revocaciones) **autenticadas** que trae una actualización `incoming` con la **misma**
+/// primaria. No quita material (anti-degradación de la decisión 3: se mezcla, no se
+/// reemplaza). Devuelve `true` si agregó algo.
 ///
 /// Sólo se mezcla lo que **verifica contra la primaria guardada**: así una
-/// actualización con el `From` spoofeado no puede inyectar una revocación forjada
-/// (el mismo criterio que `strip_forged_revocations` y `verify_key_bindings`).
+/// actualización con el `From` spoofeado no puede inyectar una revocación ni una
+/// auto-firma forjada (el mismo criterio que `strip_forged_revocations` y
+/// `verify_key_bindings`). Fusionar las auto-firmas importa porque llevan el
+/// `KeyExpirationTime` de la primaria: cuando un contacto **renueva** el plazo reenvía
+/// la misma huella con una auto-firma más nueva, y sin adoptarla la copia guardada
+/// vencería para siempre tras el plazo original (`primary_usable` daría `false` y no se
+/// podría ni verificar ni cifrar). `primary_usable` ya elige la auto-firma verificada
+/// más nueva, así que una certificación forjada sigue sin poder cambiar la expiración.
 ///
-/// shortcut: no se agregan subclaves **nuevas** del blob entrante (rotación de
-/// subclave), sólo se honran las revocaciones/bindings de las ya conocidas; subir a
-/// soportar rotación si un contacto rota su subclave de cifrado y hay que adoptarla.
+/// shortcut: sí se adopta la **renovación de expiración** de la primaria; lo que **no**
+/// se adopta son subclaves **nuevas** del blob (rotación de subclave): sólo se honran las
+/// revocaciones/bindings de las ya conocidas. Subir a soportar rotación si un contacto
+/// rota su subclave de cifrado y hay que adoptarla.
 fn merge_authenticated_updates(stored: &mut SignedPublicKey, incoming: &SignedPublicKey) -> bool {
     let primary = stored.primary_key.clone();
     let mut changed = false;
@@ -271,6 +279,38 @@ fn merge_authenticated_updates(stored: &mut SignedPublicKey, incoming: &SignedPu
         if sig.verify_key(&primary).is_ok() && !stored.details.revocation_signatures.contains(sig) {
             stored.details.revocation_signatures.push(sig.clone());
             changed = true;
+        }
+    }
+
+    // Auto-firmas directas de la primaria autenticadas que falten: llevan el plazo de la
+    // primaria, así que sin esto una renovación de expiración nunca se adoptaría.
+    for sig in &incoming.details.direct_signatures {
+        if sig.verify_key(&primary).is_ok() && !stored.details.direct_signatures.contains(sig) {
+            stored.details.direct_signatures.push(sig.clone());
+            changed = true;
+        }
+    }
+
+    // Certificaciones de UID autenticadas que falten, por UID ya conocido (mismo `id`):
+    // también llevan el plazo de la primaria en su auto-certificación.
+    for inc_user in &incoming.details.users {
+        let Some(stored_user) = stored
+            .details
+            .users
+            .iter_mut()
+            .find(|u| u.id == inc_user.id)
+        else {
+            continue;
+        };
+        for sig in &inc_user.signatures {
+            if sig
+                .verify_certification(&primary, Tag::UserId, &inc_user.id)
+                .is_ok()
+                && !stored_user.signatures.contains(sig)
+            {
+                stored_user.signatures.push(sig.clone());
+                changed = true;
+            }
         }
     }
 
