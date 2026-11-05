@@ -488,9 +488,8 @@ fn un_sobre_pgp_abierto_no_lista_adjuntos_con_numeros_del_arbol_descifrado() {
 /// verdad, y se lee con la función real del descifrado.
 #[tokio::test]
 async fn lo_que_importa_el_import_es_lo_que_lee_el_descifrado_por_el_mismo_account_id() {
-    use crate::pgp_ipc_tests::{import, sealed_fd};
+    use crate::pgp_ipc_tests::import;
     use crate::pgp_send_tests::{armored, fingerprint, protected_key};
-    let _ = sealed_fd;
 
     let f = crate::test_bus::Fixture::start(&[("cta", "ana@vasak.test")]).await;
     let key = protected_key("Ana <ana@vasak.test>", "frase-de-paso-de-prueba");

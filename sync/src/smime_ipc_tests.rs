@@ -6,6 +6,9 @@
 //! ventana: el nombre del error D-Bus, lo que queda en el llavero y el JSON.
 
 use crate::access::tests::Answer;
+use crate::ipc_test_support::{
+    pipe_fd, regular_file_fd, sealed_fd, short_name, unsealed_fd, NAME_PREFIX,
+};
 use crate::smime_sign::test_support::*;
 use crate::smime_sign::{certificate_matches_address, certificate_summary};
 use crate::store::key::tests::{lock_and_announce, unlock_and_announce};
@@ -13,7 +16,6 @@ use crate::store::smime_key::parse_pkcs12;
 use crate::test_bus::{captured_logs, error_of, Fixture};
 
 const ACCOUNT: &str = "cta";
-const NAME_PREFIX: &str = "ar.net.vasak.os.AccountsSync.";
 /// Una contraseña que no es la de ningún `.p12` de prueba y que no se parece a
 /// nada que el servicio imprima por su cuenta: si aparece, se filtró.
 const WRONG_PASSWORD: &[u8] = b"contrasena-equivocada-9f3a-no-filtrar";
@@ -23,28 +25,6 @@ const MAX_PASSWORD: usize = 4096;
 const LEGACY_P12: &[u8] = include_bytes!("../tests/fixtures/smime/rsa-legacy.p12");
 const ONLY_CERTS_P12: &[u8] = include_bytes!("../tests/fixtures/smime/solo-certs.p12");
 const ONLY_KEY_P12: &[u8] = include_bytes!("../tests/fixtures/smime/solo-clave.p12");
-
-/// Un memfd sellado con estos bytes, como lo manda el cliente: `.p12` y
-/// contraseña viajan por descriptor, no como `ay`. Sella contra escritura (y
-/// contra crecer/encoger) para que el servicio lo acepte.
-fn sealed_fd(bytes: &[u8]) -> zbus::zvariant::OwnedFd {
-    use rustix::fs::{fcntl_add_seals, memfd_create, MemfdFlags, SealFlags};
-    use std::io::Write;
-
-    let fd = memfd_create(
-        "smime-prueba",
-        MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
-    )
-    .unwrap();
-    let mut file = std::fs::File::from(fd);
-    file.write_all(bytes).unwrap();
-    fcntl_add_seals(
-        &file,
-        SealFlags::WRITE | SealFlags::SHRINK | SealFlags::GROW | SealFlags::SEAL,
-    )
-    .unwrap();
-    std::os::fd::OwnedFd::from(file).into()
-}
 
 async fn import(
     f: &Fixture,
@@ -59,45 +39,6 @@ async fn import(
     .await
 }
 
-/// Un memfd con estos bytes pero **sin sellar**: el que manda un cliente que
-/// podría seguir escribiendo después de que el servicio validó (TOCTOU).
-fn unsealed_fd(bytes: &[u8]) -> zbus::zvariant::OwnedFd {
-    use rustix::fs::{memfd_create, MemfdFlags};
-    use std::io::Write;
-
-    let fd = memfd_create(
-        "smime-prueba-sin-sello",
-        MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
-    )
-    .unwrap();
-    let mut file = std::fs::File::from(fd);
-    file.write_all(bytes).unwrap();
-    std::os::fd::OwnedFd::from(file).into()
-}
-
-/// El extremo de lectura de un pipe con estos bytes ya escritos. El de escritura
-/// se cierra: si el servicio llegara a leerlo, termina en EOF en vez de colgarse.
-fn pipe_fd(bytes: &[u8]) -> zbus::zvariant::OwnedFd {
-    use std::io::Write;
-
-    let (reader, mut writer) = std::io::pipe().unwrap();
-    writer.write_all(bytes).unwrap();
-    drop(writer);
-    std::os::fd::OwnedFd::from(reader).into()
-}
-
-/// Un archivo común en disco (no un memfd) con estos bytes: no admite sellos.
-fn regular_file_fd(bytes: &[u8]) -> zbus::zvariant::OwnedFd {
-    use std::io::Write;
-
-    // Sin crate de temporales: se crea, se abre y se borra el nombre al instante.
-    let path = std::env::temp_dir().join(format!("vasak-smime-prueba-{}", std::process::id()));
-    let mut file = std::fs::File::create_new(&path).unwrap();
-    std::fs::remove_file(&path).unwrap();
-    file.write_all(bytes).unwrap();
-    std::os::fd::OwnedFd::from(file).into()
-}
-
 /// `ImportSmimeIdentity` con los descriptores tal cual, sin sellar nada.
 async fn import_fds(
     f: &Fixture,
@@ -107,14 +48,6 @@ async fn import_fds(
 ) -> zbus::Result<zbus::Message> {
     f.call("ImportSmimeIdentity", &(account, p12, password))
         .await
-}
-
-/// El nombre corto del error (`WrongPassword`…), sin el prefijo del servicio.
-fn short_name(result: zbus::Result<zbus::Message>) -> String {
-    let (name, _) = error_of(result);
-    name.strip_prefix(NAME_PREFIX)
-        .unwrap_or_else(|| panic!("el nombre {name} no es del servicio"))
-        .to_string()
 }
 
 async fn identity(f: &Fixture, account: &str) -> serde_json::Value {

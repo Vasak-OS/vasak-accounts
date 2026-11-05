@@ -110,6 +110,8 @@ mod graph_write;
 // D-Bus que arma los parches y encola es el PR siguiente de este hito
 // (`vasak-accounts#23`); por ahora lo ejercitan sus pruebas y la cola.
 #[cfg(test)]
+mod ipc_test_support;
+#[cfg(test)]
 mod pgp_ipc_tests;
 #[cfg(test)]
 mod pgp_send_tests;

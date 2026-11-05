@@ -6,6 +6,7 @@
 //! ve la ventana: el nombre del error D-Bus, lo que queda en el llavero y el JSON.
 
 use crate::access::tests::Answer;
+use crate::ipc_test_support::{pipe_fd, regular_file_fd, sealed_fd, short_name, unsealed_fd};
 use crate::pgp::tests::{clave_vieja, con_primaria_muerta, con_primaria_revocada};
 use crate::pgp_send_tests::{
     armored, dead_keys, fingerprint, protected_key, ACCOUNT, ADDRESS, PASSPHRASE,
@@ -14,68 +15,11 @@ use crate::store::key::tests::lock_and_announce;
 use crate::test_bus::{error_of, Fixture};
 use pgp::types::KeyDetails as _;
 
-const NAME_PREFIX: &str = "ar.net.vasak.os.AccountsSync.";
 const WRONG_PASSPHRASE: &[u8] = b"contrasena-equivocada-9f3a-no-filtrar";
 const MAX_KEY: usize = 1024 * 1024;
 const MAX_PASSPHRASE: usize = 4096;
 const UID: &str = "Ana <ana@vasak.test>";
 const PASSPHRASE_STR: &str = "frase-de-paso-de-prueba";
-
-/// Un memfd sellado con estos bytes, como lo manda el cliente.
-pub(crate) fn sealed_fd(bytes: &[u8]) -> zbus::zvariant::OwnedFd {
-    use rustix::fs::{fcntl_add_seals, memfd_create, MemfdFlags, SealFlags};
-    use std::io::Write;
-
-    let fd = memfd_create(
-        "pgp-prueba",
-        MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
-    )
-    .unwrap();
-    let mut file = std::fs::File::from(fd);
-    file.write_all(bytes).unwrap();
-    fcntl_add_seals(
-        &file,
-        SealFlags::WRITE | SealFlags::SHRINK | SealFlags::GROW | SealFlags::SEAL,
-    )
-    .unwrap();
-    std::os::fd::OwnedFd::from(file).into()
-}
-
-/// Un memfd con estos bytes pero **sin sellar** (TOCTOU).
-fn unsealed_fd(bytes: &[u8]) -> zbus::zvariant::OwnedFd {
-    use rustix::fs::{memfd_create, MemfdFlags};
-    use std::io::Write;
-
-    let fd = memfd_create(
-        "pgp-prueba-sin-sello",
-        MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
-    )
-    .unwrap();
-    let mut file = std::fs::File::from(fd);
-    file.write_all(bytes).unwrap();
-    std::os::fd::OwnedFd::from(file).into()
-}
-
-/// El extremo de lectura de un pipe con estos bytes; el de escritura se cierra.
-fn pipe_fd(bytes: &[u8]) -> zbus::zvariant::OwnedFd {
-    use std::io::Write;
-
-    let (reader, mut writer) = std::io::pipe().unwrap();
-    writer.write_all(bytes).unwrap();
-    drop(writer);
-    std::os::fd::OwnedFd::from(reader).into()
-}
-
-/// Un archivo común en disco (no un memfd): no admite sellos.
-fn regular_file_fd(bytes: &[u8]) -> zbus::zvariant::OwnedFd {
-    use std::io::Write;
-
-    let path = std::env::temp_dir().join(format!("vasak-pgp-prueba-{}", std::process::id()));
-    let mut file = std::fs::File::create_new(&path).unwrap();
-    std::fs::remove_file(&path).unwrap();
-    file.write_all(bytes).unwrap();
-    std::os::fd::OwnedFd::from(file).into()
-}
 
 async fn import_fds(
     f: &Fixture,
@@ -94,13 +38,6 @@ pub(crate) async fn import(
     passphrase: &[u8],
 ) -> zbus::Result<zbus::Message> {
     import_fds(f, account, sealed_fd(key), sealed_fd(passphrase)).await
-}
-
-fn short_name(result: zbus::Result<zbus::Message>) -> String {
-    let (name, _) = error_of(result);
-    name.strip_prefix(NAME_PREFIX)
-        .unwrap_or_else(|| panic!("el nombre del error no es del servicio"))
-        .to_string()
 }
 
 async fn identity_reply(f: &Fixture, account: &str) -> String {
