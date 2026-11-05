@@ -1213,9 +1213,8 @@ Content-Type: application/pgp-keys\r\nContent-Transfer-Encoding: {cte}\r\n\r\n{c
     /// (Autocrypt L1 manda ignorar la cabecera si no coincide). Un remitente
     /// cualquiera puede sembrar en el peerstate TOFU una clave suya bajo la dirección
     /// de otra persona; cuando después llegue el correo legítimo, ya habrá una clave
-    /// «conocida» distinta. Se deja `ignore` hasta decidir el arreglo.
+    /// «conocida» distinta.
     #[tokio::test]
-    #[ignore = "hallazgo PR4: Autocrypt addr distinto del From se ingiere igual"]
     async fn una_cabecera_autocrypt_con_un_addr_que_no_es_el_from_no_siembra_el_peerstate() {
         let fixture = Fixture::new("pgp-autocrypt-ajeno").await;
         let atacante = clave_completa("Atacante <atacante@vasak.test>");

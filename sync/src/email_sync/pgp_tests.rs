@@ -184,10 +184,8 @@ fn lo_que_no_se_puede_abrir_queda_no_disponible_y_nunca_se_guarda_crudo() {
 /// guardado es la **armadura del sobre** (el texto del mensaje es el blob cifrado).
 /// No filtra el claro, pero contradice lo que dicen la V15 y el doc de
 /// `opened_rows_decrypting` («el cuerpo queda vacío, nunca roto»), a diferencia de
-/// S/MIME y de PGP/MIME, donde el sobre no es una parte de texto. Se deja `ignore`
-/// hasta decidir el arreglo; al arreglarlo se le quita el `ignore`.
+/// S/MIME y de PGP/MIME, donde el sobre no es una parte de texto.
 #[test]
-#[ignore = "hallazgo PR4: el inline no abierto guarda la armadura como cuerpo"]
 fn un_pgp_inline_que_no_se_pudo_abrir_queda_con_el_cuerpo_vacio() {
     let yo = clave_completa("Yo <yo@vasak.test>");
     let otro = clave_completa("Otro <otro@vasak.test>");

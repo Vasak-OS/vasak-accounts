@@ -1229,19 +1229,23 @@ Content-Type: text/plain\r\n\r\nhola\r\n",
     }
 
     #[test]
-    fn un_adjunto_de_claves_sin_from_se_omite_pero_la_cabecera_autocrypt_no() {
+    fn un_correo_sin_from_no_siembra_claves_ni_por_adjunto_ni_por_autocrypt() {
         let key = publica(&clave_completa("Ana <ana@example.com>"));
         let sin_from = correo_con_partes("", "", &[adjunta(&key)]);
         assert!(incoming_public_keys(&sin_from).is_empty());
-        let con_autocrypt = correo_con_partes(
-            "",
-            &format!(
-                "Autocrypt: addr=ana@example.com; keydata={}\r\n",
-                b64(&bytes(&key))
-            ),
-            &[],
+        // Sin remitente no hay contra qué cotejar el `addr` (Autocrypt L1): se ignora.
+        let cabecera = format!(
+            "Autocrypt: addr=ana@example.com; keydata={}\r\n",
+            b64(&bytes(&key))
         );
-        assert_eq!(incoming_public_keys(&con_autocrypt).len(), 1);
+        let con_autocrypt = correo_con_partes("", &cabecera, &[]);
+        assert!(incoming_public_keys(&con_autocrypt).is_empty());
+        // Control: con un `From` que coincide con el `addr`, la cabecera sí entra.
+        let con_from = correo_con_partes("Ana <ana@example.com>", &cabecera, &[]);
+        assert_eq!(incoming_public_keys(&con_from).len(), 1);
+        // Y con un `From` ajeno, no.
+        let ajeno = correo_con_partes("Mallory <mallory@example.com>", &cabecera, &[]);
+        assert!(incoming_public_keys(&ajeno).is_empty());
     }
 
     #[test]
