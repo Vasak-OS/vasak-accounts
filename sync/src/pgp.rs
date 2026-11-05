@@ -3020,9 +3020,8 @@ Content-Type: application/octet-stream\r\nContent-Transfer-Encoding: {cte}\r\n\r
         // Revocada manda: la ventana pinta una sola razón.
         let vivo = clave_vieja("Ana <ana@vasak.test>");
         let mut key = con_primaria_con_vencimiento_en_el_uid(&vivo, 24 * 3600);
-        key.details.revocation_signatures = con_primaria_revocada(&vivo)
-            .details
-            .revocation_signatures;
+        key.details.revocation_signatures =
+            con_primaria_revocada(&vivo).details.revocation_signatures;
         assert_eq!(primary_liveness(&key), (true, false));
     }
 }
