@@ -394,3 +394,87 @@ fn un_correo_comun_rinde_lo_mismo_con_o_sin_material_y_candidatas_pgp() {
     let sin = rows(plano, None, &[]);
     assert_eq!(con, sin);
 }
+
+// ── Hallazgos de revisión (PR4) ────────────────────────────────────────
+
+const SMIME_CON_FIRMA_PGP: &[u8] =
+    include_bytes!("../../tests/fixtures/pgp/smime-enveloped-con-firma-pgp.eml");
+const FIRMANTE_PGP_PUB: &[u8] = include_bytes!("../../tests/fixtures/pgp/firmante.pub.asc");
+
+#[test]
+fn una_firma_pgp_dentro_de_un_sobre_smime_abierto_se_verifica() {
+    let firmante = crate::pgp::parse_public_key(FIRMANTE_PGP_PUB).expect("la clave de prueba");
+    let huella = firmante.primary_key.fingerprint().to_string();
+
+    // Con la clave del firmante como candidata, la firma de adentro cierra.
+    let (body, _) = opened_rows_decrypting(
+        1,
+        SMIME_CON_FIRMA_PGP,
+        false,
+        Some(&smime_material()),
+        None,
+        std::slice::from_ref(&firmante),
+    );
+    assert_eq!(body.smime_encrypted, Some(1), "el sobre S/MIME se abrió");
+    assert!(
+        text(&body).contains("SECRETO-PGP-EN-S-MIME"),
+        "{:?}",
+        body.text_body
+    );
+    assert_eq!(
+        body.pgp_status,
+        Some(0),
+        "la firma PGP de adentro se verificó"
+    );
+    assert_eq!(body.pgp_signer, Some(huella));
+    // Es PGP dentro de S/MIME: el estado S/MIME de la firma no se toca.
+    assert_eq!(body.smime_status, None);
+
+    // Sin candidatas la firma se ve, pero de clave desconocida (no «no chequeada»).
+    let (sin_clave, _) = opened_rows_decrypting(
+        1,
+        SMIME_CON_FIRMA_PGP,
+        false,
+        Some(&smime_material()),
+        None,
+        &[],
+    );
+    assert_eq!(
+        (sin_clave.pgp_status, sin_clave.pgp_signer),
+        (Some(1), None)
+    );
+}
+
+/// Un multipart con un adjunto, como contenido (con sus propias cabeceras).
+const MULTIPART_CON_ADJUNTO: &str = "Content-Type: multipart/mixed; boundary=\"M\"\r\n\r\n\
+--M\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nSECRETO-PGP: con adjunto\r\n\
+--M\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=\"informe.pdf\"\r\n\r\ndatos\r\n\
+--M--\r\n";
+
+#[test]
+fn un_sobre_pgp_abierto_no_lista_adjuntos_con_numeros_del_arbol_descifrado() {
+    let yo = clave_completa("Yo <yo@vasak.test>");
+    // Control: el mismo multipart **sin cifrar** sí lista el adjunto (si no, el
+    // «vacío» de abajo no probaría nada).
+    let plano = format!("From: ana@x.com\r\n{MULTIPART_CON_ADJUNTO}");
+    let (_, adjuntos) = opened_rows_decrypting(7, plano.as_bytes(), false, None, None, &[]);
+    assert_eq!(adjuntos.len(), 1);
+    assert_eq!(adjuntos[0].part_number, "2");
+
+    // Cifrado (inline y PGP/MIME): se abre y se muestra, pero los números de parte del
+    // árbol descifrado no son secciones IMAP del mensaje cifrado, así que no se listan.
+    let armado = cifrar(MULTIPART_CON_ADJUNTO.as_bytes(), &publica(&yo));
+    for (via, raw) in [
+        ("inline", correo_inline(&armado)),
+        ("pgp/mime", correo_pgp_mime(&armado)),
+    ] {
+        let (body, adjuntos) =
+            opened_rows_decrypting(7, &raw, false, None, Some(&material(&yo)), &[]);
+        assert_eq!(body.pgp_encrypted, Some(1), "{via}");
+        assert!(text(&body).contains("SECRETO-PGP: con adjunto"), "{via}");
+        assert!(
+            adjuntos.is_empty(),
+            "{via}: no se emiten filas con números del árbol descifrado: {adjuntos:?}"
+        );
+    }
+}

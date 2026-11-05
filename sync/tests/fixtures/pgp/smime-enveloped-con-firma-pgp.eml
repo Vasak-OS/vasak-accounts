@@ -1,0 +1,27 @@
+From: alice@vasak.test
+To: yo@vasak.test
+Subject: cifrado con firma pgp
+Date: Thu, 10 Sep 2026 12:00:00 +0000
+MIME-Version: 1.0
+Content-Disposition: attachment; filename="smime.p7m"
+Content-Type: application/pkcs7-mime; smime-type=enveloped-data; name="smime.p7m"
+Content-Transfer-Encoding: base64
+
+MIIDLAYJKoZIhvcNAQcDoIIDHTCCAxkCAQAxggFAMIIBPAIBADAkMAwxCjAIBgNV
+BAMMAVMCFALECIkmnvzmtFeXqgzPfRO683UiMA0GCSqGSIb3DQEBAQUABIIBAJQC
+50SP7XKpRgFRPYB26FPJN3Dp9J8j6tZWGlXEliwbtq8a5DfkZTwoQ/DNiJeRggRa
+V3VvxOnua+pznWH7urshBpB5WWq/rBerwSS41dWOC8VgdltC/QJqnqfHsK3cilPL
+uP7/B6Qc1Jh52Hcf3UEuc3jUi22KmNQ9iQPutwUKAeWx+2++J67YgMjEcdqgWhCO
+/pzaE8Y2W55zwxTWhYjHSErRcF61PwFM6elILDew3/+Tq/EB/bV3Lag7G9PsCm54
+FnSE8yEvK8CFvUIw3WbRobxK4JdIyz0hsDn7E64/e0/6e0vfPPqA31GXup8DFFqR
+Xqp4FeOlCKcm6SkmzUUwggHOBgkqhkiG9w0BBwEwHQYJYIZIAWUDBAEqBBC/I1T/
+mCbNfOQIyWmti6yfgIIBoDr0A9eFBrFXopVVn2ZUQXPFhwMR5QyrSMefxShRgwhu
+Vbmjd/bbGeFneFwFQSjsdtIjvBuf90RSFX2W3t6QjQ4WLvLWhmbfbchH3XMREbGY
+QAEcTvHgudni96Tm7THc+n9VHorp9LmJlfiqmjgY6ygJakM8kQyWf6p+5vz+KyNF
+kiv5CmE8itbwYlgyRI9HJkDLCs05ohFh2WYnrAofxGiOrtt7/kR+KF0MvNibVbuO
+cskMKo2+Ll5Xb+ImNaRFWH4DR5o/YtuKLdCwMx9Qf96RjV0GvvJoW2AmhVpzQlxd
+5hDvYqseQNoqmi6l65FZKD4DqdTzOGc4LeWF9hfJeyhhE991uVFXozQP1gL14YfN
+B24QHoV0a19cJ+M9IycmFGiSbsxeGpYhrwV38Mv/dI6RSMGTtzSh6qPVLOeoTe+8
+6+fm6LbP+2G+UaHZZLRV29j+Yz5wvAjyiqI/4ZzUmbDGgn82IGCTCC9mr9UFmKfd
+qN0mYJdIaxXIbtz48vlPK5SvxuIOEbzB6X4vstvp6refFhU2bdaYFp4AzvXnMs20
+

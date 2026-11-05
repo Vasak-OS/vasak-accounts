@@ -1683,4 +1683,20 @@ mod tests {
         assert_eq!(json["responder_a"], "ana@x.com");
         assert_eq!(json["nombre"], "Ana");
     }
+
+    /// `get_all` devuelve **todas** las apariciones de una cabecera repetida, en orden y
+    /// sin distinguir mayúsculas; `get` sigue devolviendo sólo la primera.
+    #[test]
+    fn get_all_devuelve_todas_las_cabeceras_repetidas_en_orden() {
+        let headers = Headers::parse(
+            "Autocrypt: uno\r\nFrom: ana@x\r\nautocrypt: dos\r\nAUTOCRYPT: tres\r\n",
+        );
+        assert_eq!(
+            headers.get_all("Autocrypt").collect::<Vec<_>>(),
+            vec!["uno", "dos", "tres"]
+        );
+        assert_eq!(headers.get("autocrypt"), Some("uno"));
+        assert_eq!(headers.get_all("from").collect::<Vec<_>>(), vec!["ana@x"]);
+        assert_eq!(headers.get_all("ausente").count(), 0);
+    }
 }

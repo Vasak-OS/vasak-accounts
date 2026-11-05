@@ -1396,6 +1396,20 @@ mod tests {
                 Some(1),
                 json!({"signature": "known", "signer": "CCDD", "encryption": "opened"}),
             ),
+            // El firmante sólo sale con firma conocida (0): una fila que trae una huella
+            // con «desconocida» (1) o «no verificable» (2) no la muestra.
+            (
+                Some(1),
+                Some("EEFF"),
+                None,
+                json!({"signature": "unknown", "signer": null, "encryption": null}),
+            ),
+            (
+                Some(2),
+                Some("EEFF"),
+                Some(1),
+                json!({"signature": "unverifiable", "signer": null, "encryption": "opened"}),
+            ),
         ];
         let mut ids = Vec::new();
         for (status, signer, encrypted, esperado) in &casos {

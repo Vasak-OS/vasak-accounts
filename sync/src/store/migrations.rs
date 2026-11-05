@@ -1640,6 +1640,96 @@ mod tests {
         assert_eq!(schema_version(&connection).unwrap(), 15);
     }
 
+    /// **v14 → v15 invalida los cuerpos cacheados con armadura PGP**: bajo la V14 un mail
+    /// PGP inline se guardó con la armadura como texto y `pgp_*` quedaría `NULL` para
+    /// siempre (`messages_without_body` sólo mira los mensajes **sin** fila de cuerpo).
+    /// La V15 borra esas filas para que se vuelvan a bajar y reprocesar; el resto de la
+    /// caché no se toca.
+    #[test]
+    fn de_v14_a_v15_se_invalidan_los_cuerpos_con_armadura_pgp_y_solo_esos() {
+        let mut connection = at_version(14);
+        connection
+            .execute(
+                "INSERT INTO mailboxes (name, display_name, role, updated_at)
+                 VALUES ('INBOX', 'Bandeja', 'inbox', 'ayer')",
+                [],
+            )
+            .unwrap();
+        // (uid, text_body, html_body)
+        let cuerpos: [(i64, Option<&str>, Option<&str>); 5] = [
+            (
+                1,
+                Some("-----BEGIN PGP MESSAGE-----\n\nhQEMA...\n-----END PGP MESSAGE-----"),
+                None,
+            ),
+            (
+                2,
+                Some(""),
+                Some("<pre>-----BEGIN PGP MESSAGE-----\nhQEMA...</pre>"),
+            ),
+            (
+                3,
+                Some("-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\nhola"),
+                None,
+            ),
+            (4, Some("un correo común"), Some("<p>sin armadura</p>")),
+            (5, Some("hablamos de PGP sin armadura"), None),
+        ];
+        let mut ids = Vec::new();
+        for (uid, text, html) in cuerpos {
+            connection
+                .execute(
+                    "INSERT INTO messages (mailbox_id, uid, from_addr, to_addrs, cc_addrs, bcc_addrs,
+                                           subject, date_ts, sort_key, size, updated_at)
+                     VALUES (1, ?1, 'ana@x.com', 'yo@x.com', '', '', 'Hola', 100, 100, 10, 'ayer')",
+                    [uid],
+                )
+                .unwrap();
+            let id = connection.last_insert_rowid();
+            connection
+                .execute(
+                    "INSERT INTO message_bodies (message_id, text_body, html_body, truncated, updated_at)
+                     VALUES (?1, ?2, ?3, 0, 'ayer')",
+                    rusqlite::params![id, text, html],
+                )
+                .unwrap();
+            ids.push(id);
+        }
+
+        apply(&mut connection).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 15);
+
+        // Quedan con cuerpo sólo los dos sin armadura...
+        let con_cuerpo: Vec<i64> = connection
+            .prepare("SELECT message_id FROM message_bodies ORDER BY message_id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(con_cuerpo, vec![ids[3], ids[4]]);
+        // ...y los otros tres quedan «sin cuerpo»: lo que `messages_without_body` vuelve a bajar.
+        let sin_cuerpo: Vec<i64> = connection
+            .prepare(
+                "SELECT m.id FROM messages m
+                 LEFT JOIN message_bodies b ON b.message_id = m.id
+                 WHERE b.message_id IS NULL ORDER BY m.id",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(sin_cuerpo, vec![ids[0], ids[1], ids[2]]);
+
+        // Y migrar otra vez no borra nada más.
+        apply(&mut connection).unwrap();
+        let restantes: i64 = connection
+            .query_row("SELECT COUNT(*) FROM message_bodies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(restantes, 2);
+    }
+
     /// **v10 → v11 no pierde nada**: el cuerpo, la firma y el firmante de una base de
     /// la v10 siguen, `smime_encrypted` arranca en `NULL` (no cifrado), la base queda
     /// igual que creada de cero, y migrar otra vez no cambia nada.

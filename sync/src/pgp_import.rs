@@ -1414,4 +1414,235 @@ Content-Type: text/plain\r\n\r\nhola\r\n",
     fn la_normalizacion_recorta_y_pasa_a_minusculas() {
         assert_eq!(normalize_address("  Ana@Example.COM \n"), "ana@example.com");
     }
+
+    // ── Hallazgos de revisión (PR4): fusionar lo autenticado, topes y Autocrypt ──
+
+    /// Una firma `SubkeyRevocation` de `firmante` sobre la subclave `index` de
+    /// `objetivo`. Con `firmante` distinto del dueño, no verifica contra su primaria.
+    fn revocacion_de_subclave(
+        firmante: &SignedSecretKey,
+        objetivo: &SignedPublicKey,
+        index: usize,
+    ) -> pgp::packet::Signature {
+        SignatureConfig::from_key(
+            OsRng,
+            &firmante.primary_key,
+            SignatureType::SubkeyRevocation,
+        )
+        .unwrap()
+        .sign_subkey_binding(
+            &firmante.primary_key,
+            firmante.primary_key.public_key(),
+            &vacia(),
+            &objetivo.public_subkeys[index].key,
+        )
+        .expect("firma de revocación de subclave")
+    }
+
+    /// Si un cleartext firmado con la subclave de firma de `secret` (la 0) se reporta
+    /// como firma de clave conocida contra `candidata`.
+    fn firma_de_la_subclave_es_conocida(
+        candidata: &SignedPublicKey,
+        secret: &SignedSecretKey,
+    ) -> bool {
+        let bloque = crate::pgp::tests::cleartext_de("hola", &*secret.secret_subkeys[0]);
+        let correo = format!("From: a@example.com\r\nContent-Type: text/plain\r\n\r\n{bloque}");
+        matches!(
+            crate::pgp::verify(correo.as_bytes(), std::slice::from_ref(candidata)),
+            crate::pgp::Verification::SignedUntrusted(_)
+        )
+    }
+
+    #[test]
+    fn reingerir_la_misma_primaria_con_una_subclave_revocada_la_deja_de_aceptar_como_firmante() {
+        let temp = TempDir::new("pgp-import-merge-revocacion-subclave");
+        let store = open_store(&temp);
+        let ana = clave_completa("Ana <ana@example.com>");
+        let sana = publica(&ana);
+        ingest_peer_key(&store, "ana@example.com", &bytes(&sana), 100).unwrap();
+        // Premisa: antes de la revocación la subclave de firma cuenta como conocida.
+        assert!(firma_de_la_subclave_es_conocida(
+            &guardada(&store, "ana@example.com"),
+            &ana
+        ));
+
+        let mut revocada = sana.clone();
+        let revocacion = revocacion_de_subclave(&ana, &revocada, 0);
+        revocada.public_subkeys[0].signatures.push(revocacion);
+        let r = ingest_peer_key(&store, "ana@example.com", &bytes(&revocada), 200);
+        assert_eq!(r.unwrap(), Ingested::Unchanged);
+
+        let g = guardada(&store, "ana@example.com");
+        assert!(
+            !firma_de_la_subclave_es_conocida(&g, &ana),
+            "la subclave revocada no puede seguir elevando a «clave conocida»"
+        );
+        // Lo demás sigue: misma huella, la subclave de cifrado sirve, primera vez intacta.
+        assert!(encryption_subkey(&g).is_some());
+        let peer = store.find_peer("ana@example.com").unwrap().unwrap();
+        assert_eq!(peer.fingerprint, huella(&sana));
+        assert_eq!((peer.first_seen, peer.updated_at), (100, 200));
+    }
+
+    #[test]
+    fn una_revocacion_de_subclave_ya_guardada_no_se_pierde_con_un_blob_con_menos_material() {
+        let temp = TempDir::new("pgp-import-merge-no-degrada");
+        let store = open_store(&temp);
+        let ana = clave_completa("Ana <ana@example.com>");
+        let sana = publica(&ana);
+        let mut revocada = sana.clone();
+        let revocacion = revocacion_de_subclave(&ana, &revocada, 0);
+        revocada.public_subkeys[0].signatures.push(revocacion);
+        ingest_peer_key(&store, "ana@example.com", &bytes(&revocada), 100).unwrap();
+        assert!(!firma_de_la_subclave_es_conocida(
+            &guardada(&store, "ana@example.com"),
+            &ana
+        ));
+
+        // Un blob viejo (sin la revocación) y uno sin subclaves no revierten ni quitan nada.
+        let mut sin_subclaves = sana.clone();
+        sin_subclaves.public_subkeys.clear();
+        for (que, entrante) in [
+            ("sin la revocación", sana.clone()),
+            ("sin subclaves", sin_subclaves),
+        ] {
+            let r = ingest_peer_key(&store, "ana@example.com", &bytes(&entrante), 200);
+            assert_eq!(r.unwrap(), Ingested::Unchanged, "{que}");
+            let g = guardada(&store, "ana@example.com");
+            assert_eq!(g.public_subkeys.len(), 2, "{que}: no se quitan subclaves");
+            assert!(
+                !firma_de_la_subclave_es_conocida(&g, &ana),
+                "{que}: la revocación guardada se conserva"
+            );
+            assert!(encryption_subkey(&g).is_some(), "{que}");
+        }
+    }
+
+    #[test]
+    fn una_revocacion_forjada_en_una_reingesta_no_se_fusiona() {
+        let temp = TempDir::new("pgp-import-merge-forjada");
+        let store = open_store(&temp);
+        let ana = clave_completa("Ana <ana@example.com>");
+        let atacante = clave_completa("Atacante <atacante@example.com>");
+        let sana = publica(&ana);
+        ingest_peer_key(&store, "ana@example.com", &bytes(&sana), 100).unwrap();
+
+        // El `From` spoofeado trae una revocación de la primaria hecha por el atacante:
+        // no verifica contra la primaria guardada y no se fusiona.
+        let mut forjada = sana.clone();
+        forjada
+            .details
+            .revocation_signatures
+            .push(revocacion(&atacante, &ana));
+        ingest_peer_key(&store, "ana@example.com", &bytes(&forjada), 200).unwrap();
+        let g = guardada(&store, "ana@example.com");
+        assert!(g.details.revocation_signatures.is_empty());
+        assert!(encryption_subkey(&g).is_some());
+
+        // Y una revocación de subclave del atacante ni siquiera pasa el gate de bindings:
+        // el blob entero se rechaza y lo guardado no cambia.
+        let mut con_subclave_forjada = sana.clone();
+        let sobre_subclave = revocacion_de_subclave(&atacante, &con_subclave_forjada, 0);
+        con_subclave_forjada.public_subkeys[0]
+            .signatures
+            .push(sobre_subclave);
+        let r = ingest_peer_key(
+            &store,
+            "ana@example.com",
+            &bytes(&con_subclave_forjada),
+            300,
+        );
+        assert!(es_error_de_clave(r));
+        assert!(firma_de_la_subclave_es_conocida(
+            &guardada(&store, "ana@example.com"),
+            &ana
+        ));
+    }
+
+    #[test]
+    fn reingerir_la_misma_primaria_con_una_auto_revocacion_valida_inhabilita_la_guardada() {
+        let temp = TempDir::new("pgp-import-merge-revocacion-primaria");
+        let store = open_store(&temp);
+        let ana = clave_completa("Ana <ana@example.com>");
+        let sana = publica(&ana);
+        ingest_peer_key(&store, "ana@example.com", &bytes(&sana), 100).unwrap();
+        assert!(encryption_subkey(&guardada(&store, "ana@example.com")).is_some());
+
+        let mut revocada = sana.clone();
+        revocada
+            .details
+            .revocation_signatures
+            .push(revocacion(&ana, &ana));
+        let r = ingest_peer_key(&store, "ana@example.com", &bytes(&revocada), 200);
+        assert_eq!(r.unwrap(), Ingested::Unchanged);
+
+        let g = guardada(&store, "ana@example.com");
+        assert_eq!(g.details.revocation_signatures.len(), 1);
+        assert!(encryption_subkey(&g).is_none(), "la revocación se fusionó");
+    }
+
+    #[test]
+    fn mas_de_16_partes_pgp_keys_se_cortan_en_16() {
+        let key = publica(&clave_completa("Ana <ana@example.com>"));
+        let con = |n: usize| {
+            let partes: Vec<_> = (0..n).map(|_| adjunta(&key)).collect();
+            incoming_public_keys(&correo_con_partes("Ana <ana@example.com>", "", &partes)).len()
+        };
+        assert_eq!(con(15), 15, "control: debajo del tope entran todas");
+        assert_eq!(con(16), 16);
+        assert_eq!(con(40), 16, "el resto se corta");
+    }
+
+    #[test]
+    fn con_dos_cabeceras_autocrypt_validas_no_se_siembra_ninguna_clave() {
+        let ana = publica(&clave_completa("Ana <ana@example.com>"));
+        let otra = publica(&clave_completa("Ana <ana@example.com>"));
+        let cabecera = |key: &SignedPublicKey, addr: &str| {
+            format!("Autocrypt: addr={addr}; keydata={}\r\n", b64(&bytes(key)))
+        };
+        let from = "Ana <ana@example.com>";
+
+        // Una sola válida: se siembra.
+        let una = correo_con_partes(from, &cabecera(&ana, "ana@example.com"), &[]);
+        assert_eq!(
+            incoming_public_keys(&una),
+            vec![("ana@example.com".to_string(), bytes(&ana))]
+        );
+
+        // Dos válidas (claves distintas, o la misma repetida): Autocrypt L1 manda
+        // ignorarlas todas, ni siquiera la primera.
+        for (que, extra) in [
+            (
+                "dos claves distintas",
+                format!(
+                    "{}{}",
+                    cabecera(&ana, "ana@example.com"),
+                    cabecera(&otra, "ana@example.com")
+                ),
+            ),
+            (
+                "la misma repetida",
+                format!(
+                    "{}{}",
+                    cabecera(&ana, "ana@example.com"),
+                    cabecera(&ana, "ana@example.com")
+                ),
+            ),
+        ] {
+            let raw = correo_con_partes(from, &extra, &[]);
+            assert!(incoming_public_keys(&raw).is_empty(), "{que}");
+        }
+
+        // Una válida y otra con `addr` ajeno al `From` (inválida para este remitente):
+        // sólo cuenta la válida, así que se siembra esa.
+        let mixta = format!(
+            "{}{}",
+            cabecera(&otra, "otro@example.com"),
+            cabecera(&ana, "ana@example.com")
+        );
+        assert_eq!(
+            incoming_public_keys(&correo_con_partes(from, &mixta, &[])),
+            vec![("ana@example.com".to_string(), bytes(&ana))]
+        );
+    }
 }

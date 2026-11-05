@@ -2520,4 +2520,353 @@ protocol=\"application/pkcs7-signature\"; boundary=\"S\"\r\n\r\n--S\r\nx\r\n--S-
             b"From: a@vasak.test\r\nContent-Type: text/plain\r\n\r\nhola\r\n"
         ));
     }
+
+    // ── Hallazgos de revisión del sync entrante (PR4) ──────────────────
+
+    /// Un correo cuyo cuerpo (`Content-Type: text/plain`) es `cuerpo`, tal cual.
+    fn correo_texto(cuerpo: &str) -> Vec<u8> {
+        correo_con(cuerpo)
+    }
+
+    #[test]
+    fn el_cleartext_pelado_sin_cabeceras_ni_texto_alrededor_sigue_verificando_como_conocido() {
+        // El interior de un sign-then-encrypt llega sin cabeceras MIME: no se puede
+        // romper ese caso legítimo al exigir que el bloque sea todo el cuerpo.
+        let alice = clave_completa("Alice <alice@vasak.test>");
+        let esperado = Verification::SignedUntrusted(alice.primary_key.fingerprint().to_string());
+        let bloque = cleartext_de("hola en claro", &*alice.secret_subkeys[0]);
+        for (que, raw) in [
+            ("pelado", bloque.clone().into_bytes()),
+            (
+                "pelado con saltos al borde",
+                format!("\r\n{bloque}\r\n").into_bytes(),
+            ),
+            ("con cabeceras", correo_texto(&bloque)),
+        ] {
+            assert_eq!(verify(&raw, &[publica(&alice)]), esperado, "{que}");
+        }
+    }
+
+    #[test]
+    fn el_texto_antepuesto_o_pospuesto_al_bloque_firmado_no_se_marca_firmado() {
+        // Anti-spoof: la firma sólo cubre su bloque, pero la vista muestra todo.
+        let alice = clave_completa("Alice <alice@vasak.test>");
+        let bloque = cleartext_de("pago 100 pesos", &*alice.secret_subkeys[0]);
+        let casos = [
+            (
+                "antepuesto, con cabeceras",
+                correo_texto(&format!(
+                    "El banco confirma tu transferencia de 9 millones.\r\n\r\n{bloque}"
+                )),
+            ),
+            (
+                "pospuesto, con cabeceras",
+                correo_texto(&format!("{bloque}\r\nDepositá a la cuenta 123.\r\n")),
+            ),
+            (
+                "pospuesto, pelado",
+                format!("{bloque}\r\nTexto del atacante\r\n").into_bytes(),
+            ),
+        ];
+        for (que, raw) in casos {
+            assert!(
+                matches!(
+                    verify(&raw, &[publica(&alice)]),
+                    Verification::Unverified(_)
+                ),
+                "{que}: con contenido fuera del bloque no puede quedar firmado"
+            );
+        }
+    }
+
+    #[test]
+    fn el_cleartext_inline_con_utf8_no_ascii_verifica_como_conocido() {
+        let alice = clave_completa("Alice <alice@vasak.test>");
+        let esperado = Verification::SignedUntrusted(alice.primary_key.fingerprint().to_string());
+        let bloque = cleartext_de("canción de cuna — ñandú ✓ 日本", &*alice.secret_subkeys[0]);
+        assert_eq!(verify(&correo_texto(&bloque), &[publica(&alice)]), esperado);
+        // Y una alteración sigue sin cerrar (el UTF-8 no relaja nada).
+        let alterado = bloque.replace("ñandú", "ñandu");
+        assert!(matches!(
+            verify(&correo_texto(&alterado), &[publica(&alice)]),
+            Verification::Unverified(_)
+        ));
+    }
+
+    /// Cifra `claro` a `para` repetido `veces` (un PKESK por vez, todos a la misma clave).
+    fn cifrar_con_pkesk_repetidos(claro: &[u8], para: &SignedPublicKey, veces: usize) -> Vec<u8> {
+        encrypt_to_keys(claro, &vec![para.clone(); veces]).expect("el cifrado sale")
+    }
+
+    #[test]
+    fn mas_de_16_pkesk_dirigidos_a_nuestra_clave_se_rechazan_antes_de_descifrar() {
+        let bob = clave_completa("Bob <bob@vasak.test>");
+        // En el tope abre (control: la cota no rompe lo legítimo)...
+        let justo = cifrar_con_pkesk_repetidos(CLARO.as_bytes(), &publica(&bob), 16);
+        assert_eq!(texto_abierto(abrir(&correo_inline(&justo), &bob)), CLARO);
+        // ...y uno más se corta, con un motivo que no filtra el claro.
+        let pasado = cifrar_con_pkesk_repetidos(CLARO.as_bytes(), &publica(&bob), 17);
+        match abrir(&correo_inline(&pasado), &bob) {
+            Decryption::Unavailable(motivo) => {
+                assert!(motivo.contains("PKESK"), "motivo: {motivo}");
+            }
+            otro => panic!("se esperaba Unavailable, salió {otro:?}"),
+        }
+    }
+
+    #[test]
+    fn los_pkesk_de_otros_destinatarios_no_cuentan_para_la_cota() {
+        let bob = clave_completa("Bob <bob@vasak.test>");
+        let otras: Vec<SignedPublicKey> = (0..20)
+            .map(|i| publica(&clave_completa(&format!("Otro{i} <o{i}@vasak.test>"))))
+            .collect();
+        let mut destinatarios = otras;
+        destinatarios.push(publica(&bob));
+        let armado = encrypt_to_keys(CLARO.as_bytes(), &destinatarios).unwrap();
+        assert_eq!(texto_abierto(abrir(&correo_inline(&armado), &bob)), CLARO);
+    }
+
+    #[test]
+    fn la_firma_de_una_subclave_bajo_una_primaria_revocada_o_expirada_no_eleva_a_clave_conocida() {
+        let alice = clave_vieja("Alice <alice@vasak.test>");
+        // Control: con la primaria sana, la subclave de firma verifica por las dos vías.
+        for (via, correo) in correos_firmados_por(&*alice.secret_subkeys[0]) {
+            assert_eq!(
+                verify(&correo, &[publica(&alice)]),
+                Verification::SignedUntrusted(alice.primary_key.fingerprint().to_string()),
+                "control {via}"
+            );
+        }
+        for (que, muerta) in [
+            ("revocada", con_primaria_revocada(&alice)),
+            (
+                "expirada",
+                con_primaria_con_vencimiento_directo(&alice, 24 * 3600),
+            ),
+        ] {
+            assert!(
+                subkey_usable(
+                    &muerta.public_subkeys[0],
+                    Timestamp::now().as_secs(),
+                    Usage::Sign
+                ),
+                "premisa: la subclave sola sigue vigente, la mata la primaria"
+            );
+            for (via, correo) in correos_firmados_por(&*alice.secret_subkeys[0]) {
+                assert!(
+                    matches!(
+                        verify(&correo, std::slice::from_ref(&muerta)),
+                        Verification::Unverified(_)
+                    ),
+                    "subclave bajo primaria {que} / {via}"
+                );
+            }
+        }
+    }
+
+    /// Una firma de `atacante` sobre **su propia** clave (`Key` directa o `CertPositive`
+    /// de su UID), con `created` una hora en el futuro (gana a cualquier auto-firma
+    /// legítima en «la más reciente») y `KeyExpirationTime` = `expiracion`. Pegada a la
+    /// clave de la víctima, no verifica contra la primaria de ésta.
+    fn firma_forjada_del_futuro(
+        atacante: &SignedSecretKey,
+        typ: SignatureType,
+        expiracion: u32,
+    ) -> pgp::packet::Signature {
+        let primaria = &atacante.primary_key;
+        let futuro = Timestamp::from_secs(Timestamp::now().as_secs() + 3600);
+        let mut config = SignatureConfig::from_key(OsRng, primaria, typ).expect("config");
+        config.hashed_subpackets = vec![
+            Subpacket::regular(SubpacketData::SignatureCreationTime(futuro)).unwrap(),
+            Subpacket::regular(SubpacketData::IssuerFingerprint(primaria.fingerprint())).unwrap(),
+            Subpacket::regular(SubpacketData::KeyExpirationTime(PgpDuration::from_secs(
+                expiracion,
+            )))
+            .unwrap(),
+        ];
+        match typ {
+            SignatureType::Key => config
+                .sign_key(primaria, &vacia(), primaria.public_key())
+                .expect("firma directa"),
+            _ => config
+                .sign_certification(
+                    primaria,
+                    primaria.public_key(),
+                    &vacia(),
+                    pgp::types::Tag::UserId,
+                    &publica(atacante).details.users[0].id,
+                )
+                .expect("certificación del UID"),
+        }
+    }
+
+    /// Las dos formas de la forjada: pegada como certificación de UID y como directa.
+    fn con_forjada(
+        victima: &SignedPublicKey,
+        atacante: &SignedSecretKey,
+        expiracion: u32,
+    ) -> Vec<(&'static str, SignedPublicKey)> {
+        let mut por_uid = victima.clone();
+        por_uid.details.users[0]
+            .signatures
+            .push(firma_forjada_del_futuro(
+                atacante,
+                SignatureType::CertPositive,
+                expiracion,
+            ));
+        let mut directa = victima.clone();
+        directa
+            .details
+            .direct_signatures
+            .push(firma_forjada_del_futuro(
+                atacante,
+                SignatureType::Key,
+                expiracion,
+            ));
+        vec![
+            ("certificación de UID", por_uid),
+            ("firma directa", directa),
+        ]
+    }
+
+    #[test]
+    fn una_certificacion_forjada_que_dice_expirada_no_inutiliza_una_clave_viva() {
+        let bob = clave_vieja("Bob <bob@vasak.test>");
+        let atacante = clave_vieja("Atacante <atacante@vasak.test>");
+        let ahora = Timestamp::now().as_secs();
+        assert!(primary_usable(&publica(&bob), ahora), "premisa: viva");
+
+        for (que, forjada) in con_forjada(&publica(&bob), &atacante, 24 * 3600) {
+            assert!(primary_usable(&forjada, ahora), "{que}");
+            assert!(encryption_subkey(&forjada).is_some(), "{que}");
+        }
+
+        // Control: la misma firma pero **válida** (de la propia primaria) sí la expira.
+        let expirada = con_primaria_con_vencimiento_en_el_uid(&bob, 24 * 3600);
+        assert!(!primary_usable(&expirada, ahora));
+    }
+
+    #[test]
+    fn una_certificacion_forjada_con_nunca_expira_no_revive_una_clave_expirada() {
+        let bob = clave_vieja("Bob <bob@vasak.test>");
+        let atacante = clave_vieja("Atacante <atacante@vasak.test>");
+        let ahora = Timestamp::now().as_secs();
+        let expirada = con_primaria_con_vencimiento_en_el_uid(&bob, 24 * 3600);
+        assert!(!primary_usable(&expirada, ahora), "premisa: expirada");
+        for (que, forjada) in con_forjada(&expirada, &atacante, 0) {
+            assert!(!primary_usable(&forjada, ahora), "{que}: no la revive");
+        }
+    }
+
+    /// La pública de `secret` con la subclave `index` reatada con una firma de binding
+    /// creada `hace_un_ano()` cuya **propia** expiración es `expiracion_de_la_firma`
+    /// (la clave en sí no vence).
+    fn con_binding_que_expira(
+        secret: &SignedSecretKey,
+        index: usize,
+        flags: KeyFlags,
+        expiracion_de_la_firma: Option<u32>,
+    ) -> SignedPublicKey {
+        let mut public = publica(secret);
+        let subkey = public.public_subkeys[index].clone();
+        let primaria = &secret.primary_key;
+        let mut config =
+            SignatureConfig::from_key(OsRng, primaria, SignatureType::SubkeyBinding).unwrap();
+        config.hashed_subpackets = vec![
+            Subpacket::regular(SubpacketData::SignatureCreationTime(hace_un_ano())).unwrap(),
+            Subpacket::regular(SubpacketData::KeyFlags(flags)).unwrap(),
+            Subpacket::regular(SubpacketData::IssuerFingerprint(primaria.fingerprint())).unwrap(),
+        ];
+        if let Some(segundos) = expiracion_de_la_firma {
+            config.hashed_subpackets.push(
+                Subpacket::regular(SubpacketData::SignatureExpirationTime(
+                    PgpDuration::from_secs(segundos),
+                ))
+                .unwrap(),
+            );
+        }
+        public.public_subkeys[index].signatures = vec![config
+            .sign_subkey_binding(primaria, primaria.public_key(), &vacia(), &subkey.key)
+            .expect("firma de la unión")];
+        public
+    }
+
+    #[test]
+    fn una_subclave_con_la_firma_de_binding_vencida_se_rechaza_aunque_la_clave_no_expire() {
+        let bob = clave_completa("Bob <bob@vasak.test>");
+        let ahora = Timestamp::now().as_secs();
+        // Subclave 1 = cifrado. Control: binding sin expiración propia, o con una
+        // futura (hace un año + dos años), sirve.
+        for (que, expiracion) in [
+            ("sin expiración", None),
+            ("futura", Some(2 * UN_ANO)),
+            ("cero", Some(0)),
+        ] {
+            let ok = con_binding_que_expira(&bob, 1, flags_de_cifrado(), expiracion);
+            assert!(
+                subkey_usable(&ok.public_subkeys[1], ahora, Usage::Encrypt),
+                "{que}"
+            );
+            assert!(encryption_subkey(&ok).is_some(), "{que}");
+        }
+        // Vencida hace ~364 días.
+        let vencida = con_binding_que_expira(&bob, 1, flags_de_cifrado(), Some(24 * 3600));
+        assert!(!subkey_usable(
+            &vencida.public_subkeys[1],
+            ahora,
+            Usage::Encrypt
+        ));
+        assert!(encryption_subkey(&vencida).is_none());
+        assert!(matches!(
+            encrypt_to_keys(b"x", &[vencida]),
+            Err(PgpError::NoEncryptionKey(_))
+        ));
+    }
+
+    /// Un correo PGP/MIME cuyo `application/octet-stream` lleva `cte` y `cuerpo`.
+    fn correo_pgp_mime_con_cte(cte: &str, cuerpo: &str) -> Vec<u8> {
+        format!(
+            "From: a@vasak.test\r\nContent-Type: multipart/encrypted; \
+protocol=\"application/pgp-encrypted\"; boundary=\"B\"\r\n\r\n--B\r\n\
+Content-Type: application/pgp-encrypted\r\n\r\nVersion: 1\r\n--B\r\n\
+Content-Type: application/octet-stream\r\nContent-Transfer-Encoding: {cte}\r\n\r\n\
+{cuerpo}\r\n--B--\r\n"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn un_sobre_pgp_mime_en_base64_se_decodifica_y_se_abre() {
+        let bob = clave_completa("Bob <bob@vasak.test>");
+        let armado = cifrar(CLARO.as_bytes(), &publica(&bob));
+        let mut binario = Vec::new();
+        Dearmor::new(&armado[..]).read_to_end(&mut binario).unwrap();
+        for (que, bytes) in [
+            ("armadura en base64", armado.clone()),
+            ("binario en base64", binario),
+        ] {
+            let raw = correo_pgp_mime_con_cte("base64", &base64_en_lineas(&bytes));
+            assert!(is_pgp_encrypted(&raw), "{que}");
+            assert_eq!(texto_abierto(abrir(&raw, &bob)), CLARO, "{que}");
+        }
+        // Control: 7bit con la armadura cruda sigue abriendo.
+        let cruda = String::from_utf8(armado).unwrap();
+        assert_eq!(
+            texto_abierto(abrir(&correo_pgp_mime_con_cte("7bit", &cruda), &bob)),
+            CLARO
+        );
+    }
+
+    #[test]
+    fn un_correo_que_cita_un_bloque_pgp_con_texto_alrededor_no_se_trata_como_cifrado() {
+        let bob = clave_completa("Bob <bob@vasak.test>");
+        let bloque = String::from_utf8(cifrar(CLARO.as_bytes(), &publica(&bob))).unwrap();
+        let respuesta = correo_texto(&format!(
+            "El jueves escribiste:\r\n\r\n{bloque}\r\nNo lo pude abrir, ¿lo mandás de nuevo?\r\n"
+        ));
+        assert!(!is_pgp_encrypted(&respuesta));
+        assert!(matches!(abrir(&respuesta, &bob), Decryption::NotEncrypted));
+        // Control: el mismo bloque como único contenido sí es un sobre.
+        assert!(is_pgp_encrypted(&correo_texto(&bloque)));
+    }
 }
