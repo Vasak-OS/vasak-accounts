@@ -12,7 +12,7 @@ use crate::access::tests::Answer;
 use crate::ipc_test_support::short_name;
 use crate::pgp::tests::{
     clave_completa, clave_vieja, con_primaria_con_vencimiento_en_el_uid, con_primaria_revocada,
-    generar, publica, subclave_de_firma,
+    con_subclave_reatada, generar, publica, subclave_de_cifrado, subclave_de_firma,
 };
 use crate::pgp_send_tests::{ACCOUNT, ADDRESS};
 use crate::store::key::fake::FakeKeys;
@@ -402,4 +402,115 @@ async fn una_cuenta_sin_almacen_da_failed_y_no_consulta_wkd() {
     let r = resolve_key_with(&m, "no-existe", DESTINATARIO, fake_wkd(Ok(None), &c)).await;
     assert!(matches!(r, Err(crate::SmimeIpcError::Failed(_))));
     assert_eq!(n(&c), 0);
+}
+
+// ── El estado del camino de cifrado: subclave muerta con la primaria viva ─
+
+#[test]
+fn una_subclave_de_cifrado_vencida_con_la_primaria_viva_dice_expired() {
+    let hace_un_ano =
+        pgp::types::Timestamp::from_secs(pgp::types::Timestamp::now().as_secs() - 365 * 24 * 3600);
+    let bob = generar(
+        "Bob <bob@vasak.test>",
+        vec![subclave_de_firma(), subclave_de_cifrado(Some(hace_un_ano))],
+    );
+    let vencida = con_subclave_reatada(&bob, 1, Some(24 * 3600), false);
+    let state = pgp_key_state(&bytes_of(&vencida));
+    assert!(!state.present);
+    assert!(state.expired, "venció la subclave de cifrado");
+    assert!(!state.revoked);
+    assert!(state.fingerprint.is_some());
+}
+
+#[test]
+fn una_subclave_de_cifrado_revocada_con_la_primaria_viva_dice_revoked() {
+    let bob = clave_completa("Bob <bob@vasak.test>");
+    let revocada = con_subclave_reatada(&bob, 1, None, true);
+    let state = pgp_key_state(&bytes_of(&revocada));
+    assert!(!state.present);
+    assert!(state.revoked, "se revocó la subclave de cifrado");
+    assert!(!state.expired);
+}
+
+#[test]
+fn una_subclave_de_firma_muerta_no_se_reporta_como_motivo_del_cifrado() {
+    // Sólo la subclave de firma está revocada; la de cifrado sirve.
+    let bob = clave_completa("Bob <bob@vasak.test>");
+    let key = con_subclave_reatada(&bob, 0, None, true);
+    let state = pgp_key_state(&bytes_of(&key));
+    assert!(state.present);
+    assert!(!state.revoked && !state.expired);
+}
+
+// ── Casing y huella retenida en la cadena ───────────────────────────────
+
+#[tokio::test]
+async fn a_wkd_se_le_pasa_la_direccion_original_y_el_peerstate_usa_la_normalizada() {
+    let (_t, m) = manager("wkd-chain-casing").await;
+    let key = publica(&clave_completa("Beto <beto@vasak.test>"));
+    let original = "Beto.Doe@Vasak.Test";
+    let recibida = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let captura = recibida.clone();
+
+    let (source, _) = resolve_key_with(&m, CUENTA, original, move |addr| {
+        *captura.lock().unwrap() = Some(addr);
+        std::future::ready(Ok(Some(wkd_key(&key))))
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(source, "wkd");
+    assert_eq!(recibida.lock().unwrap().as_deref(), Some(original));
+    // El peerstate se llaveó por la dirección normalizada.
+    let normalizada = "beto.doe@vasak.test";
+    assert!(m
+        .with_store(CUENTA, move |s| s.find_peer(normalizada))
+        .await
+        .unwrap()
+        .is_some());
+    // Y otra grafía de la misma dirección ya lo ve como peerstate.
+    let c = calls();
+    let (source, _) = resolve_key_with(&m, CUENTA, "BETO.DOE@vasak.test", fake_wkd(Ok(None), &c))
+        .await
+        .unwrap();
+    assert_eq!(source, "peerstate");
+    assert_eq!(n(&c), 0);
+}
+
+#[tokio::test]
+async fn si_otra_clave_se_guardo_entre_el_miss_y_el_upsert_se_informa_la_retenida() {
+    let (_t, m) = manager("wkd-chain-retenida").await;
+    let de_wkd = publica(&clave_completa("Beto <beto@vasak.test>"));
+    let retenida = publica(&clave_completa("Beto <beto@vasak.test>"));
+    assert_ne!(
+        crate::pgp::fingerprint(&de_wkd),
+        crate::pgp::fingerprint(&retenida)
+    );
+    let retenida_bytes = bytes_of(&retenida);
+
+    // La carrera: mientras WKD responde, un sync concurrente guarda OTRA clave.
+    let (source, state) = resolve_key_with(&m, CUENTA, DESTINATARIO, |_| async {
+        m.with_store(CUENTA, move |s| {
+            crate::pgp_import::ingest_peer_key(s, DESTINATARIO, &retenida_bytes, 1_000).unwrap();
+            Ok::<(), crate::store::StoreError>(())
+        })
+        .await
+        .unwrap();
+        Ok(Some(wkd_key(&de_wkd)))
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(source, "peerstate", "TOFU conservó la otra");
+    assert_eq!(
+        state.fingerprint,
+        Some(crate::pgp::fingerprint(&retenida)),
+        "se informa la huella retenida, no la de WKD"
+    );
+    let peer = m
+        .with_store(CUENTA, |s| s.find_peer(DESTINATARIO))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(peer.fingerprint, crate::pgp::fingerprint(&retenida));
 }

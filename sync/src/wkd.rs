@@ -474,6 +474,12 @@ mod tests {
             v6("fc00::1"),
             v6("fd12:3456::1"),
             v6("ff02::1"),
+            // Site-local `fec0::/10` (obsoleta): se veta.
+            v6("fec0::1"),
+            v6("feff::1"),
+            // CGNAT `100.64.0.0/10`.
+            v4(100, 64, 0, 1),
+            v4(100, 127, 255, 255),
             // IPv4 mapeada en IPv6: se desmapea y se revalida.
             v6("::ffff:127.0.0.1"),
             v6("::ffff:10.1.2.3"),
@@ -492,10 +498,11 @@ mod tests {
             // Fronteras de las privadas: 172.15 y 172.32 no son RFC1918.
             v4(172, 15, 0, 1),
             v4(172, 32, 0, 1),
+            // Fronteras de CGNAT: 100.63 y 100.128 son públicas.
+            v4(100, 63, 255, 255),
+            v4(100, 128, 0, 0),
             v6("2606:2800:220:1:248:1893:25c8:1946"),
             v6("::ffff:8.8.8.8"),
-            // `fec0::/10` (site-local, obsoleta) queda fuera de `fe80::/10`.
-            v6("fec0::1"),
         ];
         for ip in publicas {
             assert!(ip_allowed(ip), "{ip} debería pasar");
@@ -546,7 +553,9 @@ mod tests {
     fn una_clave_valida_con_subclave_de_cifrado_se_acepta_con_la_huella_recomputada() {
         let key = publica(&clave_completa("Beto <beto@vasak.test>"));
         let bytes = bytes_of(&key);
-        let found = validate_key_bytes(&bytes).unwrap().expect("es usable");
+        let found = validate_key_bytes(&bytes, "beto@vasak.test")
+            .unwrap()
+            .expect("es usable");
         assert_eq!(found.bytes, bytes);
         assert_eq!(found.fingerprint, crate::pgp::fingerprint(&key));
     }
@@ -562,7 +571,11 @@ mod tests {
         // Premisa: el selector sí la elegiría; sólo el binding la frena.
         assert!(crate::pgp::encryption_subkey(&forjada).is_some());
 
-        assert!(validate_key_bytes(&bytes_of(&forjada)).unwrap().is_none());
+        assert!(
+            validate_key_bytes(&bytes_of(&forjada), "victima@vasak.test")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -572,7 +585,9 @@ mod tests {
         let expirada = con_primaria_con_vencimiento_en_el_uid(&vivo, 24 * 3600);
         for (que, key) in [("revocada", revocada), ("expirada", expirada)] {
             assert!(
-                validate_key_bytes(&bytes_of(&key)).unwrap().is_none(),
+                validate_key_bytes(&bytes_of(&key), "beto@vasak.test")
+                    .unwrap()
+                    .is_none(),
                 "{que}"
             );
         }
@@ -584,13 +599,19 @@ mod tests {
             "Beto <beto@vasak.test>",
             vec![subclave_de_firma()],
         ));
-        assert!(validate_key_bytes(&bytes_of(&key)).unwrap().is_none());
+        assert!(validate_key_bytes(&bytes_of(&key), "beto@vasak.test")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     fn bytes_que_no_son_una_clave_se_tratan_como_sin_clave() {
-        assert!(validate_key_bytes(b"<html>404</html>").unwrap().is_none());
-        assert!(validate_key_bytes(b"").unwrap().is_none());
+        assert!(validate_key_bytes(b"<html>404</html>", "beto@vasak.test")
+            .unwrap()
+            .is_none());
+        assert!(validate_key_bytes(b"", "beto@vasak.test")
+            .unwrap()
+            .is_none());
     }
 
     // ── get_capped contra un servidor HTTP de loopback ──────────────────
@@ -821,5 +842,89 @@ mod tests {
         let (r, tried) = run(vec![Err(WkdError::Blocked), Err(WkdError::TooLarge)]).await;
         assert!(matches!(r, Err(WkdError::TooLarge)), "{:?}", r.err());
         assert_eq!(tried.len(), 2);
+    }
+
+    // ── Dominio inválido y UID↔dirección ────────────────────────────────
+
+    #[test]
+    fn un_dominio_que_altera_la_url_es_bad_address() {
+        for malo in [
+            "joe@ex:ample",
+            "joe@ex/ample",
+            "joe@ex ample",
+            "joe@ex?ample",
+            "joe@ex#ample",
+            "joe@ex\tample",
+        ] {
+            assert!(
+                matches!(split_address(malo), Err(WkdError::BadAddress)),
+                "{malo:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn un_dominio_que_altera_la_url_no_llega_a_la_red() {
+        let r = fetch_key("joe@127.0.0.1:8080").await;
+        assert!(matches!(r, Err(WkdError::BadAddress)), "{:?}", r.err());
+    }
+
+    #[test]
+    fn una_clave_cuyo_uid_no_liga_la_direccion_pedida_se_trata_como_sin_clave() {
+        // Binding y subclave de cifrado impecables, pero es la clave de OTRA identidad.
+        let bytes = bytes_of(&publica(&clave_completa("Beto <beto@vasak.test>")));
+        // Control: con su dirección se acepta.
+        assert!(validate_key_bytes(&bytes, "beto@vasak.test")
+            .unwrap()
+            .is_some());
+        for otra in ["otro@vasak.test", "beto@otro.test", "", "  "] {
+            assert!(
+                validate_key_bytes(&bytes, otra).unwrap().is_none(),
+                "{otra:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn la_direccion_se_compara_normalizada_con_el_uid() {
+        let bytes = bytes_of(&publica(&clave_completa("Beto <beto@vasak.test>")));
+        assert!(validate_key_bytes(&bytes, " Beto@Vasak.TEST ")
+            .unwrap()
+            .is_some());
+    }
+
+    // ── Saneo de la revocación forjada ──────────────────────────────────
+
+    #[test]
+    fn una_revocacion_forjada_por_un_tercero_se_sanea_y_la_clave_sigue_usable() {
+        use pgp::packet::{SignatureConfig, SignatureType};
+        use pgp::types::KeyDetails as _;
+        use rand::rngs::OsRng;
+
+        let victima = clave_completa("Victima <victima@vasak.test>");
+        let atacante = clave_completa("Atacante <atacante@vasak.test>");
+        let mut key = publica(&victima);
+        // Una `KeyRevocation` sobre la primaria de la víctima, firmada por el atacante.
+        let forjada =
+            SignatureConfig::from_key(OsRng, &atacante.primary_key, SignatureType::KeyRevocation)
+                .unwrap()
+                .sign_key(
+                    &atacante.primary_key,
+                    &crate::pgp::tests::vacia(),
+                    victima.primary_key.public_key(),
+                )
+                .expect("firma forjada");
+        key.details.revocation_signatures.push(forjada);
+        // Premisa: sin el saneo, la mera presencia inutilizaría la clave.
+        assert!(crate::pgp::encryption_subkey(&key).is_none());
+
+        let found = validate_key_bytes(&bytes_of(&key), "victima@vasak.test")
+            .unwrap()
+            .expect("la forjada se descarta y la clave sirve");
+        // Se guardan los bytes saneados, no el blob crudo: al releerlos no vuelve.
+        let guardada = crate::pgp::parse_public_key(&found.bytes).unwrap();
+        assert!(guardada.details.revocation_signatures.is_empty());
+        assert!(crate::pgp::encryption_subkey(&guardada).is_some());
+        assert_ne!(found.bytes, bytes_of(&key));
     }
 }
