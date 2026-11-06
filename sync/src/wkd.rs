@@ -134,7 +134,13 @@ fn split_address(address: &str) -> Result<(String, String), WkdError> {
     let at = address.rfind('@').ok_or(WkdError::BadAddress)?;
     let localpart = &address[..at];
     let domain = &address[at + 1..];
-    if localpart.is_empty() || domain.is_empty() || domain.contains('@') {
+    // El dominio tiene que ser un hostname pelado: nada que pueda alterar el puerto, la
+    // ruta, el query o el fragmento de la URL en ninguno de los dos métodos. Rechaza
+    // `@`, `:`, `/`, `?`, `#` y espacios en blanco.
+    if localpart.is_empty()
+        || domain.is_empty()
+        || domain.contains(|c: char| matches!(c, '@' | ':' | '/' | '?' | '#') || c.is_whitespace())
+    {
         return Err(WkdError::BadAddress);
     }
     Ok((localpart.to_string(), domain.to_lowercase()))
@@ -162,13 +168,20 @@ fn zbase32(data: &[u8]) -> String {
     out
 }
 
+/// WKD (draft-koch) exige SHA-1 para derivar la ruta `hu/`: no es un uso de seguridad
+/// (no protege integridad ni firma), es la **clave de lookup** del directorio. No hay
+/// alternativa en el estándar. Centralizado en un solo punto, con el localpart ya en
+/// minúsculas (el hash siempre va en minúsculas).
+fn wkd_localpart_hash(localpart_lower: &str) -> [u8; 20] {
+    use sha1::{Digest, Sha1};
+    Sha1::digest(localpart_lower.as_bytes()).into() // NOSONAR: SHA-1 lo exige el spec de WKD (ruta hu/), no es uso de seguridad
+}
+
 /// Deriva la URL WKD para un método. El `<Z>` es z-base32 de SHA-1 del localpart en
 /// minúsculas; el `?l=` lleva el localpart **original**, percent-encoded por el crate
 /// `url`.
 fn build_url(localpart: &str, domain: &str, method: Method) -> Result<Url, WkdError> {
-    use sha1::{Digest, Sha1};
-    let digest = Sha1::digest(localpart.to_lowercase().as_bytes());
-    let z = zbase32(&digest);
+    let z = zbase32(&wkd_localpart_hash(&localpart.to_lowercase()));
     let base = match method {
         Method::Advanced => {
             format!("https://openpgpkey.{domain}/.well-known/openpgpkey/{domain}/hu/{z}")
@@ -206,7 +219,15 @@ async fn fetch_and_validate(
         return Ok(None);
     }
     match get_capped(url, &pinned).await? {
-        Some(bytes) => validate_key_bytes(&bytes),
+        Some(bytes) => {
+            // El parseo + validación de hasta 1 MiB de clave hostil es CPU: fuera del
+            // runtime. La dirección (localpart original @ dominio en minúsculas) se usa
+            // para exigir el UID; `validate_key_bytes` la normaliza.
+            let address = format!("{localpart}@{domain}");
+            tokio::task::spawn_blocking(move || validate_key_bytes(&bytes, &address))
+                .await
+                .map_err(|_| WkdError::Network("la validación de la clave WKD se cortó".into()))?
+        }
         None => Ok(None),
     }
 }
@@ -244,6 +265,14 @@ async fn get_capped(url: Url, pinned: &[SocketAddr]) -> Result<Option<Vec<u8>>, 
     let host = url.host_str().ok_or(WkdError::BadAddress)?;
     let client = reqwest::Client::builder()
         .connect_timeout(graph::CONNECT_TIMEOUT)
+        // Plazo de la petición **entera**, cuerpo incluido: `tokio::time::timeout` sobre
+        // `send()` sólo cubre hasta las cabeceras, así que un cuerpo que se estanca
+        // colgaría la lectura capada sin este plazo.
+        .timeout(graph::REQUEST_TIMEOUT)
+        // Sin proxy: con `HTTPS_PROXY` heredado, reqwest tunelearía por un proxy que
+        // resuelve el host por su cuenta, **salteándose el pin** `resolve_to_addrs` y con
+        // él el veto SSRF. Ya fijamos la IP validada; un proxy rompería ese pin.
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .resolve_to_addrs(host, pinned)
         .build()
@@ -265,54 +294,82 @@ async fn get_capped(url: Url, pinned: &[SocketAddr]) -> Result<Option<Vec<u8>>, 
         })
 }
 
-/// Valida unos bytes de clave **como un adjunto hostil** (es dato de red no confiable):
-/// parsea, verifica el binding ([`crate::pgp_import::verify_key_bindings`]), recomputa la
-/// huella y exige subclave de cifrado usable. Si algo de eso falla, se trata como **sin
-/// clave** (`Ok(None)`), no como error. Función pura sobre bytes, sin red: es el borde de
-/// entrada no confiable, y por eso es `pub(crate)` —se prueba suelta—.
-pub(crate) fn validate_key_bytes(bytes: &[u8]) -> Result<Option<WkdKey>, WkdError> {
-    let Ok(key) = crate::pgp::parse_public_key(bytes) else {
+/// Valida unos bytes de clave **como un adjunto hostil** (es dato de red no confiable)
+/// para la dirección pedida. En orden:
+///
+/// 1. parsea;
+/// 2. verifica el binding de las subclaves ([`crate::pgp_import::verify_key_bindings`]);
+/// 3. exige un **UID auto-certificado válido con `address`**: WKD es autoritativo para su
+///    dominio, pero una respuesta no debe colar la clave de **otra** identidad (se
+///    normaliza igual que el peerstate);
+/// 4. **sanea** las revocaciones de primaria forjadas de terceros
+///    ([`crate::pgp_import::strip_forged_revocations`]) **antes** de evaluar la subclave de
+///    cifrado —una revocación forjada no debe inutilizar una clave usable— y guarda los
+///    bytes **saneados** (no el blob crudo), para que al releerlos del peerstate no vuelvan;
+/// 5. exige subclave de cifrado usable; la huella se recomputa desde la clave.
+///
+/// Si algo de eso falla, se trata como **sin clave** (`Ok(None)`), no como error. Función
+/// pura sobre bytes, sin red: es el borde de entrada no confiable, y por eso es
+/// `pub(crate)` —se prueba suelta—.
+pub(crate) fn validate_key_bytes(bytes: &[u8], address: &str) -> Result<Option<WkdKey>, WkdError> {
+    let Ok(mut key) = crate::pgp::parse_public_key(bytes) else {
         return Ok(None);
     };
     if crate::pgp_import::verify_key_bindings(&key).is_err() {
         return Ok(None);
     }
+    let want = crate::pgp_import::normalize_address(address);
+    if want.is_empty() || !crate::pgp_import::self_signed_emails(&key).contains(&want) {
+        return Ok(None);
+    }
+    let Ok(sanitized) = crate::pgp_import::strip_forged_revocations(&mut key, bytes) else {
+        return Ok(None);
+    };
     if crate::pgp::encryption_subkey(&key).is_none() {
         return Ok(None);
     }
     Ok(Some(WkdKey {
-        bytes: bytes.to_vec(),
+        bytes: sanitized,
         fingerprint: crate::pgp::fingerprint(&key),
     }))
 }
 
 /// Si una IP resuelta es un destino **externo** válido para WKD. Rechaza loopback,
-/// privadas RFC1918, link-local, ULA (`fc00::/7`), no especificada y multicast. Una
-/// IPv4 mapeada en IPv6 se desmapea y se revalida como IPv4.
+/// privadas RFC1918, CGNAT (`100.64.0.0/10`), link-local, ULA (`fc00::/7`), site-local
+/// (`fec0::/10`), no especificada y multicast. Una IPv4 mapeada en IPv6 se desmapea y se
+/// revalida como IPv4.
 fn ip_allowed(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
+            let o = v4.octets();
+            // CGNAT `100.64.0.0/10` (RFC 6598): primer octeto 100, segundo 64..=127.
+            let is_cgnat = o[0] == 100 && (64..=127).contains(&o[1]);
             !(v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
                 || v4.is_unspecified()
                 || v4.is_multicast()
-                || v4.is_broadcast())
+                || v4.is_broadcast()
+                || is_cgnat)
         }
         IpAddr::V6(v6) => {
             if let Some(mapped) = v6.to_ipv4_mapped() {
                 return ip_allowed(IpAddr::V4(mapped));
             }
             let octets = v6.octets();
+            let high10 = u16::from_be_bytes([octets[0], octets[1]]) & 0xffc0;
             // ULA `fc00::/7`: el primer octeto es `1111110x`.
             let is_unique_local = (octets[0] & 0xfe) == 0xfc;
             // Link-local `fe80::/10`: los diez bits altos son `1111111010`.
-            let is_link_local = (u16::from_be_bytes([octets[0], octets[1]]) & 0xffc0) == 0xfe80;
+            let is_link_local = high10 == 0xfe80;
+            // Site-local `fec0::/10` (obsoleta, RFC 3879): los diez bits altos `1111111011`.
+            let is_site_local = high10 == 0xfec0;
             !(v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
                 || is_unique_local
-                || is_link_local)
+                || is_link_local
+                || is_site_local)
         }
     }
 }
@@ -336,9 +393,7 @@ mod tests {
 
     #[test]
     fn el_hash_del_localpart_coincide_con_el_vector_del_draft() {
-        use sha1::{Digest, Sha1};
-        let digest = Sha1::digest(b"joe.doe");
-        assert_eq!(zbase32(&digest), Z_JOE_DOE);
+        assert_eq!(zbase32(&wkd_localpart_hash("joe.doe")), Z_JOE_DOE);
     }
 
     #[test]
