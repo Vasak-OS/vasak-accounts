@@ -2900,15 +2900,47 @@ async fn compose_outgoing(
             "el cifrado S/MIME todavía no está disponible".into(),
         )),
         compose::EncryptMethod::None => match draft.effective_sign_method() {
-            compose::SignMethod::Smime => sign_message(keys, draft, message_id, date).await,
+            compose::SignMethod::Smime => {
+                // El camino S/MIME no carga la identidad OpenPGP (indexa por `From`), así
+                // que la cabecera Autocrypt se arma leyendo la secreta del llavero.
+                let autocrypt = account_autocrypt_header(keys, account_id, &draft.from).await;
+                sign_message(keys, draft, message_id, date, autocrypt).await
+            }
             compose::SignMethod::Pgp => {
                 sign_message_pgp(keys, draft, account_id, message_id, date).await
             }
             compose::SignMethod::None => {
-                compose::build_message(draft, message_id, date).map_err(smtp::SmtpError::Permanent)
+                let autocrypt = account_autocrypt_header(keys, account_id, &draft.from).await;
+                compose::build_message_with_autocrypt(draft, message_id, date, autocrypt.as_deref())
+                    .map_err(smtp::SmtpError::Permanent)
             }
         },
     }
+}
+
+/// La cabecera `Autocrypt:` propia de una cuenta para los salientes, o `None` si la cuenta
+/// no tiene identidad OpenPGP (o su clave no se puede leer): en ese caso no se anuncia nada
+/// —no es un error, el mensaje sale igual—. Lee la secreta del llavero y deriva la pública;
+/// es el camino de los envíos **sin** PGP (plano y S/MIME), donde la identidad no se carga
+/// para otra cosa. Los caminos PGP arman la cabecera desde la secreta que ya tienen cargada
+/// ([`autocrypt_from_secret`]), sin releer el llavero.
+async fn account_autocrypt_header(
+    keys: &store::key::SecretServiceKeys,
+    account_id: &str,
+    from: &str,
+) -> Option<String> {
+    let bytes = keys.find_pgp_secret_key(account_id).await.ok()??;
+    let secret = crate::pgp::parse_secret_key(&bytes).ok()?;
+    autocrypt_from_secret(from, &secret)
+}
+
+/// La cabecera `Autocrypt:` derivada de una identidad OpenPGP ya cargada: serializa la
+/// clave **pública** (nunca la secreta, [`::pgp::composed::SignedSecretKey::to_public_key`])
+/// y la envuelve con [`compose::autocrypt_header`]. `None` si la pública no serializa.
+fn autocrypt_from_secret(from: &str, secret: &::pgp::composed::SignedSecretKey) -> Option<String> {
+    use ::pgp::ser::Serialize as _;
+    let public_key = secret.to_public_key().to_bytes().ok()?;
+    Some(compose::autocrypt_header(from, &public_key))
 }
 
 /// Arma el mensaje cifrado con PGP/MIME (RFC 3156 §4), tomando el almacén vivo para el
@@ -3068,8 +3100,17 @@ where
     .map_err(|e| smtp::SmtpError::Permanent(e.to_string()))?;
     let armored = String::from_utf8(armored)
         .map_err(|e| smtp::SmtpError::Permanent(format!("el sobre PGP no es ASCII: {e}")))?;
-    let headers = compose::build_message_headers(draft, message_id, date)
+    // La cabecera Autocrypt va en el sobre externo (claro), NO adentro del cifrado: se
+    // arma desde la secreta ya cargada (`our_secret`), sin releer el llavero. Si la
+    // identidad está corrupta (`our_secret` es `None`) no se anuncia nada.
+    let mut headers = compose::build_message_headers(draft, message_id, date)
         .map_err(smtp::SmtpError::Permanent)?;
+    if let Some(header) = our_secret
+        .as_ref()
+        .and_then(|secret| autocrypt_from_secret(&draft.from, secret))
+    {
+        headers.push(header);
+    }
     Ok(pgp_encrypt::build_encrypted_message(&headers, &armored))
 }
 
@@ -3081,6 +3122,7 @@ async fn sign_message(
     draft: &compose::Draft,
     message_id: &str,
     date: &str,
+    autocrypt: Option<String>,
 ) -> Result<String, smtp::SmtpError> {
     let from = &draft.from;
 
@@ -3099,8 +3141,11 @@ async fn sign_message(
             smtp::SmtpError::Permanent(format!("no hay cadena de certificados S/MIME para {from}"))
         })?;
 
-    let headers = compose::build_message_headers(draft, message_id, date)
+    let mut headers = compose::build_message_headers(draft, message_id, date)
         .map_err(smtp::SmtpError::Permanent)?;
+    if let Some(header) = autocrypt {
+        headers.push(header);
+    }
     let content = compose::build_content_entity(draft);
     let signature = smime_sign::detached_signature(content.as_bytes(), key.as_slice(), &certs)
         .map_err(|e| smtp::SmtpError::Permanent(e.to_string()))?;
@@ -3142,8 +3187,13 @@ async fn sign_message_pgp(
         .map_err(|e| smtp::SmtpError::Permanent(e.to_string()))?;
     let password = ::pgp::types::Password::from(passphrase.as_slice());
 
-    let headers = compose::build_message_headers(draft, message_id, date)
+    // La cabecera Autocrypt, desde la secreta ya cargada (sin releer el llavero), en las
+    // cabeceras de dirección (sin firmar, como el resto del sobre de un multipart/signed).
+    let mut headers = compose::build_message_headers(draft, message_id, date)
         .map_err(smtp::SmtpError::Permanent)?;
+    if let Some(header) = autocrypt_from_secret(&draft.from, &secret_key) {
+        headers.push(header);
+    }
     let content = compose::build_content_entity(draft);
     let signature = crate::pgp::sign_detached(content.as_bytes(), &secret_key, &password)
         .map_err(|e| smtp::SmtpError::Permanent(e.to_string()))?;
