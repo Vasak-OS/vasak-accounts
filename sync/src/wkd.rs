@@ -842,9 +842,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn un_error_seguido_de_sin_clave_sigue_siendo_error() {
-        let (r, _) = run(vec![Err(WkdError::Blocked), Ok(None)]).await;
-        assert!(matches!(r, Err(WkdError::Blocked)));
+    async fn un_404_definitivo_gana_sobre_un_error_de_red_del_otro_metodo() {
+        // El caso común de un dominio sin WKD: advanced no resuelve (error de red) y
+        // direct responde 404. Es «sin clave» definitivo, no una falla reintentable.
+        let (r, tried) = run(vec![Err(WkdError::Network("nxdomain".into())), Ok(None)]).await;
+        assert!(matches!(r, Ok(None)), "{:?}", r.err());
+        assert_eq!(tried.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn un_404_de_advanced_gana_sobre_un_error_de_red_de_direct() {
+        let (r, _) = run(vec![Ok(None), Err(WkdError::Network("caído".into()))]).await;
+        assert!(matches!(r, Ok(None)), "{:?}", r.err());
+    }
+
+    #[tokio::test]
+    async fn si_ambos_dan_404_es_sin_clave() {
+        let (r, _) = run(vec![Ok(None), Ok(None)]).await;
+        assert!(matches!(r, Ok(None)), "{:?}", r.err());
+    }
+
+    #[tokio::test]
+    async fn si_ambos_fallan_la_red_sigue_siendo_error_reintentable() {
+        let (r, _) = run(vec![
+            Err(WkdError::Network("a".into())),
+            Err(WkdError::Network("b".into())),
+        ])
+        .await;
+        assert!(matches!(r, Err(WkdError::Network(_))), "{:?}", r.err());
     }
 
     #[tokio::test]

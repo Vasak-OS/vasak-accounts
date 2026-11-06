@@ -79,7 +79,7 @@ impl FakeWkd {
 fn encrypted_draft(to: &[&str]) -> Draft {
     Draft {
         from: ADDRESS.into(),
-        to: to.iter().map(|s| s.to_string()).collect(),
+        to: to.iter().map(ToString::to_string).collect(),
         subject: "Secreto".into(),
         body: "El lince cena a las ocho.".into(),
         encrypt_method: Some(EncryptMethod::Pgp),
@@ -559,7 +559,7 @@ async fn missing_key(
     recipients: &[&str],
     wkd: &FakeWkd,
 ) -> Option<String> {
-    let recipients: Vec<String> = recipients.iter().map(|s| s.to_string()).collect();
+    let recipients: Vec<String> = recipients.iter().map(ToString::to_string).collect();
     // Captura sólo referencias: es `Copy`, como pide `first_recipient_without_key`.
     let fetch = |addr: String| {
         wkd.calls.fetch_add(1, Ordering::SeqCst);
