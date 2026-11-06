@@ -539,6 +539,100 @@ async fn una_cuenta_sin_almacen_falla_temporal_y_no_sale_en_claro() {
     assert_eq!(wkd.calls(), 0);
 }
 
+// ── 8a. Validación al encolar: la primera dirección sin clave ───────────
+
+async fn missing_key(
+    m: &StoreManager<FakeKeys>,
+    recipients: &[&str],
+    wkd: &FakeWkd,
+) -> Option<String> {
+    let recipients: Vec<String> = recipients.iter().map(|s| s.to_string()).collect();
+    // Captura sólo referencias: es `Copy`, como pide `first_recipient_without_key`.
+    let fetch = |addr: String| {
+        wkd.calls.fetch_add(1, Ordering::SeqCst);
+        std::future::ready(Ok(wkd.table.get(&addr).map(wkd_key)))
+    };
+    crate::first_recipient_without_key(m, CUENTA, &recipients, fetch)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn si_todos_tienen_clave_en_el_peerstate_nadie_falta() {
+    let (_t, m) = manager("enc-encolar-todos").await;
+    store_peer(
+        &m,
+        BETO,
+        &publica(&clave_completa("Beto <beto@vasak.test>")),
+    )
+    .await;
+    store_peer(
+        &m,
+        CARLA,
+        &publica(&clave_completa("Carla <carla@vasak.test>")),
+    )
+    .await;
+    let wkd = FakeWkd::new(&[]);
+
+    assert_eq!(missing_key(&m, &[BETO, CARLA], &wkd).await, None);
+    assert_eq!(wkd.calls(), 0);
+}
+
+#[tokio::test]
+async fn si_a_uno_le_falta_la_clave_devuelve_la_direccion_de_ese_y_no_la_del_que_tiene() {
+    let (_t, m) = manager("enc-encolar-falta").await;
+    store_peer(
+        &m,
+        BETO,
+        &publica(&clave_completa("Beto <beto@vasak.test>")),
+    )
+    .await;
+    let wkd = FakeWkd::new(&[]);
+
+    assert_eq!(
+        missing_key(&m, &[BETO, CARLA], &wkd).await.as_deref(),
+        Some(CARLA)
+    );
+    // El orden no cambia quién falta.
+    assert_eq!(
+        missing_key(&m, &[CARLA, BETO], &wkd).await.as_deref(),
+        Some(CARLA)
+    );
+}
+
+#[tokio::test]
+async fn una_clave_muerta_en_el_peerstate_cuenta_como_faltante_al_encolar() {
+    let (_t, m) = manager("enc-encolar-muerta").await;
+    let vivo = clave_vieja("Beto <beto@vasak.test>");
+    store_peer(&m, BETO, &con_primaria_revocada(&vivo)).await;
+    let wkd = FakeWkd::new(&[]);
+
+    assert_eq!(missing_key(&m, &[BETO], &wkd).await.as_deref(), Some(BETO));
+}
+
+#[tokio::test]
+async fn sin_destinatarios_nadie_falta_y_un_acierto_de_wkd_cuenta_como_tener_clave() {
+    let (_t, m) = manager("enc-encolar-wkd").await;
+    let beto = publica(&clave_completa("Beto <beto@vasak.test>"));
+    let wkd = FakeWkd::new(&[(BETO, &beto)]);
+
+    assert_eq!(missing_key(&m, &[], &wkd).await, None);
+    assert_eq!(missing_key(&m, &[BETO], &wkd).await, None);
+    assert_eq!(wkd.calls(), 1);
+}
+
+#[tokio::test]
+async fn un_almacen_ausente_al_encolar_es_error_y_no_pasa_por_alto() {
+    let (_t, m) = manager("enc-encolar-sin-almacen").await;
+    let wkd = FakeWkd::new(&[]);
+    let recipients = vec![BETO.to_string()];
+    let fetch = |addr: String| std::future::ready(Ok(wkd.table.get(&addr).map(wkd_key)));
+
+    let result = crate::first_recipient_without_key(&m, "no-existe", &recipients, fetch).await;
+
+    assert!(result.is_err());
+}
+
 // ── 8. Validación al encolar, por el bus ────────────────────────────────
 
 const ACCOUNT_ID: &str = ACCOUNT;
