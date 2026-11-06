@@ -1125,6 +1125,34 @@ where
     }
 }
 
+/// La primera dirección de `recipients` que **no** tiene clave de cifrado PGP usable, o
+/// `None` si todas la tienen. Es la validación de «no cifrar a medias» al encolar: si falta
+/// la clave de alguno se rechaza temprano (si no, cifrar fallaría tarde en el despachador y
+/// el borrador quedaría trabado —y nunca se manda en claro—). Inyectable (`manager` +
+/// `wkd_fetch`) para probar el rechazo sin el `live_store()` global; en producción
+/// `wkd_fetch` es [`crate::wkd::fetch_key`].
+async fn first_recipient_without_key<K, F, Fut>(
+    manager: &StoreManager<K>,
+    account_id: &str,
+    recipients: &[String],
+    wkd_fetch: F,
+) -> Result<Option<String>, SmimeIpcError>
+where
+    K: KeySource,
+    F: Fn(String) -> Fut + Copy,
+    Fut: std::future::Future<Output = Result<Option<crate::wkd::WkdKey>, crate::wkd::WkdError>>,
+{
+    for address in recipients {
+        if resolve_recipient_encryption_key(manager, account_id, address, wkd_fetch)
+            .await?
+            .is_none()
+        {
+            return Ok(Some(address.clone()));
+        }
+    }
+    Ok(None)
+}
+
 /// Parsea bytes de clave pública y la devuelve **sólo** si tiene subclave de cifrado
 /// usable; si no parsea, no tiene subclave de cifrado, o está muerta, es `None` («sin
 /// clave de cifrado»). El parseo y el chequeo son CPU: van en `spawn_blocking`.
@@ -1963,21 +1991,19 @@ impl Service {
                         "el almacén de la cuenta no está disponible para cifrar".into(),
                     ));
                 };
-                for address in draft.recipients() {
-                    let resolved = resolve_recipient_encryption_key(
-                        manager,
-                        &account_id,
-                        &address,
-                        |addr| async move { crate::wkd::fetch_key(&addr).await },
-                    )
-                    .await
-                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-                    if resolved.is_none() {
-                        return Err(zbus::fdo::Error::InvalidArgs(format!(
-                            "no hay clave PGP de cifrado usable para {address}: \
-                             no se puede cifrar el mensaje"
-                        )));
-                    }
+                if let Some(address) = first_recipient_without_key(
+                    manager,
+                    &account_id,
+                    &draft.recipients(),
+                    |addr| async move { crate::wkd::fetch_key(&addr).await },
+                )
+                .await
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+                {
+                    return Err(zbus::fdo::Error::InvalidArgs(format!(
+                        "no hay clave PGP de cifrado usable para {address}: \
+                         no se puede cifrar el mensaje"
+                    )));
                 }
             }
         }
