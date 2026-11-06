@@ -438,7 +438,13 @@ async fn el_resolvedor_devuelve_la_clave_viva_y_nada_para_la_muerta_o_la_solo_de
             .await
             .unwrap();
 
-        assert_eq!(found.is_some(), what == "viva", "{what}");
+        // Ajustado a RecipientKey (FIX-NOW C4): `Found` sólo para la clave viva; las muertas
+        // y la sólo-de-firma son `Absent`.
+        assert_eq!(
+            matches!(found, crate::RecipientKey::Found(_)),
+            what == "viva",
+            "{what}"
+        );
     }
 }
 
@@ -502,7 +508,10 @@ async fn un_acierto_de_wkd_se_guarda_y_el_segundo_envio_ya_no_sale_a_la_red() {
 }
 
 #[tokio::test]
-async fn un_fallo_de_wkd_es_sin_clave_y_no_cifra() {
+async fn una_caida_de_red_de_wkd_es_reintentable_y_no_cifra_a_medias() {
+    // Ajustado (FIX-NOW C4): una caída **transitoria** de WKD no vuelve permanente el envío
+    // cifrado a un destinatario cuya clave sólo vive en WKD; es `Temporary` (reintentable),
+    // no `Permanent`. Igual no cifra a medias ni manda en claro.
     let (_t, m) = manager("enc-wkd-error").await;
     let (keys, _s, _sh) = fake_keyring().await;
     let draft = encrypted_draft(&[BETO]);
@@ -512,9 +521,13 @@ async fn un_fallo_de_wkd_es_sin_clave_y_no_cifra() {
     let result =
         crate::encrypt_outgoing_pgp(&m, &keys, &draft, CUENTA, MESSAGE_ID, DATE, failing).await;
 
-    let detail = permanent(result);
-    assert!(detail.contains(BETO), "{detail}");
-    assert!(!detail.contains("caído"), "no se filtra el motivo de red");
+    match result {
+        Err(SmtpError::Temporary(detail)) => {
+            assert!(detail.contains(BETO), "{detail}");
+            assert!(!detail.contains("caído"), "no se filtra el motivo de red");
+        }
+        other => panic!("se esperaba un fallo temporal reintentable, salió {other:?}"),
+    }
 }
 
 #[tokio::test]
