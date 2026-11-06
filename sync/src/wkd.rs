@@ -103,9 +103,13 @@ pub async fn fetch_key(address: &str) -> Result<Option<WkdKey>, WkdError> {
 }
 
 /// El respaldo advanced→direct: prueba cada método en orden y devuelve la primera
-/// clave usable; un `Ok(None)` pasa al siguiente método, y un `Err` se recuerda pero
-/// no corta (un método puede fallar la red y el otro traer la clave). Si ningún método
-/// trae clave, devuelve el último error, o `Ok(None)` si todos dieron «sin clave».
+/// clave usable. Una respuesta **definitiva** «sin clave» (un 404 → `Ok(None)`) de
+/// cualquier método **gana** sobre un `Err` transitorio de otro: el caso común es
+/// `openpgpkey.<dom>` que no existe (NXDOMAIN → `Err` de red en *advanced*) y `<dom>`
+/// que responde 404 en *direct* —eso es «no hay clave WKD», no una falla transitoria—,
+/// y confundirlos haría que el envío cifrado reintentara sin fin un dominio que nunca
+/// va a publicar clave. Sólo si **ningún** método dio una respuesta definitiva (todos
+/// fallaron la red) se devuelve el error, que arriba se trata como reintentable.
 /// `attempt` queda inyectable para probar el respaldo sin red (en producción es
 /// [`fetch_and_validate`], que pasa por el veto SSRF y el GET).
 async fn try_methods<F, Fut>(mut attempt: F) -> Result<Option<WkdKey>, WkdError>
@@ -114,12 +118,18 @@ where
     Fut: std::future::Future<Output = Result<Option<WkdKey>, WkdError>>,
 {
     let mut last_err: Option<WkdError> = None;
+    let mut saw_definitive_none = false;
     for method in [Method::Advanced, Method::Direct] {
         match attempt(method).await {
             Ok(Some(key)) => return Ok(Some(key)),
-            Ok(None) => {}
+            Ok(None) => saw_definitive_none = true,
             Err(e) => last_err = Some(e),
         }
+    }
+    // Un 404 definitivo de cualquier método es «sin clave» (permanente); sólo si no
+    // hubo ninguna respuesta definitiva se propaga el error de red (reintentable).
+    if saw_definitive_none {
+        return Ok(None);
     }
     match last_err {
         Some(e) => Err(e),
@@ -832,9 +842,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn un_error_seguido_de_sin_clave_sigue_siendo_error() {
-        let (r, _) = run(vec![Err(WkdError::Blocked), Ok(None)]).await;
-        assert!(matches!(r, Err(WkdError::Blocked)));
+    async fn un_404_definitivo_gana_sobre_un_error_de_red_del_otro_metodo() {
+        // El caso común de un dominio sin WKD: advanced no resuelve (error de red) y
+        // direct responde 404. Es «sin clave» definitivo, no una falla reintentable.
+        let (r, tried) = run(vec![Err(WkdError::Network("nxdomain".into())), Ok(None)]).await;
+        assert!(matches!(r, Ok(None)), "{:?}", r.err());
+        assert_eq!(tried.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn un_404_de_advanced_gana_sobre_un_error_de_red_de_direct() {
+        let (r, _) = run(vec![Ok(None), Err(WkdError::Network("caído".into()))]).await;
+        assert!(matches!(r, Ok(None)), "{:?}", r.err());
+    }
+
+    #[tokio::test]
+    async fn si_ambos_dan_404_es_sin_clave() {
+        let (r, _) = run(vec![Ok(None), Ok(None)]).await;
+        assert!(matches!(r, Ok(None)), "{:?}", r.err());
+    }
+
+    #[tokio::test]
+    async fn si_ambos_fallan_la_red_sigue_siendo_error_reintentable() {
+        let (r, _) = run(vec![
+            Err(WkdError::Network("a".into())),
+            Err(WkdError::Network("b".into())),
+        ])
+        .await;
+        assert!(matches!(r, Err(WkdError::Network(_))), "{:?}", r.err());
     }
 
     #[tokio::test]

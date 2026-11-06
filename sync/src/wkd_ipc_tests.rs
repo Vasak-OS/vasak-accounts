@@ -213,11 +213,11 @@ fn la_clave_guardada_por_wkd_se_relee_del_peerstate_con_la_misma_huella() {
 
 // ── La cadena peerstate → WKD con un almacén real y un WKD falso ────────
 
-const CUENTA: &str = "cuenta";
+pub(crate) const CUENTA: &str = "cuenta";
 
 /// Un administrador de almacenes de verdad (llavero falso, disco temporal) con la base
 /// de `CUENTA` abierta.
-async fn manager(label: &str) -> (TempDir, StoreManager<FakeKeys>) {
+pub(crate) async fn manager(label: &str) -> (TempDir, StoreManager<FakeKeys>) {
     let temp = TempDir::new(label);
     let manager = StoreManager::new(
         FakeKeys::default(),

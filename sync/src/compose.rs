@@ -84,6 +84,23 @@ pub enum SignMethod {
     Pgp,
 }
 
+/// Con qué método se **cifra** el mensaje al enviarlo. Ortogonal a la firma: se
+/// puede firmar y cifrar a la vez (sign-then-encrypt), o sólo cifrar. El motor de
+/// PGP/MIME ([`crate::pgp_encrypt`]) está acá; la ventana elige el método, gateado
+/// por tener clave de cifrado de **todos** los destinatarios. Por omisión no se
+/// cifra. S/MIME todavía no está implementado (se muestra «no disponible»).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EncryptMethod {
+    /// No cifrar.
+    #[default]
+    None,
+    /// Cifrar con S/MIME (todavía no implementado).
+    Smime,
+    /// Cifrar con PGP/MIME (RFC 3156 §4, `multipart/encrypted`).
+    Pgp,
+}
+
 /// Lo que la persona escribió.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Draft {
@@ -141,6 +158,17 @@ pub struct Draft {
         rename = "metodo_firma"
     )]
     pub sign_method: Option<SignMethod>,
+    /// El método de cifrado, cuando la ventana lo manda explícito. Es `Option` por la
+    /// misma retrocompatibilidad que [`Draft::sign_method`]: ausente **no se
+    /// serializa**, así la cola ya escrita y el UI que no lo manda se vuelven a
+    /// escribir idénticos, y el campo sólo aparece cuando de verdad se eligió cifrar.
+    /// Ausente deriva en [`EncryptMethod::None`] (ver [`Draft::effective_encrypt_method`]).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "metodo_cifrado"
+    )]
+    pub encrypt_method: Option<EncryptMethod>,
     /// Si al enviar hay que recordar un seguimiento: el instante (epoch
     /// segundos) en que avisar si para entonces nadie respondió. Lo pone la
     /// ventana con el toggle de seguimiento (PR5); por omisión no hay
@@ -197,6 +225,15 @@ impl Draft {
             None if self.sign => SignMethod::Smime,
             None => SignMethod::None,
         }
+    }
+
+    /// El método de cifrado efectivo: el explícito si la ventana lo mandó, y si no,
+    /// ninguno. No hay un campo viejo del que derivar (el cifrado es nuevo), así que
+    /// ausente es [`EncryptMethod::None`]. Un solo lugar decide, como
+    /// [`Draft::effective_sign_method`], para que la validación al encolar y el armado
+    /// al enviar no diverjan.
+    pub fn effective_encrypt_method(&self) -> EncryptMethod {
+        self.encrypt_method.unwrap_or_default()
     }
 }
 
