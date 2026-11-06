@@ -17,14 +17,29 @@ pub fn build_signed_message(
     content_entity: &str,
     armored_signature: &str,
 ) -> String {
+    // Las cabeceras de dirección, y a continuación la entidad `multipart/signed` como
+    // otra cabecera más del mensaje de afuera (el `\r\n` de unión continúa la lista).
+    let mut out = headers.join("\r\n");
+    out.push_str("\r\n");
+    out.push_str(&signed_entity(content_entity, armored_signature));
+    out
+}
+
+/// La **entidad** `multipart/signed` sola, sin cabeceras de dirección: su propio
+/// `Content-Type`, la entidad de contenido (parte 1, firmada byte a byte) y la firma
+/// separada (parte 2, `application/pgp-signature`, el armor tal cual). Empieza por su
+/// `Content-Type` —sin línea en blanco delante—, así sirve de dos maneras: con
+/// cabeceras de dirección delante es un mensaje firmado ([`build_signed_message`]), y
+/// cruda es el MIME que PR7 cifra en el sign-then-encrypt (la firma queda **adentro**
+/// del sobre).
+pub fn signed_entity(content_entity: &str, armored_signature: &str) -> String {
     // La frontera no puede aparecer ni en el contenido ni en la firma armada.
     let boundary = crate::compose::boundary(&[content_entity, armored_signature]);
 
-    let mut out = headers.join("\r\n");
-    out.push_str(&format!(
-        "\r\nContent-Type: multipart/signed; protocol=\"application/pgp-signature\"; \
+    let mut out = format!(
+        "Content-Type: multipart/signed; protocol=\"application/pgp-signature\"; \
          micalg=\"pgp-sha256\"; boundary=\"{boundary}\"\r\n\r\n"
-    ));
+    );
     // Parte 1: la entidad de contenido, exactamente lo que se firmó. El `\r\n`
     // que sigue es de la frontera, no del contenido.
     out.push_str(&format!("--{boundary}\r\n"));
