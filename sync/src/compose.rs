@@ -442,6 +442,50 @@ pub fn format_address(name: &str, address: &str) -> String {
     format!("\"{name}\" <{address}>")
 }
 
+/// La cabecera `Autocrypt:` propia para un mensaje saliente (Autocrypt Level 1).
+///
+/// Se anuncia en **todos** los salientes cuando la cuenta tiene identidad OpenPGP, para
+/// que el par aprenda nuestra clave y pueda cifrarnos sin pasos manuales (distribución
+/// pasiva estilo Autocrypt). `addr` es la dirección de la cuenta (el `From`) y
+/// `public_key` la clave **pública** en **binario** (no armor ASCII).
+///
+/// Es la contraparte de emisión de [`crate::pgp_import::parse_autocrypt_header`]: lo que
+/// se emite acá tiene que volver a parsear allá (misma sintaxis L1 — es la mejor prueba
+/// del formato).
+///
+/// **No se emite `prefer-encrypt`.** Omitirlo equivale a `nopreference`: VasakOS cifra por
+/// toggle-por-mensaje, no por defecto, así que **no** le decimos al par «ciframe siempre»
+/// (`prefer-encrypt=mutual`), que no es nuestro modelo.
+///
+/// Defensa de inyección de cabeceras: `addr` pasa por [`safe_header`] (una dirección
+/// válida es ASCII sin control, así que sale igual) y el `keydata` es base64 estándar
+/// (alfabeto `A-Za-z0-9+/=`), de modo que ni la dirección ni la clave pueden meter un
+/// `\r\n` que abra otra cabecera. El base64 largo se pliega con el espacio de continuación
+/// de RFC 5322, que [`crate::message::Headers::parse`] vuelve a juntar y el parser de
+/// Autocrypt descarta del `keydata` antes de decodificar.
+pub fn autocrypt_header(addr: &str, public_key: &[u8]) -> String {
+    use base64::Engine;
+
+    let addr = safe_header(addr);
+    let keydata = base64::engine::general_purpose::STANDARD.encode(public_key);
+
+    // `addr=…; keydata=` entero en el primer renglón (una dirección válida es corta y no
+    // tiene espacios, así que nunca se pliega **dentro** de la dirección: un espacio
+    // insertado ahí la rompería); sólo el base64 se parte en renglones de continuación,
+    // que empiezan con un espacio.
+    let mut out = format!("Autocrypt: addr={addr}; keydata=");
+    let mut line_len = out.len();
+    for byte in keydata.bytes() {
+        if line_len >= HEADER_LINE_LENGTH {
+            out.push_str("\r\n ");
+            line_len = 1;
+        }
+        out.push(char::from(byte));
+        line_len += 1;
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // El cuerpo
 // ---------------------------------------------------------------------------
@@ -507,7 +551,24 @@ fn encode_qp_line(line: &str) -> String {
 /// que el resultado se pueda probar entero: si leyera el reloj, el test tendría
 /// que buscar partes sueltas en vez de comparar el mensaje completo.
 pub fn build_message(draft: &Draft, message_id: &str, date: &str) -> Result<String, String> {
-    let headers = build_message_headers(draft, message_id, date)?;
+    build_message_with_autocrypt(draft, message_id, date, None)
+}
+
+/// Como [`build_message`], pero con la cabecera `Autocrypt:` propia añadida a las
+/// cabeceras de nivel superior cuando `autocrypt` es `Some` (la cuenta tiene identidad
+/// OpenPGP). Es el camino **plano**; los caminos firmado y cifrado agregan la misma
+/// cabecera a su propia lista antes de llamar a sus constructores. Ver
+/// [`autocrypt_header`].
+pub fn build_message_with_autocrypt(
+    draft: &Draft,
+    message_id: &str,
+    date: &str,
+    autocrypt: Option<&str>,
+) -> Result<String, String> {
+    let mut headers = build_message_headers(draft, message_id, date)?;
+    if let Some(header) = autocrypt {
+        headers.push(header.to_string());
+    }
     let content = build_content_entity(draft);
     // Los de dirección, después la entidad de contenido con sus propios headers.
     // El `\r\n` de unión continúa la lista de cabeceras; la línea en blanco que
