@@ -103,9 +103,13 @@ pub async fn fetch_key(address: &str) -> Result<Option<WkdKey>, WkdError> {
 }
 
 /// El respaldo advanced→direct: prueba cada método en orden y devuelve la primera
-/// clave usable; un `Ok(None)` pasa al siguiente método, y un `Err` se recuerda pero
-/// no corta (un método puede fallar la red y el otro traer la clave). Si ningún método
-/// trae clave, devuelve el último error, o `Ok(None)` si todos dieron «sin clave».
+/// clave usable. Una respuesta **definitiva** «sin clave» (un 404 → `Ok(None)`) de
+/// cualquier método **gana** sobre un `Err` transitorio de otro: el caso común es
+/// `openpgpkey.<dom>` que no existe (NXDOMAIN → `Err` de red en *advanced*) y `<dom>`
+/// que responde 404 en *direct* —eso es «no hay clave WKD», no una falla transitoria—,
+/// y confundirlos haría que el envío cifrado reintentara sin fin un dominio que nunca
+/// va a publicar clave. Sólo si **ningún** método dio una respuesta definitiva (todos
+/// fallaron la red) se devuelve el error, que arriba se trata como reintentable.
 /// `attempt` queda inyectable para probar el respaldo sin red (en producción es
 /// [`fetch_and_validate`], que pasa por el veto SSRF y el GET).
 async fn try_methods<F, Fut>(mut attempt: F) -> Result<Option<WkdKey>, WkdError>
@@ -114,12 +118,18 @@ where
     Fut: std::future::Future<Output = Result<Option<WkdKey>, WkdError>>,
 {
     let mut last_err: Option<WkdError> = None;
+    let mut saw_definitive_none = false;
     for method in [Method::Advanced, Method::Direct] {
         match attempt(method).await {
             Ok(Some(key)) => return Ok(Some(key)),
-            Ok(None) => {}
+            Ok(None) => saw_definitive_none = true,
             Err(e) => last_err = Some(e),
         }
+    }
+    // Un 404 definitivo de cualquier método es «sin clave» (permanente); sólo si no
+    // hubo ninguna respuesta definitiva se propaga el error de red (reintentable).
+    if saw_definitive_none {
+        return Ok(None);
     }
     match last_err {
         Some(e) => Err(e),
