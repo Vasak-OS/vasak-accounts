@@ -318,10 +318,16 @@ async fn sin_pedir_firma_el_mensaje_sale_como_siempre_haya_o_no_identidad() {
         .await
         .unwrap();
 
-    for keys in [&empty, &loaded] {
+    // Sin identidad sale como siempre; con identidad sale igual **más** la cabecera
+    // Autocrypt propia (PR8) y nada más: sigue sin firma.
+    let announced = crate::autocrypt_from_secret(ADDRESS, &key).unwrap();
+    let with_autocrypt =
+        compose::build_message_with_autocrypt(&plain, MESSAGE_ID, DATE, Some(&announced)).unwrap();
+
+    for (keys, expected) in [(&empty, &expected), (&loaded, &with_autocrypt)] {
         for draft in [&plain, &draft_with(Some(SignMethod::None))] {
             let message = compose(keys, draft).await.unwrap();
-            assert_eq!(message, expected);
+            assert_eq!(&message, expected);
             assert_eq!(
                 crate::pgp::verify(message.as_bytes(), &[publica(&key)]),
                 PgpVerification::NotSigned

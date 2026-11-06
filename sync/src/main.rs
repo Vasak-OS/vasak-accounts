@@ -103,6 +103,8 @@ mod replay;
 // Graph (`/me/events`, `/me/contacts`), con su propio `@odata.etag` y
 // `POST`/`PATCH`/`DELETE` (`vasak-accounts#97`).
 #[cfg(test)]
+mod autocrypt_send_tests;
+#[cfg(test)]
 mod followup_loop_tests;
 #[cfg(test)]
 mod followup_tests;
