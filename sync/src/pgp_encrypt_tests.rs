@@ -646,6 +646,209 @@ async fn un_almacen_ausente_al_encolar_es_error_y_no_pasa_por_alto() {
     assert!(result.is_err());
 }
 
+// ── 11. Caída transitoria de WKD vs ausencia genuina ────────────────────
+
+fn network_down(_: String) -> std::future::Ready<Result<Option<WkdKey>, WkdError>> {
+    std::future::ready(Err(WkdError::Network("caído".into())))
+}
+
+#[tokio::test]
+async fn al_enviar_una_caida_de_wkd_es_temporal_y_una_ausencia_genuina_es_permanente() {
+    let draft = encrypted_draft(&[BETO]);
+
+    // Caída de red: reintentable, nombra al destinatario, no filtra el motivo.
+    let (_t, m) = manager("enc-transitoria").await;
+    let (keys, _s, _sh) = fake_keyring().await;
+    let result =
+        crate::encrypt_outgoing_pgp(&m, &keys, &draft, CUENTA, MESSAGE_ID, DATE, network_down)
+            .await;
+    match result {
+        Err(SmtpError::Temporary(detail)) => assert!(detail.contains(BETO), "{detail}"),
+        other => panic!("se esperaba Temporary, salió {other:?}"),
+    }
+
+    // WKD responde «no hay», o el destino está vetado / la dirección es inválida: permanente.
+    let (_t, m) = manager("enc-ausente").await;
+    let ausente = FakeWkd::new(&[]);
+    let detail = permanent(encrypt(&m, &keys, &draft, &ausente).await);
+    assert!(detail.contains(BETO), "{detail}");
+    for error in [WkdError::Blocked, WkdError::BadAddress, WkdError::TooLarge] {
+        let (_t, m) = manager("enc-ausente-error").await;
+        let fails = move |_: String| {
+            std::future::ready(Err::<Option<WkdKey>, _>(match &error {
+                WkdError::Blocked => WkdError::Blocked,
+                WkdError::BadAddress => WkdError::BadAddress,
+                _ => WkdError::TooLarge,
+            }))
+        };
+        let result =
+            crate::encrypt_outgoing_pgp(&m, &keys, &draft, CUENTA, MESSAGE_ID, DATE, fails).await;
+        assert!(matches!(result, Err(SmtpError::Permanent(_))), "{result:?}");
+    }
+}
+
+#[tokio::test]
+async fn al_encolar_una_caida_de_wkd_no_rechaza_pero_una_ausencia_genuina_si() {
+    let (_t, m) = manager("enc-encolar-transitoria").await;
+    let recipients = vec![BETO.to_string()];
+
+    // Caída de red sin peerstate: nadie «falta», se deja encolar y el envío reintenta.
+    let transient = crate::first_recipient_without_key(&m, CUENTA, &recipients, network_down)
+        .await
+        .unwrap();
+    assert_eq!(transient, None);
+
+    // «No hay» genuino: se rechaza nombrando a la persona.
+    let wkd = FakeWkd::new(&[]);
+    assert_eq!(missing_key(&m, &[BETO], &wkd).await.as_deref(), Some(BETO));
+}
+
+// ── 12. Firma S/MIME + cifrado PGP: combo no soportado ──────────────────
+
+#[tokio::test]
+async fn firmar_con_smime_y_cifrar_con_pgp_se_rechaza_permanente_y_nunca_sale_cifrado_sin_firma() {
+    let (_t, m) = manager("enc-combo").await;
+    let (keys, _s, _sh) = fake_keyring().await;
+    let beto = clave_completa("Beto <beto@vasak.test>");
+    let wkd = FakeWkd::new(&[(BETO, &publica(&beto))]);
+    let explicit = Draft {
+        sign_method: Some(SignMethod::Smime),
+        ..encrypted_draft(&[BETO])
+    };
+    // El legacy `firmar: true` sin método explícito deriva en S/MIME.
+    let legacy = Draft {
+        sign: true,
+        ..encrypted_draft(&[BETO])
+    };
+
+    for draft in [explicit, legacy] {
+        let detail = permanent(encrypt(&m, &keys, &draft, &wkd).await);
+        assert!(detail.contains("no está soportado"), "{detail}");
+    }
+    assert_eq!(wkd.calls(), 0, "falla antes de resolver claves");
+}
+
+#[tokio::test]
+async fn firmar_con_smime_y_cifrar_con_pgp_se_rechaza_al_encolar_con_invalidargs() {
+    use crate::smime_sign::test_support::{PASSWORD, RSA_ADDRESS, RSA_P12};
+    // Con certificado S/MIME cargado, la firma pasa su validación y es el combo lo que
+    // se rechaza (sin certificado, fallaría antes por el certificado).
+    let f = Fixture::start(&[(ACCOUNT, RSA_ADDRESS)]).await;
+    let imported = crate::store::smime_key::parse_pkcs12(RSA_P12, PASSWORD).unwrap();
+    f.keys()
+        .store_smime_identity(RSA_ADDRESS, &imported)
+        .await
+        .unwrap();
+    for extra in [
+        serde_json::json!({"metodo_firma": "smime"}),
+        // El legacy `firmar: true` sin método explícito deriva en S/MIME.
+        serde_json::json!({"firmar": true}),
+    ] {
+        let mut draft = serde_json::json!({
+            "para": ["dest@otro.test"], "asunto": "Hola", "cuerpo": "x",
+            "metodo_cifrado": "pgp",
+        });
+        draft
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+
+        let result = f
+            .call("SendMessage", &(ACCOUNT_ID, draft.to_string(), ""))
+            .await;
+
+        let (name, text) = error_of(result);
+        assert_eq!(name, "org.freedesktop.DBus.Error.InvalidArgs");
+        assert!(text.contains("no está soportado"), "{text}");
+    }
+    assert_eq!(outbox_len(&f).await, 0);
+}
+
+// ── 13. Carrera: otra clave retenida en el peerstate gana a la de WKD ───
+
+#[tokio::test]
+async fn si_otra_clave_se_guardo_entre_el_miss_y_el_upsert_se_cifra_a_la_retenida() {
+    let (_t, m) = manager("enc-retenida").await;
+    let (keys, _s, _sh) = fake_keyring().await;
+    let de_wkd = clave_completa("Beto <beto@vasak.test>");
+    let retenida = clave_completa("Beto <beto@vasak.test>");
+    let retenida_bytes = bytes_of(&publica(&retenida));
+    let wkd_pub = publica(&de_wkd);
+    let draft = encrypted_draft(&[BETO]);
+    let manager_ref = &m;
+
+    // La carrera: mientras WKD responde, un sync concurrente guarda OTRA clave.
+    let racing = |_: String| {
+        let retenida_bytes = retenida_bytes.clone();
+        let wkd_pub = wkd_pub.clone();
+        async move {
+            manager_ref
+                .with_store(CUENTA, move |s| {
+                    crate::pgp_import::ingest_peer_key(s, BETO, &retenida_bytes, 1_000).unwrap();
+                    Ok::<(), crate::store::StoreError>(())
+                })
+                .await
+                .unwrap();
+            Ok(Some(wkd_key(&wkd_pub)))
+        }
+    };
+
+    let message = crate::encrypt_outgoing_pgp(&m, &keys, &draft, CUENTA, MESSAGE_ID, DATE, racing)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        opened(&message, &retenida),
+        compose::build_content_entity(&draft)
+    );
+    assert!(
+        cannot_open(&message, &de_wkd),
+        "se cifró a la clave de WKD descartada"
+    );
+}
+
+// ── 14. Identidad propia corrupta ───────────────────────────────────────
+
+async fn store_corrupt_identity(keys: &SecretServiceKeys) {
+    keys.store_pgp_identity(CUENTA, b"esto no es una clave", b"")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn una_identidad_propia_corrupta_no_bloquea_el_cifrado_sin_firma() {
+    let (_t, m) = manager("enc-corrupta").await;
+    let (keys, _s, _sh) = fake_keyring().await;
+    store_corrupt_identity(&keys).await;
+    let beto = clave_completa("Beto <beto@vasak.test>");
+    let wkd = FakeWkd::new(&[(BETO, &publica(&beto))]);
+    let draft = encrypted_draft(&[BETO]);
+
+    let message = encrypt(&m, &keys, &draft, &wkd).await.unwrap();
+
+    assert_eq!(
+        opened(&message, &beto),
+        compose::build_content_entity(&draft)
+    );
+}
+
+#[tokio::test]
+async fn una_identidad_propia_corrupta_con_firma_pgp_es_permanente_y_no_sale_sin_firmar() {
+    let (_t, m) = manager("enc-corrupta-firma").await;
+    let (keys, _s, _sh) = fake_keyring().await;
+    store_corrupt_identity(&keys).await;
+    let beto = clave_completa("Beto <beto@vasak.test>");
+    let wkd = FakeWkd::new(&[(BETO, &publica(&beto))]);
+    let draft = Draft {
+        sign_method: Some(SignMethod::Pgp),
+        ..encrypted_draft(&[BETO])
+    };
+
+    let result = encrypt(&m, &keys, &draft, &wkd).await;
+
+    assert!(matches!(result, Err(SmtpError::Permanent(_))), "{result:?}");
+}
+
 // ── 8. Validación al encolar, por el bus ────────────────────────────────
 
 const ACCOUNT_ID: &str = ACCOUNT;
