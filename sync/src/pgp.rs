@@ -789,6 +789,66 @@ fn primary_usable(key: &SignedPublicKey, now: u32) -> bool {
     true
 }
 
+/// La huella de la primaria de una clave pública, recomputada desde la clave. El
+/// detalle de que `fingerprint()` viene del trait `KeyDetails` queda en este módulo —el
+/// límite de la cripto—, así que quien resuelve destinatarios (`crate::wkd`, el método
+/// `ResolveRecipientKey`) la obtiene sin importar el trait.
+pub fn fingerprint(key: &SignedPublicKey) -> String {
+    key.primary_key.fingerprint().to_string()
+}
+
+/// Si la clave primaria está **revocada** y si está **expirada**, por separado. Reusa el
+/// mismo criterio que [`primary_usable`]: revocada es la presencia de una
+/// `KeyRevocation`; expirada es «no usable y no revocada» —el único otro motivo por el
+/// que la primaria deja de serlo—. Para el motivo cuando una clave no es usable; la
+/// resolución de destinatario usa [`encryption_liveness`], que la envuelve.
+pub fn primary_liveness(key: &SignedPublicKey) -> (bool, bool) {
+    let revoked = key
+        .details
+        .revocation_signatures
+        .iter()
+        .any(|sig| sig.typ() == Some(SignatureType::KeyRevocation));
+    let expired = !revoked && !primary_usable(key, Timestamp::now().as_secs());
+    (revoked, expired)
+}
+
+/// El estado del **camino de cifrado** de una clave pública, para que
+/// `ResolveRecipientKey` diga no sólo si se puede cifrar sino **por qué no**: devuelve
+/// `(present, revoked, expired)`, donde `present` es «hay subclave de cifrado usable»
+/// ([`encryption_subkey`]). Mira la **subclave de cifrado**, no sólo la primaria: una
+/// primaria viva con la subclave de cifrado vencida o revocada da `present:false` con el
+/// motivo correcto. El orden del motivo: una primaria muerta mata todo
+/// ([`primary_liveness`]); si la primaria vive, se mira la subclave de cifrado muerta. Si
+/// no hay ninguna subclave con capacidad de cifrado (sólo firma), es `(false, false,
+/// false)`: no hay a qué cifrar, sin motivo que pintar.
+pub fn encryption_liveness(key: &SignedPublicKey) -> (bool, bool, bool) {
+    if encryption_subkey(key).is_some() {
+        return (true, false, false);
+    }
+    let (primary_revoked, primary_expired) = primary_liveness(key);
+    if primary_revoked || primary_expired {
+        return (false, primary_revoked, primary_expired);
+    }
+    // Primaria viva pero sin subclave de cifrado usable: el motivo sale de la subclave
+    // **con capacidad de cifrado** que esté muerta (revocada gana sobre vencida).
+    let now = Timestamp::now().as_secs();
+    for subkey in &key.public_subkeys {
+        let Some(binding) = latest_subkey_binding(subkey) else {
+            continue;
+        };
+        if !binding_allows_encrypt(subkey, binding) {
+            continue;
+        }
+        if subkey_revoked(subkey) {
+            return (false, true, false);
+        }
+        if binding_expired(subkey, binding, now) {
+            return (false, false, true);
+        }
+    }
+    (false, false, false)
+}
+
 /// Para qué se busca una subclave.
 #[derive(Clone, Copy)]
 enum Usage {
@@ -805,46 +865,15 @@ enum Usage {
 /// **estrictamente** (una subclave marcada sólo de cifrado no firma, aunque su
 /// algoritmo pudiera).
 fn subkey_usable(subkey: &SignedPublicSubKey, now: u32, usage: Usage) -> bool {
-    // Revocada → muerta. (La revocación se toma por presencia; verificar su firma
-    // es parte del gate de import, PR3.)
-    if subkey
-        .signatures
-        .iter()
-        .any(|sig| sig.typ() == Some(SignatureType::SubkeyRevocation))
-    {
+    // Revocada o expirada → muerta.
+    if subkey_revoked(subkey) {
         return false;
     }
-
-    let Some(binding) = subkey
-        .signatures
-        .iter()
-        .filter(|sig| sig.typ() == Some(SignatureType::SubkeyBinding))
-        .max_by_key(|sig| sig.created().map(|t| t.as_secs()).unwrap_or(0))
-    else {
+    let Some(binding) = latest_subkey_binding(subkey) else {
         return false;
     };
-
-    // Expirada → muerta. El vencimiento es relativo a la creación de la subclave.
-    // `key_expiration_time()` de cero segundos significa «nunca expira» (RFC 9580
-    // §5.2.3.13), no «expiró al crearse»: se filtra para no matar esas subclaves.
-    if let Some(expiration) = binding.key_expiration_time().filter(|d| d.as_secs() != 0) {
-        let created = subkey.created_at().as_secs();
-        if created.saturating_add(expiration.as_secs()) < now {
-            return false;
-        }
-    }
-
-    // La **firma de binding** puede tener su propia expiración (distinta de la de
-    // clave); rPGP 0.21 no la aplica. Vencida → el binding ya no vale → subclave
-    // muerta. Es relativa a la creación de la firma, cero = «nunca expira».
-    if let Some(sig_expiration) = binding
-        .signature_expiration_time()
-        .filter(|d| d.as_secs() != 0)
-    {
-        let sig_created = binding.created().map(|t| t.as_secs()).unwrap_or(0);
-        if sig_created.saturating_add(sig_expiration.as_secs()) < now {
-            return false;
-        }
+    if binding_expired(subkey, binding, now) {
+        return false;
     }
 
     let flags = binding.key_flags();
@@ -872,6 +901,72 @@ fn subkey_usable(subkey: &SignedPublicSubKey, now: u32, usage: Usage) -> bool {
         Usage::Encrypt => subkey.algorithm().can_encrypt(),
         Usage::Sign => subkey.algorithm().can_sign(),
     }
+}
+
+/// La firma de **binding** más reciente de una subclave (la que manda sus flags y su
+/// vencimiento), o `None` si no tiene ninguna.
+fn latest_subkey_binding(subkey: &SignedPublicSubKey) -> Option<&pgp::packet::Signature> {
+    subkey
+        .signatures
+        .iter()
+        .filter(|sig| sig.typ() == Some(SignatureType::SubkeyBinding))
+        .max_by_key(|sig| sig.created().map(|t| t.as_secs()).unwrap_or(0))
+}
+
+/// Si una subclave está **revocada** (presencia de una `SubkeyRevocation`). La
+/// revocación se toma por presencia; verificar su firma es parte del gate de import (PR3).
+fn subkey_revoked(subkey: &SignedPublicSubKey) -> bool {
+    subkey
+        .signatures
+        .iter()
+        .any(|sig| sig.typ() == Some(SignatureType::SubkeyRevocation))
+}
+
+/// Si una subclave está **vencida**, por el vencimiento de clave **o** por el de la firma
+/// de binding (rPGP 0.21 no aplica el segundo). `binding` es su binding más reciente
+/// ([`latest_subkey_binding`]). Un `key_expiration_time`/`signature_expiration_time` de
+/// cero segundos significa «nunca expira» (RFC 9580 §5.2.3.13), no «expiró al crearse».
+fn binding_expired(
+    subkey: &SignedPublicSubKey,
+    binding: &pgp::packet::Signature,
+    now: u32,
+) -> bool {
+    // Vencimiento de clave, relativo a la creación de la subclave.
+    if let Some(expiration) = binding.key_expiration_time().filter(|d| d.as_secs() != 0) {
+        let created = subkey.created_at().as_secs();
+        if created.saturating_add(expiration.as_secs()) < now {
+            return true;
+        }
+    }
+    // Vencimiento de la firma de binding, relativo a la creación de la firma.
+    if let Some(sig_expiration) = binding
+        .signature_expiration_time()
+        .filter(|d| d.as_secs() != 0)
+    {
+        let sig_created = binding.created().map(|t| t.as_secs()).unwrap_or(0);
+        if sig_created.saturating_add(sig_expiration.as_secs()) < now {
+            return true;
+        }
+    }
+    false
+}
+
+/// Si la binding de una subclave le permite **cifrar**: con flags presentes se exige un
+/// flag de cifrado **y** que el algoritmo cifre; sin flags, manda el algoritmo. Mismo
+/// criterio que la rama `Encrypt` de [`subkey_usable`], aislado para que
+/// [`encryption_liveness`] identifique la subclave de cifrado muerta y reporte su motivo.
+fn binding_allows_encrypt(subkey: &SignedPublicSubKey, binding: &pgp::packet::Signature) -> bool {
+    let flags = binding.key_flags();
+    let any_flag = flags.certify()
+        || flags.sign()
+        || flags.encrypt_comms()
+        || flags.encrypt_storage()
+        || flags.authentication();
+    if any_flag {
+        return (flags.encrypt_comms() || flags.encrypt_storage())
+            && subkey.algorithm().can_encrypt();
+    }
+    subkey.algorithm().can_encrypt()
 }
 
 /// Un identificador de una clave para los mensajes de error (la huella de la
@@ -2955,5 +3050,48 @@ Content-Type: application/octet-stream\r\nContent-Transfer-Encoding: {cte}\r\n\r
             verify(&con_texto, &candidatas),
             Verification::Unverified(_)
         ));
+    }
+
+    // ── Huella y vida de la primaria (ResolveRecipientKey) ─────────────
+
+    #[test]
+    fn la_huella_se_recomputa_de_la_primaria_en_hexadecimal() {
+        let secret = clave_completa("Ana <ana@vasak.test>");
+        let publica = publica(&secret);
+        let huella = fingerprint(&publica);
+        assert_eq!(huella, secret.primary_key.fingerprint().to_string());
+        // v4: SHA-1, 40 dígitos hexadecimales.
+        assert_eq!(huella.len(), 40, "{huella}");
+        assert!(huella.chars().all(|c| c.is_ascii_hexdigit()), "{huella}");
+        // Claves distintas, huellas distintas.
+        let otra = self::publica(&clave_completa("Beto <beto@vasak.test>"));
+        assert_ne!(huella, fingerprint(&otra));
+    }
+
+    #[test]
+    fn la_vida_de_la_primaria_distingue_viva_revocada_y_expirada() {
+        let vivo = clave_vieja("Ana <ana@vasak.test>");
+        assert_eq!(primary_liveness(&publica(&vivo)), (false, false));
+
+        assert_eq!(
+            primary_liveness(&con_primaria_revocada(&vivo)),
+            (true, false),
+            "revocada"
+        );
+        assert_eq!(
+            primary_liveness(&con_primaria_con_vencimiento_en_el_uid(&vivo, 24 * 3600)),
+            (false, true),
+            "expirada"
+        );
+    }
+
+    #[test]
+    fn una_primaria_revocada_y_con_vencimiento_se_informa_revocada_no_expirada() {
+        // Revocada manda: la ventana pinta una sola razón.
+        let vivo = clave_vieja("Ana <ana@vasak.test>");
+        let mut key = con_primaria_con_vencimiento_en_el_uid(&vivo, 24 * 3600);
+        key.details.revocation_signatures =
+            con_primaria_revocada(&vivo).details.revocation_signatures;
+        assert_eq!(primary_liveness(&key), (true, false));
     }
 }

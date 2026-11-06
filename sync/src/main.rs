@@ -127,6 +127,8 @@ mod smtp;
 mod snooze_core_tests;
 #[cfg(test)]
 mod snooze_tests;
+#[cfg(test)]
+mod wkd_ipc_tests;
 // El bucle que devuelve los pospuestos a su hora (`vasak-accounts#22`, PR 3). La
 // cola la escribe el almacén (`store::snooze`, PR 2); acá está sólo el reloj y
 // la vuelta por IMAP.
@@ -137,6 +139,10 @@ mod store_api;
 mod test_bus;
 mod tls;
 mod vcard;
+// El cliente WKD (descubre la clave pública de un destinatario por HTTPS, endurecido
+// anti-SSRF) y el método D-Bus `ResolveRecipientKey` que lo usa (`vasak-accounts#21`,
+// PR6). Se ejercita al redactar, no en el camino de sync entrante.
+mod wkd;
 mod xdg;
 
 use std::collections::HashMap;
@@ -879,6 +885,177 @@ fn pgp_ipc_from_parse(error: crate::pgp::PgpError) -> SmimeIpcError {
         PgpError::NoSigningKey => SmimeIpcError::Failed("la clave PGP no puede firmar".into()),
         PgpError::NoEncryptionKey(_) => {
             SmimeIpcError::Failed("la clave PGP no puede cifrar".into())
+        }
+    }
+}
+
+/// El estado de la clave de un destinatario que devuelve `ResolveRecipientKey`.
+/// `present` es «hay subclave de cifrado usable»; `expired`/`revoked` dicen por qué no
+/// cuando la clave existe pero murió.
+struct PgpKeyState {
+    present: bool,
+    fingerprint: Option<String>,
+    expired: bool,
+    revoked: bool,
+}
+
+impl PgpKeyState {
+    /// Sin clave: ni huella ni estado que informar.
+    fn absent() -> Self {
+        PgpKeyState {
+            present: false,
+            fingerprint: None,
+            expired: false,
+            revoked: false,
+        }
+    }
+}
+
+/// Evalúa los bytes de una clave del peerstate: si parsea, su huella y el estado del
+/// **camino de cifrado** ([`crate::pgp::encryption_liveness`]) —si hay subclave de cifrado
+/// usable (`present`) y, si no, por qué (`expired`/`revoked`), mirando la subclave de
+/// cifrado y no sólo la primaria—. Si no parsea, «sin clave» (estado, no un lugar para
+/// filtrar errores de material). CPU: va en `spawn_blocking`.
+fn pgp_key_state(bytes: &[u8]) -> PgpKeyState {
+    match crate::pgp::parse_public_key(bytes) {
+        Ok(key) => {
+            let (present, revoked, expired) = crate::pgp::encryption_liveness(&key);
+            PgpKeyState {
+                present,
+                fingerprint: Some(crate::pgp::fingerprint(&key)),
+                expired,
+                revoked,
+            }
+        }
+        Err(_) => PgpKeyState::absent(),
+    }
+}
+
+/// Serializa el estado de clave a JSON. Si no hay huella (la clave no parseó o no
+/// había), la fuente se degrada a `none`, para no decir «peerstate» sin clave.
+fn resolve_key_json(source: &str, state: PgpKeyState) -> Result<String, SmimeIpcError> {
+    let source = if state.fingerprint.is_some() {
+        source
+    } else {
+        "none"
+    };
+    let value = serde_json::json!({
+        "present": state.present,
+        "source": source,
+        "fingerprint": state.fingerprint,
+        "expired": state.expired,
+        "revoked": state.revoked,
+    });
+    serde_json::to_string(&value)
+        .map_err(|e| SmimeIpcError::Failed(format!("no se pudo serializar: {e}")))
+}
+
+/// Tope de resoluciones de clave de destinatario (`ResolveRecipientKey`) en curso a la
+/// vez, **compartido entre peticiones**. El método dispara red (WKD) con el dominio del
+/// destinatario; sin tope, un llamador que lo spamea abriría conexiones salientes sin
+/// límite (amplificación DoS). Chico a propósito: WKD es infrecuente y es al redactar.
+const MAX_CONCURRENT_RECIPIENT_RESOLUTIONS: usize = 8;
+
+/// El semáforo global del tope de arriba. `try_acquire` rechaza con error permanente al
+/// exceder (no encola sin límite); el permiso se suelta al soltar la guarda.
+static RECIPIENT_RESOLUTION_LIMIT: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_RECIPIENT_RESOLUTIONS);
+
+/// La cadena de resolución de la clave de un destinatario: **peerstate → WKD**,
+/// devolviendo la fuente (`peerstate`/`wkd`/`none`) y el estado de clave. Recibe el
+/// cliente WKD **inyectado** (`wkd_fetch`) para que las pruebas ejerzan la cadena
+/// completa —acierto de peerstate, acierto de WKD con su upsert, y «sin clave»— con un
+/// almacén real y un WKD falso, sin DNS ni HTTPS. El método D-Bus le pasa el cliente
+/// real ([`crate::wkd::fetch_key`]); la **puerta de permisos va antes**, en el método.
+///
+/// Un acierto de WKD se guarda al peerstate (TOFU, `ingest_peer_key`) como mejor
+/// esfuerzo: un fallo de guardado no cambia la respuesta —ya encontramos la clave—, y la
+/// 2ª consulta la ve como peerstate.
+async fn resolve_key_with<K, F, Fut>(
+    manager: &StoreManager<K>,
+    account_id: &str,
+    address: &str,
+    wkd_fetch: F,
+) -> Result<(&'static str, PgpKeyState), SmimeIpcError>
+where
+    K: KeySource,
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<crate::wkd::WkdKey>, crate::wkd::WkdError>>,
+{
+    // La dirección se normaliza para el peerstate (clave de lookup/upsert), pero a WKD
+    // se le pasa la **original**: el `?l=` conserva la parte local tal cual y el hash la
+    // baja a minúsculas por su cuenta.
+    let normalized = crate::pgp_import::normalize_address(address);
+
+    // 1) Peerstate (incluye lo ingerido de Autocrypt/adjuntos por el sync).
+    let lookup = normalized.clone();
+    let peer = manager
+        .with_store(account_id, move |s| s.find_peer(&lookup))
+        .await
+        .map_err(|e| SmimeIpcError::Failed(format!("el peerstate no está disponible: {e}")))?;
+    if let Some(peer) = peer {
+        // El parseo y la evaluación de la clave son CPU: fuera del runtime.
+        let state = tokio::task::spawn_blocking(move || pgp_key_state(&peer.public_key))
+            .await
+            .map_err(|_| SmimeIpcError::Failed("el parseo de la clave PGP se cortó".into()))?;
+        return Ok(("peerstate", state));
+    }
+
+    // 2) WKD, con la dirección original. Una clave válida y usable se guarda al peerstate
+    //    (TOFU) y se informa `source: wkd`. Un fallo (no encontrada, destino SSRF vetado,
+    //    sin subclave usable) es «sin clave»: no se filtra el motivo, sólo al diario.
+    match wkd_fetch(address.to_string()).await {
+        Ok(Some(found)) => {
+            let now = chrono::Utc::now().timestamp();
+            let bytes = found.bytes.clone();
+            let addr = normalized.clone();
+            // Guardar al peerstate. Si un sync concurrente guardó **otra** clave entre el
+            // `find_peer` y este upsert, `ingest_peer_key` la conserva (TOFU: `Changed`) y
+            // no la pisa; en ese caso hay que informar la **retenida**, no la de WKD, para
+            // no mentir sobre qué clave quedó. Devuelve los bytes retenidos si pasó eso.
+            let retained = manager
+                .with_store(
+                    account_id,
+                    move |s| match crate::pgp_import::ingest_peer_key(s, &addr, &bytes, now) {
+                        Ok(crate::pgp_import::Ingested::Changed { .. }) => {
+                            Ok(s.find_peer(&addr)?.map(|p| p.public_key))
+                        }
+                        Ok(_) => Ok(None),
+                        Err(e) => {
+                            tracing::debug!("WKD: no se guardó la clave al peerstate: {e}");
+                            Ok(None)
+                        }
+                    },
+                )
+                .await;
+
+            match retained {
+                // Otra clave quedó retenida en el peerstate: informar su estado real.
+                Ok(Some(retained_bytes)) => {
+                    let state = tokio::task::spawn_blocking(move || pgp_key_state(&retained_bytes))
+                        .await
+                        .map_err(|_| {
+                            SmimeIpcError::Failed("el parseo de la clave PGP se cortó".into())
+                        })?;
+                    Ok(("peerstate", state))
+                }
+                // La clave de WKD quedó guardada (o el guardado falló, pero la tenemos en
+                // mano): se informa esa, que ya pasó la validación (usable, no muerta).
+                _ => Ok((
+                    "wkd",
+                    PgpKeyState {
+                        present: true,
+                        fingerprint: Some(found.fingerprint),
+                        expired: false,
+                        revoked: false,
+                    },
+                )),
+            }
+        }
+        Ok(None) => Ok(("none", PgpKeyState::absent())),
+        Err(e) => {
+            tracing::debug!("WKD no resolvió la clave del destinatario: {e}");
+            Ok(("none", PgpKeyState::absent()))
         }
     }
 }
@@ -2026,6 +2203,65 @@ impl Service {
         keys.delete_pgp_identity(&account_id)
             .await
             .map_err(smime_ipc_from_keyring)
+    }
+
+    /// Resuelve la clave pública OpenPGP de un destinatario, en JSON
+    /// `{present, source, fingerprint, expired, revoked}`. Lo usa la ventana al
+    /// redactar para gatear el cifrado por destinatario; `present` es «hay una clave
+    /// con subclave de cifrado usable», y `expired`/`revoked` dicen por qué no la hay
+    /// cuando la clave existe pero murió.
+    ///
+    /// **Gateado por `EMAIL_RESOURCE`** como las mutaciones de identidad: resolver
+    /// dispara **red** con el dominio del destinatario (WKD), que es una **acción**, no
+    /// una lectura local. El permiso es el de la cuenta que resuelve (su dirección va
+    /// al diálogo); el destinatario no la elige.
+    ///
+    /// Cadena de resolución: **peerstate → WKD**. El peerstate ya incluye las claves
+    /// Autocrypt que el sync entrante ingirió (PR4 las mete directo al peerstate: **no
+    /// hay un almacén de gossip aparte**), así que no hay un paso «autocrypt» separado;
+    /// la fuente que se devuelve es `peerstate`, `wkd` o `none`. Una clave hallada por
+    /// WKD se guarda al peerstate (TOFU) para no volver a la red.
+    async fn resolve_recipient_key(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        account_id: String,
+        address: String,
+    ) -> Result<String, SmimeIpcError> {
+        let our_address = self.account_address(&account_id).await?;
+        self.authorize_smime(header.sender().map(|s| s.as_str()), &our_address)
+            .await?;
+
+        // Se rechaza una dirección vacía mirando la normalizada, pero a la cadena se le
+        // pasa la **original**: WKD conserva el casing de la parte local en `?l=`
+        // ([`resolve_key_with`] normaliza para el peerstate por su cuenta).
+        if crate::pgp_import::normalize_address(&address).is_empty() {
+            return Err(SmimeIpcError::Failed(
+                "la dirección del destinatario está vacía".into(),
+            ));
+        }
+
+        let Some(manager) = store_api::live_store() else {
+            return Err(SmimeIpcError::Failed(
+                "el almacén de la cuenta no está disponible".into(),
+            ));
+        };
+
+        // Tope de resoluciones en curso: este método dispara red (WKD), así que un
+        // llamador que lo spamea abriría conexiones salientes sin límite. El permiso se
+        // suelta al terminar. La puerta de permisos ya pasó, arriba.
+        let _permit = RECIPIENT_RESOLUTION_LIMIT.try_acquire().map_err(|_| {
+            SmimeIpcError::Failed(
+                "demasiadas resoluciones de clave en curso; probá de nuevo".into(),
+            )
+        })?;
+
+        // La cadena peerstate → WKD y el upsert del acierto van en `resolve_key_with`,
+        // con el cliente WKD inyectado; acá sólo se le pasa el real.
+        let (source, state) = resolve_key_with(manager, &account_id, &address, |addr| async move {
+            crate::wkd::fetch_key(&addr).await
+        })
+        .await?;
+        resolve_key_json(source, state)
     }
 
     /// Lo que está esperando salir, y lo que se trabó.
