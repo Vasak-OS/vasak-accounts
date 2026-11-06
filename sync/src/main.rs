@@ -113,6 +113,8 @@ mod graph_write;
 #[cfg(test)]
 mod ipc_test_support;
 #[cfg(test)]
+mod pgp_encrypt_tests;
+#[cfg(test)]
 mod pgp_ipc_tests;
 #[cfg(test)]
 mod pgp_send_tests;
