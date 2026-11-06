@@ -418,7 +418,11 @@ fn primary_has_valid_self_signature(key: &SignedPublicKey) -> bool {
 ///
 /// Si no se descartó ninguna firma, se guardan los bytes originales tal cual se
 /// ingirieron; si se descartó alguna, se re-serializa la clave saneada.
-fn strip_forged_revocations(
+///
+/// `pub(crate)` para que WKD (`crate::wkd::validate_key_bytes`) sanee una clave
+/// descargada con el **mismo** criterio que un adjunto antes de evaluarla y guardarla:
+/// una revocación forjada de un tercero no debe inutilizar una clave usable.
+pub(crate) fn strip_forged_revocations(
     key: &mut SignedPublicKey,
     original: &[u8],
 ) -> Result<Vec<u8>, PgpError> {
