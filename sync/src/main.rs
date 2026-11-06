@@ -1063,24 +1063,41 @@ where
     }
 }
 
-/// La clave pública **usable para cifrar** de un destinatario, o `None` si no hay. La
-/// cadena es la misma que [`resolve_key_with`] —**peerstate → WKD**, con el cliente WKD
-/// inyectado para que las pruebas la ejerzan con un almacén real y un WKD falso— pero
-/// devuelve la [`SignedPublicKey`] lista para cifrar en vez del estado JSON que gatea la
-/// UI: el camino de compose (PR7) necesita la clave de verdad, no su resumen.
+/// Qué se encontró al resolver la clave de cifrado de un destinatario. Distingue tres
+/// estados porque no son lo mismo para el envío: lo genuinamente ausente es permanente,
+/// pero una caída de red de WKD es reintentable y **no** debe trabar el mensaje.
+enum RecipientKey {
+    /// Hay una clave con subclave de cifrado usable.
+    Found(::pgp::composed::SignedPublicKey),
+    /// Genuinamente no hay clave usable: el peerstate está vacío, WKD dijo «no hay», la
+    /// clave está muerta (primaria o subclave de cifrado revocada/expirada) o es
+    /// sólo-de-firma, o el destino WKD está vetado (SSRF). Permanente: esperar no la trae.
+    Absent,
+    /// No se pudo averiguar por una falla **transitoria** de red de WKD (caída/timeout).
+    /// Reintentable: la clave puede aparecer cuando la red vuelva, así que no se vuelve
+    /// permanente el envío ni se rechaza al encolar por esto.
+    Transient,
+}
+
+/// La clave de cifrado de un destinatario: `Found`/`Absent`/`Transient`. La cadena es la
+/// misma que [`resolve_key_with`] —**peerstate → WKD**, con el cliente WKD inyectado para
+/// que las pruebas la ejerzan con un almacén real y un WKD falso— pero devuelve la
+/// [`SignedPublicKey`] lista para cifrar en vez del estado JSON que gatea la UI: el camino
+/// de compose (PR7) necesita la clave de verdad, no su resumen.
 ///
 /// «Usable» es que tenga **subclave de cifrado** vigente ([`crate::pgp::encryption_subkey`]):
-/// una clave muerta (primaria o subclave de cifrado revocada/expirada) o sólo-de-firma es
-/// `None`, igual que [`resolve_key_with`] la reporta como «sin clave de cifrado». El
-/// peerstate manda sobre WKD (TOFU): si ya conocemos una clave para la dirección, no se
-/// sale a la red por otra; sólo se consulta WKD cuando no hay ninguna. Un acierto de WKD se
-/// guarda al peerstate (TOFU, mejor-esfuerzo) para no repetir la red en el próximo envío.
+/// una clave muerta o sólo-de-firma es `Absent`. El peerstate manda sobre WKD (TOFU): si ya
+/// conocemos una clave para la dirección, no se sale a la red por otra; sólo se consulta WKD
+/// cuando no hay ninguna. La consulta WKD se acota con el semáforo global compartido
+/// ([`RECIPIENT_RESOLUTION_LIMIT`]) para no abrir conexiones salientes sin límite. Un
+/// acierto de WKD se guarda al peerstate (TOFU, mejor-esfuerzo); si un sync concurrente
+/// guardó **otra** clave entre el miss y el upsert, se usa la **retenida**, no la de WKD.
 async fn resolve_recipient_encryption_key<K, F, Fut>(
     manager: &StoreManager<K>,
     account_id: &str,
     address: &str,
     wkd_fetch: F,
-) -> Result<Option<::pgp::composed::SignedPublicKey>, SmimeIpcError>
+) -> Result<RecipientKey, SmimeIpcError>
 where
     K: KeySource,
     F: FnOnce(String) -> Fut,
@@ -1095,42 +1112,81 @@ where
         .await
         .map_err(|e| SmimeIpcError::Failed(format!("el peerstate no está disponible: {e}")))?;
     if let Some(peer) = peer {
-        return usable_encryption_key(peer.public_key).await;
+        return Ok(found_or_absent(
+            usable_encryption_key(peer.public_key).await?,
+        ));
     }
 
-    // 2) WKD, con la dirección original (conserva el casing de la parte local en `?l=`). Un
-    //    acierto se guarda al peerstate (TOFU, mejor-esfuerzo): un fallo de guardado no
-    //    cambia la respuesta —ya tenemos la clave en mano—. Un fallo o un «no encontrada»
-    //    es «sin clave»: no se filtra el motivo, sólo al diario.
+    // 2) WKD, con la dirección original (conserva el casing de la parte local en `?l=`),
+    //    acotada por el semáforo global: sin él un envío cifrado a muchos destinatarios sin
+    //    peerstate abriría conexiones salientes sin límite (amplificación DoS), la misma
+    //    puerta que `ResolveRecipientKey`. El permiso se suelta al salir de esta rama.
+    let _permit = RECIPIENT_RESOLUTION_LIMIT
+        .acquire()
+        .await
+        .map_err(|_| SmimeIpcError::Failed("el semáforo de resolución se cerró".into()))?;
     match wkd_fetch(address.to_string()).await {
         Ok(Some(found)) => {
             let now = chrono::Utc::now().timestamp();
             let bytes = found.bytes.clone();
             let addr = normalized.clone();
-            let _ = manager
-                .with_store(account_id, move |s| {
-                    if let Err(e) = crate::pgp_import::ingest_peer_key(s, &addr, &bytes, now) {
-                        tracing::debug!("WKD: no se guardó la clave al peerstate al cifrar: {e}");
-                    }
-                    Ok::<(), crate::store::StoreError>(())
-                })
+            // Guardar al peerstate (TOFU). Si un sync concurrente guardó OTRA clave entre el
+            // `find_peer` de arriba y este upsert, `ingest_peer_key` la conserva (Changed) y
+            // hay que usar la **retenida**, no la de WKD: cifrar a la de WKD mandaría a una
+            // clave que el peerstate ya descartó. Devuelve los bytes retenidos si pasó eso.
+            let retained = manager
+                .with_store(
+                    account_id,
+                    move |s| match crate::pgp_import::ingest_peer_key(s, &addr, &bytes, now) {
+                        Ok(crate::pgp_import::Ingested::Changed { .. }) => {
+                            Ok(s.find_peer(&addr)?.map(|p| p.public_key))
+                        }
+                        Ok(_) => Ok(None),
+                        Err(e) => {
+                            tracing::debug!("WKD: no se guardó la clave al peerstate: {e}");
+                            Ok(None)
+                        }
+                    },
+                )
                 .await;
-            usable_encryption_key(found.bytes).await
+            // La retenida por la carrera gana; si no, la de WKD recién traída.
+            let bytes = match retained {
+                Ok(Some(retained_bytes)) => retained_bytes,
+                _ => found.bytes,
+            };
+            Ok(found_or_absent(usable_encryption_key(bytes).await?))
         }
-        Ok(None) => Ok(None),
+        Ok(None) => Ok(RecipientKey::Absent),
+        // Una caída/timeout de red es transitoria (reintentable); el resto —destino vetado
+        // por SSRF, dirección inválida, clave demasiado grande— es genuinamente «sin clave».
+        // No se filtra el motivo, sólo al diario.
+        Err(crate::wkd::WkdError::Network(e)) => {
+            tracing::debug!("WKD caído al resolver la clave de cifrado: {e}");
+            Ok(RecipientKey::Transient)
+        }
         Err(e) => {
             tracing::debug!("WKD no resolvió la clave del destinatario al cifrar: {e}");
-            Ok(None)
+            Ok(RecipientKey::Absent)
         }
     }
 }
 
-/// La primera dirección de `recipients` que **no** tiene clave de cifrado PGP usable, o
-/// `None` si todas la tienen. Es la validación de «no cifrar a medias» al encolar: si falta
-/// la clave de alguno se rechaza temprano (si no, cifrar fallaría tarde en el despachador y
-/// el borrador quedaría trabado —y nunca se manda en claro—). Inyectable (`manager` +
-/// `wkd_fetch`) para probar el rechazo sin el `live_store()` global; en producción
-/// `wkd_fetch` es [`crate::wkd::fetch_key`].
+/// Traduce el `Option` de [`usable_encryption_key`] a `Found`/`Absent`.
+fn found_or_absent(key: Option<::pgp::composed::SignedPublicKey>) -> RecipientKey {
+    match key {
+        Some(key) => RecipientKey::Found(key),
+        None => RecipientKey::Absent,
+    }
+}
+
+/// La primera dirección de `recipients` que **genuinamente** no tiene clave de cifrado PGP
+/// usable (`Absent`), o `None` si todas la tienen o sólo faltan por una caída transitoria de
+/// WKD. Es la validación de «no cifrar a medias» al encolar: una clave genuinamente ausente
+/// se rechaza temprano (si no, cifrar fallaría tarde en el despachador y el borrador quedaría
+/// trabado —y nunca se manda en claro—), pero una falla **transitoria** de WKD NO traba el
+/// borrador: se encola y el despachador reintenta la resolución. Inyectable (`manager` +
+/// `wkd_fetch`) para probar sin el `live_store()` global; en producción `wkd_fetch` es
+/// [`crate::wkd::fetch_key`].
 async fn first_recipient_without_key<K, F, Fut>(
     manager: &StoreManager<K>,
     account_id: &str,
@@ -1143,11 +1199,10 @@ where
     Fut: std::future::Future<Output = Result<Option<crate::wkd::WkdKey>, crate::wkd::WkdError>>,
 {
     for address in recipients {
-        if resolve_recipient_encryption_key(manager, account_id, address, wkd_fetch)
-            .await?
-            .is_none()
-        {
-            return Ok(Some(address.clone()));
+        match resolve_recipient_encryption_key(manager, account_id, address, wkd_fetch).await? {
+            // Sólo lo genuinamente ausente se rechaza al encolar.
+            RecipientKey::Absent => return Ok(Some(address.clone())),
+            RecipientKey::Found(_) | RecipientKey::Transient => {}
         }
     }
     Ok(None)
@@ -1986,6 +2041,14 @@ impl Service {
                 ));
             }
             compose::EncryptMethod::Pgp => {
+                // Firmar con S/MIME y cifrar con PGP a la vez no está soportado (el sobre PGP
+                // no llevaría la firma S/MIME pedida): se rechaza fail-closed al encolar, no
+                // se manda sin la firma. El UI no ofrece esta combinación.
+                if let compose::SignMethod::Smime = draft.effective_sign_method() {
+                    return Err(zbus::fdo::Error::InvalidArgs(
+                        "firmar con S/MIME y cifrar con PGP a la vez no está soportado".into(),
+                    ));
+                }
                 let Some(manager) = store_api::live_store() else {
                     return Err(zbus::fdo::Error::Failed(
                         "el almacén de la cuenta no está disponible para cifrar".into(),
@@ -2897,33 +2960,64 @@ where
     F: Fn(String) -> Fut,
     Fut: std::future::Future<Output = Result<Option<crate::wkd::WkdKey>, crate::wkd::WkdError>>,
 {
-    // 1) La clave de cifrado de cada destinatario (peerstate → WKD). Falta de clave es
-    //    permanente y nombra al destinatario; no se cifra a medias.
+    // Firmar con S/MIME y cifrar con PGP a la vez no está soportado: el sobre PGP no
+    // llevaría la firma S/MIME pedida. Se rechaza permanente (fail-closed), nunca se manda
+    // cifrado-sin-la-firma-pedida. (El legacy `firmar:true` sin método da effective=Smime.)
+    if let compose::SignMethod::Smime = draft.effective_sign_method() {
+        return Err(smtp::SmtpError::Permanent(
+            "firmar con S/MIME y cifrar con PGP a la vez no está soportado".into(),
+        ));
+    }
+
+    // 1) La clave de cifrado de cada destinatario (peerstate → WKD). Falta genuina es
+    //    permanente y nombra al destinatario; una caída transitoria de WKD es reintentable
+    //    (Temporary), no permanente: no se traba el envío por una red caída. No se cifra a
+    //    medias en ningún caso.
     let mut recipient_keys: Vec<::pgp::composed::SignedPublicKey> = Vec::new();
     for address in draft.recipients() {
-        let key =
-            resolve_recipient_encryption_key(manager, account_id, &address, |addr| wkd_fetch(addr))
-                .await
-                .map_err(|e| smtp::SmtpError::Temporary(e.to_string()))?
-                .ok_or_else(|| {
-                    smtp::SmtpError::Permanent(format!(
-                        "no hay clave PGP de cifrado usable para {address}"
-                    ))
-                })?;
-        recipient_keys.push(key);
+        match resolve_recipient_encryption_key(manager, account_id, &address, |addr| {
+            wkd_fetch(addr)
+        })
+        .await
+        .map_err(|e| smtp::SmtpError::Temporary(e.to_string()))?
+        {
+            RecipientKey::Found(key) => recipient_keys.push(key),
+            RecipientKey::Absent => {
+                return Err(smtp::SmtpError::Permanent(format!(
+                    "no hay clave PGP de cifrado usable para {address}"
+                )))
+            }
+            RecipientKey::Transient => {
+                return Err(smtp::SmtpError::Temporary(format!(
+                    "no se pudo resolver la clave PGP de cifrado de {address}: WKD no responde"
+                )))
+            }
+        }
     }
 
     // 2) La identidad de la cuenta: hace falta entera si además se firma; para cifrar a la
-    //    propia alcanza su pública. Se carga una vez.
+    //    propia alcanza su pública. Se carga una vez. Una identidad propia **corrupta** no
+    //    bloquea el envío cifrado-sin-firma (se saltea cifrar-a-la-propia, Enviados queda
+    //    ilegible pero el mensaje llega a los destinatarios); si se pidió firmar con PGP, la
+    //    clave hace falta entera → permanente (no mandar sin firmar).
     let our_secret = match keys
         .find_pgp_secret_key(account_id)
         .await
         .map_err(|e| smtp::SmtpError::Temporary(e.to_string()))?
     {
-        Some(bytes) => Some(
-            crate::pgp::parse_secret_key(&bytes)
-                .map_err(|e| smtp::SmtpError::Permanent(e.to_string()))?,
-        ),
+        Some(bytes) => match crate::pgp::parse_secret_key(&bytes) {
+            Ok(secret) => Some(secret),
+            Err(e) => {
+                if let compose::SignMethod::Pgp = draft.effective_sign_method() {
+                    return Err(smtp::SmtpError::Permanent(e.to_string()));
+                }
+                tracing::warn!(
+                    "la identidad OpenPGP propia de «{account_id}» no se pudo leer; \
+                     se cifra sin copia a la propia (Enviados quedará ilegible): {e}"
+                );
+                None
+            }
+        },
         None => None,
     };
 
@@ -2962,9 +3056,16 @@ where
         content
     };
 
-    // 4) Cifrar ese MIME y armar el `multipart/encrypted`.
-    let armored = crate::pgp::encrypt_to_keys(inner.as_bytes(), &recipient_keys)
-        .map_err(|e| smtp::SmtpError::Permanent(e.to_string()))?;
+    // 4) Cifrar ese MIME y armar el `multipart/encrypted`. El cifrado es CPU (clave pública
+    //    por destinatario): va en `spawn_blocking` para no bloquear el runtime, igual que el
+    //    descifrado y la validación de claves.
+    let inner_bytes = inner.into_bytes();
+    let armored = tokio::task::spawn_blocking(move || {
+        crate::pgp::encrypt_to_keys(&inner_bytes, &recipient_keys)
+    })
+    .await
+    .map_err(|_| smtp::SmtpError::Permanent("el cifrado PGP se cortó".into()))?
+    .map_err(|e| smtp::SmtpError::Permanent(e.to_string()))?;
     let armored = String::from_utf8(armored)
         .map_err(|e| smtp::SmtpError::Permanent(format!("el sobre PGP no es ASCII: {e}")))?;
     let headers = compose::build_message_headers(draft, message_id, date)
