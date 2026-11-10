@@ -1508,6 +1508,7 @@ mod tests {
                             ACCOUNT,
                             id,
                             None,
+                            "",
                             &ExpansionLimits::DEFAULT,
                         ) else {
                             panic!("no se pudo leer el evento {id}");

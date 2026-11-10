@@ -375,6 +375,42 @@ pub fn param<'a>(params: &'a [String], name: &str) -> Option<&'a str> {
     })
 }
 
+/// Una dirección de calendario (`CAL-ADDRESS`) sin el esquema `mailto:` (sin
+/// distinguir mayúsculas), recortada. Es la dirección «pelada» que se compara.
+fn strip_mailto(address: &str) -> &str {
+    let address = address.trim();
+    address
+        .get(..7)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("mailto:"))
+        .map_or(address, |_| address[7..].trim())
+}
+
+/// Si una dirección de calendario —el valor de un `ATTENDEE` u `ORGANIZER`, con o
+/// sin el esquema `mailto:`— es la misma que `mine` (la dirección de la cuenta).
+///
+/// **Es la única regla de «cuál asistente soy yo», compartida por la lectura del
+/// detalle y por el parche de PARTSTAT**: así lo que la UI muestra (mi estado, si
+/// puedo contestar) y lo que el PUT escribe nunca discrepan. La parte local se
+/// compara **exacta**; el dominio **sin distinguir mayúsculas**, porque un
+/// servidor puede devolverlo en otra caja (`JUAN@Example.COM` y `juan@example.com`
+/// no coinciden, pero `juan@EXAMPLE.com` y `juan@example.com` sí). Una dirección
+/// vacía —de un lado o del otro— no coincide con nadie: así nunca me agrego ni me
+/// marco por error cuando no se pudo resolver mi dirección.
+pub fn same_calendar_address(cal_address: &str, mine: &str) -> bool {
+    let a = strip_mailto(cal_address);
+    let b = strip_mailto(mine);
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    match (a.rsplit_once('@'), b.rsplit_once('@')) {
+        (Some((local_a, domain_a)), Some((local_b, domain_b))) => {
+            local_a == local_b && domain_a.eq_ignore_ascii_case(domain_b)
+        }
+        // Sin `@` de algún lado no es un correo normal: exacta y punto.
+        _ => a == b,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // El árbol de componentes
 // ---------------------------------------------------------------------------
@@ -699,6 +735,41 @@ pub fn rfc3339(seconds: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// La regla de «cuál asistente soy yo»: el esquema `mailto:` no cuenta, el
+    /// dominio no distingue mayúsculas, la parte local **sí**, y una dirección
+    /// vacía no coincide con nadie. Es la misma pieza que usan la lectura del
+    /// detalle y el parche de PARTSTAT, así que fijarla cierra que no discrepen.
+    #[test]
+    fn same_calendar_address_compara_direccion_de_calendario() {
+        // Con y sin `mailto:`, en cualquier caja del esquema.
+        assert!(same_calendar_address(
+            "mailto:juan@example.com",
+            "juan@example.com"
+        ));
+        assert!(same_calendar_address(
+            "MAILTO:juan@example.com",
+            "mailto:juan@example.com"
+        ));
+        // El dominio sin distinguir mayúsculas.
+        assert!(same_calendar_address(
+            "mailto:juan@EXAMPLE.com",
+            "juan@example.com"
+        ));
+        // La parte local **sí** distingue: `Juan` no es `juan`.
+        assert!(!same_calendar_address(
+            "mailto:Juan@example.com",
+            "juan@example.com"
+        ));
+        // Otra persona no soy yo.
+        assert!(!same_calendar_address(
+            "mailto:ana@example.com",
+            "juan@example.com"
+        ));
+        // Una dirección vacía no coincide con nadie —ni con otra vacía—.
+        assert!(!same_calendar_address("mailto:juan@example.com", ""));
+        assert!(!same_calendar_address("", ""));
+    }
 
     /// El formato corta las líneas largas y sigue en la siguiente con un espacio
     /// adelante. Sin volver a juntarlas, un título largo aparece cortado a la
