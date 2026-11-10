@@ -1161,6 +1161,15 @@ pub struct EventDetail {
     pub alarms: Vec<AlarmItem>,
     pub organizer: Option<Person>,
     pub attendees: Vec<Person>,
+    /// Si yo —la dirección de la cuenta— figuro entre los `ATTENDEE` del evento:
+    /// o sea, si fui invitada y la UI puede ofrecer contestar (Aceptar / Rechazar
+    /// / Tentativo). `false` si no estoy invitada o si no se pudo resolver mi
+    /// dirección.
+    pub am_i_attendee: bool,
+    /// Mi respuesta actual (`accepted`, `declined`, `tentative`, `needs-action`,
+    /// …) en minúscula, o vacío si no estoy invitada o mi `ATTENDEE` no trae
+    /// `PARTSTAT`. Es el estado que la UI muestra marcado.
+    pub my_response: String,
     /// El ETag del objeto guardado, para pasarlo como `if_match` al editar.
     /// **Vacío** en un objeto recién creado local sin confirmar: así la
     /// aplicación sabe que todavía no se puede editar.
@@ -1269,11 +1278,19 @@ fn alarms_of(component: &Component, limits: &ExpansionLimits) -> Vec<AlarmItem> 
 ///
 /// La conexión se usa sólo para leer el objeto: interpretarlo y expandir la
 /// vez pedida es CPU, y corre sin ella.
+///
+/// `my_address` es la dirección de la cuenta (su correo), para marcar cuál
+/// asistente soy yo: llena [`EventDetail::am_i_attendee`] y
+/// [`EventDetail::my_response`] comparándola contra cada `ATTENDEE`
+/// ([`ical::same_calendar_address`]). Vacía —o si no estoy invitada— deja los dos
+/// en su valor neutro (`false` y cadena vacía), y la UI no ofrece contestar. La
+/// resuelve quien llama; no sale del crudo.
 pub fn get_event(
     reader: &impl Reader,
     account_id: &str,
     id: i64,
     occurrence: Option<i64>,
+    my_address: &str,
     limits: &ExpansionLimits,
 ) -> Result<Option<EventDetail>, StoreError> {
     type EventHead = (
@@ -1366,6 +1383,11 @@ pub fn get_event(
         }
     };
     let (start, end, all_day) = times.unwrap_or_default();
+    // Cuál `ATTENDEE` soy yo, con la misma regla que usa el parche de PARTSTAT, para
+    // que lo que la UI muestra y lo que un PUT escribiría nunca discrepen.
+    let me = component
+        .all("ATTENDEE")
+        .find(|p| ical::same_calendar_address(&p.value, my_address));
     let detail = EventDetail {
         event_id: GlobalId {
             account_id: account_id.to_string(),
@@ -1405,6 +1427,11 @@ pub fn get_event(
             .take(MAX_ATTENDEES)
             .map(person)
             .collect(),
+        am_i_attendee: me.is_some(),
+        my_response: me
+            .and_then(|p| p.param("PARTSTAT"))
+            .map(|s| ical::visible(s, 32).to_ascii_lowercase())
+            .unwrap_or_default(),
         etag: etag.unwrap_or_default(),
         sync_state: SyncState::derive(pending_op.as_deref(), op_state.as_deref()),
         truncated: false,
@@ -1588,6 +1615,7 @@ mod tests {
                 "cuenta",
                 1,
                 None,
+                "",
                 &ExpansionLimits::DEFAULT,
             ) else {
                 panic!("no se pudo leer el evento");
@@ -1652,6 +1680,7 @@ mod tests {
             "cuenta",
             id,
             occurrence,
+            "",
             &ExpansionLimits::DEFAULT,
         ) else {
             panic!("no se pudo leer el evento");
@@ -1740,6 +1769,7 @@ mod tests {
             "cuenta",
             1,
             None,
+            "",
             &ExpansionLimits::DEFAULT,
         ) else {
             panic!("no se pudo leer el evento");
@@ -2518,6 +2548,7 @@ mod tests {
             "cuenta",
             1,
             None,
+            "",
             &ExpansionLimits::DEFAULT,
         )
         .unwrap()
@@ -2544,6 +2575,7 @@ mod tests {
             "cuenta",
             1,
             Some(moved),
+            "",
             &ExpansionLimits::DEFAULT,
         )
         .unwrap()
@@ -2560,6 +2592,7 @@ mod tests {
                 "cuenta",
                 1,
                 Some(12345),
+                "",
                 &ExpansionLimits::DEFAULT
             )
             .unwrap(),
@@ -2571,6 +2604,7 @@ mod tests {
                 "cuenta",
                 99,
                 None,
+                "",
                 &ExpansionLimits::DEFAULT
             )
             .unwrap(),
@@ -2596,6 +2630,7 @@ mod tests {
             "cuenta",
             1,
             None,
+            "",
             &ExpansionLimits::DEFAULT,
         )
         .unwrap()
@@ -3323,6 +3358,7 @@ mod tests {
                 "cuenta",
                 2,
                 None,
+                "",
                 &ExpansionLimits::DEFAULT
             )
             .unwrap()
@@ -3334,6 +3370,7 @@ mod tests {
             "cuenta",
             1,
             None,
+            "",
             &ExpansionLimits::DEFAULT
         )
         .unwrap()

@@ -1037,6 +1037,8 @@ impl<K: KeySource> StoreApi<K> {
             .await?;
         self.activate_after_read(CALENDAR_AREA, &id.account_id, &account)
             .await;
+        // Para marcar cuál asistente soy yo y mi estado en el detalle.
+        let my_address = self.calendar_address(&id.account_id).await;
         let account_id = id.account_id.clone();
         let event = self
             .manager
@@ -1046,6 +1048,7 @@ impl<K: KeySource> StoreApi<K> {
                     &account_id,
                     id.id,
                     occurrence,
+                    &my_address,
                     &ExpansionLimits::DEFAULT,
                 )
             })
