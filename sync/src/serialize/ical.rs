@@ -1428,6 +1428,51 @@ mod tests {
         );
     }
 
+    /// El `SEQUENCE` lo sube lo que el organizador posee, no mi respuesta: un RSVP
+    /// solo lo deja; un RSVP junto con un cambio del evento sí lo sube, y mi
+    /// respuesta se fija igual.
+    #[test]
+    fn rsvp_no_sube_el_sequence_pero_una_edicion_si() {
+        let solo = edited(INVITE, &rsvp("juan@example.com", Partstat::Accepted));
+        assert!(solo.contains("SEQUENCE:2") && !solo.contains("SEQUENCE:3"));
+
+        let mut junto = rsvp("juan@example.com", Partstat::Accepted);
+        junto.summary = set("Otro título");
+        let out = edited(INVITE, &junto);
+        assert!(out.contains("SEQUENCE:3"), "{out}");
+        let event = &parse_document(&out).components[0];
+        assert_eq!(
+            attendee(event, "juan@example.com").param("PARTSTAT"),
+            Some("ACCEPTED")
+        );
+    }
+
+    /// Un `Leave`/`Clear` de partstat no contesta nada, aunque mi dirección esté.
+    #[test]
+    fn partstat_sin_set_no_toca_a_nadie() {
+        for change in [Change::Leave, Change::Clear] {
+            let patch = EventPatch {
+                partstat: change,
+                my_address: "juan@example.com".into(),
+                summary: set("Otro"),
+                ..Default::default()
+            };
+            let out = edited(INVITE, &patch);
+            assert!(out.contains("PARTSTAT=NEEDS-ACTION"), "{out}");
+        }
+    }
+
+    /// Si mi dirección aparece dos veces, se contesta sólo la primera línea.
+    #[test]
+    fn rsvp_con_mi_direccion_repetida_fija_solo_la_primera() {
+        let raw = "BEGIN:VEVENT\r\nUID:a\r\nSUMMARY:X\r\nDTSTART:20260915T140000Z\r\n\
+            ATTENDEE;CN=Uno:mailto:juan@example.com\r\n\
+            ATTENDEE;CN=Dos:mailto:juan@example.com\r\nEND:VEVENT\r\n";
+        let out = edited(raw, &rsvp("juan@example.com", Partstat::Declined));
+        assert_eq!(out.matches("PARTSTAT=DECLINED").count(), 1, "{out}");
+        assert!(out.contains("ATTENDEE;CN=Dos:mailto:juan@example.com"));
+    }
+
     /// Un evento sin ningún `ATTENDEE` y un RSVP: no hay a quién contestar, no se
     /// agrega nada y el SEQUENCE no se mueve.
     #[test]

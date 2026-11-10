@@ -6659,4 +6659,74 @@ mod tests {
             before
         );
     }
+
+    // ── RSVP: del JSON al parche ─────────────────────────────────────────────
+
+    fn json_map(text: &str) -> serde_json::Map<String, serde_json::Value> {
+        match serde_json::from_str(text).unwrap() {
+            serde_json::Value::Object(map) => map,
+            other => panic!("se esperaba un objeto: {other}"),
+        }
+    }
+
+    #[test]
+    fn el_partstat_del_cuerpo_es_una_de_las_tres_respuestas() {
+        for (text, expected) in [
+            ("accepted", Partstat::Accepted),
+            ("declined", Partstat::Declined),
+            ("tentative", Partstat::Tentative),
+        ] {
+            let obj = json_map(&format!(r#"{{"partstat":"{text}"}}"#));
+            assert_eq!(
+                partstat_change(&obj, "partstat").unwrap(),
+                Change::Set(expected),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn un_cuerpo_sin_partstat_no_contesta_nada() {
+        let obj = json_map(r#"{"summary":"X"}"#);
+        assert_eq!(partstat_change(&obj, "partstat").unwrap(), Change::Leave);
+    }
+
+    #[test]
+    fn un_partstat_fuera_del_dominio_es_un_argumento_invalido() {
+        for body in [
+            r#"{"partstat":"needs-action"}"#,
+            r#"{"partstat":"delegated"}"#,
+            r#"{"partstat":"ACCEPTED\r\nX-EVIL:1"}"#,
+            r#"{"partstat":""}"#,
+            r#"{"partstat":null}"#,
+            r#"{"partstat":7}"#,
+            r#"{"partstat":true}"#,
+        ] {
+            let obj = json_map(body);
+            assert!(
+                matches!(
+                    partstat_change(&obj, "partstat"),
+                    Err(StoreError::InvalidArgument(_))
+                ),
+                "{body} tenía que rechazarse"
+            );
+        }
+    }
+
+    /// La dirección con la que se empareja sale de la cuenta, **no** del cuerpo:
+    /// un `my_address` mandado por el cliente se ignora.
+    #[test]
+    fn el_parche_de_evento_cablea_partstat_y_toma_mi_direccion_de_la_cuenta() {
+        let obj = json_map(r#"{"partstat":"declined","my_address":"otro@x.com"}"#);
+        let patch = event_patch_from(&obj, "juan@example.com").unwrap();
+        assert_eq!(patch.partstat, Change::Set(Partstat::Declined));
+        assert_eq!(patch.my_address, "juan@example.com");
+        assert!(!patch.is_empty());
+
+        let sin = event_patch_from(&json_map("{}"), "juan@example.com").unwrap();
+        assert_eq!(sin.partstat, Change::Leave);
+        assert!(sin.is_empty(), "la dirección sola no es un cambio");
+
+        assert!(event_patch_from(&json_map(r#"{"partstat":"nope"}"#), "j@x").is_err());
+    }
 }

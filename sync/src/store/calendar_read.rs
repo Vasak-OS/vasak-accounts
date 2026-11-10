@@ -2524,6 +2524,88 @@ mod tests {
         );
     }
 
+    /// Cuál asistente soy yo: mi `ATTENDEE` marca `am_i_attendee` y trae mi
+    /// respuesta; otro correo, una dirección vacía o un evento sin asistentes
+    /// dejan los dos neutros; el dominio en otra caja sí coincide, la parte local
+    /// no.
+    #[test]
+    fn el_detalle_marca_cual_asistente_soy_yo() {
+        let raw = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:r\r\nSUMMARY:Reunión\r\n\
+            DTSTART:20260915T140000Z\r\nDTEND:20260915T150000Z\r\n\
+            ORGANIZER;CN=Jefa:mailto:jefa@example.com\r\n\
+            ATTENDEE;CN=Juan;PARTSTAT=ACCEPTED:mailto:juan@example.com\r\n\
+            ATTENDEE;CN=Ana;PARTSTAT=DECLINED:mailto:ana@example.com\r\n\
+            END:VEVENT\r\nEND:VCALENDAR\r\n";
+        let sin_asistentes = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:q\r\nSUMMARY:Solo\r\n\
+            DTSTART:20260915T140000Z\r\nDTEND:20260915T150000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let temp = TempDir::new("leer-evento-yo");
+        let store = store_with(
+            &temp,
+            &[
+                ("https://x/c/r.ics", raw),
+                ("https://x/c/q.ics", sin_asistentes),
+            ],
+        );
+        let detail = |id: i64, mine: &str| {
+            get_event(
+                store.connection(),
+                "cuenta",
+                id,
+                None,
+                mine,
+                &ExpansionLimits::DEFAULT,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let me = detail(1, "juan@example.com");
+        assert!(me.am_i_attendee);
+        assert_eq!(me.my_response, "accepted");
+        // El resto de los asistentes sigue en la lista.
+        assert_eq!(me.attendees.len(), 2);
+
+        let ana = detail(1, "mailto:ana@example.com");
+        assert!(ana.am_i_attendee);
+        assert_eq!(ana.my_response, "declined");
+
+        // Dominio en otra caja: sí soy yo.
+        assert!(detail(1, "juan@EXAMPLE.com").am_i_attendee);
+        // Parte local en otra caja, otro correo, vacía: no.
+        for mine in ["JUAN@example.com", "otro@example.com", ""] {
+            let d = detail(1, mine);
+            assert!(!d.am_i_attendee, "{mine:?}");
+            assert_eq!(d.my_response, "", "{mine:?}");
+        }
+        // Sin asistentes: nadie soy yo.
+        let solo = detail(2, "juan@example.com");
+        assert!(!solo.am_i_attendee);
+        assert_eq!(solo.my_response, "");
+    }
+
+    /// Soy un asistente que todavía no contestó: `am_i_attendee` sí, y mi
+    /// respuesta es lo que diga el `PARTSTAT` (o vacía si no tiene).
+    #[test]
+    fn el_detalle_sin_partstat_me_marca_pero_sin_respuesta() {
+        let raw = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:n\r\nSUMMARY:X\r\n\
+            DTSTART:20260915T140000Z\r\nDTEND:20260915T150000Z\r\n\
+            ATTENDEE;CN=Juan:mailto:juan@example.com\r\n\
+            END:VEVENT\r\nEND:VCALENDAR\r\n";
+        let temp = TempDir::new("leer-evento-sin-partstat");
+        let store = store_with(&temp, &[("https://x/c/n.ics", raw)]);
+        let d = get_event(
+            store.connection(),
+            "cuenta",
+            1,
+            None,
+            "juan@example.com",
+            &ExpansionLimits::DEFAULT,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(d.am_i_attendee);
+        assert_eq!(d.my_response, "");
+    }
+
     /// Un evento entero, con la repetición en partes, los recordatorios, el
     /// organizador y los asistentes; nunca el crudo. Y una vez movida trae lo
     /// de su excepción.
