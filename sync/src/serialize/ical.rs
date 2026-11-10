@@ -37,7 +37,7 @@
 //! vez y vale para los dos.
 
 use super::{detect_eol, escape_text, fold, logical_lines, render, Change, Logical};
-use crate::ical::{split_line, DateValue};
+use crate::ical::{same_calendar_address, split_line, DateValue};
 
 /// Lo que puede salir mal al serializar.
 ///
@@ -163,11 +163,59 @@ impl TodoStatus {
     }
 }
 
+/// Mi respuesta a una invitación: el `PARTSTAT` que una persona fija al contestar
+/// (RFC 5545 §3.2.12), acotado a los tres valores que tienen sentido como
+/// respuesta.
+///
+/// **Es un dominio cerrado a propósito**, como [`TodoStatus`]: el `PARTSTAT` no
+/// sale de un texto libre que termine en el parámetro de un `ATTENDEE`, sino de
+/// uno de estos tres, así que un valor adversario no puede inyectar nada por acá.
+/// El parser JSON de `store_api.rs` lo arma con [`Partstat::parse`], que rechaza
+/// cualquier otra cosa (incluidos `NEEDS-ACTION` o `DELEGATED`, que no son una
+/// respuesta que la persona elija).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Partstat {
+    Accepted,
+    Declined,
+    Tentative,
+}
+
+impl Partstat {
+    /// El texto fijo que va al parámetro `PARTSTAT=`.
+    pub fn as_ical(self) -> &'static str {
+        match self {
+            Partstat::Accepted => "ACCEPTED",
+            Partstat::Declined => "DECLINED",
+            Partstat::Tentative => "TENTATIVE",
+        }
+    }
+
+    /// Un `PARTSTAT` desde el texto que mandó quien llama; `None` si no es una de
+    /// las tres respuestas. No distingue mayúsculas: iCalendar las escribe en
+    /// mayúsculas, pero la ventana podría mandar `accepted`.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_uppercase().as_str() {
+            "ACCEPTED" => Some(Self::Accepted),
+            "DECLINED" => Some(Self::Declined),
+            "TENTATIVE" => Some(Self::Tentative),
+            _ => None,
+        }
+    }
+}
+
 /// Lo que cambia de un `VEVENT`.
 ///
 /// Cada campo es un [`Change`]: por omisión no se toca, así que un parche sólo
 /// nombra lo que cambia. Las propiedades de texto —`SUMMARY`, `DESCRIPTION`,
 /// `LOCATION`— se escapan; las fechas van tal como las arma quien llama.
+///
+/// `partstat` es aparte: no edita una propiedad del evento sino **mi** respuesta
+/// como asistente. Fija el parámetro `PARTSTAT` del `ATTENDEE` cuyo `CAL-ADDRESS`
+/// es `my_address` (ver [`same_calendar_address`]), dejando el resto de ese
+/// asistente —y todos los demás— intacto. `my_address` **no** viene del payload
+/// del cliente: lo resuelve `store_api` desde la cuenta del evento. Si está vacía
+/// o no hay un `ATTENDEE` que coincida, el `partstat` es un no-op (ver
+/// [`put_partstat`]): no me agrego ni invento una línea.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EventPatch {
     pub summary: Change<String>,
@@ -175,16 +223,33 @@ pub struct EventPatch {
     pub location: Change<String>,
     pub start: Change<DateSpec>,
     pub end: Change<DateSpec>,
+    pub partstat: Change<Partstat>,
+    pub my_address: String,
 }
 
 impl EventPatch {
-    /// Si no cambia nada: todos los campos en `Leave`.
+    /// Si no cambia nada: todos los campos en `Leave`. `my_address` sola no es un
+    /// cambio —es sólo a quién emparejar—, así que no cuenta.
     pub fn is_empty(&self) -> bool {
         self.summary == Change::Leave
             && self.description == Change::Leave
             && self.location == Change::Leave
             && self.start == Change::Leave
             && self.end == Change::Leave
+            && self.partstat == Change::Leave
+    }
+
+    /// Si el parche toca algo que **el organizador posee** —lo que de verdad
+    /// cambia la versión del evento—, y por eso sube el `SEQUENCE`. Contestar una
+    /// invitación (`partstat`) **no** lo hace: en iTIP una respuesta de un
+    /// asistente conserva el `SEQUENCE`, que es el número de revisión del
+    /// organizador. Así un RSVP deja el `SEQUENCE` byte por byte.
+    fn changes_revision(&self) -> bool {
+        self.summary != Change::Leave
+            || self.description != Change::Leave
+            || self.location != Change::Leave
+            || self.start != Change::Leave
+            || self.end != Change::Leave
     }
 }
 
@@ -235,6 +300,14 @@ trait ComponentPatch {
 
     /// Si no cambia nada.
     fn is_empty(&self) -> bool;
+
+    /// Si editar este parche sube el `SEQUENCE` del componente. Por omisión sí:
+    /// una edición es una revisión nueva. Lo sobreescribe el evento para que
+    /// contestar una invitación —que no cambia nada que el organizador posea— no
+    /// lo toque (ver [`EventPatch::changes_revision`]).
+    fn bumps_sequence(&self) -> bool {
+        true
+    }
 
     /// Comprueba lo que el parche fija antes de escribir nada: fechas que no
     /// inyecten una línea, rangos dentro de su dominio.
@@ -382,8 +455,9 @@ fn apply_component_changes<P: ComponentPatch>(
             "END" => {
                 if component_closes_target(&stack, &target_depth, &value, P::COMPONENT) {
                     patch.flush_missing(&mut out, &done);
-                    // Editar es subir el `SEQUENCE`; si no estaba, va en 1.
-                    if !sequence_seen {
+                    // Editar es subir el `SEQUENCE`; si no estaba, va en 1. Un
+                    // parche que no cambia la revisión (un RSVP) no lo agrega.
+                    if patch.bumps_sequence() && !sequence_seen {
                         out.extend(fold(&render("SEQUENCE", &[], "1")));
                     }
                     target_depth = None;
@@ -428,6 +502,12 @@ fn edit_direct<P: ComponentPatch>(
 ) {
     if name == "SEQUENCE" {
         *sequence_seen = true;
+        // Un parche que no cambia la revisión (un RSVP) deja el `SEQUENCE` como
+        // estaba, byte por byte; sólo una edición de verdad lo sube.
+        if !patch.bumps_sequence() {
+            out.extend_from_slice(&logical.physical);
+            return;
+        }
         let current = value.trim().parse::<u64>().unwrap_or(0);
         let next = current.saturating_add(1);
         out.extend(fold(&render("SEQUENCE", &[], &next.to_string())));
@@ -442,6 +522,7 @@ fn edit_direct<P: ComponentPatch>(
             logical,
             name,
             params: &params,
+            value,
         };
         patch.edit_field(&mut ctx, done)
     };
@@ -529,6 +610,9 @@ struct EditContext<'a> {
     logical: &'a Logical,
     name: &'a str,
     params: &'a [String],
+    /// El valor de la línea (lo que va después del primer `:`): el `CAL-ADDRESS`
+    /// de un `ATTENDEE`, para saber si esa línea soy yo.
+    value: &'a str,
 }
 
 impl EditContext<'_> {
@@ -613,6 +697,61 @@ fn put_number(ctx: &mut EditContext, change: &Change<u8>, done: &mut bool) {
     }
 }
 
+/// Fija —o deja— el `PARTSTAT` de **mi** `ATTENDEE`, contestando una invitación.
+///
+/// Conservador por diseño: sobre una línea `ATTENDEE`, si su `CAL-ADDRESS` es mi
+/// dirección (ver [`same_calendar_address`]) y todavía no contesté en este
+/// recorrido (`done`), reescribe la línea con el `PARTSTAT` nuevo **conservando el
+/// `CAL-ADDRESS` y todos los demás parámetros** (`CN`, `ROLE`, `RSVP`…) y sin
+/// duplicar el `PARTSTAT` si ya había uno. Cualquier otra línea `ATTENDEE` —otro
+/// asistente, o yo ya contestado— se deja byte por byte. El valor nuevo es uno de
+/// los tres fijos de [`Partstat`]: no hay texto libre que pueda inyectar nada.
+///
+/// `Change::Leave` y `Change::Clear` dejan la línea como estaba: no hay
+/// contestación, así que no se toca a nadie (el `store_api` sólo manda `Set` o
+/// nada). El organizador no pasa por acá —sólo se mira `ATTENDEE`—.
+fn put_partstat(
+    ctx: &mut EditContext,
+    change: &Change<Partstat>,
+    my_address: &str,
+    done: &mut bool,
+) {
+    if let Change::Set(partstat) = change {
+        if !*done && same_calendar_address(ctx.value, my_address) {
+            *done = true;
+            // El `CAL-ADDRESS` va intacto; se preserva todo parámetro salvo el
+            // `PARTSTAT`, que se reemplaza por el nuevo.
+            let value = ctx.value.to_string();
+            let params = params_with_partstat(ctx.params, partstat.as_ical());
+            ctx.rewrite_with(&params, &value);
+            return;
+        }
+    }
+    ctx.keep();
+}
+
+/// Los parámetros de una línea con el `PARTSTAT` fijado al valor nuevo: se saca
+/// cualquier `PARTSTAT` anterior (no se duplica) y se agrega el nuevo al final,
+/// conservando los demás parámetros en su orden. El valor es uno de los tres
+/// fijos de [`Partstat`], así que no inyecta nada.
+fn params_with_partstat(params: &[String], value: &str) -> Vec<String> {
+    let mut kept: Vec<String> = params
+        .iter()
+        .filter(|param| !param_named(param, "PARTSTAT"))
+        .cloned()
+        .collect();
+    kept.push(format!("PARTSTAT={value}"));
+    kept
+}
+
+/// Si un parámetro crudo (`CLAVE=VALOR`) tiene ese nombre, sin distinguir
+/// mayúsculas.
+fn param_named(param: &str, name: &str) -> bool {
+    param
+        .split_once('=')
+        .is_some_and(|(key, _)| key.trim().eq_ignore_ascii_case(name))
+}
+
 // ── Agregar lo que falta al cerrar (o al crear) ──────────────────────────────
 //
 // Las de arriba (`put_*`) editan una propiedad **en el lugar** mientras se
@@ -671,6 +810,9 @@ struct EventDone {
     location: bool,
     start: bool,
     end: bool,
+    /// Si ya contesté: fijado mi `PARTSTAT` en mi `ATTENDEE`. Evita tocar un
+    /// segundo asistente que coincidiera.
+    partstat: bool,
 }
 
 impl ComponentPatch for EventPatch {
@@ -679,6 +821,10 @@ impl ComponentPatch for EventPatch {
 
     fn is_empty(&self) -> bool {
         EventPatch::is_empty(self)
+    }
+
+    fn bumps_sequence(&self) -> bool {
+        self.changes_revision()
     }
 
     fn validate(&self) -> Result<(), SerializeError> {
@@ -698,6 +844,7 @@ impl ComponentPatch for EventPatch {
             "LOCATION" => put_text(ctx, &self.location, &mut done.location),
             "DTSTART" => put_date(ctx, &self.start, &mut done.start),
             "DTEND" => put_date(ctx, &self.end, &mut done.end),
+            "ATTENDEE" => put_partstat(ctx, &self.partstat, &self.my_address, &mut done.partstat),
             _ => return false,
         }
         true
@@ -709,6 +856,8 @@ impl ComponentPatch for EventPatch {
         append_text(out, &self.location, done.location, "LOCATION");
         append_date(out, &self.start, done.start, "DTSTART");
         append_date(out, &self.end, done.end, "DTEND");
+        // `partstat` **no** se agrega si faltaba: si no hay un `ATTENDEE` que sea
+        // yo, contestar es un no-op seguro —no me agrego ni invento la línea—.
     }
 }
 
@@ -1154,6 +1303,166 @@ mod tests {
                 ..Default::default()
             },
         );
+        let document = parse_document(&out);
+        assert!(!document.truncated);
+        assert_eq!(document.components.len(), 1);
+        assert_eq!(document.components[0].name, "VEVENT");
+    }
+
+    // ── RSVP: fijar mi PARTSTAT (ATTENDEE) ──────────────────────────────────
+    //
+    // Contestar una invitación cambia **sólo** el `PARTSTAT` de mi `ATTENDEE`:
+    // todo lo demás del VEVENT —los otros asistentes, el organizador, el
+    // `SEQUENCE`, lo desconocido— queda byte por byte. Lo que no estoy invitada
+    // es un no-op seguro: no me agrego.
+
+    /// Un evento con organizador y dos asistentes, uno soy yo (`juan@`). Mi línea
+    /// trae varios parámetros y un `PARTSTAT` previo, para probar que se preserva
+    /// lo demás y no se duplica.
+    const INVITE: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:inv-1\r\n\
+        SUMMARY:Reunión\r\nDTSTART:20260915T140000Z\r\nDTEND:20260915T150000Z\r\n\
+        ORGANIZER;CN=Jefa:mailto:jefa@example.com\r\n\
+        ATTENDEE;CN=Juan;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:juan@example.com\r\n\
+        ATTENDEE;CN=Ana;PARTSTAT=ACCEPTED:mailto:ana@example.com\r\n\
+        SEQUENCE:2\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+    fn rsvp(address: &str, partstat: Partstat) -> EventPatch {
+        EventPatch {
+            partstat: Change::Set(partstat),
+            my_address: address.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// El `ATTENDEE` cuyo `CAL-ADDRESS` (sin `mailto:`) es ese correo, leído con el
+    /// parser de verdad —que desdobla el plegado—.
+    fn attendee<'a>(event: &'a Component, email: &str) -> &'a crate::ical::Property {
+        event
+            .all("ATTENDEE")
+            .find(|p| p.value.trim_start_matches("mailto:") == email)
+            .expect("está el asistente")
+    }
+
+    /// **El corazón del RSVP conservador: sólo cambia mi PARTSTAT.** Se fija mi
+    /// respuesta y: mi `ATTENDEE` queda en `ACCEPTED` conservando `CN`, `ROLE`,
+    /// `RSVP` y el `CAL-ADDRESS`; el otro asistente y el organizador salen byte por
+    /// byte; y el `SEQUENCE` **no** sube (una respuesta conserva la revisión).
+    #[test]
+    fn rsvp_fija_mi_partstat_y_no_toca_lo_demas() {
+        let out = edited(INVITE, &rsvp("juan@example.com", Partstat::Accepted));
+
+        let event = &parse_document(&out).components[0];
+        let me = attendee(event, "juan@example.com");
+        assert_eq!(me.param("PARTSTAT"), Some("ACCEPTED"));
+        // Lo demás de mi línea, intacto.
+        assert_eq!(me.param("CN"), Some("Juan"));
+        assert_eq!(me.param("ROLE"), Some("REQ-PARTICIPANT"));
+        assert_eq!(me.param("RSVP"), Some("TRUE"));
+        // No se duplicó el PARTSTAT.
+        assert_eq!(
+            me.params
+                .iter()
+                .filter(|p| p.to_ascii_uppercase().starts_with("PARTSTAT="))
+                .count(),
+            1
+        );
+
+        // El otro asistente y el organizador, byte por byte (líneas cortas, no
+        // plegadas: aparecen tal cual en la salida).
+        assert!(
+            out.contains("ATTENDEE;CN=Ana;PARTSTAT=ACCEPTED:mailto:ana@example.com"),
+            "{out}"
+        );
+        assert!(out.contains("ORGANIZER;CN=Jefa:mailto:jefa@example.com"));
+        // Contestar no sube el SEQUENCE.
+        assert!(out.contains("SEQUENCE:2"));
+        assert!(!out.contains("SEQUENCE:3"));
+    }
+
+    /// Un `ATTENDEE` sin `PARTSTAT` previo lo **agrega** (no es duplicar), sin
+    /// tocar sus otros parámetros.
+    #[test]
+    fn rsvp_agrega_partstat_si_no_habia() {
+        let raw = "BEGIN:VEVENT\r\nUID:a\r\nSUMMARY:X\r\nDTSTART:20260915T140000Z\r\n\
+            ATTENDEE;CN=Juan:mailto:juan@example.com\r\nEND:VEVENT\r\n";
+        let out = edited(raw, &rsvp("juan@example.com", Partstat::Tentative));
+        let event = &parse_document(&out).components[0];
+        let me = attendee(event, "juan@example.com");
+        assert_eq!(me.param("PARTSTAT"), Some("TENTATIVE"));
+        assert_eq!(me.param("CN"), Some("Juan"));
+    }
+
+    /// **No-op seguro si no estoy invitada:** mi dirección no está entre los
+    /// asistentes, así que el crudo vuelve byte por byte —no me agrego, no subo el
+    /// SEQUENCE, no invento una línea—.
+    #[test]
+    fn rsvp_no_op_si_no_estoy_invitada() {
+        let out = edited(INVITE, &rsvp("nadie@example.com", Partstat::Declined));
+        assert_eq!(out, INVITE);
+        assert_eq!(out.matches("ATTENDEE").count(), 2);
+    }
+
+    /// Una dirección propia vacía —no se pudo resolver— tampoco toca a nadie: no
+    /// coincide con ningún asistente, es otro no-op.
+    #[test]
+    fn rsvp_con_direccion_vacia_es_no_op() {
+        let out = edited(INVITE, &rsvp("", Partstat::Accepted));
+        assert_eq!(out, INVITE);
+    }
+
+    /// El dominio no distingue mayúsculas, la parte local **sí**: `JUAN@` no es
+    /// `juan@`, así que no se toca esa línea (otro no-op); el mismo correo con el
+    /// dominio en otra caja **sí** es mío.
+    #[test]
+    fn rsvp_coincidencia_de_direccion() {
+        // Parte local distinta por mayúsculas: no soy yo.
+        let otra_caja_local = edited(INVITE, &rsvp("JUAN@example.com", Partstat::Declined));
+        assert_eq!(otra_caja_local, INVITE);
+
+        // Dominio en otra caja: sí soy yo.
+        let out = edited(INVITE, &rsvp("juan@EXAMPLE.COM", Partstat::Declined));
+        let event = &parse_document(&out).components[0];
+        assert_eq!(
+            attendee(event, "juan@example.com").param("PARTSTAT"),
+            Some("DECLINED")
+        );
+    }
+
+    /// Un evento sin ningún `ATTENDEE` y un RSVP: no hay a quién contestar, no se
+    /// agrega nada y el SEQUENCE no se mueve.
+    #[test]
+    fn rsvp_sin_asistentes_no_agrega_nada() {
+        let raw = "BEGIN:VEVENT\r\nUID:a\r\nSUMMARY:X\r\nDTSTART:20260915T140000Z\r\n\
+            SEQUENCE:5\r\nEND:VEVENT\r\n";
+        let out = edited(raw, &rsvp("juan@example.com", Partstat::Accepted));
+        assert_eq!(out, raw);
+    }
+
+    /// El `PARTSTAT` sale de un dominio cerrado: sólo las tres respuestas, sin
+    /// distinguir mayúsculas, y vuelven a su texto fijo. Cualquier otra cosa —un
+    /// estado que no es una respuesta (`NEEDS-ACTION`), o un texto con una
+    /// inyección— no se interpreta, así que no hay forma de que llegue al
+    /// parámetro.
+    #[test]
+    fn el_partstat_sale_de_un_dominio_cerrado() {
+        assert_eq!(Partstat::parse("accepted"), Some(Partstat::Accepted));
+        assert_eq!(Partstat::parse("DECLINED"), Some(Partstat::Declined));
+        assert_eq!(Partstat::parse(" tentative "), Some(Partstat::Tentative));
+        assert_eq!(Partstat::Accepted.as_ical(), "ACCEPTED");
+        assert_eq!(Partstat::Declined.as_ical(), "DECLINED");
+        assert_eq!(Partstat::Tentative.as_ical(), "TENTATIVE");
+        // No son una respuesta que la persona elija, o traen una inyección.
+        assert_eq!(Partstat::parse("NEEDS-ACTION"), None);
+        assert_eq!(Partstat::parse("DELEGATED"), None);
+        assert_eq!(Partstat::parse("ACCEPTED\r\nX-:1"), None);
+        assert_eq!(Partstat::parse("cualquier cosa"), None);
+    }
+
+    /// Lo escrito tras un RSVP es un árbol válido: se parsea sin truncarse, con un
+    /// solo VEVENT.
+    #[test]
+    fn rsvp_deja_un_arbol_valido() {
+        let out = edited(INVITE, &rsvp("juan@example.com", Partstat::Accepted));
         let document = parse_document(&out);
         assert!(!document.truncated);
         assert_eq!(document.components.len(), 1);

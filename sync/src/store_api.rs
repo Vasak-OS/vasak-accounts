@@ -60,7 +60,9 @@ use crate::dav_sync::BrokerCredentials;
 use crate::email_sync::{EmailScheduler, EmailSync, MailboxToken, EMAIL_TICK};
 use crate::ical::recurrence::ExpansionLimits;
 use crate::reminders;
-use crate::serialize::ical::{DateSpec, EventPatch, SerializeError, TaskPatch, TodoStatus};
+use crate::serialize::ical::{
+    DateSpec, EventPatch, Partstat, SerializeError, TaskPatch, TodoStatus,
+};
 use crate::serialize::vcard::{ContactPatch, LabeledValue, PostalAddress, Relation};
 use crate::serialize::{ical as ical_write, vcard as vcard_write, Change};
 use crate::store::calendar::{derive_with_occurrences, ObjectRow, Window};
@@ -1661,6 +1663,32 @@ impl<K: KeySource> StoreApi<K> {
     /// y tipo —qué `put_*_in_store` serializa y con qué clave responde— lo decide
     /// [`CalendarObjectKind`]. Devuelve `{"<clave>_id": "<cuenta>/<id>"}`, sin el
     /// `href` (la dirección en el servidor no es pública).
+    /// La dirección (correo) de una cuenta de calendario, para ubicar «yo» entre
+    /// los asistentes de un evento —al leer el detalle y al contestar una
+    /// invitación—. Es el `username` de la configuración de la capacidad, la misma
+    /// identidad bajo la que la cuenta figura en el servidor.
+    ///
+    /// **Mejor esfuerzo:** si el servicio de cuentas no responde o la cuenta no
+    /// guarda una dirección, devuelve vacío. Una dirección vacía no coincide con
+    /// ningún `ATTENDEE` (ver `ical::same_calendar_address`), así que el detalle sale
+    /// sin marcar asistente y contestar es un no-op; nunca falla la lectura ni la
+    /// escritura por esto.
+    async fn calendar_address(&self, account_id: &str) -> String {
+        let Ok(broker) = broker::Broker::connect().await else {
+            return String::new();
+        };
+        let Ok(data) = broker.account_data(account_id, CALENDAR_AREA).await else {
+            return String::new();
+        };
+        let config = data.get("config").cloned().unwrap_or(data);
+        config
+            .get("username")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    }
+
     async fn put_calendar_object(
         &self,
         header: &Header<'_>,
@@ -1686,12 +1714,19 @@ impl<K: KeySource> StoreApi<K> {
         } else {
             None
         };
+        // Mi dirección, para ubicar mi `ATTENDEE` si el payload contesta una
+        // invitación (`partstat`). Sólo un evento la usa; una tarea no tiene
+        // asistentes. Mejor esfuerzo: si no se resuelve, contestar es un no-op.
+        let my_address = match kind {
+            CalendarObjectKind::Event => self.calendar_address(&account_id).await,
+            CalendarObjectKind::Task => String::new(),
+        };
         // El `href` que devuelve el encolado resuelve el `id` nuevo, pero no sale
         // por el bus: la dirección en el servidor no es pública.
         let (id, _href) = self
             .manager
             .with_store(&account_id, move |store| {
-                kind.put_in_store(store, calendar_id, &payload, &if_match, uid)
+                kind.put_in_store(store, calendar_id, &payload, &if_match, uid, &my_address)
             })
             .await
             .map_err(read_error)?;
@@ -2357,9 +2392,12 @@ fn forbid_id_on_create(obj: &serde_json::Map<String, serde_json::Value>) -> Resu
     Ok(())
 }
 
-/// El parche de un evento, del cuerpo JSON.
+/// El parche de un evento, del cuerpo JSON. `my_address` es la dirección de la
+/// cuenta del evento —la resuelve [`StoreApi::calendar_address`], **no** viene del
+/// payload—: ubica mi `ATTENDEE` al contestar una invitación (`partstat`).
 fn event_patch_from(
     obj: &serde_json::Map<String, serde_json::Value>,
+    my_address: &str,
 ) -> Result<EventPatch, StoreError> {
     Ok(EventPatch {
         summary: text_change(obj, "summary")?,
@@ -2367,7 +2405,33 @@ fn event_patch_from(
         location: text_change(obj, "location")?,
         start: date_change(obj, "start")?,
         end: date_change(obj, "end")?,
+        partstat: partstat_change(obj, "partstat")?,
+        my_address: my_address.to_string(),
     })
+}
+
+/// Cómo cambia mi respuesta a una invitación: ausente no se toca, un texto la fija
+/// **sólo si es una de las tres respuestas** (`accepted`/`declined`/`tentative`,
+/// ver [`Partstat`]). Cualquier otra cosa —otro texto, `null`, un número— es un
+/// argumento inválido: no hay forma de que un valor libre termine en el parámetro
+/// `PARTSTAT`. No hay `Clear`: una invitación se contesta, no se «desconsta».
+fn partstat_change(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<Change<Partstat>, StoreError> {
+    match obj.get(key) {
+        None => Ok(Change::Leave),
+        Some(serde_json::Value::String(text)) => {
+            Partstat::parse(text).map(Change::Set).ok_or_else(|| {
+                StoreError::InvalidArgument(format!(
+                    "«{key}» es una respuesta de invitación: accepted, declined o tentative"
+                ))
+            })
+        }
+        Some(_) => Err(StoreError::InvalidArgument(format!(
+            "«{key}» es accepted, declined o tentative"
+        ))),
+    }
 }
 
 /// Cómo cambia el estado de una tarea: ausente no se toca, `null` lo saca, un
@@ -2579,11 +2643,13 @@ impl CalendarObjectKind {
         payload: &str,
         if_match: &str,
         uid: Option<String>,
+        my_address: &str,
     ) -> Result<(i64, String), StoreError> {
         match self {
             CalendarObjectKind::Event => {
-                put_event_in_store(store, calendar_id, payload, if_match, uid)
+                put_event_in_store(store, calendar_id, payload, if_match, uid, my_address)
             }
+            // Una tarea no tiene asistentes: `my_address` no le aplica.
             CalendarObjectKind::Task => {
                 put_task_in_store(store, calendar_id, payload, if_match, uid)
             }
@@ -2607,9 +2673,10 @@ fn put_event_in_store(
     payload: &str,
     if_match: &str,
     uid: Option<String>,
+    my_address: &str,
 ) -> Result<(i64, String), StoreError> {
     let obj = json_object(payload)?;
-    let patch = CalendarPatch::Event(event_patch_from(&obj)?);
+    let patch = CalendarPatch::Event(event_patch_from(&obj, my_address)?);
     put_calendar_object_in_store(store, calendar_id, &obj, if_match, uid, patch)
 }
 
