@@ -239,6 +239,34 @@ async fn resolve_op<K: KeySource>(
                 }
             }
         }
+        PendingKind::SetColor => {
+            // El color va en `payload`. Uno que no es UTF-8 no mejora
+            // reintentando: se descarta y la próxima bajada trae el real.
+            let color = match String::from_utf8(op.payload.clone().unwrap_or_default()) {
+                Ok(color) => color,
+                Err(_) => {
+                    tracing::info!("'{account_id}': set_color con un color guardado que no es UTF-8; se descarta");
+                    return close(manager, account_id, Close::SetColor(op)).await;
+                }
+            };
+            match run(deadline, client.set_calendar_color(&url, &color)).await {
+                Timed::Elapsed => retry_or_drop(op, "plazo de la vuelta".into(), report),
+                Timed::Done(Ok(())) => {
+                    report.pushed += 1;
+                    Close::SetColor(op)
+                }
+                // Un color no tiene conflicto por ETag: reintentable se reintenta,
+                // permanente se descarta (la bajada reconcilia), nunca a `conflict`.
+                Timed::Done(Err(e)) if e.is_retryable() => retry_or_drop(op, e.log_text(), report),
+                Timed::Done(Err(e)) => {
+                    tracing::info!(
+                        "'{account_id}': set_color falló permanente, se descarta: {}",
+                        e.log_text()
+                    );
+                    Close::SetColor(op)
+                }
+            }
+        }
     };
     close(manager, account_id, decision).await?;
 
@@ -298,12 +326,34 @@ fn retry_or_escalate(op: PendingOp, detail: String, report: &mut ReplayReport) -
     }
 }
 
+/// Como [`retry_or_escalate`] pero para una op `set_color`: reintenta mientras no
+/// pase el tope y, al pasarlo, **descarta** la op en vez de escalar a conflicto —un
+/// color no tiene conflicto que resolver de cara a la persona, y la próxima bajada
+/// trae el real—.
+fn retry_or_drop(op: PendingOp, detail: String, report: &mut ReplayReport) -> Close {
+    if op.attempts + 1 < MAX_REPLAY_ATTEMPTS {
+        report.retried += 1;
+        Close::Retry(op, detail)
+    } else {
+        tracing::info!(
+            "set_color: se descarta tras {} intentos: {detail}",
+            op.attempts + 1
+        );
+        Close::SetColor(op)
+    }
+}
+
 /// Cómo se cierra una op en la base.
 enum Close {
     /// `put` cerrado con éxito, con el ETag del servidor si vino.
     Put(PendingOp, Option<String>),
     /// `delete` cerrado con éxito.
     Delete(PendingOp),
+    /// `set_color` cerrado: salió bien, o se dio por vencido en un error
+    /// permanente. En los dos casos se borra la op (el color ya está local; una
+    /// bajada posterior reconcilia si el empuje no llegó). No hay variante de
+    /// conflicto para el color: no tiene UI de local-vs-servidor.
+    SetColor(PendingOp),
     /// Conflicto o error permanente: se conserva lo local, la op queda en
     /// `conflict` con el detalle.
     Conflict(PendingOp, String),
@@ -321,6 +371,7 @@ async fn close<K: KeySource>(
         .with_store(account_id, move |store| match close {
             Close::Put(op, etag) => store.complete_put(&op, etag.as_deref()),
             Close::Delete(op) => store.complete_delete(&op),
+            Close::SetColor(op) => store.complete_set_color(&op),
             Close::Conflict(op, detail) => store.mark_conflict(&op, &detail),
             Close::Retry(op, detail) => store.retry_later(&op, &detail),
         })

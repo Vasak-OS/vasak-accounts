@@ -623,3 +623,142 @@ async fn apagar_el_almacen_vacia_la_cola() {
     assert!(f.manager.prepare_for_sync(CALENDAR_AREA, ACCOUNT).await);
     assert_eq!(f.pending().await, 0);
 }
+
+// ── El color del calendario (`set_color`) ───────────────────────────────
+
+impl Fixture {
+    async fn enqueue_set_color(&self, color: &str) {
+        let id = self.calendar.id;
+        let color = color.to_string();
+        self.manager
+            .with_store(ACCOUNT, move |store| store.enqueue_set_color(id, &color))
+            .await
+            .unwrap();
+    }
+
+    /// Cuántas ops hay en la cola y en qué estado, de cualquier objeto.
+    async fn op_states(&self) -> Vec<String> {
+        self.manager
+            .with_store(ACCOUNT, |store| {
+                Ok(store
+                    .pending_ops(CALENDAR_AREA)?
+                    .into_iter()
+                    .map(|op| format!("{:?}", op.state))
+                    .collect())
+            })
+            .await
+            .unwrap()
+    }
+}
+
+/// Un `set_color` que sale bien llega al servidor, se cuenta como empujado y
+/// cierra la op.
+#[tokio::test]
+async fn un_set_color_sube_el_color_y_cierra_la_op() {
+    let f = Fixture::new("replay-color-ok").await;
+    f.enqueue_set_color("#112233").await;
+    assert_eq!(f.pending().await, 1);
+
+    let report = f.replay().await;
+    assert_eq!(report.pushed, 1);
+    assert_eq!(report.conflicts, 0);
+    assert_eq!(report.remaining, 0);
+    assert_eq!(f.pending().await, 0);
+    assert_eq!(
+        f.server.state().collections[0].color.as_deref(),
+        Some("#112233")
+    );
+}
+
+/// Un error reintentable (`507`) deja la op para la próxima vuelta, en `ready`.
+#[tokio::test]
+async fn un_set_color_reintentable_queda_para_reintentar() {
+    let f = Fixture::new("replay-color-reintento").await;
+    f.server.state().force_write_status = Some(507);
+    f.enqueue_set_color("#112233").await;
+
+    let report = f.replay().await;
+    assert_eq!(report.retried, 1);
+    assert_eq!(report.pushed, 0);
+    assert_eq!(report.remaining, 1);
+    assert_eq!(f.op_states().await, vec!["Ready".to_string()]);
+    // Y cuando el servidor se recupera, el reintento llega.
+    f.server.state().force_write_status = None;
+    let report = f.replay().await;
+    assert_eq!(report.pushed, 1);
+    assert_eq!(f.pending().await, 0);
+}
+
+/// **Un error permanente descarta la op**, no la escala a conflicto: un color no
+/// tiene conflicto que resolver, y la próxima bajada trae el real.
+#[tokio::test]
+async fn un_set_color_permanente_se_descarta_sin_pasar_a_conflicto() {
+    for status in [500, 403, 404, 400] {
+        let f = Fixture::new("replay-color-permanente").await;
+        f.server.state().force_write_status = Some(status);
+        f.enqueue_set_color("#112233").await;
+
+        let report = f.replay().await;
+        assert_eq!(report.conflicts, 0, "{status}");
+        assert_eq!(report.retried, 0, "{status}");
+        assert_eq!(f.pending().await, 0, "{status}: la op se descartó");
+        assert!(f.op_states().await.is_empty(), "{status}");
+        // El color local (optimista) no se revierte al descartar.
+        let id = f.calendar.id;
+        let local: Option<String> = f
+            .manager
+            .with_store(ACCOUNT, move |store| {
+                Ok(store
+                    .connection()
+                    .query_row("SELECT color FROM calendars WHERE id = ?1", [id], |r| {
+                        r.get(0)
+                    })
+                    .unwrap())
+            })
+            .await
+            .unwrap();
+        assert_eq!(local.as_deref(), Some("#112233"), "{status}");
+    }
+}
+
+/// Un reintentable que no se arregla **se descarta al pasar el tope**, nunca
+/// escala a `conflict` (a diferencia de un `put`).
+#[tokio::test]
+async fn un_set_color_que_agota_los_reintentos_se_descarta_y_no_escala() {
+    let f = Fixture::new("replay-color-tope").await;
+    f.server.state().force_write_status = Some(507);
+    f.enqueue_set_color("#112233").await;
+
+    let mut conflicts = 0;
+    for _ in 0..MAX_REPLAY_ATTEMPTS {
+        conflicts += f.replay().await.conflicts;
+        assert!(
+            !f.op_states().await.contains(&"Conflict".to_string()),
+            "nunca queda en conflicto"
+        );
+    }
+    assert_eq!(conflicts, 0);
+    assert_eq!(f.pending().await, 0, "pasado el tope, la op se descartó");
+}
+
+/// Un `set_color` en el mismo calendario no pisa ni se mezcla con la op de un
+/// evento: las dos se empujan.
+#[tokio::test]
+async fn un_set_color_y_un_put_del_mismo_calendario_se_empujan_los_dos() {
+    let f = Fixture::new("replay-color-y-put").await;
+    f.enqueue_put("a.ics", &event("a", "Reunión", "20260928T140000Z"), None)
+        .await;
+    f.enqueue_set_color("#112233").await;
+    assert_eq!(f.pending().await, 2);
+
+    let report = f.replay().await;
+    assert_eq!(report.pushed, 2);
+    assert_eq!(f.pending().await, 0);
+    assert!(f.server.state().collections[0]
+        .resources
+        .contains_key("a.ics"));
+    assert_eq!(
+        f.server.state().collections[0].color.as_deref(),
+        Some("#112233")
+    );
+}

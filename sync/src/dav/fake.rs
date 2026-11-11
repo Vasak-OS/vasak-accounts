@@ -449,6 +449,7 @@ fn answer(state: &mut FakeState, request: &RecordedRequest) -> Answer {
     match request.method.as_str() {
         "PUT" => return put(state, request),
         "DELETE" => return delete(state, request),
+        "PROPPATCH" => return proppatch(state, request),
         _ => {}
     }
     let book = state
@@ -661,6 +662,46 @@ fn answer(state: &mut FakeState, request: &RecordedRequest) -> Answer {
 /// `If-Match: "<etag>"` reemplaza, y choca con `412` si el recurso no está o su
 /// ETag es otro. Cuando sale bien, sube la versión y contesta con el nuevo
 /// `ETag` —salvo que `omit_put_etag` pida no mandarlo—.
+/// Fija el `calendar-color` de una colección con `PROPPATCH`. Reconoce **sólo**
+/// esa propiedad —que es lo único que manda el cliente—: extrae el color del
+/// cuerpo y lo guarda en la colección cuyo `path` es el objetivo, de modo que el
+/// `PROPFIND` siguiente lo devuelve. Honra `force_write_status` para que una
+/// prueba pueda forzar un error. Una ruta que no es una colección da `404`.
+fn proppatch(state: &mut FakeState, request: &RecordedRequest) -> Answer {
+    if let Some(status) = state.force_write_status {
+        return (status, String::new()).into();
+    }
+    let Some(index) = state
+        .collections
+        .iter()
+        .position(|b| b.path == request.path)
+    else {
+        return (404, String::new()).into();
+    };
+    let Some(color) = color_from_proppatch(&request.body) else {
+        return (400, String::new()).into();
+    };
+    state.collections[index].color = Some(color);
+    // Un `207 Multistatus` con la propiedad en 200: el cliente sólo mira el estado
+    // de la respuesta HTTP, así que el cuerpo es el mínimo válido.
+    let body = format!(
+        "{CALDAV_HEAD}<d:response><d:href>{}</d:href><d:propstat>\
+         <d:prop><a:calendar-color/></d:prop><d:status>HTTP/1.1 200 OK</d:status>\
+         </d:propstat></d:response>{TAIL}",
+        request.path
+    );
+    (207, body).into()
+}
+
+/// El valor de `<a:calendar-color>…</a:calendar-color>` del cuerpo de un
+/// `PROPPATCH`, sin importar el prefijo de espacio de nombres. `None` si no está.
+fn color_from_proppatch(body: &str) -> Option<String> {
+    let open = body.find("calendar-color>")? + "calendar-color>".len();
+    let rest = &body[open..];
+    let end = rest.find('<')?;
+    Some(rest[..end].to_string())
+}
+
 fn put(state: &mut FakeState, request: &RecordedRequest) -> Answer {
     if let Some(status) = state.force_write_status {
         return (status, String::new()).into();

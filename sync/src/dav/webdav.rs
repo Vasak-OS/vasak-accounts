@@ -590,12 +590,19 @@ pub fn href_for_request(url: &url::Url) -> String {
 /// escritura que llegan con `vasak-accounts#23`.
 ///
 /// Un tipo y no un texto para que escribir en el servidor no se pueda hacer sin
-/// agregar una variante acá. La escritura entra con `PUT` y `DELETE`, y **sólo
-/// por [`DavClient::put`] y [`DavClient::delete`]**, que exigen una precondición
-/// de ETag: la prueba `el_cliente_solo_escribe_con_precondicion` lo fija.
-/// `PROPPATCH`, `MKCOL`, `MKCALENDAR`, `MOVE`… quedan afuera a propósito (fuera
-/// del alcance de M2). Qué gana en un conflicto lo decide la cola de
-/// operaciones (PR siguiente), no este cliente.
+/// agregar una variante acá. La escritura de **recursos** entra con `PUT` y
+/// `DELETE`, y **sólo por [`DavClient::put`] y [`DavClient::delete`]**, que exigen
+/// una precondición de ETag: la prueba `el_cliente_solo_escribe_con_precondicion`
+/// lo fija. `MKCOL`, `MKCALENDAR`, `MOVE`… siguen afuera a propósito.
+///
+/// `PROPPATCH` entra con una única capacidad acotada,
+/// [`DavClient::set_calendar_color`]: fija **sólo** la propiedad `calendar-color`
+/// de una colección, con un cuerpo que arma el propio cliente a partir de un color
+/// validado —nada de XML del llamador—. Va **sin** precondición de ETag a
+/// propósito: una colección no tiene un ETag por recurso, y el color es una
+/// preferencia de display, no un dato que se pierda (last-write-wins; una bajada
+/// posterior reconcilia). No es un `PROPPATCH` general: no hay forma de escribir
+/// otra propiedad por este camino.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
     Propfind,
@@ -606,15 +613,19 @@ pub enum Method {
     Put,
     #[cfg_attr(not(test), allow(dead_code))]
     Delete,
+    /// Sólo por [`DavClient::set_calendar_color`]; nunca un PROPPATCH general.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Proppatch,
 }
 
 impl Method {
     #[cfg(test)]
-    pub const ALL: [Method; 4] = [
+    pub const ALL: [Method; 5] = [
         Method::Propfind,
         Method::Report,
         Method::Put,
         Method::Delete,
+        Method::Proppatch,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -623,6 +634,7 @@ impl Method {
             Method::Report => "REPORT",
             Method::Put => "PUT",
             Method::Delete => "DELETE",
+            Method::Proppatch => "PROPPATCH",
         }
     }
 
@@ -963,6 +975,83 @@ impl DavClient {
         }
         Ok(())
     }
+
+    /// Fija el `calendar-color` de una colección con `PROPPATCH`, la **única**
+    /// escritura que no es `PUT`/`DELETE`.
+    ///
+    /// Acotada a propósito: el cuerpo lo arma este método a partir de un `color`
+    /// que **valida antes de tocar la red** ([`is_calendar_color`]: `#` y 6 u 8
+    /// dígitos hexadecimales), así que no hay forma de escribir otra propiedad ni
+    /// de inyectar XML por este camino. Va **sin precondición de ETag**: una
+    /// colección no tiene un ETag por recurso con el que condicionar, y el color
+    /// es una preferencia de display —last-write-wins; si choca con un cambio del
+    /// servidor, la próxima bajada trae el color real y reconcilia—, no un dato
+    /// que se pierda.
+    ///
+    /// Las mismas defensas que [`DavClient::put`]: sólo el origen de la cuenta (una
+    /// redirección mandaría la credencial a otro servidor), `Authorization`
+    /// sensible, y no se lee el cuerpo de la respuesta. El estado se mapea igual:
+    /// `401` credencial que no vale, una redirección se rechaza, y cualquier otro
+    /// estado que no sea éxito vuelve como [`DavError::Status`].
+    // Todavía sin llamador en el binario fuera de la cola de escritura; lo
+    // ejercitan las pruebas y lo usa `replay` para la op `set_color`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn set_calendar_color(&self, url: &url::Url, color: &str) -> Result<(), DavError> {
+        if url.origin() != self.home.origin() {
+            return Err(DavError::ForeignOrigin);
+        }
+        if !is_calendar_color(color) {
+            return Err(DavError::BadPrecondition);
+        }
+
+        // El cuerpo lo arma el cliente: una sola propiedad, un color ya validado.
+        // Se escapa igual, por defensa en profundidad, aunque un hexadecimal no
+        // trae caracteres especiales de XML.
+        let body = format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+             <d:propertyupdate xmlns:d=\"DAV:\" xmlns:a=\"http://apple.com/ns/ical/\">\
+             <d:set><d:prop><a:calendar-color>{}</a:calendar-color></d:prop></d:set>\
+             </d:propertyupdate>",
+            xml_escape(color)
+        );
+
+        let response = self
+            .http
+            .request(Method::Proppatch.to_reqwest(), url.clone())
+            .header(reqwest::header::AUTHORIZATION, self.authorization.clone())
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/xml; charset=utf-8",
+            )
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| DavError::network(e.without_url()))?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(DavError::Unauthorized);
+        }
+        if status.is_redirection() {
+            return Err(DavError::Redirect(status.as_u16()));
+        }
+        if !status.is_success() {
+            return Err(DavError::Status(status.as_u16()));
+        }
+        Ok(())
+    }
+}
+
+/// Si un texto es un `calendar-color` que el cliente acepta escribir: un `#`
+/// seguido de 6 (`#RRGGBB`) u 8 (`#RRGGBBAA`) dígitos hexadecimales. Nada más
+/// llega al servidor —ni texto libre ni XML—, así que la escritura del color no
+/// puede inyectar otra propiedad ni romper el cuerpo.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn is_calendar_color(color: &str) -> bool {
+    let Some(hex) = color.strip_prefix('#') else {
+        return false;
+    };
+    (hex.len() == 6 || hex.len() == 8) && hex.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Lee el cuerpo de una respuesta, cortando apenas pasa el tope.
@@ -2037,36 +2126,42 @@ mod tests {
     #[test]
     fn el_cliente_solo_escribe_con_precondicion() {
         for method in Method::ALL {
+            // Qué verbos escriben en el servidor. `PROPPATCH` escribe, pero **sólo**
+            // la propiedad `calendar-color` por `set_calendar_color` (ver su doc);
+            // `PUT`/`DELETE` escriben recursos.
             let writes = match method {
                 Method::Propfind | Method::Report => false,
-                Method::Put | Method::Delete => true,
+                Method::Put | Method::Delete | Method::Proppatch => true,
             };
-            // Sólo `PUT` y `DELETE` escriben; ningún otro verbo de escritura
-            // entró.
+            // La precondición de ETag es **obligatoria** para los escritores de
+            // recursos (`PUT`/`DELETE`). `PROPPATCH` va sin ella a propósito: una
+            // colección no tiene un ETag por recurso y el color es last-write-wins.
+            let needs_etag_precondition = matches!(method, Method::Put | Method::Delete);
             assert_eq!(
                 writes,
+                matches!(method.as_str(), "PUT" | "DELETE" | "PROPPATCH"),
+                "{}",
+                method.as_str()
+            );
+            assert_eq!(
+                needs_etag_precondition,
                 matches!(method.as_str(), "PUT" | "DELETE"),
                 "{}",
                 method.as_str()
             );
+            // Ningún otro verbo de escritura entró: el único PROPPATCH es el del
+            // color, y MKCOL/MKCALENDAR/MOVE/COPY/LOCK/UNLOCK/POST/PATCH siguen
+            // afuera.
             assert!(
                 !matches!(
                     method.as_str(),
-                    "POST"
-                        | "PATCH"
-                        | "PROPPATCH"
-                        | "MKCOL"
-                        | "MKCALENDAR"
-                        | "MOVE"
-                        | "COPY"
-                        | "LOCK"
-                        | "UNLOCK"
+                    "POST" | "PATCH" | "MKCOL" | "MKCALENDAR" | "MOVE" | "COPY" | "LOCK" | "UNLOCK"
                 ),
                 "{}",
                 method.as_str()
             );
         }
-        assert_eq!(Method::ALL.len(), 4);
+        assert_eq!(Method::ALL.len(), 5);
 
         // La precondición es un valor que hay que elegir: las dos formas, y nada
         // más. El `match` sin comodín hace que una tercera no compile sin pasar
@@ -2410,6 +2505,182 @@ mod tests {
         assert_eq!(
             client.delete(&card, "\"v1\"").await,
             Err(DavError::Status(500))
+        );
+    }
+
+    // ── El color del calendario (PROPPATCH) ──────────────────────────────
+
+    /// Sólo `#RRGGBB` y `#RRGGBBAA` son un color escribible.
+    #[test]
+    fn un_color_de_calendario_es_hash_y_seis_u_ocho_hexadecimales() {
+        for ok in [
+            "#FF5733",
+            "#ff5733",
+            "#Ff5733",
+            "#FF573380",
+            "#ff5733aa",
+            "#000000",
+        ] {
+            assert!(is_calendar_color(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "#",
+            "FF5733",
+            "#FFF",
+            "#FFFF",
+            "#FFFFF",
+            "#FFFFFFF",
+            "#FFFFFFFFF",
+            "#GGGGGG",
+            "#FF573Z",
+            " #FF5733",
+            "#FF5733 ",
+            "#FF 733",
+            "red",
+            "#FF5733<",
+            "#é12345",
+        ] {
+            assert!(!is_calendar_color(bad), "{bad:?}");
+        }
+    }
+
+    /// Fijar el color llega al servidor y el `PROPFIND` siguiente lo devuelve.
+    #[tokio::test]
+    async fn set_calendar_color_fija_el_color_y_el_propfind_lo_devuelve() {
+        let server = FakeDav::start_caldav().await;
+        let client = client_for(&server);
+        let calendar = server.collection_url(0);
+
+        assert_eq!(
+            client.set_calendar_color(&calendar, "#112233").await,
+            Ok(())
+        );
+
+        let (calendars, _) = crate::dav::caldav::list_calendars(&client).await.unwrap();
+        assert_eq!(calendars[0].color.as_deref(), Some("#112233"));
+        let sent = server
+            .requests()
+            .into_iter()
+            .find(|r| r.method == "PROPPATCH")
+            .expect("salió un PROPPATCH");
+        assert_eq!(sent.path, "/dav/ana/personal/");
+        assert_eq!(sent.content_type, "application/xml; charset=utf-8");
+        assert!(sent.authorization.starts_with("Basic "));
+        // Sin precondición de ETag a propósito.
+        assert!(sent.if_match.is_empty() && sent.if_none_match.is_empty());
+    }
+
+    /// El cuerpo lo arma el cliente: el color y `calendar-color`, y ninguna otra
+    /// propiedad.
+    #[tokio::test]
+    async fn set_calendar_color_manda_solo_la_propiedad_del_color() {
+        let server = FakeDav::start_caldav().await;
+        let client = client_for(&server);
+        client
+            .set_calendar_color(&server.collection_url(0), "#AABBCC80")
+            .await
+            .unwrap();
+
+        let body = server
+            .requests()
+            .into_iter()
+            .find(|r| r.method == "PROPPATCH")
+            .unwrap()
+            .body;
+        let document = roxmltree::Document::parse(&body).unwrap();
+        let props: Vec<_> = document
+            .descendants()
+            .filter(|n| n.parent().is_some_and(|p| p.has_tag_name((NS_DAV, "prop"))))
+            .collect();
+        assert_eq!(props.len(), 1, "una sola propiedad: {body}");
+        assert_eq!(props[0].tag_name().name(), "calendar-color");
+        assert_eq!(props[0].text(), Some("#AABBCC80"));
+        // Y ni `remove` ni otra propiedad (displayname, resourcetype…).
+        assert!(!body.contains("remove"));
+        assert!(!body.contains("displayname"));
+        assert!(!body.contains("resourcetype"));
+    }
+
+    /// **Un color inválido no toca la red**: se rechaza como precondición mala y
+    /// el servidor no recibe ni un pedido.
+    #[tokio::test]
+    async fn set_calendar_color_con_un_color_invalido_no_toca_la_red() {
+        let server = FakeDav::start_caldav().await;
+        let client = client_for(&server);
+        let calendar = server.collection_url(0);
+
+        for bad in ["rojo", "#FFF", "#GGGGGG", "", "#FF5733</a:calendar-color>"] {
+            assert_eq!(
+                client.set_calendar_color(&calendar, bad).await,
+                Err(DavError::BadPrecondition),
+                "{bad:?}"
+            );
+        }
+        assert!(server.requests().is_empty(), "no se tocó la red");
+        assert_eq!(
+            server.state().collections[0].color.as_deref(),
+            Some("#FF5733"),
+            "el color del servidor no cambió"
+        );
+    }
+
+    /// Una dirección de otro origen no sale, igual que un `PUT`.
+    #[tokio::test]
+    async fn set_calendar_color_a_otro_origen_no_sale() {
+        let server = FakeDav::start_caldav().await;
+        let other = FakeDav::start_caldav().await;
+        let client = client_for(&server);
+
+        assert_eq!(
+            client
+                .set_calendar_color(&other.collection_url(0), "#112233")
+                .await,
+            Err(DavError::ForeignOrigin)
+        );
+        assert!(other.requests().is_empty(), "no se tocó el otro servidor");
+        assert!(server.requests().is_empty());
+    }
+
+    /// El mapeo de estados es el de las demás escrituras.
+    #[tokio::test]
+    async fn set_calendar_color_mapea_los_estados_del_servidor() {
+        for (status, expected) in [
+            (401, DavError::Unauthorized),
+            (302, DavError::Redirect(302)),
+            (500, DavError::Status(500)),
+            (503, DavError::Status(503)),
+            (403, DavError::Status(403)),
+        ] {
+            let server = FakeDav::start_caldav().await;
+            server.state().force_write_status = Some(status);
+            let client = client_for(&server);
+            assert_eq!(
+                client
+                    .set_calendar_color(&server.collection_url(0), "#112233")
+                    .await,
+                Err(expected),
+                "{status}"
+            );
+            assert_eq!(
+                server.state().collections[0].color.as_deref(),
+                Some("#FF5733"),
+                "un error no cambia el color"
+            );
+        }
+    }
+
+    /// El servidor de mentira contesta `404` a un `PROPPATCH` sobre algo que no
+    /// es una colección.
+    #[tokio::test]
+    async fn un_proppatch_a_una_ruta_que_no_es_coleccion_da_404() {
+        let server = FakeDav::start_caldav().await;
+        let client = client_for(&server);
+        let nowhere = server.home_url().join("no-existe/").unwrap();
+
+        assert_eq!(
+            client.set_calendar_color(&nowhere, "#112233").await,
+            Err(DavError::Status(404))
         );
     }
 

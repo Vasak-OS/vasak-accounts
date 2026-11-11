@@ -26,6 +26,7 @@ interface ar.net.vasak.os.AccountsStore
   method ResolveConflict(in s account_id, in s area, in s id, in s choice, out s)
   method SearchContacts(in s account_id, in s query, in s cursor, in u limit, out s)
   method SearchMessages(in s account_id, in s query, in x mailbox_id, in s cursor, in u limit, out s)
+  method SetCalendarColor(in s account_id, in s calendar_id, in s color, out s)
   method SetStoreEnabled(in s account_id, in b enabled)
   signal Changed(s area, s account_id, t generation)
   signal StatusChanged()

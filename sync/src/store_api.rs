@@ -55,7 +55,7 @@ use crate::access::{
 use crate::broker::{self, BrokerError};
 use crate::calendar_sync::{CalendarScheduler, CalendarSync, CALENDAR_TICK};
 use crate::contacts_sync::{ContactsScheduler, ContactsSync, CONTACTS_TICK};
-use crate::dav::webdav::{HttpPolicy, Limits};
+use crate::dav::webdav::{is_calendar_color, HttpPolicy, Limits};
 use crate::dav_sync::BrokerCredentials;
 use crate::email_sync::{EmailScheduler, EmailSync, MailboxToken, EMAIL_TICK};
 use crate::ical::recurrence::ExpansionLimits;
@@ -1381,6 +1381,53 @@ impl<K: KeySource> StoreApi<K> {
             if_match,
         )
         .await
+    }
+
+    /// Fija el color de un calendario, **encolándolo** hacia el servidor con
+    /// `PROPPATCH` (`calendar-color`). Actualiza el color local en el acto —la
+    /// ventana lo refleja sin esperar la red— y la señal `Changed` del área sale
+    /// sola; el empuje lo lleva al servidor en la próxima vuelta. Es
+    /// last-write-wins: no exige precondición de ETag (una colección no tiene un
+    /// ETag por recurso) y, si choca con un cambio del servidor, una bajada
+    /// posterior trae el color real y reconcilia —un color no es dato que se pierda—.
+    ///
+    /// `color` es `#RRGGBB` o `#RRGGBBAA`; cualquier otra cosa da `InvalidArgs` sin
+    /// tocar nada —no hay forma de que un valor libre llegue al servidor—.
+    /// `calendar_id` es el número local del calendario. Devuelve `{}`.
+    ///
+    /// Autoriza con `store.calendar` **antes** de actuar, y respeta el límite por
+    /// llamante.
+    async fn set_calendar_color(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        account_id: String,
+        calendar_id: String,
+        color: String,
+    ) -> zbus::fdo::Result<String> {
+        let calendar_id = contacts_read::parse_id(&calendar_id).map_err(invalid)?;
+        // Se valida **antes** de autorizar o tocar la base: un color que no es un
+        // hexadecimal no llega nunca al servidor ni a la columna local.
+        if !is_calendar_color(&color) {
+            return Err(invalid(InvalidArgument("el color es #RRGGBB o #RRGGBBAA")));
+        }
+        let account = self
+            .manager
+            .area_account(CALENDAR_AREA, &account_id)
+            .await
+            .map_err(to_fdo)?;
+        self.authorize(&header, CALENDAR_RESOURCE, &account.display_name)
+            .await?;
+        self.caller_limit(&header, &account_id)?;
+        self.activate_after_read(CALENDAR_AREA, &account_id, &account)
+            .await;
+        self.manager
+            .with_store(&account_id, move |store| {
+                store.enqueue_set_color(calendar_id, &color)
+            })
+            .await
+            .map_err(read_error)?;
+        self.ask_for_sync(CALENDAR_AREA, &account_id);
+        Ok("{}".to_string())
     }
 
     /// Borra una tarea, **encolando** el borrado hacia el servidor. Un `VTODO` se
@@ -3696,6 +3743,7 @@ mod tests {
                 "ResolveConflict",
                 "SearchContacts",
                 "SearchMessages",
+                "SetCalendarColor",
                 "SetStoreEnabled",
                 "StatusChanged"
             ]
@@ -5326,6 +5374,131 @@ mod tests {
                 .is_err(),
             "una escritura negada no avisa por Changed"
         );
+    }
+
+    /// El color que tiene un calendario en la base local.
+    async fn local_color_of(api: &Api, account: &str, calendar_id: i64) -> Option<String> {
+        api.manager
+            .read_store(account, move |store| {
+                Ok(store
+                    .connection()
+                    .query_row(
+                        "SELECT color FROM calendars WHERE id = ?1",
+                        [calendar_id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .unwrap())
+            })
+            .await
+            .unwrap()
+    }
+
+    /// `SetCalendarColor` con un color válido **encola**: contesta `{}`, el color
+    /// local cambia en el acto y queda una op `set_color` sobre el calendario.
+    #[tokio::test]
+    async fn set_calendar_color_encola_el_color() {
+        let mut api = Api::new("api-color-ok", vec![with_both("cuenta")], Answer::Allow).await;
+        let cal_id = api
+            .manager
+            .with_store("cuenta", |store| Ok(calendar(store, "https://x/a/").id))
+            .await
+            .unwrap();
+        let (client, _service) = api.client(":1.7").await;
+
+        for color in ["#112233", "#aabbcc80"] {
+            let result = call(
+                &client,
+                "SetCalendarColor",
+                &("cuenta", cal_id.to_string(), color),
+            )
+            .await;
+            assert_eq!(result.unwrap(), "{}", "{color}");
+            assert_eq!(
+                local_color_of(&api, "cuenta", cal_id).await.as_deref(),
+                Some(color)
+            );
+        }
+
+        let ops = pending_ops_of(&api, "cuenta", CALENDAR_AREA).await;
+        assert_eq!(ops.len(), 1, "la última pisa a la anterior");
+        assert_eq!(ops[0].kind, PendingKind::SetColor);
+        assert_eq!(ops[0].object_href, "https://x/a/");
+        assert_eq!(ops[0].payload.as_deref(), Some(b"#aabbcc80".as_slice()));
+    }
+
+    /// **Un color inválido se rechaza antes de tocar nada**: `InvalidArgs`, ni
+    /// pregunta por el permiso, ni encola, ni cambia el color local.
+    #[tokio::test]
+    async fn set_calendar_color_con_un_color_invalido_no_toca_nada() {
+        let mut api = Api::new("api-color-bad", vec![with_both("cuenta")], Answer::Allow).await;
+        let (cal_id, before) = api
+            .manager
+            .with_store("cuenta", |store| {
+                let cal = calendar(store, "https://x/a/");
+                let color: Option<String> = store
+                    .connection()
+                    .query_row("SELECT color FROM calendars WHERE id = ?1", [cal.id], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                Ok((cal.id, color))
+            })
+            .await
+            .unwrap();
+        let (client, _service) = api.client(":1.7").await;
+
+        for bad in [
+            "",
+            "rojo",
+            "112233",
+            "#FFF",
+            "#GGGGGG",
+            "#1122334",
+            "#112233</a:calendar-color>",
+        ] {
+            let result = call(
+                &client,
+                "SetCalendarColor",
+                &("cuenta", cal_id.to_string(), bad),
+            )
+            .await;
+            assert_eq!(error_name(&result), INVALID_ARGS, "{bad:?}");
+        }
+
+        assert_eq!(api.access.permissions.calls(), 0, "no se pidió permiso");
+        assert_eq!(pending_count_of(&api, "cuenta", CALENDAR_AREA).await, 0);
+        assert_eq!(local_color_of(&api, "cuenta", cal_id).await, before);
+    }
+
+    /// Sin permiso, `SetCalendarColor` no actúa; y un calendario que no existe es
+    /// `InvalidArgs` sin dejar una op.
+    #[tokio::test]
+    async fn set_calendar_color_sin_permiso_o_sin_calendario_no_encola() {
+        let mut api = Api::new("api-color-deny", vec![with_both("cuenta")], Answer::Deny).await;
+        let cal_id = api
+            .manager
+            .with_store("cuenta", |store| Ok(calendar(store, "https://x/a/").id))
+            .await
+            .unwrap();
+        let (client, _service) = api.client(":1.7").await;
+        let result = call(
+            &client,
+            "SetCalendarColor",
+            &("cuenta", cal_id.to_string(), "#112233"),
+        )
+        .await;
+        assert_eq!(error_name(&result), ACCESS_DENIED);
+        assert_eq!(pending_count_of(&api, "cuenta", CALENDAR_AREA).await, 0);
+        assert_ne!(
+            local_color_of(&api, "cuenta", cal_id).await.as_deref(),
+            Some("#112233")
+        );
+
+        let mut api = Api::new("api-color-nocal", vec![with_both("cuenta")], Answer::Allow).await;
+        let (client, _service) = api.client(":1.7").await;
+        let result = call(&client, "SetCalendarColor", &("cuenta", "999", "#112233")).await;
+        assert_eq!(error_name(&result), INVALID_ARGS);
+        assert_eq!(pending_count_of(&api, "cuenta", CALENDAR_AREA).await, 0);
     }
 
     /// **La validación de los identificadores va antes del permiso y de la

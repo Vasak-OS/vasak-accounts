@@ -282,6 +282,14 @@ async fn resolve_op<K: KeySource>(
                 }
             }
         }
+        PendingKind::SetColor => {
+            // El color de un calendario por Graph tiene su propio modelo (no es un
+            // PROPPATCH de CalDAV) y está fuera de alcance: se descarta la op sin
+            // empujar. El color local quedó fijado al encolar; una bajada posterior
+            // reconcilia. (Decisión 2: lo no implementado no rompe.)
+            tracing::info!("'{account_id}': set_color no se empuja sobre Graph; se descarta");
+            return close(manager, account_id, Close::SetColor(op)).await;
+        }
     };
     close(manager, account_id, decision).await?;
 
@@ -647,6 +655,9 @@ enum Close {
     Put(PendingOp, Option<String>),
     /// `DELETE` cerrado.
     Delete(PendingOp),
+    /// `set_color` descartado: Graph no empuja el color (fuera de alcance). Sólo
+    /// borra la op; el color local quedó al encolar y la bajada reconcilia.
+    SetColor(PendingOp),
     /// Conflicto o error firme: se conserva el local, la op queda en `conflict`.
     Conflict(PendingOp, String),
     /// Para reintentar.
@@ -664,6 +675,7 @@ async fn close<K: KeySource>(
             Close::Create(op, href, etag) => store.complete_create(&op, &href, etag.as_deref()),
             Close::Put(op, etag) => store.complete_put(&op, etag.as_deref()),
             Close::Delete(op) => store.complete_delete(&op),
+            Close::SetColor(op) => store.complete_set_color(&op),
             Close::Conflict(op, detail) => store.mark_conflict(&op, &detail),
             Close::Retry(op, detail) => store.retry_later(&op, &detail),
         })
