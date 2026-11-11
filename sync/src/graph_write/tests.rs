@@ -1601,6 +1601,41 @@ mod end_to_end_calendar {
         }
     }
 
+    /// **El color de un calendario no se empuja por Graph**: la op `set_color` se
+    /// descarta —sin ningún pedido a Graph, ni `PATCH` ni nada— y el color local
+    /// (optimista) se queda; jamás pasa a conflicto.
+    #[tokio::test]
+    async fn un_set_color_se_descarta_sin_pedir_nada_a_graph() {
+        let f = Fixture::new("graph-cal-color").await;
+        let id = f.calendar.id;
+        f.manager
+            .with_store(ACCOUNT, move |store| store.enqueue_set_color(id, "#112233"))
+            .await
+            .unwrap();
+        assert_eq!(f.pending().await, 1);
+
+        let report = f.replay().await;
+
+        assert!(f.server.requests().is_empty(), "no se tocó Graph");
+        assert_eq!(f.pending().await, 0, "la op se descartó");
+        assert_eq!(report.conflicts, 0);
+        assert_eq!(report.remaining, 0);
+        assert_eq!(f.op_state(COLLECTION).await, None);
+        let color: Option<String> = f
+            .manager
+            .with_store(ACCOUNT, move |store| {
+                Ok(store
+                    .connection()
+                    .query_row("SELECT color FROM calendars WHERE id = ?1", [id], |r| {
+                        r.get(0)
+                    })
+                    .unwrap())
+            })
+            .await
+            .unwrap();
+        assert_eq!(color.as_deref(), Some("#112233"));
+    }
+
     /// **Crear**: `POST /me/events` con `transactionId` (idempotencia de Graph) sacado
     /// del `href` local, sin `If-Match`; el `href` se re-basa al `id` del servidor y
     /// el ETag queda guardado.

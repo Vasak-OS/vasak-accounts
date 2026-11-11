@@ -39,6 +39,12 @@ pub enum PendingKind {
     Put,
     /// Borrar.
     Delete,
+    /// Fijar el `calendar-color` de una **colección** (no de un objeto): el color
+    /// va en `payload` y `object_href` es el propio href del calendario. Va con
+    /// `PROPPATCH`, sin precondición de ETag (una colección no tiene un ETag por
+    /// recurso), y es last-write-wins: una op nueva pisa la anterior sin confirmar
+    /// y, si falla permanente, la próxima bajada trae el color real y reconcilia.
+    SetColor,
 }
 
 impl PendingKind {
@@ -46,6 +52,7 @@ impl PendingKind {
         match self {
             PendingKind::Put => "put",
             PendingKind::Delete => "delete",
+            PendingKind::SetColor => "set_color",
         }
     }
 
@@ -53,6 +60,7 @@ impl PendingKind {
         match text {
             "put" => Some(PendingKind::Put),
             "delete" => Some(PendingKind::Delete),
+            "set_color" => Some(PendingKind::SetColor),
             _ => None,
         }
     }
@@ -326,6 +334,53 @@ impl Store {
         Ok(())
     }
 
+    /// Encola fijar el color de un calendario, por su `id` local. Resuelve el href
+    /// del calendario, actualiza su columna `color` en el acto —optimista, para que
+    /// la ventana lo refleje sin esperar la red— y suma una op `set_color` cuyo
+    /// `object_href` es ese mismo href: una por calendario, la última pisa la
+    /// anterior sin confirmar (misma `UNIQUE (area, object_href)`). El `color` llega
+    /// **ya validado** por la superficie D-Bus (`#RRGGBB`/`#RRGGBBAA`); acá se
+    /// guarda tal cual, como `payload` de la op y como columna local.
+    ///
+    /// Si la op falla permanente en el empuje, la próxima bajada trae el color real
+    /// del servidor y pisa el local: no hay dato que se pierda. Un `id` que no es de
+    /// ningún calendario es un argumento inválido.
+    pub fn enqueue_set_color(&mut self, calendar_id: i64, color: &str) -> Result<(), StoreError> {
+        let transaction = self.connection.transaction().map_err(classify)?;
+        let href: Option<String> = transaction
+            .query_row(
+                "SELECT href FROM calendars WHERE id = ?1",
+                [calendar_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(classify)?;
+        let Some(href) = href else {
+            return Err(StoreError::InvalidArgument(
+                "no hay un calendario con ese id".into(),
+            ));
+        };
+        transaction
+            .execute(
+                "UPDATE calendars SET color = ?2 WHERE id = ?1",
+                rusqlite::params![calendar_id, color],
+            )
+            .map_err(classify)?;
+        insert_pending_op(
+            &transaction,
+            CALENDAR_AREA,
+            &href,
+            &href,
+            PendingKind::SetColor,
+            None,
+            Some(color.as_bytes()),
+        )?;
+        let generation = bump_generation(&transaction, CALENDAR_AREA)?;
+        transaction.commit().map_err(classify)?;
+        self.note_change(CALENDAR_AREA, generation);
+        Ok(())
+    }
+
     /// Las ops pendientes de un área, en el orden en que se encolaron.
     pub fn pending_ops(&self, area: &str) -> Result<Vec<PendingOp>, StoreError> {
         let mut statement = self
@@ -410,6 +465,20 @@ impl Store {
             )
             .map_err(classify)?;
         Ok(affected > 0)
+    }
+
+    /// Cierra una op `set_color`: sólo borra la op (el color ya quedó en la
+    /// columna del calendario al encolar; no hay fila de objeto que tocar).
+    /// **Condicional a `id`+`revision`**: si una op de color nueva la reemplazó
+    /// mientras el empuje hablaba con la red, no se toca —se deja viva la nueva—.
+    /// No sube la generación: el color visible ya cambió al encolar, cerrar no lo
+    /// cambia. También es el cierre de «darse por vencido» en un error permanente:
+    /// se descarta la op y la próxima bajada trae el color real del servidor.
+    pub fn complete_set_color(&mut self, op: &PendingOp) -> Result<(), StoreError> {
+        let transaction = self.connection.transaction().map_err(classify)?;
+        Self::close_op(&transaction, op)?;
+        transaction.commit().map_err(classify)?;
+        Ok(())
     }
 
     /// Cierra un `put` que salió bien. Con `new_etag`, el del recurso recién
@@ -1786,5 +1855,151 @@ mod tests {
             store.resolve_conflict("email", 1, ConflictChoice::KeepLocal),
             Err(StoreError::InvalidArgument(_))
         ));
+    }
+
+    // ── El color del calendario (`set_color`) ────────────────────────────
+
+    const CAL: &str = "https://x/c/";
+
+    fn local_color(store: &Store, id: i64) -> Option<String> {
+        store
+            .connection()
+            .query_row("SELECT color FROM calendars WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    /// Encolar el color lo fija ya en la columna local y suma una op `set_color`
+    /// sobre el href del propio calendario, con el color de `payload` y sin ETag.
+    #[test]
+    fn encolar_el_color_lo_fija_local_y_suma_la_op() {
+        use super::super::calendar::tests::calendar;
+        let temp = TempDir::new("cola-color");
+        let mut store = open_store(&temp);
+        let cal = calendar(&mut store, CAL);
+        assert_eq!(local_color(&store, cal.id).as_deref(), Some("#FF0000"));
+
+        store.enqueue_set_color(cal.id, "#00FF00").unwrap();
+
+        assert_eq!(local_color(&store, cal.id).as_deref(), Some("#00FF00"));
+        let ops = store.pending_ops(CALENDAR_AREA).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].kind, PendingKind::SetColor);
+        assert_eq!(ops[0].object_href, CAL);
+        assert_eq!(ops[0].collection_href, CAL);
+        assert_eq!(ops[0].payload.as_deref(), Some(b"#00FF00".as_slice()));
+        assert_eq!(ops[0].base_etag, None, "sin precondición de ETag");
+        assert_eq!(ops[0].state, PendingState::Ready);
+    }
+
+    /// Re-encolar pisa la op anterior: una sola por calendario, con el color nuevo
+    /// y la revisión más alta.
+    #[test]
+    fn re_encolar_el_color_pisa_la_op_anterior() {
+        use super::super::calendar::tests::calendar;
+        let temp = TempDir::new("cola-color-pisa");
+        let mut store = open_store(&temp);
+        let cal = calendar(&mut store, CAL);
+        store.enqueue_set_color(cal.id, "#111111").unwrap();
+        let first = store.pending_ops(CALENDAR_AREA).unwrap().remove(0);
+
+        store.enqueue_set_color(cal.id, "#222222").unwrap();
+
+        let ops = store.pending_ops(CALENDAR_AREA).unwrap();
+        assert_eq!(ops.len(), 1, "una sola op por calendario");
+        assert_eq!(ops[0].payload.as_deref(), Some(b"#222222".as_slice()));
+        assert!(ops[0].revision > first.revision);
+        assert_eq!(local_color(&store, cal.id).as_deref(), Some("#222222"));
+    }
+
+    /// Un calendario que no existe es un argumento inválido y no deja nada.
+    #[test]
+    fn encolar_el_color_de_un_calendario_inexistente_es_invalido() {
+        use super::super::calendar::tests::calendar;
+        let temp = TempDir::new("cola-color-inexistente");
+        let mut store = open_store(&temp);
+        let cal = calendar(&mut store, CAL);
+
+        assert!(matches!(
+            store.enqueue_set_color(cal.id + 100, "#00FF00"),
+            Err(StoreError::InvalidArgument(_))
+        ));
+        assert_eq!(store.pending_count(CALENDAR_AREA).unwrap(), 0);
+        assert_eq!(local_color(&store, cal.id).as_deref(), Some("#FF0000"));
+    }
+
+    /// La op de color y la de un evento del mismo calendario no chocan: son dos
+    /// ops (distinto `object_href`), y cerrar una no toca la otra.
+    #[test]
+    fn la_op_de_color_no_choca_con_la_de_un_evento() {
+        use super::super::calendar::tests::{calendar, object, weekly, window};
+        let temp = TempDir::new("cola-color-y-put");
+        let mut store = open_store(&temp);
+        let cal = calendar(&mut store, CAL);
+        let w = window();
+        let event = object("https://x/c/a.ics", &weekly("a", "20260926T130000Z"), w);
+        store.enqueue_calendar_put(&cal, &event, w).unwrap();
+        store.enqueue_set_color(cal.id, "#00FF00").unwrap();
+
+        let ops = store.pending_ops(CALENDAR_AREA).unwrap();
+        assert_eq!(ops.len(), 2);
+        assert!(ops.iter().any(|op| op.kind == PendingKind::Put));
+        let color = ops
+            .iter()
+            .find(|op| op.kind == PendingKind::SetColor)
+            .unwrap()
+            .clone();
+
+        store.complete_set_color(&color).unwrap();
+
+        let left = store.pending_ops(CALENDAR_AREA).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].kind, PendingKind::Put, "la del evento sigue");
+        let marked: i64 = store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM calendar_objects WHERE pending_op = 'put'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(marked, 1, "la fila del evento sigue marcada");
+    }
+
+    /// Cerrar la op de color sólo la borra; el color local se queda.
+    #[test]
+    fn cerrar_el_color_borra_la_op_y_deja_el_color_local() {
+        use super::super::calendar::tests::calendar;
+        let temp = TempDir::new("cola-color-cierra");
+        let mut store = open_store(&temp);
+        let cal = calendar(&mut store, CAL);
+        store.enqueue_set_color(cal.id, "#00FF00").unwrap();
+        let op = store.pending_ops(CALENDAR_AREA).unwrap().remove(0);
+
+        store.complete_set_color(&op).unwrap();
+
+        assert_eq!(store.pending_count(CALENDAR_AREA).unwrap(), 0);
+        assert_eq!(local_color(&store, cal.id).as_deref(), Some("#00FF00"));
+    }
+
+    /// **Cierre condicional a la revisión**: si un color nuevo reemplazó la op
+    /// mientras el empuje hablaba con la red, cerrar con la foto vieja no borra la
+    /// nueva.
+    #[test]
+    fn cerrar_el_color_con_una_foto_vieja_no_borra_la_op_nueva() {
+        use super::super::calendar::tests::calendar;
+        let temp = TempDir::new("cola-color-foto-vieja");
+        let mut store = open_store(&temp);
+        let cal = calendar(&mut store, CAL);
+        store.enqueue_set_color(cal.id, "#111111").unwrap();
+        let snapshot = store.pending_ops(CALENDAR_AREA).unwrap().remove(0);
+        store.enqueue_set_color(cal.id, "#222222").unwrap();
+
+        store.complete_set_color(&snapshot).unwrap();
+
+        let ops = store.pending_ops(CALENDAR_AREA).unwrap();
+        assert_eq!(ops.len(), 1, "la op nueva sobrevive");
+        assert_eq!(ops[0].payload.as_deref(), Some(b"#222222".as_slice()));
     }
 }

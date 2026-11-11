@@ -791,6 +791,47 @@ WHERE ltrim(text_body, char(32) || char(9) || char(10) || char(13)) LIKE '-----B
    OR ltrim(html_body, char(32) || char(9) || char(10) || char(13)) LIKE '-----BEGIN PGP %';
 ";
 
+/// v16 (vasak-calendar#6, punto 4b): `op` admite `set_color` para fijar el color
+/// de un calendario (`PROPPATCH` de `calendar-color`), además de `put`/`delete`.
+///
+/// El `CHECK` de la columna `op` (V5) sólo dejaba `put`/`delete`, y SQLite **no
+/// altera un `CHECK`**: hay que reconstruir la tabla (crear, copiar, renombrar) y
+/// recrear su índice. Se conservan todas las columnas —incluidas las `server_etag`
+/// / `server_raw` de la V6— y todos los datos; lo único que cambia es el `CHECK`.
+/// La tabla sigue siendo `STRICT` y mantiene su `UNIQUE (area, object_href)`.
+const V16: &str = "
+CREATE TABLE pending_dav_ops_new (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    area            TEXT NOT NULL CHECK (area IN ('calendar', 'contacts')),
+    collection_href TEXT NOT NULL,
+    object_href     TEXT NOT NULL,
+    op              TEXT NOT NULL CHECK (op IN ('put', 'delete', 'set_color')),
+    base_etag       TEXT,
+    payload         BLOB,
+    state           TEXT NOT NULL DEFAULT 'ready' CHECK (state IN ('ready', 'conflict')),
+    created_at      TEXT NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT,
+    revision        INTEGER NOT NULL DEFAULT 0,
+    server_etag     TEXT,
+    server_raw      BLOB,
+    UNIQUE (area, object_href)
+) STRICT;
+
+INSERT INTO pending_dav_ops_new
+    (id, area, collection_href, object_href, op, base_etag, payload, state,
+     created_at, attempts, last_error, revision, server_etag, server_raw)
+SELECT
+    id, area, collection_href, object_href, op, base_etag, payload, state,
+    created_at, attempts, last_error, revision, server_etag, server_raw
+FROM pending_dav_ops;
+
+DROP TABLE pending_dav_ops;
+ALTER TABLE pending_dav_ops_new RENAME TO pending_dav_ops;
+
+CREATE INDEX pending_dav_ops_by_area ON pending_dav_ops (area, id);
+";
+
 /// Todas las migraciones, en orden.
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
@@ -809,6 +850,7 @@ pub fn migrations() -> Migrations<'static> {
         M::up(V13),
         M::up(V14),
         M::up(V15),
+        M::up(V16),
     ])
 }
 
@@ -845,7 +887,7 @@ mod tests {
         let mut connection = Connection::open_in_memory().unwrap();
         apply(&mut connection).unwrap();
         let version = schema_version(&connection).unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, 16);
 
         let tables = |c: &Connection| -> Vec<String> {
             let mut statement = c
@@ -975,7 +1017,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 15);
+        assert_eq!(schema_version(&connection).unwrap(), 16);
 
         // Lo que había sigue, y la marca nueva es NULL.
         let object_mark: Option<String> = connection
@@ -1018,7 +1060,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 15);
+        assert_eq!(schema_version(&connection).unwrap(), 16);
 
         // La op sigue, en conflicto, y las columnas nuevas son NULL.
         let (state, server_etag, server_raw): (String, Option<String>, Option<Vec<u8>>) =
@@ -1077,7 +1119,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 15);
+        assert_eq!(schema_version(&connection).unwrap(), 16);
 
         // El contacto sigue, y la tabla nueva arranca vacía.
         let contacts: i64 = connection
@@ -1189,7 +1231,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 15);
+        assert_eq!(schema_version(&connection).unwrap(), 16);
 
         // El enlace sigue, y las columnas nuevas arrancan nulas.
         let (resource, photo, media): (String, Option<Vec<u8>>, Option<String>) = connection
@@ -1253,7 +1295,7 @@ mod tests {
 
         apply(&mut connection).unwrap();
         assert_eq!(columns(&connection), before);
-        assert_eq!(schema_version(&connection).unwrap(), 15);
+        assert_eq!(schema_version(&connection).unwrap(), 16);
     }
 
     /// **v11 → v12 no pierde nada**: un enlace con su foto de una base de la v11
@@ -1289,7 +1331,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 15);
+        assert_eq!(schema_version(&connection).unwrap(), 16);
 
         // Lo que había sigue, y las columnas nuevas traen sus defaults.
         let row: (String, Option<Vec<u8>>, String, i64) = connection
@@ -1347,7 +1389,7 @@ mod tests {
         let object = insert_object(&connection, calendar, "https://x/c/1.ics");
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 15);
+        assert_eq!(schema_version(&connection).unwrap(), 16);
 
         // Lo que había sigue.
         assert_eq!(
@@ -1445,7 +1487,7 @@ mod tests {
 
         apply(&mut fresh).unwrap();
         assert_eq!(columns(&fresh), before);
-        assert_eq!(schema_version(&fresh).unwrap(), 15);
+        assert_eq!(schema_version(&fresh).unwrap(), 16);
 
         let mut from_v8 = at_version(8);
         apply(&mut from_v8).unwrap();
@@ -1502,7 +1544,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 15);
+        assert_eq!(schema_version(&connection).unwrap(), 16);
 
         // Lo que había sigue, y las columnas nuevas son NULL.
         let row: (String, Option<String>, i64, Option<i64>, Option<String>) = connection
@@ -1533,7 +1575,7 @@ mod tests {
         let before = columns(&connection);
         apply(&mut connection).unwrap();
         assert_eq!(columns(&connection), before);
-        assert_eq!(schema_version(&connection).unwrap(), 15);
+        assert_eq!(schema_version(&connection).unwrap(), 16);
     }
 
     /// **v14 → v15 no pierde nada**: el cuerpo y el estado S/MIME de una base de la
@@ -1593,7 +1635,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 15);
+        assert_eq!(schema_version(&connection).unwrap(), 16);
 
         #[allow(clippy::type_complexity)]
         let row: (
@@ -1661,7 +1703,7 @@ mod tests {
         let before = columns(&connection);
         apply(&mut connection).unwrap();
         assert_eq!(columns(&connection), before);
-        assert_eq!(schema_version(&connection).unwrap(), 15);
+        assert_eq!(schema_version(&connection).unwrap(), 16);
     }
 
     /// **v14 → v15 invalida los cuerpos PGP inline cacheados** (marcador al inicio, con o sin blancos antes): bajo la V14 un mail
@@ -1738,7 +1780,7 @@ mod tests {
         }
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 15);
+        assert_eq!(schema_version(&connection).unwrap(), 16);
 
         // Quedan con cuerpo los que no son PGP inline (incluidos los que sólo citan)...
         let con_cuerpo: Vec<i64> = connection
@@ -1889,7 +1931,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 15);
+        assert_eq!(schema_version(&connection).unwrap(), 16);
 
         let row: (String, Option<String>, i64, Option<i64>, Option<String>, Option<i64>) =
             connection
@@ -1925,7 +1967,7 @@ mod tests {
         let before = columns(&connection);
         apply(&mut connection).unwrap();
         assert_eq!(columns(&connection), before);
-        assert_eq!(schema_version(&connection).unwrap(), 15);
+        assert_eq!(schema_version(&connection).unwrap(), 16);
     }
 
     /// La marca `pending_op` sólo acepta los dos valores conocidos, o `NULL`.
@@ -2097,7 +2139,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 15);
+        assert_eq!(schema_version(&connection).unwrap(), 16);
 
         let count = |sql: &str| -> i64 { connection.query_row(sql, [], |r| r.get(0)).unwrap() };
         assert_eq!(count("SELECT count(*) FROM mailboxes"), 1);
@@ -2167,7 +2209,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 15);
+        assert_eq!(schema_version(&connection).unwrap(), 16);
 
         let count = |sql: &str| -> i64 { connection.query_row(sql, [], |r| r.get(0)).unwrap() };
         assert_eq!(count("SELECT count(*) FROM mailboxes"), 1);
@@ -2201,7 +2243,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 15);
+        assert_eq!(schema_version(&connection).unwrap(), 16);
         let message: String = connection
             .query_row("SELECT message FROM sync_log", [], |row| row.get(0))
             .unwrap();
@@ -2502,7 +2544,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 15);
+        assert_eq!(schema_version(&connection).unwrap(), 16);
         assert_eq!(found(&connection, "jose"), vec![id]);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_emails"), 1);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_phones"), 1);
@@ -2673,7 +2715,7 @@ mod tests {
             .unwrap();
 
         apply(&mut connection).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 15);
+        assert_eq!(schema_version(&connection).unwrap(), 16);
         assert_eq!(found(&connection, "jose"), vec![id]);
         assert_eq!(count(&connection, "SELECT count(*) FROM occurrences"), 2);
         assert_eq!(count(&connection, "SELECT count(*) FROM contact_emails"), 1);
