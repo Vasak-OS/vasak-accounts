@@ -223,6 +223,11 @@ pub struct EventPatch {
     pub location: Change<String>,
     pub start: Change<DateSpec>,
     pub end: Change<DateSpec>,
+    /// Las `CATEGORIES` del evento, como una lista entera (RFC 5545 §3.8.1.2):
+    /// `Set` las fija todas, `Clear` las saca, `Leave` no las toca. Una lista con
+    /// varias líneas `CATEGORIES` en el crudo se colapsa en una (ver
+    /// [`put_categories`]).
+    pub categories: Change<Vec<String>>,
     pub partstat: Change<Partstat>,
     pub my_address: String,
 }
@@ -236,6 +241,7 @@ impl EventPatch {
             && self.location == Change::Leave
             && self.start == Change::Leave
             && self.end == Change::Leave
+            && self.categories == Change::Leave
             && self.partstat == Change::Leave
     }
 
@@ -250,6 +256,7 @@ impl EventPatch {
             || self.location != Change::Leave
             || self.start != Change::Leave
             || self.end != Change::Leave
+            || self.categories != Change::Leave
     }
 }
 
@@ -730,6 +737,54 @@ fn put_partstat(
     ctx.keep();
 }
 
+/// Reescribe —o saca, o deja— las `CATEGORIES` de un evento, como una línea
+/// única. `Leave` deja la línea; `Clear` la saca; `Set` la reescribe con la lista
+/// entera y descarta cualquier `CATEGORIES` posterior (un evento puede traer
+/// varias líneas y acá se colapsan en una). Una lista vacía —o toda en blanco— no
+/// escribe una `CATEGORIES:` vacía: equivale a sacarla.
+fn put_categories(ctx: &mut EditContext, change: &Change<Vec<String>>, done: &mut bool) {
+    match change {
+        Change::Leave => ctx.keep(),
+        Change::Clear => {}
+        Change::Set(names) => {
+            if !*done {
+                *done = true;
+                let joined = joined_categories(names);
+                if !joined.is_empty() {
+                    ctx.rewrite(&joined);
+                }
+            }
+        }
+    }
+}
+
+/// Agrega la línea `CATEGORIES` si el parche la fija y no se escribió ya. Una
+/// lista vacía no agrega nada.
+fn append_categories(out: &mut Vec<String>, change: &Change<Vec<String>>, done: bool, name: &str) {
+    if let Change::Set(names) = change {
+        if !done {
+            let joined = joined_categories(names);
+            if !joined.is_empty() {
+                out.extend(fold(&render(name, &[], &joined)));
+            }
+        }
+    }
+}
+
+/// Las categorías como el valor de una sola línea `CATEGORIES`: cada nombre
+/// escapado (una coma adentro va como `\,`, así se lee como un solo valor) y
+/// juntos por una coma **sin** escapar, que es el separador de la lista. Los
+/// nombres en blanco se descartan.
+fn joined_categories(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty())
+        .map(escape_text)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Los parámetros de una línea con el `PARTSTAT` fijado al valor nuevo: se saca
 /// cualquier `PARTSTAT` anterior (no se duplica) y se agrega el nuevo al final,
 /// conservando los demás parámetros en su orden. El valor es uno de los tres
@@ -810,6 +865,7 @@ struct EventDone {
     location: bool,
     start: bool,
     end: bool,
+    categories: bool,
     /// Si ya contesté: fijado mi `PARTSTAT` en mi `ATTENDEE`. Evita tocar un
     /// segundo asistente que coincidiera.
     partstat: bool,
@@ -844,6 +900,7 @@ impl ComponentPatch for EventPatch {
             "LOCATION" => put_text(ctx, &self.location, &mut done.location),
             "DTSTART" => put_date(ctx, &self.start, &mut done.start),
             "DTEND" => put_date(ctx, &self.end, &mut done.end),
+            "CATEGORIES" => put_categories(ctx, &self.categories, &mut done.categories),
             "ATTENDEE" => put_partstat(ctx, &self.partstat, &self.my_address, &mut done.partstat),
             _ => return false,
         }
@@ -856,6 +913,7 @@ impl ComponentPatch for EventPatch {
         append_text(out, &self.location, done.location, "LOCATION");
         append_date(out, &self.start, done.start, "DTSTART");
         append_date(out, &self.end, done.end, "DTEND");
+        append_categories(out, &self.categories, done.categories, "CATEGORIES");
         // `partstat` **no** se agrega si faltaba: si no hay un `ATTENDEE` que sea
         // yo, contestar es un no-op seguro —no me agrego ni invento la línea—.
     }
@@ -1512,6 +1570,154 @@ mod tests {
         assert!(!document.truncated);
         assert_eq!(document.components.len(), 1);
         assert_eq!(document.components[0].name, "VEVENT");
+    }
+
+    // ── CATEGORIES (escritura conservadora) ─────────────────────────────────
+
+    fn names(list: &[&str]) -> Change<Vec<String>> {
+        Change::Set(list.iter().map(|s| s.to_string()).collect())
+    }
+
+    fn categories_patch(categories: Change<Vec<String>>) -> EventPatch {
+        EventPatch {
+            categories,
+            ..Default::default()
+        }
+    }
+
+    /// Las líneas lógicas de un crudo, sin las `CATEGORIES` ni el `SEQUENCE`: lo
+    /// que un parche de categorías no tiene que tocar.
+    fn lines_without_categories(raw: &str) -> Vec<String> {
+        raw.split("\r\n")
+            .filter(|l| !l.starts_with("CATEGORIES") && !l.starts_with("SEQUENCE"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn category_lines(raw: &str) -> Vec<String> {
+        raw.split("\r\n")
+            .filter(|l| l.starts_with("CATEGORIES"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    const WITH_CATEGORIES: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:abc\r\n\
+        SUMMARY:Reunión\r\nCATEGORIES:Viejo\r\nDTSTART:20260915T140000Z\r\n\
+        CATEGORIES:Otro,Mas\r\nX-FOO;A=b:bar\r\nSEQUENCE:3\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+    #[test]
+    fn set_de_categorias_reescribe_una_sola_linea_y_deja_el_resto_intacto() {
+        let out = edited(
+            WITH_CATEGORIES,
+            &categories_patch(names(&["Trabajo", "Casa"])),
+        );
+        assert_eq!(
+            category_lines(&out),
+            vec!["CATEGORIES:Trabajo,Casa"],
+            "{out}"
+        );
+        assert_eq!(
+            lines_without_categories(&out),
+            lines_without_categories(WITH_CATEGORIES)
+        );
+    }
+
+    #[test]
+    fn un_parche_de_categorias_no_toca_summary_ni_fechas() {
+        let raw = "BEGIN:VEVENT\r\nUID:a\r\nSUMMARY:X\r\nDTSTART:20260915T140000Z\r\n\
+            DTEND:20260915T150000Z\r\nEND:VEVENT\r\n";
+        let out = edited(raw, &categories_patch(names(&["A"])));
+        assert_eq!(
+            lines_without_categories(&out),
+            lines_without_categories(raw)
+        );
+        assert_eq!(category_lines(&out), vec!["CATEGORIES:A"]);
+    }
+
+    #[test]
+    fn varias_lineas_categories_se_colapsan_en_una_al_hacer_set() {
+        let out = edited(WITH_CATEGORIES, &categories_patch(names(&["Uno", "Dos"])));
+        assert_eq!(category_lines(&out).len(), 1, "{out}");
+        assert!(!out.contains("Viejo") && !out.contains("Otro"), "{out}");
+    }
+
+    #[test]
+    fn una_coma_dentro_del_nombre_sale_escapada_y_el_separador_no() {
+        let out = edited(EVENT, &categories_patch(names(&["a,b"])));
+        assert_eq!(category_lines(&out), vec![r"CATEGORIES:a\,b"], "{out}");
+        let out = edited(EVENT, &categories_patch(names(&["x", "a,b"])));
+        assert_eq!(category_lines(&out), vec![r"CATEGORIES:x,a\,b"], "{out}");
+    }
+
+    #[test]
+    fn clear_saca_todas_las_lineas_categories() {
+        let out = edited(WITH_CATEGORIES, &categories_patch(Change::Clear));
+        assert!(category_lines(&out).is_empty(), "{out}");
+        assert_eq!(
+            lines_without_categories(&out),
+            lines_without_categories(WITH_CATEGORIES)
+        );
+    }
+
+    #[test]
+    fn leave_deja_las_categorias_byte_por_byte() {
+        let patch = EventPatch {
+            summary: set("Otro"),
+            ..Default::default()
+        };
+        let out = edited(WITH_CATEGORIES, &patch);
+        assert_eq!(
+            category_lines(&out),
+            vec!["CATEGORIES:Viejo", "CATEGORIES:Otro,Mas"]
+        );
+    }
+
+    #[test]
+    fn una_lista_vacia_o_en_blanco_no_deja_una_categories_vacia() {
+        for patch in [names(&[]), names(&["", "  "])] {
+            let out = edited(WITH_CATEGORIES, &categories_patch(patch.clone()));
+            assert!(category_lines(&out).is_empty(), "{out}");
+            // Tampoco se agrega a un evento que no tenía.
+            let out = edited(EVENT, &categories_patch(patch));
+            assert!(category_lines(&out).is_empty(), "{out}");
+        }
+    }
+
+    #[test]
+    fn un_evento_nuevo_con_categorias_lleva_la_linea() {
+        let out = created(
+            "u1",
+            "20260915T000000Z",
+            &categories_patch(names(&["Trabajo", "Casa"])),
+        );
+        assert_eq!(
+            category_lines(&out),
+            vec!["CATEGORIES:Trabajo,Casa"],
+            "{out}"
+        );
+        let sin = created("u1", "20260915T000000Z", &EventPatch::default());
+        assert!(category_lines(&sin).is_empty());
+    }
+
+    /// Cambiar categorías cambia la versión del evento: sube el SEQUENCE (3 → 4,
+    /// o lo pone en 1). Contestar una invitación no.
+    #[test]
+    fn cambiar_categorias_sube_el_sequence_y_contestar_no() {
+        let out = edited(EVENT, &categories_patch(names(&["A"])));
+        assert!(
+            out.contains("SEQUENCE:4") && !out.contains("SEQUENCE:3"),
+            "{out}"
+        );
+
+        let raw = "BEGIN:VEVENT\r\nUID:a\r\nSUMMARY:X\r\nEND:VEVENT\r\n";
+        let out = edited(raw, &categories_patch(Change::Clear));
+        assert!(out.contains("SEQUENCE:1"), "{out}");
+
+        let solo = edited(INVITE, &rsvp("juan@example.com", Partstat::Accepted));
+        assert!(
+            solo.contains("SEQUENCE:2") && !solo.contains("SEQUENCE:3"),
+            "{solo}"
+        );
     }
 
     // ── Tareas (VTODO) ──────────────────────────────────────────────────────
