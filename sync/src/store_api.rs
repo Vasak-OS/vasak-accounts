@@ -1288,7 +1288,8 @@ impl<K: KeySource> StoreApi<K> {
     ///   parche nombra (decisión 3).
     /// - `payload`: un objeto JSON. Cada campo ausente **no se toca**, `null` lo
     ///   **saca**, y un valor lo **fija**: `summary`, `description`, `location`
-    ///   de texto; `start`, `end` como `{"value": "...", "params": ["..."]}`. Al
+    ///   de texto; `start`, `end` como `{"value": "...", "params": ["..."]}`;
+    ///   `categories` como una lista de textos (vacía o `null` las saca). Al
     ///   editar, `id` identifica el evento.
     ///
     /// Devuelve `{"event_id": "<cuenta>/<id>"}`. **No devuelve el `href`**: la
@@ -2408,9 +2409,39 @@ fn event_patch_from(
         location: text_change(obj, "location")?,
         start: date_change(obj, "start")?,
         end: date_change(obj, "end")?,
+        categories: string_list_change(obj, "categories")?,
         partstat: partstat_change(obj, "partstat")?,
         my_address: my_address.to_string(),
     })
+}
+
+/// Cómo cambia una lista de textos —las `categories` de un evento—: ausente no se
+/// toca, `null` las saca todas, una lista de textos las fija enteras. Una lista
+/// vacía fija «sin categorías» (equivale a sacarlas). Cualquier otra forma —un
+/// número, un objeto, un elemento que no es texto— es un argumento inválido, con
+/// texto fijo que no lleva nada del cuerpo.
+fn string_list_change(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<Change<Vec<String>>, StoreError> {
+    match obj.get(key) {
+        None => Ok(Change::Leave),
+        Some(serde_json::Value::Null) => Ok(Change::Clear),
+        Some(serde_json::Value::Array(items)) => {
+            let values = items
+                .iter()
+                .map(|item| {
+                    item.as_str().map(str::to_string).ok_or_else(|| {
+                        StoreError::InvalidArgument(format!("cada elemento de «{key}» es un texto"))
+                    })
+                })
+                .collect::<Result<Vec<_>, StoreError>>()?;
+            Ok(Change::Set(values))
+        }
+        Some(_) => Err(StoreError::InvalidArgument(format!(
+            "«{key}» es una lista de textos o null"
+        ))),
+    }
 }
 
 /// Cómo cambia mi respuesta a una invitación: ausente no se toca, un texto la fija
@@ -6667,6 +6698,39 @@ mod tests {
             serde_json::Value::Object(map) => map,
             other => panic!("se esperaba un objeto: {other}"),
         }
+    }
+
+    #[test]
+    fn las_categorias_del_cuerpo_son_una_lista_de_textos() {
+        let cambio = |body: &str| string_list_change(&json_map(body), "categories");
+        assert_eq!(cambio(r#"{"summary":"X"}"#).unwrap(), Change::Leave);
+        assert_eq!(cambio(r#"{"categories":null}"#).unwrap(), Change::Clear);
+        assert_eq!(
+            cambio(r#"{"categories":["a","b"]}"#).unwrap(),
+            Change::Set(vec!["a".to_string(), "b".to_string()])
+        );
+        assert_eq!(cambio(r#"{"categories":[]}"#).unwrap(), Change::Set(vec![]));
+        for body in [
+            r#"{"categories":[1]}"#,
+            r#"{"categories":["a",null]}"#,
+            r#"{"categories":7}"#,
+            r#"{"categories":"a"}"#,
+            r#"{"categories":{}}"#,
+        ] {
+            assert!(
+                matches!(cambio(body), Err(StoreError::InvalidArgument(_))),
+                "{body} tenía que rechazarse"
+            );
+        }
+    }
+
+    #[test]
+    fn el_parche_de_evento_cablea_las_categorias() {
+        let obj = json_map(r#"{"categories":["x"]}"#);
+        let patch = event_patch_from(&obj, "a@b.c").unwrap();
+        assert_eq!(patch.categories, Change::Set(vec!["x".to_string()]));
+        assert!(!patch.is_empty());
+        assert!(event_patch_from(&json_map(r#"{"categories":[1]}"#), "a@b.c").is_err());
     }
 
     #[test]
