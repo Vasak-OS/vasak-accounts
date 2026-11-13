@@ -1143,6 +1143,11 @@ pub struct EventDetail {
     pub title: String,
     pub description: String,
     pub location: String,
+    /// El enlace de videollamada del evento (`CONFERENCE`, o una URL de un
+    /// dominio conocido en `LOCATION`/`URL`/`DESCRIPTION`), o vacío si no hay.
+    /// Viaja tal cual vino: la aplicación lo abre con `xdg-open` al tocar
+    /// «Unirse», nunca solo.
+    pub meeting_url: String,
     pub start: String,
     pub end: String,
     pub all_day: bool,
@@ -1407,6 +1412,7 @@ pub fn get_event(
             .map(|p| ical::visible_multiline(&ical::unescape_text(&p.value), MAX_DESCRIPTION))
             .unwrap_or_default(),
         location: component.text("LOCATION", MAX_TEXT).unwrap_or_default(),
+        meeting_url: ical::meeting_url(component),
         start,
         end,
         all_day,
@@ -2692,6 +2698,47 @@ mod tests {
             .unwrap(),
             None
         );
+    }
+
+    /// `GetEvent` trae el enlace de videollamada: el de `CONFERENCE` si lo hay,
+    /// el de la ubicación si no, y vacío para un evento común.
+    #[test]
+    fn el_detalle_trae_el_enlace_de_videollamada() {
+        let evento = |uid: &str, extra: &str| {
+            format!(
+                "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:{uid}\r\nSUMMARY:X\r\n\
+                 DTSTART:20260915T140000Z\r\nDTEND:20260915T150000Z\r\n{extra}\
+                 END:VEVENT\r\nEND:VCALENDAR\r\n"
+            )
+        };
+        let con_conference = evento("a", "CONFERENCE:https://talk.example.org/call/1\r\n");
+        let con_ubicacion = evento("b", "LOCATION:https://meet.google.com/abc-defg-hij\r\n");
+        let sin_enlace = evento("c", "LOCATION:Aula 3\r\n");
+        let temp = TempDir::new("leer-evento-enlace");
+        let store = store_with(
+            &temp,
+            &[
+                ("https://x/c/a.ics", con_conference.as_str()),
+                ("https://x/c/b.ics", con_ubicacion.as_str()),
+                ("https://x/c/c.ics", sin_enlace.as_str()),
+            ],
+        );
+        let url = |id: i64| {
+            get_event(
+                store.connection(),
+                "cuenta",
+                id,
+                None,
+                "",
+                &ExpansionLimits::DEFAULT,
+            )
+            .unwrap()
+            .unwrap()
+            .meeting_url
+        };
+        assert_eq!(url(1), "https://talk.example.org/call/1");
+        assert_eq!(url(2), "https://meet.google.com/abc-defg-hij");
+        assert_eq!(url(3), "");
     }
 
     /// Un evento que no entra en un mega vuelve recortado, nunca como error.
