@@ -28,6 +28,7 @@ pub mod recurrence;
 pub mod timezones;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use url::Url;
 
 use timezones::{Zone, Zones};
 
@@ -464,6 +465,83 @@ impl Component {
         self.first(name)
             .and_then(|p| DateValue::parse(&p.value, &p.params))
     }
+}
+
+/// Dominios de videollamada que se reconocen en `LOCATION`, `URL` y
+/// `DESCRIPTION` cuando el evento no trae `CONFERENCE`. Se comparan por sufijo
+/// de host, para aceptar subdominios (`empresa.zoom.us`, `us02web.zoom.us`).
+const MEETING_HOSTS: [&str; 5] = [
+    "meet.google.com",
+    "zoom.us",
+    "teams.microsoft.com",
+    "webex.com",
+    "meet.jit.si",
+];
+
+/// El enlace de videollamada del evento, o vacío si no hay.
+///
+/// Prefiere `CONFERENCE` (RFC 7986 §5.11), la propiedad hecha para esto y la que
+/// ponen los servidores modernos —incluido el Talk del propio Nextcloud—; si no
+/// está, busca una URL de un dominio conocido en `LOCATION`, `URL` y
+/// `DESCRIPTION`, que es donde casi siempre viaja. Devuelve la URL **tal cual
+/// vino**, sin reescribirla.
+///
+/// Sólo acepta `http`/`https`: un `javascript:` o un `file:` que quien creó el
+/// evento haya metido en cualquiera de esos campos no es un enlace para abrir, y
+/// esta función es lo único entre ese texto y el `xdg-open` de la aplicación.
+pub fn meeting_url(component: &Component) -> String {
+    if let Some(p) = component.first("CONFERENCE") {
+        let uri = p.value.trim();
+        if is_http_url(uri) {
+            return visible(uri, MAX_TEXT);
+        }
+    }
+    for name in ["LOCATION", "URL", "DESCRIPTION"] {
+        if let Some(found) = component
+            .first(name)
+            .and_then(|p| known_meeting_url(&unescape_text(&p.value)))
+        {
+            return visible(&found, MAX_TEXT);
+        }
+    }
+    String::new()
+}
+
+/// Si el texto es una URL `http`/`https`. Se parsea con el estándar WHATWG (el
+/// crate `url`, el mismo que usa el navegador), no a mano: así una barra
+/// invertida —que el navegador y `xdg-open` tratan como `/`— no deja ver un host
+/// distinto del que se termina abriendo.
+fn is_http_url(value: &str) -> bool {
+    Url::parse(value).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+}
+
+/// La primera URL `http`/`https` del texto cuyo host es de un dominio conocido.
+///
+/// El host se saca con el crate `url` (WHATWG), no a mano, por lo mismo que
+/// [`is_http_url`]: el allowlist de dominios no se puede evadir con una `\`, un
+/// `@` o un `:` ubicados para que el navegador vea un host distinto del que se
+/// comprobó. Devuelve la URL tal cual vino; un token que pasa el filtro tiene,
+/// con el mismo parser que el navegador, un host conocido.
+fn known_meeting_url(text: &str) -> Option<String> {
+    text.split(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\''))
+        .map(|token| token.trim_end_matches(|c| matches!(c, '.' | ',' | ')' | ']' | ';')))
+        .find(|token| {
+            Url::parse(token).is_ok_and(|url| {
+                matches!(url.scheme(), "http" | "https")
+                    && url.host_str().is_some_and(is_known_host)
+            })
+        })
+        .map(str::to_string)
+}
+
+fn is_known_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    MEETING_HOSTS.iter().any(|domain| {
+        host == *domain
+            || host
+                .strip_suffix(domain)
+                .is_some_and(|rest| rest.ends_with('.'))
+    })
 }
 
 /// Un recurso de calendario leído entero.
@@ -1337,5 +1415,108 @@ mod tests {
         );
         let color = color_of(&event_with(&format!("COLOR:{}\r\n", "a".repeat(500)))).unwrap();
         assert_eq!(color.len(), 64);
+    }
+
+    /// `CONFERENCE` (RFC 7986) manda sobre cualquier URL del texto.
+    #[test]
+    fn el_enlace_de_videollamada_prefiere_conference() {
+        let event = event_with(
+            "CONFERENCE;VALUE=URI:https://talk.example.org/call/abc\r\n\
+             LOCATION:https://meet.google.com/xyz-abcd-efg\r\n",
+        );
+        assert_eq!(meeting_url(&event), "https://talk.example.org/call/abc");
+    }
+
+    /// Un `CONFERENCE` que no es http(s) no se usa, pero no tapa el respaldo.
+    #[test]
+    fn un_conference_sin_http_cae_al_respaldo() {
+        let event =
+            event_with("CONFERENCE:tel:+34123456789\r\nLOCATION:https://meet.jit.si/sala\r\n");
+        assert_eq!(meeting_url(&event), "https://meet.jit.si/sala");
+        let solo = event_with("CONFERENCE:javascript:alert(1)\r\n");
+        assert_eq!(meeting_url(&solo), "");
+    }
+
+    /// Cada dominio conocido se reconoce en cada uno de los tres campos.
+    #[test]
+    fn el_enlace_se_reconoce_en_location_url_y_description() {
+        let urls = [
+            "https://meet.google.com/abc-defg-hij",
+            "https://us02web.zoom.us/j/123456?pwd=x",
+            "https://teams.microsoft.com/l/meetup-join/19",
+            "https://empresa.webex.com/meet/yo",
+            "https://meet.jit.si/Sala",
+        ];
+        for url in urls {
+            for line in [
+                format!("LOCATION:{url}\r\n"),
+                format!("URL:{url}\r\n"),
+                format!("DESCRIPTION:Unite acá: {url}. Saludos\r\n"),
+            ] {
+                assert_eq!(meeting_url(&event_with(&line)), url, "{line}");
+            }
+        }
+    }
+
+    /// Un dominio que no es de videollamada, o que sólo lo imita, no cuenta.
+    #[test]
+    fn una_url_de_dominio_desconocido_no_es_videollamada() {
+        for line in [
+            "DESCRIPTION:Ver https://example.com/reunion\r\n",
+            "LOCATION:https://zoom.us.evil.example/j/1\r\n",
+            "LOCATION:https://notzoom.us/j/1\r\n",
+            "LOCATION:https://evil.example/?u=https://zoom.us/j/1\r\n",
+        ] {
+            assert_eq!(meeting_url(&event_with(line)), "", "{line}");
+        }
+    }
+
+    /// Frontera de seguridad: ese texto acaba en `xdg-open`, así que sólo
+    /// http(s) sale, aunque el resto parezca de un dominio conocido.
+    #[test]
+    fn el_enlace_de_videollamada_nunca_es_javascript_ni_file() {
+        for line in [
+            "LOCATION:javascript://zoom.us/%0Aalert(1)\r\n",
+            "URL:file://meet.google.com/etc/passwd\r\n",
+            "DESCRIPTION:tel:meet.jit.si ftp://webex.com/x\r\n",
+            "CONFERENCE:file:///etc/passwd\r\n",
+        ] {
+            assert_eq!(meeting_url(&event_with(line)), "", "{line}");
+        }
+    }
+
+    /// Sin nada que lo sugiera, vacío.
+    #[test]
+    fn un_evento_sin_enlace_no_tiene_videollamada() {
+        assert_eq!(
+            meeting_url(&event_with("SUMMARY:Café\r\nLOCATION:Aula 3\r\n")),
+            ""
+        );
+        assert_eq!(meeting_url(&event_with("")), "");
+    }
+
+    /// Regresión (bypass del allowlist): el navegador y `xdg-open` leen `\` como
+    /// `/`, así que `https://evil.com\@zoom.us/` abre evil.com aunque un parser a
+    /// mano vea `zoom.us`. Con el parser WHATWG ni la `\` suelta ni la escapada
+    /// (`\\` en iCal) dejan pasar un host que no es de videollamada.
+    #[test]
+    fn la_barra_invertida_no_esconde_otro_host_tras_un_dominio_conocido() {
+        for line in [
+            "LOCATION:https://evil.com\\@zoom.us/phish\r\n",
+            "LOCATION:https://evil.com\\.zoom.us/phish\r\n",
+            "LOCATION:https://evil.com\\\\@zoom.us/phish\r\n",
+            "DESCRIPTION:Unite https://evil.com\\@zoom.us/phish ya\r\n",
+        ] {
+            assert_eq!(meeting_url(&event_with(line)), "", "{line}");
+        }
+    }
+
+    /// El inverso: con el mismo parser, `https://zoom.us\@evil.com/sala` tiene
+    /// host `zoom.us` (lo que sigue a la `\` es camino), así que es legítimo y
+    /// sale tal cual vino.
+    #[test]
+    fn una_barra_invertida_tras_el_dominio_conocido_deja_el_host_conocido() {
+        let event = event_with("LOCATION:https://zoom.us\\@evil.com/sala\r\n");
+        assert_eq!(meeting_url(&event), "https://zoom.us\\@evil.com/sala");
     }
 }
